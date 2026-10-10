@@ -1,0 +1,38 @@
+# Build output
+bin/
+obj/
+artifacts/
+
+# Runtime dependencies: produced by packaging/, never committed (deps/README.md)
+deps/*
+!deps/README.md
+
+# Native build tree
+build/
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj*
+*.sln.DotSettings.user
+
+# Android
+.gradle/
+local.properties
+*.apk
+*.keystore
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs (never commit a runtime log)
+*.log
+
+# Local agent state and temporary development toolchains
+.workbuddy-ai/
+.tmp-*

@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- NotifyIcon for the tray; the only reason Windows Forms is referenced. -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>AnPod.Desktop</RootNamespace>
+    <AssemblyName>AnPod</AssemblyName>
+    <!--
+      The native capture DLL is x64-only (plan §1.2). Setting PlatformTarget
+      (rather than a Platforms list) pins the architecture without creating a
+      second output folder, so `dotnet build` on the csproj and on the solution
+      land in the same place.
+    -->
+    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!--
+      Stamps the icon into AnPod.exe (Explorer, taskbar, Alt-Tab). The same
+      .ico is also embedded as a WPF resource below, because the Win32 icon
+      resource is not reachable from managed code without P/Invoke.
+      Regenerate with: <python> packaging/make-icon.py
+    -->
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AnPod.Core\AnPod.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Loaded at runtime by AppIcon for the window and the tray icon.
+      Explicitly a Resource: the SDK does not pick .ico up on its own.
+    -->
+    <Resource Include="Assets\icon.ico" />
+  </ItemGroup>
+
+  <!--
+    Runtime dependencies are produced by other toolchains and are NOT in source
+    control (see deps/README and packaging/). Copy them next to AnPod.exe when
+    they exist; never fail the build when they are absent, because the C# app
+    compiles and starts without them and reports the missing piece at runtime.
+  -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\deps\audio_capture.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\deps\audio_capture.dll')"
+          Link="audio_capture.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\deps\adb.exe"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\deps\adb.exe')"
+          Link="adb.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\deps\AdbWinApi.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\deps\AdbWinApi.dll')"
+          Link="AdbWinApi.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\deps\AdbWinUsbApi.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\deps\AdbWinUsbApi.dll')"
+          Link="AdbWinUsbApi.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\deps\server"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\deps\server')"
+          Link="server" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

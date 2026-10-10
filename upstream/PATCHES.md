@@ -1,0 +1,239 @@
+# Patches applied to reused code
+
+AnPod modifies LGPL-3.0-or-later code from ysbing/AudioShare. This file records
+every change so the corresponding source can be produced and the obligation in
+`LICENSES/LGPL-3.0-or-later.txt` satisfied (plan §2.2.5).
+
+Base revision: `70db6b531db2c21b5a41a289722aa3996de67ebe`
+(see `SOURCE_VERSIONS.md`).
+
+---
+
+## A. `audio_capture.cpp` — native WASAPI capture
+
+Each item maps to a defect identified in plan §3.4.
+
+### A1. Listener binds to loopback only *(§3.4.3)*
+
+**Before:** `addr.sin_addr.s_addr = htonl(INADDR_ANY);`
+**After:** `addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);`
+
+The ADB reverse tunnel terminates on the host's loopback, so the port never
+needs to be reachable from the LAN. This closes an accidental exposure where any
+host on the network could connect and receive the audio stream.
+
+### A2. Handshake connect code is verified *(§3.4.4, §7.1)*
+
+**Before:** the first byte sequence received was accepted unconditionally, then
+handed to the callback.
+
+**After:** a new export `AudioCapture_SetConnectToken(const char*)` records the
+token the current session expects. `ListenThread` compares the received code and
+drops any mismatching client, continuing to wait for the real one. An empty
+token preserves the upstream permissive behaviour.
+
+### A3. Format fallback validates the sample subtype *(§3.4.6)*
+
+**Before:** anything that was not PCM16 was cast to `const float*` and
+converted. A 24-bit or 32-bit integer mix format therefore produced noise.
+
+**After:** `AnalyseMixFormat` inspects `WAVEFORMATEXTENSIBLE.SubFormat`,
+`wBitsPerSample` and `Samples.wValidBitsPerSample`. Only
+`KSDATAFORMAT_SUBTYPE_PCM` with 16 bits (16 valid bits) and
+`KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` with 32 bits are accepted; anything else
+returns `ANPOD_ERR_UNSUPPORTED_FORMAT` and `Initialize` fails instead of
+playing garbage. Sample rate is range-checked to 8000–192000 Hz.
+
+### A4. Bounded send backlog *(§3.4.5)*
+
+**Before:** `SendAll` looped on blocking `send` with no timeout. A slow consumer
+stalled the capture thread, and because WASAPI kept buffering, playback drifted
+further behind real time with every packet.
+
+**After:** the client socket gets `SO_SNDTIMEO = 200 ms`. `SendPacket` abandons
+the remainder of a packet on `WSAETIMEDOUT` (dropping the oldest audio, which is
+the correct remedy) and only reports a fatal error for a genuinely broken
+socket. Drops are counted in `g_droppedPacketCount` and surfaced via
+`OutputDebugString` for the P4 performance work.
+
+### A5. Endpoint invalidation is reported *(§3.4.8)*
+
+**Before:** `AUDCLNT_E_DEVICE_INVALIDATED` from `GetBuffer`/`GetNextPacketSize`
+fell into the generic `FAILED(hr)` branch and silently ended capture.
+
+**After:** it sets `ANPOD_ERR_DEVICE_INVALIDATED`, which the managed side polls
+and turns into a session rebuild.
+
+### A6. Diagnostics exports *(§3.1 note)*
+
+Added `AudioCapture_GetLastErrorCode`, `AudioCapture_GetLastErrorMessage` and
+`AudioCapture_ClearLastError`. Upstream only implemented these for macOS, so the
+Windows DLL previously had no way to explain a failure. The six original exports
+are unchanged and still resolve.
+
+### A7. COM lifetime is balanced *(§5.5)*
+
+**Before:** `CoInitializeEx` was called on every `Initialize` with no matching
+`CoUninitialize`.
+
+**After:** `g_bComInitialized` tracks whether this module performed the
+initialisation, and `Cleanup` only calls `CoUninitialize` when it did. The
+`RPC_E_CHANGED_MODE` case (another apartment already owns the thread) is
+explicitly not balanced.
+
+### A8. Resource leaks on error paths
+
+**Before:** several early returns in `Initialize` leaked `IMMDevice`,
+`IAudioClient` or the `WAVEFORMATEX` allocation.
+
+**After:** every failure path funnels through `AudioCapture_Cleanup`, which
+releases whatever was acquired. `IMMDevice` is released exactly once on the
+success path.
+
+### A9. New public header
+
+`audio_capture.h` did not exist upstream. It declares the exports, the callback
+signature, the calling convention and the error-code table, so the managed side
+has one authoritative source for the ABI.
+
+### A10. `AudioCapture_SetStreamingEnabled` — pause without dropping the peer
+
+**Before:** the only way to stop forwarding audio was `AudioCapture_Stop`, which
+closes `g_clientSocket` and `g_listenSocket`. The Android payload's `read()` then
+returns -1, its `try (LocalSocket …)` block unwinds, and the process exits — so
+muting and unmuting the phone cost a full reconnect (reverse mapping, payload
+restart, handshake) every time.
+
+**After:** a `g_bStreamingEnabled` flag that the capture thread reads once per
+iteration. While it is false the thread still drains and releases the WASAPI
+buffer — so the audio engine never stalls — but writes zeros into the output
+buffer instead of converting the captured frames:
+
+```c
+if (!g_bStreamingEnabled) {
+    memset(outBuf, 0, (size_t)frames * 2 * sizeof(short));
+}
+```
+
+The socket stays open, the peer stays connected, its `AudioTrack` stays alive
+and primed, and resuming is seamless with no re-handshake. Reset to `TRUE` by
+`ResetSessionState` so a new session always starts audible.
+
+This is the one export that is **required** rather than optional on the managed
+side (see `NativeAudioCapture`): an old DLL would silently ignore the call and
+keep playing, which is a worse failure than refusing to load.
+
+### A11. Deliberately unchanged
+
+* The `Sleep(1)` + `timeBeginPeriod(1)` polling loop is kept as-is, per plan
+  §3.4.7. `timeEndPeriod(1)` is still paired on every exit path.
+* The 48 kHz stereo PCM16 preferred-format negotiation.
+* `SO_SNDBUF = 32 KiB`, `TCP_NODELAY`.
+* Release-before-send ordering.
+
+---
+
+## B. `Main.java` — Android playback
+
+### B1. Full header validation *(§3.3)*
+
+**Before:** only `sampleRate` was read; `bitsPerSample` was parsed and then
+ignored, so a 24-bit stream would have been fed to a 16-bit `AudioTrack`.
+
+**After:** `validateFormat` rejects a sample rate outside 8000–192000, a channel
+count other than 1 or 2, and any bit depth other than 16, throwing
+`UNSUPPORTED_*` before the `AudioTrack` is created.
+
+### B2. Machine-readable lifecycle logging *(§5.6)*
+
+Lifecycle events are written to stderr as `ANPOD START|FORMAT|PLAYING|STOP|
+RELEASED|ERROR ...`, which `AndroidProcessSession` mirrors into the Windows log.
+
+### B3. Guaranteed release
+
+`AudioTrack.stop()` and `release()` are each wrapped against `Throwable` and
+their outcome logged as `STOP_FAILED` / `RELEASE_FAILED`, so `release()` always
+runs and a failed stream cannot leak the track.
+
+**Why `Throwable` and not `IllegalStateException`:** the original upstream guard
+only caught `IllegalStateException`. Under `app_process` a `NullPointerException`
+escaped from `stop()` and *replaced* the genuine exception on the way out,
+destroying the only evidence of the real fault. Catching the widest type here
+keeps the original cause intact for the caller.
+
+### B4. Argument length limits *(§3.4.4)*
+
+`Options.parse` rejects a socket name or connect code longer than 128 bytes.
+
+### B5. Package rename
+
+`com.ysbing.audioshare` → `com.anpod.server`. The wire protocol is unchanged, so
+either side can be swapped independently; the class name in
+`AndroidServerLayout.MainClass` must match whichever payload is deployed.
+
+### B6. `AudioTrack` state is checked before use
+
+**Before:** the track was built and `play()` called without confirming the
+constructor had actually produced a usable instance. On an unsupported format or
+an exhausted device the object stayed in `STATE_UNINITIALIZED` and the failure
+surfaced later as an opaque exception from the audio stack.
+
+**After:** `getState()` is compared against `STATE_INITIALIZED` immediately
+after construction; anything else raises `IOException("AUDIO_TRACK_NOT_INITIALIZED
+state=… sampleRate=… channelMask=… bufferBytes=…")`, which the Windows log shows
+verbatim.
+
+### B7. `Context` is injected into `PlayerBase` *(the reconnect-loop fix)*
+
+**Symptom:** the desktop app connected, started streaming, then ~120 ms later
+reported `Android audio process exited unexpectedly` and reconnected — repeating
+every ~1.5 s indefinitely.
+
+**Root cause:** AnPod runs its payload with `app_process`, which never creates an
+`ActivityThread` application instance. `AudioTrack.play()` calls up into
+`PlayerBase.updateState()`, which dereferences
+`mContext.getPackageManager()` — with `mContext == null` this throws
+`NullPointerException` the moment playback starts. The upstream code, written for
+an in-app (`Activity`) context, never had to care.
+
+**After:** `resolveSystemContext()` obtains a real system `Context` from a bare
+`ActivityThread` instance:
+
+```java
+android.os.Looper.prepare();
+ActivityThread thread = ActivityThread.class.getDeclaredConstructor().newInstance();
+return (Context) ActivityThread.class.getMethod("getSystemContext").invoke(thread);
+```
+
+`attachPlayerContext(track)` then walks the instance's class hierarchy looking
+for a `Context`-typed field and injects it, logging
+`CONTEXT_ATTACHED <Type>.<field>` on success or `CONTEXT_FIELD_NOT_FOUND`.
+The track is built *without* a context and patched afterwards, because
+`AudioTrack.Builder.setContext()` throws `UnsupportedOperationException:
+Cannot create AudioTrack` on these builds.
+
+**Two dead ends, recorded so they are not retried:**
+
+* `AudioTrack.Builder.setContext()` — rejected by the platform, see above.
+* `ActivityThread.systemMain()` — *permanently poisons* `AudioTrack` creation in
+  the process: tracks built before the call still play, but every track built
+  afterwards fails. The bare constructor avoids the side effect entirely.
+
+---
+
+## C. Not modified
+
+* The 8-byte little-endian format header layout.
+* The `LocalSocket` abstract-namespace handshake ordering.
+* `MODE_STREAM` + `ENCODING_PCM_16BIT` + `PERFORMANCE_MODE_LOW_LATENCY` on
+  Android 8.0+.
+* Pre-roll of one minimum buffer before `play()`.
+
+---
+
+## D. Rebuilding
+
+The corresponding source for the LGPL portions is exactly the contents of
+`src/AnPod.Native/` and `src/AnPod.AndroidServer/` in this repository. Build
+instructions are in `README.md`; `packaging/build-native.ps1` and
+`packaging/build-android.ps1` reproduce the binaries from source.

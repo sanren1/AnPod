@@ -1,0 +1,72 @@
+/*
+ * AnPod Android audio server payload.
+ *
+ * This module produces an APK whose only purpose is to act as a classes.dex
+ * container. It is pushed to /data/local/tmp and started through app_process —
+ * it is never installed by the user and has no launcher activity (plan §3.2).
+ */
+plugins {
+    id 'com.android.application' version '8.5.2'
+}
+
+android {
+    namespace 'com.anpod.server'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.anpod.server'
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            // The payload is loaded by app_process, not installed, so shrinking
+            // would only risk removing entry points.
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        // Lint noise is irrelevant for a non-installed payload.
+        abortOnError false
+    }
+}
+
+/*
+ * Publishes the built APK as `deps/server`, the exact file AnPod pushes to the
+ * phone. Override the destination with -PanpodPayloadPath=<path>.
+ */
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        def capitalized = variant.name.substring(0, 1).toUpperCase() + variant.name.substring(1)
+        def assembleTask = "assemble${capitalized}"
+        def copyTask = "copy${capitalized}Apk"
+
+        tasks.matching { it.name == assembleTask }.configureEach {
+            finalizedBy copyTask
+        }
+
+        tasks.register(copyTask, Copy) {
+            def apkDir = layout.buildDirectory.dir("outputs/apk/${variant.name}").get().asFile
+            from(apkDir) {
+                include '*.apk'
+            }
+
+            def destination = file(
+                findProperty('anpodPayloadPath')
+                    ?: "${rootProject.projectDir}/../../deps/server")
+
+            into destination.parentFile
+            rename { destination.name }
+        }
+    }
+}

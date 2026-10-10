@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AnPod audio server payload.
+
+  There is no activity, no service and no permission request: the payload is
+  started by app_process and only opens a LocalSocket plus an AudioTrack, both
+  of which are permission-free for the shell user.
+
+  The APK exists solely because app_process needs a zip containing
+  classes.dex on its classpath.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="AnPod Server"
+        android:hasCode="true" />
+
+</manifest>

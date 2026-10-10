@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AnPod.Core holds the pure, UI-free logic: models, ADB output parsing and
+    settings (de)serialisation. It has no WPF dependency so it can be unit
+    tested without a desktop runtime.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>AnPod.Core</RootNamespace>
+    <AssemblyName>AnPod.Core</AssemblyName>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

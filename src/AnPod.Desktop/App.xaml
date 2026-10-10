@@ -1,0 +1,18 @@
+<Application x:Class="AnPod.Desktop.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:System.Windows.Controls;assembly=PresentationFramework"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Assets/Theme.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- Used for the empty device-list panel. The framework ships this
+                 one; a hand-written converter would be the same three lines
+                 plus a class to maintain. -->
+            <controls:BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

@@ -1,0 +1,52 @@
+ANDROID SDK PLATFORM-TOOLS — DISTRIBUTION NOTICE
+================================================
+
+AnPod ships `adb.exe`, `AdbWinApi.dll` and `AdbWinUsbApi.dll` from the Android
+SDK Platform-Tools package as runtime dependencies. These files are placed in
+`deps/` by the operator and are NOT part of the AnPod source repository.
+
+Source
+------
+  https://developer.android.com/tools/releases/platform-tools
+
+Licence
+-------
+  The Android SDK is distributed under the Android Software Development Kit
+  License Agreement and includes additional third-party notices. The
+  authoritative text is the `NOTICE.txt` file shipped inside the platform-tools
+  archive.
+
+  See also:
+    https://developer.android.com/studio/terms
+
+Obligations before any redistribution
+-------------------------------------
+AnPod currently invokes `adb.exe` as a separate process and does not link
+against it. Redistributing the binaries is nonetheless a redistribution of
+Google's software and must satisfy the SDK terms.
+
+Bundled version
+---------------
+  Platform-Tools package revision 37.0.1
+  `adb version` reports: Android Debug Bridge version 1.0.41
+                         Version 37.0.1-15733141
+
+Before publishing a portable package, verify all of the following (plan §P5.4):
+
+  [x] The exact platform-tools version string is recorded in
+      `upstream/SOURCE_VERSIONS.md` (revision 37.0.1).
+  [x] `NOTICE.txt` from the platform-tools archive is copied into the package
+      (kept at `deps/PLATFORM_TOOLS_NOTICE.txt`).
+  [x] This notice is copied into the package.
+  [ ] The SDK terms have been re-read for the current version, and the
+      redistribution clause has been confirmed to permit this use.
+      -- NOT YET DONE. This is a human/legal review step; the build is
+         technically complete but must not be published until it is ticked.
+
+Until the final checklist item is complete, `deps/` must not be published.
+
+Note on the ADB daemon
+----------------------
+AnPod never calls `adb kill-server`. The daemon is shared with Android Studio
+and other tools on the machine, so only AnPod's own reverse mappings and shell
+processes are touched (plan §1.3, §3.2).
