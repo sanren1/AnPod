@@ -92,29 +92,29 @@
 | Receiver Gradle 构建 | PASS | 在 Windows PowerShell 5.1 执行；apksigner 验证成功。merged Manifest 确认通知/前台服务权限、DUMP 边界、private `shortService`，无 Launcher、无媒体播放 FGS、无局域网权限。 |
 | Receiver APK 摘要 / 签名 | PASS | APK SHA-256：`b32eeaf06d40372c4a243eadf3b1c48067875af44f9e3a7b1d23d67628004f62`；证书 SHA-256：`fea24331dc877cb9537ef3596a42374871104b0b949a4cdc88b64b1ad6a45436`。当前为本机临时 debug 签名，未生成 release 密钥、未声称 release 签名。 |
 | PowerShell 5.1 JSON → Rust `read_artifact` | PASS | `receiver.json` 为无 BOM UTF-8；Rust 对由脚本实际生成的 APK/JSON 调用 `read_artifact` 成功。 |
-| Rust 离线检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`：22/22 通过，含 fake-adb 生命周期、安全拒绝及当前用户路径。 |
-| Android 普通应用权限 Probe | NOT_TESTED | 无权限 Probe APK 已构建；Receiver 已安装，但普通应用调用 Provider/Bootstrap 的实际拒绝结果尚未验证。 |
+| Rust 离线检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`：22/22 通过；`ANPOD_RECEIVER_ARTIFACT_DIR` 与 `ANPOD_P1_USB_SERIAL` 两个环境变量入口未设置时默认跳过。真机生命周期入口另行在已安装 Receiver 上执行：1/1 PASS，覆盖 status/health/start/health/stop/health。 |
+| Android 普通应用权限 Probe | PASS | 无权限 Probe 声明 Receiver `<queries>`；Status ok 后由 `run-as` 读取私有结果 `provider=denied bootstrap=denied`，两入口均因 SecurityException 被拒绝。只卸载临时 Probe。 |
 
 ### target 与兼容范围
 
-- 真实构建目标是 targetSdk 35，不沿用早先 API 34 APK。Android 16 / API 36 设备只能覆盖该 APK 在 API 36 系统上的运行，不覆盖 targetSdk 36 专属行为。
+- P1 阻断验收在 Android 16 / API 36 系统、Receiver targetSdk 35 的目标设备通过；结论仅适用于这一个目标组合，不代表 v2 发布验收通过。Android 16 / targetSdk 36 的专属行为及其他 Android 版本均为 NOT_TESTED。
 - API 35 对音频焦点有 targetSdk 35+ 规则；P1 不请求音频焦点。P2 音频实现必须单独验证前台服务/音频焦点约束。
-- Android 16 / targetSdk 36 的专属行为为 NOT_TESTED；API 36 目标构建尚未选择为 P1 目标。Android 12/14/15 真机也为 NOT_TESTED。
+- Android 12/14/15 设备及其他 OS 版本：NOT_TESTED。Receiver 没有 release 签名密钥，正式 release 签名：NOT_TESTED；候选 APK 使用本机临时 debug 证书。
 - Android 17 / targetSdk 37 的局域网权限兼容差异仍未解决；P1 不请求 `ACCESS_LOCAL_NETWORK`，也不启用网络接收。
-- 锁屏后短时服务、force-stop 后状态及合法 USB 恢复路径尚未真机验证。短时服务不能作为 P2 音频服务方案。
+- Receiver 在前台健康状态约 121 秒后按 shortService 期限自行停止，health error 为空；强制停止 Receiver 自身包后 dumpsys 显示无该服务、health inactive，再通过合法 USB Bootstrap/START 恢复健康并 STOP 成功。锁屏与重启后纯网络唤醒为 NOT_TESTED / 未实现；P1 不含网络接收。短时服务不能作为 P2 音频服务方案。
 
 ### 真机记录
 
-- 目标设备：Android 16 / API 36，省略型号和 ADB 标识；ADB 同时显示 USB 与 Wi-Fi 两条连接记录，使用 `adb -d get-serialno` 唯一确认 USB 目标。
+- 目标设备：Android 16 / API 36，省略型号和 ADB 标识。ADB 同时显示 USB 与 Wi-Fi 记录；依据 `adb devices -l` 选择其中唯一已授权的物理 USB 记录，Rust `ensure_usb_device` 对此选择实测通过。`adb -d get-serialno` 曾返回 `unknown`，没有用它宣称唯一确认 USB。
 - 安装前只读检查：当前 Android user 为 0，Receiver 未安装，旧 `com.anpod.server.Main` 音频服务进程为 0。没有启动或停止旧 AnPod 音频。
-- 首次 install：**FAIL（历史记录）**。首次 `adb install -r` 返回 `INSTALL_FAILED_ABORTED: User rejected permissions`；用户当时反馈未看到 USB 安装提示。未绕过系统确认。
-- 后续 install：**PASS**。设备解锁亮屏后，本机 APK SHA-256 与 metadata 一致且 `apksigner` 证书校验通过；对已确认的 USB 目标执行一次 `adb install -r` 返回 `Success`。Android 显示系统通知授权页，用户明确允许通知。未卸载应用。
-- 真机生命周期（直接 ADB）：**PASS**。按当前 Android 用户读取到 `serviceActive=true`、`foreground=true`、`healthy=true`；显式 STOP 后三项均为 `false`。此次结果验证直接 ADB 入口，不代表本次 Rust 用户绑定修复已在手机上独立运行。
-- 安装 APK 字节与随包 metadata SHA-256 匹配。普通应用权限 Probe：**NOT_TESTED**。修复后 Rust 管理路径的已安装生命周期真机复验仍待执行。
-- 不执行 `pm grant`，不触发 `adb kill-server`，不为测试卸载已安装 Receiver。
+- 首次 install：**FAIL（历史记录，原因未知）**。首次 `adb install -r` 返回 `INSTALL_FAILED_ABORTED: User rejected permissions`；用户当时反馈未看到 USB 安装提示。未据此推断 ROM 设置或绕过确认。
+- 后续 install：**PASS**。本机 APK SHA-256 与 metadata 一致且 `apksigner` 证书校验通过；经用户授权的 USB 目标安装返回 `Success`。Android 随后显示通知授权页，用户明确允许通知。Receiver 未卸载或重装。
+- 修复后的 Rust 管理路径真机生命周期：**PASS，1/1**。在已安装 Receiver 上验证 status、health、START、health、STOP、health；安装路径含合法 `=` 填充，所有包管理与 Provider/Activity 操作绑定当前 user 0。未执行卸载。
+- 安装 APK 字节与随包 metadata SHA-256 匹配。普通应用权限 Probe：**PASS**。新版 Probe 仅申请自身可见性 `<queries>`，Status ok 后 `run-as` 私有文件读取成功，内容精确为 `provider=denied bootstrap=denied`；两入口均被实际普通应用 UID 拒绝。验证完成后只卸载临时 Probe，Receiver 保留且处于 stopped / foreground=false / healthy=false。
+- 本次未执行 `pm grant`、未触发 `adb kill-server`，未操作旧 AnPod 音频。
 
 ### 候选包与回退
 
 - 普通旧 Tauri 包只要求原有五个桌面运行文件和 Platform-Tools notice；Receiver APK/JSON 不再是 `tauri.conf` 或普通打包路径的强制依赖。
-- 上一版候选包 `artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip` 的 SHA-256 为 `C6E3E9A6EB0627732EE6CACF24F5A03B269BA396E5E86E0CF6120AE2EA464B70`，包含 APK、JSON、README 图标 `icon.png`、原有桌面运行文件和 notices/licenses/upstream；该包早于当前 Rust 用户绑定修复，不能作为最新候选交付。待修复后的 Rust 已安装生命周期真机复验通过后再刷新候选包。稳定 ZIP `AnPod-1.0.4-tauri-win-x64-portable.zip` 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
-- 回退继续使用既有稳定 ZIP。Receiver 不自动卸载；若候选验收未完成，停止使用候选包并完成人工复测，不进入 P2。
+- Receiver 候选包已刷新：`artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip`，SHA-256 `73EF0826D605D55ACD19CEC1C75D205F4347B0C4C8D35960B30FE42BB0F59650`。含当前 Receiver APK/JSON、icon.png、原有五个桌面运行依赖及 notices/licenses/upstream；归档内 APK SHA-256 与 JSON metadata 相符。包内不含 Probe APK、密钥、日志、本机路径或设备标识。稳定 ZIP 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
+- 回退继续使用既有稳定 ZIP。候选包是 Android 16 / targetSdk 35 上的 P1 验收包，不代表 v2 完整发布；P2 与其他发布门槛仍由后续音频会话处理。
