@@ -93,7 +93,7 @@
 | Receiver APK 摘要 / 签名 | PASS | APK SHA-256：`b32eeaf06d40372c4a243eadf3b1c48067875af44f9e3a7b1d23d67628004f62`；证书 SHA-256：`fea24331dc877cb9537ef3596a42374871104b0b949a4cdc88b64b1ad6a45436`。当前为本机临时 debug 签名，未生成 release 密钥、未声称 release 签名。 |
 | PowerShell 5.1 JSON → Rust `read_artifact` | PASS | `receiver.json` 为无 BOM UTF-8；Rust 对由脚本实际生成的 APK/JSON 调用 `read_artifact` 成功。 |
 | Rust 离线检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`：22/22 通过，含 fake-adb 生命周期、安全拒绝及当前用户路径。 |
-| Android 普通应用权限 Probe | NOT_TESTED | 无权限 Probe APK 已构建；Receiver 首次安装被系统拒绝，未运行真实权限探测。 |
+| Android 普通应用权限 Probe | NOT_TESTED | 无权限 Probe APK 已构建；Receiver 已安装，但普通应用调用 Provider/Bootstrap 的实际拒绝结果尚未验证。 |
 
 ### target 与兼容范围
 
@@ -107,11 +107,14 @@
 
 - 目标设备：Android 16 / API 36，省略型号和 ADB 标识；ADB 同时显示 USB 与 Wi-Fi 两条连接记录，使用 `adb -d get-serialno` 唯一确认 USB 目标。
 - 安装前只读检查：当前 Android user 为 0，Receiver 未安装，旧 `com.anpod.server.Main` 音频服务进程为 0。没有启动或停止旧 AnPod 音频。
-- install：**FAIL / 需人工排查确认提示**。Rust 管理路径执行首次 `adb install -r` 时收到 `INSTALL_FAILED_ABORTED: User rejected permissions`；用户反馈未看到 USB 安装提示，Receiver 未安装，未尝试绕过提示。health/start/stop 真实设备流程及 Probe 调用因此为 NOT_TESTED。
-- 安装后只读复查：Receiver 仍未安装，旧 `com.anpod.server.Main` 音频服务进程为 0。待系统确认提示原因解决并由用户允许后，再从 uninstalled 开始运行 `p1_real_usb_install_health_start_stop_when_explicitly_requested`。不执行 `pm grant`，不触发 `adb kill-server`。
+- 首次 install：**FAIL（历史记录）**。首次 `adb install -r` 返回 `INSTALL_FAILED_ABORTED: User rejected permissions`；用户当时反馈未看到 USB 安装提示。未绕过系统确认。
+- 后续 install：**PASS**。设备解锁亮屏后，本机 APK SHA-256 与 metadata 一致且 `apksigner` 证书校验通过；对已确认的 USB 目标执行一次 `adb install -r` 返回 `Success`。Android 显示系统通知授权页，用户明确允许通知。未卸载应用。
+- 真机生命周期（直接 ADB）：**PASS**。按当前 Android 用户读取到 `serviceActive=true`、`foreground=true`、`healthy=true`；显式 STOP 后三项均为 `false`。此次结果验证直接 ADB 入口，不代表本次 Rust 用户绑定修复已在手机上独立运行。
+- 安装 APK 字节与随包 metadata SHA-256 匹配。普通应用权限 Probe：**NOT_TESTED**。修复后 Rust 管理路径的已安装生命周期真机复验仍待执行。
+- 不执行 `pm grant`，不触发 `adb kill-server`，不为测试卸载已安装 Receiver。
 
 ### 候选包与回退
 
 - 普通旧 Tauri 包只要求原有五个桌面运行文件和 Platform-Tools notice；Receiver APK/JSON 不再是 `tauri.conf` 或普通打包路径的强制依赖。
-- Receiver 候选包已构建：`artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip`，SHA-256 `C6E3E9A6EB0627732EE6CACF24F5A03B269BA396E5E86E0CF6120AE2EA464B70`。ZIP 包含 APK、JSON、README 图标 `icon.png`、原有桌面运行文件和 notices/licenses/upstream；稳定 ZIP `AnPod-1.0.4-tauri-win-x64-portable.zip` 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
-- 回退继续使用既有稳定 ZIP。Receiver 不自动卸载；若候选验收未完成，停止使用候选包并等待系统确认/人工复测，不进入 P2。
+- 上一版候选包 `artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip` 的 SHA-256 为 `C6E3E9A6EB0627732EE6CACF24F5A03B269BA396E5E86E0CF6120AE2EA464B70`，包含 APK、JSON、README 图标 `icon.png`、原有桌面运行文件和 notices/licenses/upstream；该包早于当前 Rust 用户绑定修复，不能作为最新候选交付。待修复后的 Rust 已安装生命周期真机复验通过后再刷新候选包。稳定 ZIP `AnPod-1.0.4-tauri-win-x64-portable.zip` 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
+- 回退继续使用既有稳定 ZIP。Receiver 不自动卸载；若候选验收未完成，停止使用候选包并完成人工复测，不进入 P2。

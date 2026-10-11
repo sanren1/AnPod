@@ -60,7 +60,8 @@ pub async fn status(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, 
 
 async fn status_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
-    if !is_installed(adb, serial, cancel).await? {
+    let user = current_android_user(adb, serial, cancel).await?;
+    if !is_installed(adb, serial, &user, cancel).await? {
         return Ok(ReceiverStatus {
             installed: false, version_name: None, version_code: None,
             service_active: false, foreground: false, healthy: false,
@@ -68,8 +69,8 @@ async fn status_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_pa
         });
     }
     let metadata = read_artifact(apk, metadata_path)?;
-    verify_installed_identity(adb, serial, &metadata, cancel).await?;
-    let health = read_health(adb, serial, cancel).await?;
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let health = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&health, &metadata)?;
     Ok(status_from_health(health))
 }
@@ -80,13 +81,14 @@ pub async fn install(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
 
 async fn install_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
 
     let apk_text = apk.to_string_lossy().into_owned();
-    let result = adb.run(Some(serial), &["install", "-r", &apk_text], Duration::from_secs(90), Some(cancel)).await?;
+    let result = adb.run(Some(serial), &["install", "-r", "--user", &user, &apk_text], Duration::from_secs(90), Some(cancel)).await?;
     ensure_adb_success(&result)?;
-    verify_installed_identity(adb, serial, &metadata, cancel).await?;
-    let health = read_health(adb, serial, cancel).await?;
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let health = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&health, &metadata)?;
     Ok(status_from_health(health))
 }
@@ -97,15 +99,16 @@ pub async fn start(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, c
 
 async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
-    if !is_installed(adb, serial, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &metadata, cancel).await?;
-    let before = read_health(adb, serial, cancel).await?;
+    if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let before = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&before, &metadata)?;
     if before.healthy { return Ok(status_from_health(before)); }
 
     let result = adb.run(Some(serial), &[
-        "shell", "am", "start", "-W", "-n", "app.anpod.receiver/.BootstrapActivity",
+        "shell", "am", "start", "--user", &user, "-W", "-n", "app.anpod.receiver/.BootstrapActivity",
         "-a", "app.anpod.receiver.action.START",
     ], Duration::from_secs(45), Some(cancel)).await?;
     ensure_adb_success(&result)?;
@@ -113,8 +116,8 @@ async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_pat
     let deadline = Instant::now() + Duration::from_secs(35);
     loop {
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
-        verify_installed_identity(adb, serial, &metadata, cancel).await?;
-        let health = read_health(adb, serial, cancel).await?;
+        verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+        let health = read_health(adb, serial, &user, cancel).await?;
         ensure_version(&health, &metadata)?;
         if health.healthy { return Ok(status_from_health(health)); }
         if !health.error.is_empty() { return Err(format!("Receiver 启动失败：{}。", health.error)); }
@@ -134,10 +137,11 @@ pub async fn health(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, 
 
 async fn health_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
-    if !is_installed(adb, serial, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &metadata, cancel).await?;
-    let health = read_health(adb, serial, cancel).await?;
+    if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let health = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&health, &metadata)?;
     Ok(status_from_health(health))
 }
@@ -148,15 +152,16 @@ pub async fn stop(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, ca
 
 async fn stop_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
-    if !is_installed(adb, serial, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &metadata, cancel).await?;
-    let before = read_health(adb, serial, cancel).await?;
+    if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let before = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&before, &metadata)?;
     if before.application_id != PACKAGE { return Err("已安装包名冲突，未执行停止操作。".into()); }
 
     let result = adb.run(Some(serial), &[
-        "shell", "am", "start", "-W", "-n", "app.anpod.receiver/.BootstrapActivity",
+        "shell", "am", "start", "--user", &user, "-W", "-n", "app.anpod.receiver/.BootstrapActivity",
         "-a", "app.anpod.receiver.action.STOP",
     ], Duration::from_secs(15), Some(cancel)).await?;
     ensure_adb_success(&result)?;
@@ -164,8 +169,8 @@ async fn stop_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
-        verify_installed_identity(adb, serial, &metadata, cancel).await?;
-        let health = read_health(adb, serial, cancel).await?;
+        verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+        let health = read_health(adb, serial, &user, cancel).await?;
         ensure_version(&health, &metadata)?;
         if !health.service_active { return Ok(status_from_health(health)); }
         if Instant::now() >= deadline { return Err("Receiver 服务在停止请求后仍处于活动状态。".into()); }
@@ -195,15 +200,13 @@ async fn ensure_usb_device(adb: &impl AdbRunner, serial: &str, cancel: &Cancella
     Ok(())
 }
 
-async fn is_installed(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<bool, String> {
-    let user = current_android_user(adb, serial, cancel).await?;
+async fn is_installed(adb: &impl AdbRunner, serial: &str, user: &str, cancel: &CancellationToken) -> Result<bool, String> {
     let result = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     if !result.success { return Err(adb_error(&result)); }
     Ok(has_listed_package(&result.stdout))
 }
 
-async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, metadata: &ArtifactMetadata, cancel: &CancellationToken) -> Result<(), String> {
-    let user = current_android_user(adb, serial, cancel).await?;
+async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &str, metadata: &ArtifactMetadata, cancel: &CancellationToken) -> Result<(), String> {
     let listed = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     ensure_adb_success(&listed)?;
     if !has_listed_package(&listed.stdout) { return Err("当前 Android 用户未安装 AnPod Receiver，已拒绝管理操作。".into()); }
@@ -234,9 +237,9 @@ fn has_listed_package(output: &str) -> bool {
     output.lines().any(|line| line.trim() == format!("package:{PACKAGE}"))
 }
 
-async fn read_health(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<Health, String> {
+async fn read_health(adb: &impl AdbRunner, serial: &str, user: &str, cancel: &CancellationToken) -> Result<Health, String> {
     let uri = HEALTH_URI;
-    let result = adb.run(Some(serial), &["shell", "content", "query", "--uri", uri], Duration::from_secs(8), Some(cancel)).await?;
+    let result = adb.run(Some(serial), &["shell", "content", "query", "--user", user, "--uri", uri], Duration::from_secs(8), Some(cancel)).await?;
     if !result.success { return Err(adb_error(&result)); }
     parse_health(&result.stdout).ok_or_else(|| "Receiver 健康接口没有返回有效状态记录。".into())
 }
@@ -263,7 +266,7 @@ fn parse_installed_apk_path(output: &str) -> Option<&str> {
     let mut paths = output.lines().filter_map(|line| line.trim().strip_prefix("package:"));
     let path = paths.next()?.trim();
     if paths.next().is_some() || !path.starts_with("/data/app/") || !path.ends_with("/base.apk")
-        || !path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/_-.~".contains(&byte)) {
+        || !path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/_-.~=".contains(&byte)) {
         return None;
     }
     Some(path)
@@ -339,12 +342,14 @@ mod tests {
     use std::{sync::Mutex, time::SystemTime};
 
     const SERIAL: &str = "FAKE123";
-    const INSTALLED_PATH: &str = "/data/app/~~test/app.anpod.receiver-random/base.apk";
+    const TEST_USER: &str = "10";
+    const INSTALLED_PATH: &str = "/data/app/~~AbCdEf0123==/app.anpod.receiver-xYz987==/base.apk";
 
     #[derive(Default)]
     struct FakeState {
         installed: bool,
         installed_hash: String,
+        user: &'static str,
         device_state: &'static str,
         usb: bool,
         install_fails: bool,
@@ -362,6 +367,7 @@ mod tests {
             Self(Mutex::new(FakeState {
                 installed,
                 installed_hash,
+                user: TEST_USER,
                 device_state: "device",
                 usb: true,
                 ..FakeState::default()
@@ -392,24 +398,24 @@ mod tests {
                         AdbResult { success: state.usb, stdout: if state.usb { format!("{SERIAL}\n") } else { String::new() }, stderr: String::new() }
                     }
                     [shell, am, command] if shell == "shell" && am == "am" && command == "get-current-user" => {
-                        AdbResult { success: true, stdout: "0\n".into(), stderr: String::new() }
+                        AdbResult { success: true, stdout: format!("{}\n", state.user), stderr: String::new() }
                     }
-                    [shell, pm, list, packages, user_option, _user, package] if shell == "shell" && pm == "pm" && list == "list" && packages == "packages" && user_option == "--user" && package == PACKAGE => {
+                    [shell, pm, list, packages, user_option, user, package] if shell == "shell" && pm == "pm" && list == "list" && packages == "packages" && user_option == "--user" && user == state.user && package == PACKAGE => {
                         let stdout = if state.installed { format!("package:{PACKAGE}\n") } else { String::new() };
                         AdbResult { success: true, stdout, stderr: String::new() }
                     }
-                    [shell, pm, path, user_option, _user, package] if shell == "shell" && pm == "pm" && path == "path" && user_option == "--user" && package == PACKAGE => {
+                    [shell, pm, path, user_option, user, package] if shell == "shell" && pm == "pm" && path == "path" && user_option == "--user" && user == state.user && package == PACKAGE => {
                         let stdout = if state.installed { format!("package:{INSTALLED_PATH}\n") } else { String::new() };
                         AdbResult { success: true, stdout, stderr: String::new() }
                     }
                     [shell, toybox, sha256sum, _] if shell == "shell" && toybox == "toybox" && sha256sum == "sha256sum" => {
                         AdbResult { success: state.installed, stdout: format!("{}  {INSTALLED_PATH}\n", state.installed_hash), stderr: String::new() }
                     }
-                    [shell, content, query, flag, uri] if shell == "shell" && content == "content" && query == "query" && flag == "--uri" && uri == HEALTH_URI => {
+                    [shell, content, query, user_option, user, flag, uri] if shell == "shell" && content == "content" && query == "query" && user_option == "--user" && user == state.user && flag == "--uri" && uri == HEALTH_URI => {
                             let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName=0.1.0-p1, versionCode=1, serviceActive={}, foreground={}, healthy={}, startedAtElapsedMs=1, error=\n", state.active, state.foreground, state.healthy);
                             AdbResult { success: true, stdout, stderr: String::new() }
                         }
-                    [install, replace, _apk] if install == "install" && replace == "-r" => {
+                    [install, replace, user_option, user, _apk] if install == "install" && replace == "-r" && user_option == "--user" && user == state.user => {
                         if state.install_fails {
                             AdbResult { success: false, stdout: String::new(), stderr: "INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match".into() }
                         } else {
@@ -470,7 +476,9 @@ mod tests {
 
     #[test]
     fn installed_and_not_installed_package_responses_are_distinct() {
-        assert_eq!(parse_installed_apk_path("package:/data/app/~~opaque/app.anpod.receiver/base.apk\n"), Some("/data/app/~~opaque/app.anpod.receiver/base.apk"));
+        assert_eq!(parse_installed_apk_path("package:/data/app/~~AbCdEf0123==/app.anpod.receiver-xYz987==/base.apk\n"), Some("/data/app/~~AbCdEf0123==/app.anpod.receiver-xYz987==/base.apk"));
+        assert_eq!(parse_installed_apk_path("package:/data/app/~~opaque/app.anpod.receiver/base.apk with space\n"), None);
+        assert_eq!(parse_installed_apk_path("package:/data/app/~~opaque/app.anpod.receiver/base.apk;id\n"), None);
         assert_eq!(parse_installed_apk_path("package:/data/app/a/base.apk\npackage:/data/app/a/split.apk\n"), None);
         assert_eq!(parse_installed_apk_path("\n"), None);
     }
@@ -521,6 +529,16 @@ mod tests {
         let stop = calls.iter().position(|call| call.iter().any(|arg| arg == "app.anpod.receiver.action.STOP")).unwrap();
         assert!(install < first_hash && first_hash < first_health && first_health < start && start < stop);
         assert!(calls.iter().filter(|call| call.starts_with(&["shell".into(), "toybox".into(), "sha256sum".into()])).count() >= 4);
+        for call in &calls {
+            if call.starts_with(&["shell".into(), "pm".into(), "list".into()])
+                || call.starts_with(&["shell".into(), "pm".into(), "path".into()])
+                || call.starts_with(&["shell".into(), "content".into(), "query".into()])
+                || call.starts_with(&["shell".into(), "am".into(), "start".into()])
+                || call.starts_with(&["install".into()]) {
+                assert!(call.windows(2).any(|pair| pair[0] == "--user" && pair[1] == TEST_USER), "wrong Android user in {call:?}");
+            }
+        }
+        assert!(calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into(), "query".into(), "--user".into(), TEST_USER.into()])));
     }
 
     #[tokio::test]
@@ -561,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p1_real_usb_install_health_start_stop_when_explicitly_requested() {
+    async fn p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested() {
         let Some(serial) = std::env::var_os("ANPOD_P1_USB_SERIAL") else { return; };
         let serial = serial.to_string_lossy();
         let deps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deps");
@@ -570,9 +588,8 @@ mod tests {
         let metadata = deps.join("receiver.json");
         let cancel = CancellationToken::new();
 
-        assert!(!status(&adb, &serial, &apk, &metadata, &cancel).await.unwrap().installed,
-            "P1 device must be checked as uninstalled before the install test");
-        assert!(install(&adb, &serial, &apk, &metadata, &cancel).await.unwrap().installed);
+        assert!(status(&adb, &serial, &apk, &metadata, &cancel).await.unwrap().installed,
+            "P1 lifecycle test requires Receiver to be installed by a separate deployment step");
         assert!(health(&adb, &serial, &apk, &metadata, &cancel).await.unwrap().installed);
         let started = start(&adb, &serial, &apk, &metadata, &cancel).await.unwrap();
         assert!(started.healthy && started.foreground);
