@@ -36,10 +36,14 @@ Cipher suite: AES-256-GCM with a 256-bit per-session key, 96-bit nonce, and
 host-to-receiver is `ANPH` (`0x414e5048`) and receiver-to-host is `ANPR`
 (`0x414e5052`). A key must be fresh for every session and must never be reused
 with a sequence in the same direction. The session ID binds the expected
-session identity in the authenticated header; it is not a key exchange. The P3
-test injects a deterministic key. Secure key generation, pairing, and key
-transport are outside this prototype and must exist before a remote receiver
-can use it.
+session identity in the authenticated header; it is not a key exchange. The
+Rust loopback sender creates a fresh random 64-bit session ID and 256-bit key
+with the existing `getrandom` dependency. The non-cloneable session material is
+moved into the sender and kept only in memory; rebuilding a sender requires a
+new material value. The loopback mock receives the same material in memory.
+Persistent device binding, HKDF, USB pairing, and remote key transport remain
+for P5. The fixed cross-language vector below remains deterministic test data
+only and is not used as a session key.
 
 The receiver checks bounds, version, type, flags, session identity, replay
 eligibility, then AEAD authentication. It commits a sequence only after

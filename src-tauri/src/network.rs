@@ -121,6 +121,22 @@ pub struct NetworkStats {
     pub pcm_payload_bytes_sent: u64,
 }
 
+pub struct UdpSessionMaterial {
+    session_id: u64,
+    key: [u8; 32],
+}
+
+impl UdpSessionMaterial {
+    pub fn generate() -> Result<Self, String> {
+        let mut bytes = [0; 40];
+        getrandom::fill(&mut bytes).map_err(|_| "Unable to generate a fresh UDP session.".to_string())?;
+        let session_id = u64::from_be_bytes(bytes[..8].try_into().expect("fixed session id bytes"));
+        let mut key = [0; 32];
+        key.copy_from_slice(&bytes[8..]);
+        Ok(Self { session_id, key })
+    }
+}
+
 pub struct UdpSender {
     stopping: Arc<AtomicBool>,
     queue: Arc<PcmQueue>,
@@ -128,7 +144,7 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn spawn(remote: SocketAddr, queue: Arc<PcmQueue>, session_id: u64, key: [u8; 32], format: PcmFormat) -> Result<Self, String> {
+    pub fn spawn(remote: SocketAddr, queue: Arc<PcmQueue>, material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
         if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) { return Err("P3 UDP prototype only permits 127.0.0.1.".into()); }
         if format.channels != PCM_CHANNELS || format.sample_rate == 0 { return Err("Unsupported PCM format for the native sink.".into()); }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
@@ -136,7 +152,7 @@ impl UdpSender {
         let worker_stopping = stopping.clone();
         let worker_queue = queue.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
-            send_loop(socket, remote, worker_queue, worker_stopping, session_id, key, format)
+            send_loop(socket, remote, worker_queue, worker_stopping, material, format)
         }).map_err(|error| error.to_string())?;
         Ok(Self { stopping, queue, worker: Some(worker) })
     }
@@ -158,8 +174,8 @@ impl Drop for UdpSender {
 }
 
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
-    session_id: u64, key: [u8; 32], format: PcmFormat) -> Result<NetworkStats, String> {
-    let mut encoder = PacketEncoder::new(&key, session_id, HOST_TO_RECEIVER);
+    material: UdpSessionMaterial, format: PcmFormat) -> Result<NetworkStats, String> {
+    let mut encoder = PacketEncoder::new(&material.key, material.session_id, HOST_TO_RECEIVER);
     let format_payload = format.encode().map_err(|error| error.to_string())?;
     send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
 
@@ -323,12 +339,12 @@ mod tests {
         assert_eq!(queue.dropped_frames(), 480);
         assert_eq!(queue.len(), PCM_QUEUE_CAPACITY);
 
-        let key = [0x5a; 32];
-        let session_id = 0x1020_3040_5060_7080;
+        let material = UdpSessionMaterial::generate().unwrap();
+        let key = material.key;
+        let session_id = material.session_id;
         let receiver_socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         receiver_socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let sender = UdpSender::spawn(receiver_socket.local_addr().unwrap(), queue.clone(),
-            session_id, key, format).unwrap();
+        let sender = UdpSender::spawn(receiver_socket.local_addr().unwrap(), queue.clone(), material, format).unwrap();
         let mut receiver = MockReceiver::new(&key, session_id);
         assert_eq!(receiver.receive(&receiver_socket).unwrap(), IngestResult::Format);
         let mut received_frame_indices = Vec::new();

@@ -179,4 +179,5 @@
 - Rust `protocol::tests`：PASS，2/2；覆盖固定 JCA 完整数据报向量，以及版本、类型、flags、长度和 session identity 头边界拒绝。
 - Java 17 `tests/AnPodUdpVectorCheck.java`：PASS；JCA 输出与 Rust 测试的完整 AES-256-GCM 数据报相同。
 - Native MSVC/CMake x64 Release 隔离构建：PASS，输出 `artifacts/p3-native/audio_capture.dll`（23,552 bytes）；`dumpbin /exports` 确认原有导出保留并新增 PCM callback 导出。编译器报告 `audio_capture.h` 的 C4819 代码页警告，DLL 构建成功。
-- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。当前 UDP sender 只允许发往 `127.0.0.1`，mock Receiver 仅在测试中运行；配对、会话密钥生成/传输和远端 Receiver 尚未实现。
+- Rust loopback sender 每次消费由 `getrandom` 生成的独立 session ID/key；mock 只在内存中接收同一材料。固定 JCA 向量仍仅作测试，不作为会话密钥。设备绑定、HKDF、USB 配对和远程密钥传输留到 P5。
+- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。当前 UDP sender 只允许发往 `127.0.0.1`，mock Receiver 仅在测试中运行，远端 Receiver 尚未实现。
