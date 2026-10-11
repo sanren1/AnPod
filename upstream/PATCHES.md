@@ -270,6 +270,18 @@ is new AnPod code, shared by the installed Receiver and `app_process` path. It p
 frames across socket reads and partial AudioTrack writes; it is not copied
 from the upstream repository.
 
+### B10. Internal UDP parser and playback adapter *(P4-A, not enabled)*
+
+The new `UdpSessionContext`, `UdpPacketDecoder`, `UdpPcmQueue`, and `UdpReceiver`
+classes are AnPod code and add no third-party dependency. A caller inside the
+app process must supply the already authenticated peer, session ID, key, and
+local bind address in memory. The adapter validates and decrypts only Format
+and Audio packets, then presents aligned PCM through a queue-backed
+`InputStream` to the existing `Pcm16FrameStream` and AudioTrack worker. The
+network thread owns only its UDP socket and short-lived packet handling; the
+existing audio worker owns AudioTrack and focus. No Intent, exported component,
+discovery, pairing, network control message, or product flow starts this path.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.

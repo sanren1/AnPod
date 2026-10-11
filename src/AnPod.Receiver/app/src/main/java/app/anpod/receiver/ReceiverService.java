@@ -131,6 +131,7 @@ public final class ReceiverService extends Service {
     public void onDestroy() {
         destroyed = true;
         foregroundReady = false;
+        if (pendingAudio != null) pendingAudio.destroy();
         pendingAudio = null;
         AudioSession session = currentAudio;
         currentAudio = null;
@@ -162,13 +163,15 @@ public final class ReceiverService extends Service {
         if (destroyed) return;
         AudioSession existing = currentAudio;
         if (existing != null) {
+            if (pendingAudio != null) pendingAudio.destroy();
             pendingAudio = request;
             cancelAudio(existing, "AudioSessionReplaced");
             return;
         }
-        if (request.socketName == null || request.socketName.isEmpty()
-                || request.connectCode == null || request.connectCode.isEmpty()) {
+        if (request.udpContext == null && (request.socketName == null || request.socketName.isEmpty()
+                || request.connectCode == null || request.connectCode.isEmpty())) {
             recordStartFailure("InvalidAudioRequest");
+            request.destroy();
             stopSelf(latestStartId);
             return;
         }
@@ -189,25 +192,64 @@ public final class ReceiverService extends Service {
         session.thread.start();
     }
 
+    /** In-process hook for an authenticated session coordinator; no Intent or exported API calls it. */
+    void startUdpAudio(UdpSessionContext context) {
+        Runnable start = () -> {
+            if (destroyed) context.destroy();
+            else startAudio(AudioRequest.udp(context));
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) start.run();
+        else if (!handler.post(start)) context.destroy();
+    }
+
+    /** Internal pause hook: drop pending and incoming history without adding a control datagram. */
+    void setUdpAudioPaused(boolean paused) {
+        AudioSession session = currentAudio;
+        if (session != null && session.request.udpContext != null && session.udpQueue != null)
+            session.udpQueue.setPaused(paused);
+    }
+
     private void receiveAudio(AudioSession session) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
         AudioManager manager = null;
         AudioFocusRequest focusRequest = null;
         AudioManager.OnAudioFocusChangeListener focusListener = null;
+        UdpPcmQueue udpQueue = null;
+        UdpReceiver udpReceiver = null;
+        Thread networkThread = null;
         String failure = "";
         try {
             ensureRunning(session);
-            LocalSocket socket = new LocalSocket();
-            synchronized (session) {
-                ensureRunning(session);
-                session.socket = socket;
-            }
-            try (LocalSocket ownedSocket = socket) {
-                ownedSocket.connect(new LocalSocketAddress(session.request.socketName, LocalSocketAddress.Namespace.ABSTRACT));
-                ownedSocket.getOutputStream().write(session.request.connectCode.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                ownedSocket.getOutputStream().flush();
-                InputStream input = ownedSocket.getInputStream();
+            LocalSocket ownedSocket = session.request.udpContext == null ? new LocalSocket() : null;
+            try (ownedSocket) {
+                InputStream input;
+                if (ownedSocket == null) {
+                    udpQueue = new UdpPcmQueue();
+                    udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
+                    UdpReceiver receiverForThread = udpReceiver;
+                    networkThread = new Thread(() -> {
+                        Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                        receiverForThread.run();
+                    }, "AnPod UDP packet receiver");
+                    synchronized (session) {
+                        ensureRunning(session);
+                        session.udpQueue = udpQueue;
+                        session.udpReceiver = udpReceiver;
+                        session.networkThread = networkThread;
+                        networkThread.start();
+                    }
+                    input = udpQueue.asPcmInputStream();
+                } else {
+                    synchronized (session) {
+                        ensureRunning(session);
+                        session.socket = ownedSocket;
+                    }
+                    ownedSocket.connect(new LocalSocketAddress(session.request.socketName, LocalSocketAddress.Namespace.ABSTRACT));
+                    ownedSocket.getOutputStream().write(session.request.connectCode.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    ownedSocket.getOutputStream().flush();
+                    input = ownedSocket.getInputStream();
+                }
                 byte[] header = new byte[8];
                 new DataInputStream(input).readFully(header);
                 int sampleRate = littleInt(header, 0);
@@ -329,13 +371,32 @@ public final class ReceiverService extends Service {
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
             if (!focusReleaseFailure.isEmpty()) failure = appendFailure(failure, focusReleaseFailure);
+            if (udpReceiver != null) udpReceiver.close();
+            if (udpQueue != null) udpQueue.stop();
+            if (networkThread != null && networkThread != Thread.currentThread()) {
+                boolean interrupted = Thread.interrupted();
+                while (networkThread.isAlive()) {
+                    try {
+                        networkThread.join();
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+            session.request.destroy();
             synchronized (STATUS_LOCK) {
                 if (statusAudioId == session.id) {
                     audioActive = false;
                     if (failure.isEmpty()) failure = session.stopReason.isEmpty() ? "AudioSessionEnded" : session.stopReason;
                 }
             }
-            synchronized (session) { session.socket = null; }
+            synchronized (session) {
+                session.socket = null;
+                if (session.udpReceiver == udpReceiver) session.udpReceiver = null;
+                if (session.udpQueue == udpQueue) session.udpQueue = null;
+                if (session.networkThread == networkThread) session.networkThread = null;
+            }
             String finalFailure = failure;
             handler.post(() -> finishAudio(session, finalFailure));
         }
@@ -378,6 +439,12 @@ public final class ReceiverService extends Service {
         if (thread != null) thread.interrupt();
         LocalSocket socket = session.socket;
         if (socket != null) try { socket.close(); } catch (IOException ignored) {}
+        UdpReceiver receiver = session.udpReceiver;
+        if (receiver != null) receiver.close();
+        UdpPcmQueue queue = session.udpQueue;
+        if (queue != null) queue.stop();
+        Thread networkThread = session.networkThread;
+        if (networkThread != null) networkThread.interrupt();
     }
 
     private void ensureRunning(AudioSession session) throws IOException {
@@ -462,19 +529,34 @@ public final class ReceiverService extends Service {
         final String socketName;
         final String connectCode;
         final String playbackMode;
+        final UdpSessionContext udpContext;
 
         AudioRequest(String socketName, String connectCode, String playbackMode) {
+            this(socketName, connectCode, playbackMode, null);
+        }
+
+        private AudioRequest(String socketName, String connectCode, String playbackMode, UdpSessionContext udpContext) {
             this.socketName = socketName;
             this.connectCode = connectCode;
             this.playbackMode = playbackMode;
+            this.udpContext = udpContext;
         }
+
+        static AudioRequest udp(UdpSessionContext context) {
+            return new AudioRequest(null, null, context.playbackMode, context);
+        }
+
+        void destroy() { if (udpContext != null) udpContext.destroy(); }
     }
 
     private static final class AudioSession {
         final long id;
         final AudioRequest request;
         volatile Thread thread;
+        volatile Thread networkThread;
         volatile LocalSocket socket;
+        volatile UdpReceiver udpReceiver;
+        volatile UdpPcmQueue udpQueue;
         volatile boolean cancelled;
         volatile String stopReason = "";
 

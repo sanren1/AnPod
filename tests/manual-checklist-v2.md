@@ -180,4 +180,11 @@
 - Java 17 `tests/AnPodUdpVectorCheck.java`：PASS；JCA 输出与 Rust 测试的完整 AES-256-GCM 数据报相同。
 - Native MSVC/CMake x64 Release 隔离构建：PASS，输出 `artifacts/p3-native/audio_capture.dll`（23,552 bytes）；`dumpbin /exports` 确认原有导出保留并新增 PCM callback 导出。编译器报告 `audio_capture.h` 的 C4819 代码页警告，DLL 构建成功。
 - Rust loopback sender 每次消费由 `getrandom` 生成的独立 session ID/key；mock 只在内存中接收同一材料。固定 JCA 向量仍仅作测试，不作为会话密钥。设备绑定、HKDF、USB 配对和远程密钥传输留到 P5。
-- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。当前 UDP sender 只允许发往 `127.0.0.1`，mock Receiver 仅在测试中运行，远端 Receiver 尚未实现。
+- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。Windows UDP sender 只允许发往 `127.0.0.1`；后续 P4-A 添加的 Android adapter 仍未接入产品启动/发现/配对流程。
+
+## P4-A Android UDP parser / playback adapter（未启用）
+
+- 文件边界：新增 `UdpSessionContext.java`、`UdpPacketDecoder.java`、`UdpPcmQueue.java`、`UdpReceiver.java`；只在 `ReceiverService.java` 增加包内 in-memory 启动/暂停 hook，并复用现有单 `AudioSession`、AudioTrack/focus、状态发布和 `Pcm16FrameStream` 播放路径。`AndroidManifest.xml` 未改：没有新增 exported 组件、网络启动 Intent 或默认 UDP listener。
+- `tests/AnPodUdpVectorCheck.java`：本次合并检查 PASS。固定 JCA 向量经真实 `UdpPacketDecoder` 解包；覆盖实际 loopback recv/close、peer/session 检查、坏 tag 后同序号合法重试、重复和乱序、unsigned 序号/帧索引跨 signed 边界、Format 序号约束、64 序号重放窗拒收、坏帧格式不提交 replay、暂停水位拒绝暂停期间晚到帧、丢弃输入流已取出半包的剩余历史、暂停丢帧与 8 包上限。还覆盖 receiver 创建后、接收线程启动前关闭时释放绑定端口。
+- Android 源码接线：Gradle 8.9 / 指定 JDK 17 / API 35 `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS。编译时 AAPT2 资源处理被跳过；此前资源链接曾报 `Unexpected error during link`，本次未改资源。没有组装 APK。
+- 测试只在本机 JDK loopback socket 上运行；没有 Android AudioTrack 真机播放、Android 网络收包、USB/热点/LAN 联通或时延/性能检查。P4-A adapter 只接受包内提供的已解析 peer/session/key 与指定本地 bind 地址；不处理发现、配对、START/STOP/SET_MODE，不接收任意 IP 作为信任依据，也未由产品流程调用。P4 真机联通和音频表现仍为 NOT_TESTED。
