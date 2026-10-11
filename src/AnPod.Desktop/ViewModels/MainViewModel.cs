@@ -1111,7 +1111,7 @@ public sealed class MainViewModel : ObservableObject
     /// One phone can be reachable two ways at once and therefore appears twice in
     /// <c>adb devices</c> — once under its USB serial, once as <c>ip:port</c>.
     /// Showing both rows in both modes is what made the two modes look like one
-    /// screen: choosing Wi-Fi still presented "vivo V2243A 已连接 USB", and the
+    /// screen: choosing Wi-Fi still presented "测试手机 已连接 USB", and the
     /// only way to tell which row a click would act on was the row's own label.
     /// Each mode now lists its own devices, so the list can never offer a device
     /// the current mode cannot use (plan §1.4 — the mode decides the transport).

@@ -2,6 +2,8 @@
 bin/
 obj/
 artifacts/
+*.pdb
+*.ilk
 
 # Runtime dependencies: produced by packaging/, never committed (deps/README.md)
 deps/*
@@ -36,6 +38,22 @@ desktop.ini
 # Local agent state and temporary development toolchains
 .workbuddy-ai/
 .tmp-*
+.codex/
+.agents/
+
+# Local credentials, private configuration and diagnostic captures
+.env
+.env.*
+!.env.example
+!.env.sample
+adbkey
+adbkey.pub
+*.key
+*.pem
+*.pfx
+*.p12
+*.pkt
+*.dmp
 
 # Tauri generated platform schemas and non-Windows app icon outputs
 src-tauri/target/

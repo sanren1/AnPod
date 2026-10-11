@@ -25,7 +25,7 @@ Tauri 1.0.4 的真机通过记录。Tauri 使用后台设备检测，旧表中�
 | 项 | 值 |
 |---|---|
 | 测试机（Windows） | Windows，x64 |
-| 测试机（Android 型号 / ROM / 版本） | vivo V2243A（PD2243），Android 16（API 36），arm64-v8a |
+| 测试机（Android 型号 / ROM / 版本） | Android 测试设备（型号与 ROM 标识省略），Android 16（API 36），arm64-v8a |
 | ADB 版本 | 1.0.41 / platform-tools 37.0.1-15733141 |
 | 原生 DLL 版本 | `audio_capture.dll`（MinGW-w64 g++ 16.2.0 构建，x64，99 868 B，11 个导出） |
 | 服务载荷版本 | `deps/server`（classes.dex 6 860 B，DEX 035） |
@@ -103,7 +103,7 @@ Tauri 1.0.4 的真机通过记录。Tauri 使用后台设备检测，旧表中�
 | W05 | Wi-Fi 播放 30 分钟 | 无累积延迟、无长时间静音、无崩溃 | ☐ | 未测 |
 | W06 | WLAN 断开 / 恢复 | 状态准确；可控重连；**主动断开后不重连** | ☐ | 未测。重连路径：`HandleSessionLossAsync` 记住 `wasWireless` → 退避循环里先 `adb connect` 再刷新设备列表。主动断开由 `_suppressedAutoConnectSerial` 抑制 |
 | W07 | 手机 IP / 端口变化 | 不无限重试旧地址；允许重新发现或重新输入 | ☐ | 未测。重试有上限（1s/2s/5s 三次）；`LastWirelessEndpoint` 只是提示，界面永远可以改 |
-| W08 | USB 与 Wi-Fi 同时识别同一台手机 | 单实例会话；不双重 push；不错误选设备 | ☐ | 未测。两条记录是**两个不同的 serial**（`10ACCH…` 与 `ip:port`）；列表**按当前模式过滤**，USB 模式只列 USB 那条、Wi-Fi 模式只列无线那条，所以同一台手机不会在同一个列表里出现两次。`ConnectCoreAsync` 只对用户选中的那个 serial 下命令 |
+| W08 | USB 与 Wi-Fi 同时识别同一台手机 | 单实例会话；不双重 push；不错误选设备 | ☐ | 未测。两条记录是**两个不同的 serial**（`TESTUSB…` 与 `ip:port`）；列表**按当前模式过滤**，USB 模式只列 USB 那条、Wi-Fi 模式只列无线那条，所以同一台手机不会在同一个列表里出现两次。`ConnectCoreAsync` 只对用户选中的那个 serial 下命令 |
 | W09 | USB ↔ Wi-Fi 切换 | 有序清理旧通道；可重新播放 | ☐ | 未测。会话进行中连接方式不可切换（要先前断开）；`TeardownSessionAsync` 定点移除本会话 reverse 映射 |
 | W10 | 关闭 Android 无线调试后点「连接」 | 提示需重新开启或重新配对，**不**提示 USB 故障 | ☐ | 未测。`DescribeConnectFailure` 刻意不提 USB——那不是数据线问题，说 USB 会把用户引到错的方向 |
 | W11 | 非可信 / 隔离的公共 LAN | 提示网络限制；不绕过安全设置 | ☐ | 未测。帮助文案点名「客户端隔离」；AnPod 不关防火墙 |

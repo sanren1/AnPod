@@ -339,13 +339,13 @@ function PairDialog({ transport, initialEndpoint, onClose, onDone }: { transport
         {qrStarted && <button className="dialog-secondary" onClick={() => { ++taskGeneration.current; void invokeApp("cancel_qr_pairing"); setQrStarted(false); setBusy(false); setMessage("配对已取消。"); }}>取消配对</button>}
       </div>}
       {tab === "code" && <form className="form-pane" onSubmit={event => { event.preventDefault(); void finish("pair_wifi", { endpoint, code }); }}>
-        <label>手机配对地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.168.1.20:37001" /></label>
+        <label>手机配对地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.0.2.20:37001" /></label>
         <label>6 位配对码<input value={code} onChange={event => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" aria-describedby="pair-code-hint" placeholder="123456" /></label>
         <small id="pair-code-hint">配对码来自手机的“使用配对码配对设备”页面。</small>
         <button className="primary-button" disabled={busy || code.length !== 6}>{busy ? "正在配对…" : "配对并添加"}</button>
       </form>}
       {tab === "address" && <form className="form-pane" onSubmit={event => { event.preventDefault(); void finish("connect_wifi", { endpoint }); }}>
-        <label>无线调试连接地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.168.1.20:5555" /></label>
+        <label>无线调试连接地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.0.2.20:5555" /></label>
         <small>请使用手机无线调试主页面显示的连接端口，不要使用配对端口。</small>
         <button className="text-button discover-button" type="button" onClick={() => void discover()} disabled={busy}><Search size={15} />搜索局域网设备</button>
         <button className="primary-button" disabled={busy || !endpoint.trim()}>{busy ? "正在连接…" : "连接地址"}</button>

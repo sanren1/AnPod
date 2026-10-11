@@ -56,7 +56,7 @@ fs.mkdirSync(out, {recursive:true});
  results.focusStable=await code.evaluate(el=>document.activeElement===el);
  results.codeRetained=await code.inputValue();
  await page.screenshot({path:`${out}/pair-code.png`});
- await page.getByLabel('手机配对地址').fill('192.168.1.20:37001');
+ await page.getByLabel('手机配对地址').fill('192.0.2.20:37001');
  await page.getByRole('button',{name:'配对并添加',exact:true}).click();
  await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();
  await page.evaluate(()=>window.reviewCompletePair());await page.waitForTimeout(200);

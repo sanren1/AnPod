@@ -29,7 +29,7 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File packaging\build-android.ps1 `
-        -AndroidSdkRoot C:\Android\Sdk -JavaHome C:\Java\jdk-17
+        -AndroidSdkRoot $env:ANDROID_SDK_ROOT -JavaHome $env:JAVA_HOME
 #>
 [CmdletBinding()]
 param(

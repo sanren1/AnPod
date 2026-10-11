@@ -72,20 +72,22 @@ return failures == 0 ? 0 : 1;
 
 // ---------------------------------------------------------------- tests
 
+// Device IDs are synthetic; network examples use documentation-only IPv4 ranges.
+
 static void ParsesEveryTransportState()
 {
     const string output =
         "List of devices attached\n" +
-        "R58M12345AB\tdevice usb:1-3 product:beyond1ltezh device:beyond1 model:SM_G9730 transport_id:1\n" +
+        "TESTUSB0001\tdevice usb:1-3 product:beyond1ltezh device:beyond1 model:SM_G9730 transport_id:1\n" +
         "0123456789ABCDEF\tunauthorized usb:1-4 transport_id:2\n" +
-        "192.168.1.20:5555\tdevice product:redfin model:Pixel_5 transport_id:3\n" +
+        "192.0.2.20:5555\tdevice product:redfin model:Pixel_5 transport_id:3\n" +
         "emulator-5554\tdevice product:sdk_gphone_x86 model:sdk_gphone_x86 transport_id:4\n" +
         "ABC123\toffline usb:2-1 transport_id:5\n";
 
     var devices = AdbOutputParser.ParseDevices(output);
 
     Equal(5, devices.Count, "device count");
-    Equal("R58M12345AB", devices[0].Serial, "serial 0");
+    Equal("TESTUSB0001", devices[0].Serial, "serial 0");
     Equal(AdbDeviceState.Device, devices[0].State, "state 0");
     Equal(AdbDeviceState.Unauthorized, devices[1].State, "state 1");
     Equal(AdbDeviceState.Device, devices[2].State, "state 2");
@@ -99,18 +101,18 @@ static void IgnoresBannerLines()
         "* daemon started successfully\n" +
         "List of devices attached\n" +
         "\n" +
-        "R58M12345AB\tdevice usb:1-3 transport_id:1\n";
+        "TESTUSB0001\tdevice usb:1-3 transport_id:1\n";
 
     var devices = AdbOutputParser.ParseDevices(output);
 
     Equal(1, devices.Count, "only the real device survives");
-    Equal("R58M12345AB", devices[0].Serial, "serial");
+    Equal("TESTUSB0001", devices[0].Serial, "serial");
 }
 
 static void ReadsUsbTag()
 {
     var devices = AdbOutputParser.ParseDevices(
-        "List of devices attached\nR58M12345AB\tdevice usb:1-3 transport_id:1\n");
+        "List of devices attached\nTESTUSB0001\tdevice usb:1-3 transport_id:1\n");
 
     Equal("1-3", devices[0].UsbTag, "usb tag");
 }
@@ -127,18 +129,18 @@ static void RecognisesNoPermissions()
 
 static void DetectsNetworkSerial()
 {
-    True(AdbOutputParser.IsNetworkSerial("192.168.1.20:5555"), "ip:port is network");
-    True(AdbOutputParser.IsNetworkSerial("10.0.0.2:5037"), "second ip:port is network");
-    False(AdbOutputParser.IsNetworkSerial("R58M12345AB"), "hardware serial is not network");
+    True(AdbOutputParser.IsNetworkSerial("192.0.2.20:5555"), "ip:port is network");
+    True(AdbOutputParser.IsNetworkSerial("198.51.100.2:5037"), "second ip:port is network");
+    False(AdbOutputParser.IsNetworkSerial("TESTUSB0001"), "hardware serial is not network");
     False(AdbOutputParser.IsNetworkSerial("emulator-5554"), "emulator is not an ip:port");
     False(AdbOutputParser.IsNetworkSerial(null), "null is not network");
-    True(AdbOutputParser.IsNetworkSerial("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp"), "TLS mDNS serial is network");
+    True(AdbOutputParser.IsNetworkSerial("adb-TESTDEVICE0001-TEST01._adb-tls-connect._tcp"), "TLS mDNS serial is network");
 }
 
 static void TlsMdnsSerialWinsUsbProperty()
 {
     var info = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp", AdbDeviceState.Device, null),
+        new AdbDeviceEntry("adb-TESTDEVICE0001-TEST01._adb-tls-connect._tcp", AdbDeviceState.Device, null),
         new Dictionary<string, string> { ["us"] = "mtp,adb" });
     Equal(TransportKind.Wifi, info.Transport, "network serial takes precedence over device-wide USB state");
 }
@@ -146,12 +148,12 @@ static void TlsMdnsSerialWinsUsbProperty()
 static void ParsesLabelledProperties()
 {
     // Deliberately out of order with an interleaved blank line.
-    const string output = "mo:SM-G9730\n\nsn:R58M12345AB\nav:13\nal:33\nmf:samsung\n";
+    const string output = "mo:SM-G9730\n\nsn:TESTUSB0001\nav:13\nal:33\nmf:samsung\n";
 
     var props = AdbOutputParser.ParseLabeledProperties(output);
 
     Equal("SM-G9730", props["mo"], "model");
-    Equal("R58M12345AB", props["sn"], "serial");
+    Equal("TESTUSB0001", props["sn"], "serial");
     Equal("13", props["av"], "android version");
     Equal("33", props["al"], "api level");
     Equal("samsung", props["mf"], "manufacturer");
@@ -159,7 +161,7 @@ static void ParsesLabelledProperties()
 
 static void UsbTagProvesUsb()
 {
-    var info = DeviceInfoFactory.Create(new AdbDeviceEntry("R58M12345AB", AdbDeviceState.Device, "1-3"));
+    var info = DeviceInfoFactory.Create(new AdbDeviceEntry("TESTUSB0001", AdbDeviceState.Device, "1-3"));
 
     True(info.IsUsb, "usb confirmed");
     False(info.TransportUnknown, "transport known");
@@ -174,7 +176,7 @@ static void UsbStateProvesUsb()
     var props = new Dictionary<string, string> { ["us"] = "mtp,adb" };
 
     var info = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("10ACCH06X1000XM", AdbDeviceState.Device, null),
+        new AdbDeviceEntry("TESTUSB0002", AdbDeviceState.Device, null),
         props);
 
     True(info.IsUsb, "usb confirmed from sys.usb.state");
@@ -255,7 +257,7 @@ static void QueryCarriesTransportKeys()
 static void NetworkSerialProvesNetwork()
 {
     var info = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("192.168.1.20:5555", AdbDeviceState.Device, null));
+        new AdbDeviceEntry("192.0.2.20:5555", AdbDeviceState.Device, null));
 
     False(info.IsUsb, "not usb");
     False(info.TransportUnknown, "transport positively identified as network");
@@ -280,7 +282,7 @@ static void BareSerialIsUnknownTransport()
 static void OnlyAuthorisedUsbIsConnectable()
 {
     var unauthorized = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("R58M12345AB", AdbDeviceState.Unauthorized, "1-3"));
+        new AdbDeviceEntry("TESTUSB0001", AdbDeviceState.Unauthorized, "1-3"));
 
     False(unauthorized.IsConnectable, "unauthorized is not connectable");
     True(unauthorized.IsUsb, "but it is still recognised as USB");
@@ -291,7 +293,7 @@ static void SettingsRoundTrip()
     var original = new AppSettings
     {
         AutoConnectLastDevice = false,
-        LastDeviceId = "R58M12345AB",
+        LastDeviceId = "TESTUSB0001",
         MinimizeToTray = false,
         LaunchAtLogin = true,
     };
@@ -299,7 +301,7 @@ static void SettingsRoundTrip()
     var restored = AppSettingsSerializer.Deserialize(AppSettingsSerializer.Serialize(original));
 
     Equal(false, restored.AutoConnectLastDevice, "auto connect");
-    Equal("R58M12345AB", restored.LastDeviceId, "last device");
+    Equal("TESTUSB0001", restored.LastDeviceId, "last device");
     Equal(false, restored.MinimizeToTray, "minimize to tray");
     Equal(true, restored.LaunchAtLogin, "launch at login");
     Equal(AppSettings.CurrentSchemaVersion, restored.SchemaVersion, "schema");
@@ -333,29 +335,29 @@ static void BlankLastDeviceNormalises()
 
 static void MasksSerial()
 {
-    var masked = LogRedactor.MaskSerial("R58M12345AB");
+    var masked = LogRedactor.MaskSerial("TESTUSB0001");
 
-    Equal("R5***AB", masked, "masked serial");
+    Equal("TE***01", masked, "masked serial");
     Equal("***", LogRedactor.MaskSerial("ABC"), "short serial fully masked");
 }
 
 static void ScrubsIps()
 {
     var scrubbed = LogRedactor.Redact(
-        "connecting to 127.0.0.1:5000 and 192.168.1.20:5555 for R58M12345AB",
-        new[] { "R58M12345AB" });
+        "connecting to 127.0.0.1:5000 and 192.0.2.20:5555 for TESTUSB0001",
+        new[] { "TESTUSB0001" });
 
     False(scrubbed.Contains("127.0.0.1"), "loopback scrubbed");
-    False(scrubbed.Contains("192.168.1.20"), "lan ip scrubbed");
-    False(scrubbed.Contains("R58M12345AB"), "secret scrubbed");
+    False(scrubbed.Contains("192.0.2.20"), "lan ip scrubbed");
+    False(scrubbed.Contains("TESTUSB0001"), "secret scrubbed");
 }
 
 static void WifiTransportIsLabelled()
 {
     var wifi = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("192.168.1.20:5555", AdbDeviceState.Device, null));
+        new AdbDeviceEntry("192.0.2.20:5555", AdbDeviceState.Device, null));
     var usb = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("R58M12345AB", AdbDeviceState.Device, "1-3"));
+        new AdbDeviceEntry("TESTUSB0001", AdbDeviceState.Device, "1-3"));
 
     Equal("Wi-Fi", wifi.TransportText, "wifi label");
     Equal("USB", usb.TransportText, "usb label");
@@ -365,7 +367,7 @@ static void WifiTransportIsLabelled()
     // An unauthorised wireless device behaves exactly like an unauthorised USB
     // one: visible, with its transport stated, but not connectable (plan §6).
     var pending = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("192.168.1.20:5555", AdbDeviceState.Unauthorized, null));
+        new AdbDeviceEntry("192.0.2.20:5555", AdbDeviceState.Unauthorized, null));
 
     False(pending.IsConnectable, "unauthorised wifi is not connectable");
     Equal(TransportKind.Wifi, pending.Transport, "transport is still known");
@@ -379,9 +381,9 @@ static void WifiTransportIsLabelled()
 static void FiltersDevicesByMode()
 {
     var wifi = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("192.168.1.20:5555", AdbDeviceState.Device, null));
+        new AdbDeviceEntry("192.0.2.20:5555", AdbDeviceState.Device, null));
     var usb = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("R58M12345AB", AdbDeviceState.Device, "1-3"));
+        new AdbDeviceEntry("TESTUSB0001", AdbDeviceState.Device, "1-3"));
 
     True(usb.MatchesTransport(TransportKind.Usb), "usb device shows in usb mode");
     False(usb.MatchesTransport(TransportKind.Wifi), "usb device is hidden in wifi mode");
@@ -393,7 +395,7 @@ static void FiltersDevicesByMode()
     // attributed to either, and hiding it would empty both lists while a phone
     // is plainly attached.
     var unknown = DeviceInfoFactory.Create(
-        new AdbDeviceEntry("R58M12345AB", AdbDeviceState.Device, null));
+        new AdbDeviceEntry("TESTUSB0001", AdbDeviceState.Device, null));
 
     Equal(TransportKind.Unknown, unknown.Transport, "a bare serial stays unclassified");
     True(unknown.MatchesTransport(TransportKind.Usb), "unclassified is visible in usb mode");
@@ -410,15 +412,15 @@ static void FiltersDevicesByMode()
 
 static void NormalisesEndpoints()
 {
-    True(WirelessAdb.TryNormalizeEndpoint("192.168.1.20:5555", out var plain, out _), "plain form");
-    Equal("192.168.1.20:5555", plain, "plain endpoint");
+    True(WirelessAdb.TryNormalizeEndpoint("192.0.2.20:5555", out var plain, out _), "plain form");
+    Equal("192.0.2.20:5555", plain, "plain endpoint");
 
     // Tutorials hand out the whole command; pasting it must just work.
-    True(WirelessAdb.TryNormalizeEndpoint("  adb connect 10.0.0.5:37099 ", out var pasted, out _), "pasted form");
-    Equal("10.0.0.5:37099", pasted, "pasted endpoint");
+    True(WirelessAdb.TryNormalizeEndpoint("  adb connect 198.51.100.5:37099 ", out var pasted, out _), "pasted form");
+    Equal("198.51.100.5:37099", pasted, "pasted endpoint");
 
-    True(WirelessAdb.TryNormalizeEndpoint("adb pair 10.0.0.5:37099", out var paired, out _), "pair form");
-    Equal("10.0.0.5:37099", paired, "pair endpoint");
+    True(WirelessAdb.TryNormalizeEndpoint("adb pair 198.51.100.5:37099", out var paired, out _), "pair form");
+    Equal("198.51.100.5:37099", paired, "pair endpoint");
 }
 
 static void RejectsBadEndpoints()
@@ -429,14 +431,14 @@ static void RejectsBadEndpoints()
 
     // The pairing port and the connect port differ on Android 11+, so a missing
     // port is the single most common mistake (plan §1.1a) and has to be named.
-    False(WirelessAdb.TryNormalizeEndpoint("192.168.1.20", out _, out var noPort), "port required");
+    False(WirelessAdb.TryNormalizeEndpoint("192.0.2.20", out _, out var noPort), "port required");
     True(noPort!.Contains("IP:端口"), "missing port explains the expected shape");
 
-    False(WirelessAdb.TryNormalizeEndpoint("192.168.1.20:0", out _, out _), "port 0 rejected");
-    False(WirelessAdb.TryNormalizeEndpoint("192.168.1.20:70000", out _, out _), "port too large rejected");
-    False(WirelessAdb.TryNormalizeEndpoint("192.168.1.20:+55", out _, out _), "signed port rejected");
+    False(WirelessAdb.TryNormalizeEndpoint("192.0.2.20:0", out _, out _), "port 0 rejected");
+    False(WirelessAdb.TryNormalizeEndpoint("192.0.2.20:70000", out _, out _), "port too large rejected");
+    False(WirelessAdb.TryNormalizeEndpoint("192.0.2.20:+55", out _, out _), "signed port rejected");
     False(WirelessAdb.TryNormalizeEndpoint("my-laptop:5555", out _, out _), "hostname rejected");
-    False(WirelessAdb.TryNormalizeEndpoint("192.168.1.20:55a5", out _, out _), "non-numeric port rejected");
+    False(WirelessAdb.TryNormalizeEndpoint("192.0.2.20:55a5", out _, out _), "non-numeric port rejected");
 }
 
 static void ValidatesPairingCode()
@@ -453,11 +455,11 @@ static void ValidatesPairingCode()
 static void ParsesConnectSuccess()
 {
     Equal(AdbConnectOutcome.Connected,
-        WirelessAdb.ParseConnectResult("connected to 192.168.1.20:5555\n", string.Empty),
+        WirelessAdb.ParseConnectResult("connected to 192.0.2.20:5555\n", string.Empty),
         "fresh connection");
 
     Equal(AdbConnectOutcome.AlreadyConnected,
-        WirelessAdb.ParseConnectResult("already connected to 192.168.1.20:5555\n", string.Empty),
+        WirelessAdb.ParseConnectResult("already connected to 192.0.2.20:5555\n", string.Empty),
         "repeat connection");
 
     // No output at all is never success; guessing here would report a phone that
@@ -468,13 +470,13 @@ static void ParsesConnectSuccess()
 
     // A port can look like a Windows socket error code. Only the message counts.
     Equal(AdbConnectOutcome.Connected,
-        WirelessAdb.ParseConnectResult("connected to 192.168.1.20:10061\n", string.Empty),
+        WirelessAdb.ParseConnectResult("connected to 192.0.2.20:10061\n", string.Empty),
         "a port resembling an error code is not an error");
 
     // A benign stderr note must not out-vote the success line.
     Equal(AdbConnectOutcome.Connected,
         WirelessAdb.ParseConnectResult(
-            "connected to 192.168.1.20:5555\n",
+            "connected to 192.0.2.20:5555\n",
             "adb server version (41) doesn't match this client (39)\n"),
         "success survives an unrelated stderr note");
 }
@@ -484,19 +486,19 @@ static void ParsesConnectFailure()
     // adb connect exits 0 for every one of these, which is the whole reason the
     // text has to be classified rather than the exit code trusted.
     Equal(AdbConnectOutcome.Failed,
-        WirelessAdb.ParseConnectResult("failed to connect to 192.168.1.20:5555\n", string.Empty),
+        WirelessAdb.ParseConnectResult("failed to connect to 192.0.2.20:5555\n", string.Empty),
         "failed to connect");
     Equal(AdbConnectOutcome.Failed,
-        WirelessAdb.ParseConnectResult("unable to connect to 192.168.1.20:5555: Connection refused\n", string.Empty),
+        WirelessAdb.ParseConnectResult("unable to connect to 192.0.2.20:5555: Connection refused\n", string.Empty),
         "unable to connect");
     Equal(AdbConnectOutcome.Failed,
-        WirelessAdb.ParseConnectResult("cannot connect to 192.168.1.20:5555: 由于目标计算机积极拒绝 (10061)\n", string.Empty),
+        WirelessAdb.ParseConnectResult("cannot connect to 192.0.2.20:5555: 由于目标计算机积极拒绝 (10061)\n", string.Empty),
         "localised refusal");
     Equal(AdbConnectOutcome.Failed,
-        WirelessAdb.ParseConnectResult(string.Empty, "missing port in specification: 192.168.1.20\n"),
+        WirelessAdb.ParseConnectResult(string.Empty, "missing port in specification: 192.0.2.20\n"),
         "missing port");
     Equal(AdbConnectOutcome.Failed,
-        WirelessAdb.ParseConnectResult("failed to connect to 192.168.1.20:5555: error: 10060\n", string.Empty),
+        WirelessAdb.ParseConnectResult("failed to connect to 192.0.2.20:5555: error: 10060\n", string.Empty),
         "socket error code");
 }
 
@@ -504,7 +506,7 @@ static void ParsesPairResults()
 {
     Equal(AdbPairOutcome.Succeeded,
         WirelessAdb.ParsePairResult(
-            "Successfully paired to 192.168.1.20:37099 [guid=adb-R58M12345AB-xyz]\n",
+            "Successfully paired to 192.0.2.20:37099 [guid=adb-TESTUSB0001-xyz]\n",
             string.Empty,
             out _),
         "pair success");
@@ -530,18 +532,18 @@ static void ParsesMdnsServices()
 {
     const string output =
         "List of discovered mdns services\n" +
-        "adb-R58M12345AB-4KPB2X._adb-tls-connect._tcp.\t192.168.1.20:37041\n" +
-        "adb-R58M12345AB-ZZ9QQ1._adb-tls-pairing._tcp.\t192.168.1.20:41287\n";
+        "adb-TESTUSB0001-TEST01._adb-tls-connect._tcp.\t192.0.2.20:37041\n" +
+        "adb-TESTUSB0001-TEST02._adb-tls-pairing._tcp.\t192.0.2.20:41287\n";
 
     var services = WirelessAdb.ParseMdnsServices(output);
     Equal(2, services.Count, "both services are parsed");
 
     var connect = services.Single(s => s.Kind == AdbMdnsKind.Connect);
-    Equal("192.168.1.20:37041", connect.Endpoint, "connect endpoint");
-    True(connect.Name.StartsWith("adb-R58M12345AB", StringComparison.Ordinal), "instance name kept");
+    Equal("192.0.2.20:37041", connect.Endpoint, "connect endpoint");
+    True(connect.Name.StartsWith("adb-TESTUSB0001", StringComparison.Ordinal), "instance name kept");
 
     var pairing = services.Single(s => s.Kind == AdbMdnsKind.Pairing);
-    Equal("192.168.1.20:41287", pairing.Endpoint, "pairing endpoint");
+    Equal("192.0.2.20:41287", pairing.Endpoint, "pairing endpoint");
 
     // The two ports really are different values — the trap this exists to close.
     True(connect.Endpoint != pairing.Endpoint, "the two ports differ");
@@ -555,13 +557,13 @@ static void ParsesMdnsRobustly()
     // Column layout has moved between platform-tools releases, so the parser
     // finds the endpoint wherever it is rather than trusting fixed positions.
     var tabs = WirelessAdb.ParseMdnsServices(
-        "adb-X-1._adb-tls-connect._tcp\t_adb-tls-connect._tcp\t10.0.0.5:5555\n");
-    Equal("10.0.0.5:5555", tabs.Single().Endpoint, "extra type column");
+        "adb-X-1._adb-tls-connect._tcp\t_adb-tls-connect._tcp\t198.51.100.5:5555\n");
+    Equal("198.51.100.5:5555", tabs.Single().Endpoint, "extra type column");
 
-    var legacy = WirelessAdb.ParseMdnsServices("adb-X-1._adb._tcp.  10.0.0.5:5555\n");
+    var legacy = WirelessAdb.ParseMdnsServices("adb-X-1._adb._tcp.  198.51.100.5:5555\n");
     Equal(AdbMdnsKind.Connect, legacy.Single().Kind, "legacy _adb._tcp counts as connect");
 
-    var other = WirelessAdb.ParseMdnsServices("printer._ipp._tcp.  10.0.0.9:631\n");
+    var other = WirelessAdb.ParseMdnsServices("printer._ipp._tcp.  198.51.100.9:631\n");
     Equal(AdbMdnsKind.Other, other.Single().Kind, "an unrelated service is not an ADB device");
 
     // Junk must not become a device, and must not throw.
@@ -608,7 +610,7 @@ static void ProbesMdnsHealth()
     // "no devices found" and send the user to debug the wrong end.
     const string listHeader = "List of discovered mdns services\n";
     const string listWithDevice =
-        "List of discovered mdns services\nadb-A-1._adb-tls-connect._tcp.  10.0.0.5:5555\n";
+        "List of discovered mdns services\nadb-A-1._adb-tls-connect._tcp.  198.51.100.5:5555\n";
 
     True(!WirelessAdb.IsMdnsHealthy(listHeader, string.Empty),
         "the services header never proves health");
@@ -621,30 +623,30 @@ static void ProbesMdnsHealth()
 static void PicksConnectEndpoint()
 {
     var one = WirelessAdb.ParseMdnsServices(
-        "adb-A-1._adb-tls-connect._tcp.  10.0.0.5:5555\n");
-    Equal("10.0.0.5:5555", WirelessAdb.PickConnectEndpoint(one, null),
+        "adb-A-1._adb-tls-connect._tcp.  198.51.100.5:5555\n");
+    Equal("198.51.100.5:5555", WirelessAdb.PickConnectEndpoint(one, null),
         "a single device needs no disambiguation");
 
     // Two phones: the one just paired with wins, by host.
     var two = WirelessAdb.ParseMdnsServices(
-        "adb-A-1._adb-tls-connect._tcp.  10.0.0.5:5555\n" +
-        "adb-B-1._adb-tls-connect._tcp.  10.0.0.6:6666\n");
-    Equal("10.0.0.6:6666", WirelessAdb.PickConnectEndpoint(two, "10.0.0.6"),
+        "adb-A-1._adb-tls-connect._tcp.  198.51.100.5:5555\n" +
+        "adb-B-1._adb-tls-connect._tcp.  198.51.100.6:6666\n");
+    Equal("198.51.100.6:6666", WirelessAdb.PickConnectEndpoint(two, "198.51.100.6"),
         "the paired host is preferred");
 
     // No basis for a choice: refusing beats silently routing audio to a phone the
     // user did not mean (plan §6).
-    Equal(null, WirelessAdb.PickConnectEndpoint(two, "10.0.0.99"),
+    Equal(null, WirelessAdb.PickConnectEndpoint(two, "198.51.100.99"),
         "an unrelated host does not justify a guess");
-    Equal(null, WirelessAdb.PickConnectEndpoint(one, "10.0.0.99"),
+    Equal(null, WirelessAdb.PickConnectEndpoint(one, "198.51.100.99"),
         "a single unrelated endpoint is not the paired target");
     Equal(null, WirelessAdb.PickConnectEndpoint(two, null),
         "two phones and no hint is ambiguous");
 
-    Equal(null, WirelessAdb.PickConnectEndpoint(Array.Empty<AdbMdnsService>(), "10.0.0.5"),
+    Equal(null, WirelessAdb.PickConnectEndpoint(Array.Empty<AdbMdnsService>(), "198.51.100.5"),
         "nothing discovered, nothing picked");
 
-    Equal("10.0.0.5", WirelessAdb.HostOf("10.0.0.5:5555"), "host extraction");
+    Equal("198.51.100.5", WirelessAdb.HostOf("198.51.100.5:5555"), "host extraction");
     Equal(null, WirelessAdb.HostOf("nonsense"), "host of nonsense is null");
 }
 
@@ -659,7 +661,7 @@ static void QrCredentialsAreSpecific()
     False(WirelessAdb.IsSameMdnsInstance("studio-AbCdEf12345", instance),
         "prefix match is not sufficient");
     False(WirelessAdb.IsValidPairingCode(password), "QR shared password is not a six-digit code");
-    Equal("adb-43081FDAS000VS-QXjCrW", WirelessAdb.TlsConnectInstance("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp."), "TLS serial instance");
+    Equal("adb-TESTDEVICE0001-TEST01", WirelessAdb.TlsConnectInstance("adb-TESTDEVICE0001-TEST01._adb-tls-connect._tcp."), "TLS serial instance");
 }
 
 static void SettingsWirelessRoundTrip(){
@@ -667,14 +669,14 @@ static void SettingsWirelessRoundTrip(){
     {
         PreferredTransport = TransportKind.Wifi,
         AutoReconnectWifi = false,
-        LastWirelessEndpoint = "192.168.1.20:5555",
+        LastWirelessEndpoint = "192.0.2.20:5555",
     };
 
     var restored = AppSettingsSerializer.Deserialize(AppSettingsSerializer.Serialize(original));
 
     Equal(TransportKind.Wifi, restored.PreferredTransport, "transport");
     Equal(false, restored.AutoReconnectWifi, "auto reconnect wifi");
-    Equal("192.168.1.20:5555", restored.LastWirelessEndpoint, "endpoint");
+    Equal("192.0.2.20:5555", restored.LastWirelessEndpoint, "endpoint");
 }
 
 static void PlaybackModeSettings()
@@ -702,11 +704,11 @@ static void OldSettingsStillLoad()
     // A file written by v1.0 has none of the wireless fields. It must keep its
     // values and gain defaults, not be discarded for being old (plan §5.10).
     var restored = AppSettingsSerializer.Deserialize(
-        "{\"schemaVersion\":1,\"autoConnectLastDevice\":false,\"lastDeviceId\":\"R58M12345AB\"," +
+        "{\"schemaVersion\":1,\"autoConnectLastDevice\":false,\"lastDeviceId\":\"TESTUSB0001\"," +
         "\"minimizeToTray\":false,\"launchAtLogin\":true}");
 
     Equal(false, restored.AutoConnectLastDevice, "v1.0 value kept");
-    Equal("R58M12345AB", restored.LastDeviceId, "v1.0 value kept");
+    Equal("TESTUSB0001", restored.LastDeviceId, "v1.0 value kept");
     Equal(true, restored.LaunchAtLogin, "v1.0 value kept");
     Equal(TransportKind.Usb, restored.PreferredTransport, "transport defaults to USB");
     Equal(true, restored.AutoReconnectWifi, "wifi reconnect defaults on");

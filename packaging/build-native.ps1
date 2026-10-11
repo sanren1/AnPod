@@ -22,7 +22,7 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File packaging\build-native.ps1 `
-        -MinGWRoot C:\tools\w64devkit
+        -MinGWRoot $env:MINGW_ROOT
 #>
 [CmdletBinding()]
 param(

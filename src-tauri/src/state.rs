@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn parses_and_filters_adb_device_rows() {
-        let rows = "List of devices attached\nZX1\tdevice product:oriole model:Pixel_8 manufacturer:Google usb:1-2\n192.168.1.5:37123 device product:a model:Phone\nZX2 unauthorized usb:1-3\n";
+        let rows = "List of devices attached\nZX1\tdevice product:oriole model:Pixel_8 manufacturer:Google usb:1-2\n192.0.2.5:37123 device product:a model:Phone\nZX2 unauthorized usb:1-3\n";
         let devices = parse_devices(rows);
         assert_eq!(devices.len(), 3);
         assert_eq!(devices[0].transport, "usb");
@@ -1253,8 +1253,8 @@ mod tests {
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["preferredTransport"], "Usb");
         assert_eq!(value["playbackMode"], "Balanced");
-        assert_eq!(normalize_endpoint("192.168.1.2:5555").unwrap(), "192.168.1.2:5555");
-        assert!(normalize_endpoint("192.168.1.2:0").is_err());
+        assert_eq!(normalize_endpoint("192.0.2.2:5555").unwrap(), "192.0.2.2:5555");
+        assert!(normalize_endpoint("192.0.2.2:0").is_err());
     }
 
     #[test]

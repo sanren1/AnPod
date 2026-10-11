@@ -49,7 +49,7 @@ public enum AdbMdnsKind
 /// <summary>
 /// One service instance advertised over mDNS, as printed by <c>adb mdns services</c>.
 /// </summary>
-/// <param name="Name">Service instance name, e.g. <c>adb-3DNN192P3ZPE-4KPB2X._adb-tls-connect._tcp.</c></param>
+/// <param name="Name">Service instance name, e.g. <c>adb-TESTDEVICE0001-TEST01._adb-tls-connect._tcp.</c></param>
 /// <param name="Endpoint">Normalised <c>ip:port</c>.</param>
 public sealed record AdbMdnsService(string Name, string Endpoint, AdbMdnsKind Kind);
 
@@ -189,7 +189,7 @@ public static partial class WirelessAdb
         var separator = text.LastIndexOf(':');
         if (separator <= 0 || separator == text.Length - 1)
         {
-            problem = "格式应为 IP:端口，例如 192.168.1.20:5555。";
+            problem = "格式应为 IP:端口，例如 192.0.2.20:5555。";
             return false;
         }
 
@@ -198,7 +198,7 @@ public static partial class WirelessAdb
 
         if (!Ipv4Regex().IsMatch(host))
         {
-            problem = "目前只支持 IPv4 地址，例如 192.168.1.20。";
+            problem = "目前只支持 IPv4 地址，例如 192.0.2.20。";
             return false;
         }
 
