@@ -1,4 +1,13 @@
-# AnPod v2 P0 手动验收清单
+# AnPod v2 验收记录与必要检查
+
+## 当前验证政策（2026-10-11 用户修订）
+
+- **20 次拔插、30 分钟锁屏和延迟对照测试：`CANCELLED_BY_USER`**。这些不再是阶段或发布关卡；不自动替换为固定次数切换、两小时播放或其他长测矩阵。
+- 后续开发和规划仅保留三组必要验证：受影响代码/契约检查、一次合并的核心功能冒烟、最终交付包的签名/依赖/许可/脱敏检查。只检查本阶段受影响且已实现的功能。
+- 主路径相关的安装/启动、实际播放、输出与模式切换、暂停/恢复、断开/停止、资源清理和电脑声音恢复合并为一轮；自动检查已覆盖的错误路径不再逐项真机复现。真实系统行为缺陷仅补对应最小检查。
+- 复用已有检查和未变化的通过结果，不逐阶段重复全套构建/测试；非平凡逻辑缺少覆盖时补一个最小可运行检查，不搭新框架。核心功能失败、鉴权/签名错误、数据丢失及隐私泄露仍需解决。
+- 未测平台和长期表现如实记录为限制，不要求穷举兼容矩阵。历史性能数据保留，没有新测量就不宣称新收益；声学对照和 Oboe 实验仅在用户重新明确要求后安排。
+- 以下 P0/P1/P2 内容为历史实施与验证记录；已执行结果不改写为取消或新的通过，旧的长测/全矩阵要求由本政策替代。
 
 ## 基线与范围
 
@@ -6,7 +15,7 @@
 - P0 基线提交：`00543589e641ae0911e660e433f55e08d4afcb6b`
 - 回退基线 `main`：`8a757b4a84f5d25749b163c482dfb1262df206c0`
 - 本阶段只做基线检查、构建验证和验收准备；未启动新的 AnPod 构建、未播放或录制真实音频。
-- `AnPod_plan_v2.md` 是用户已有的未跟踪文件，本次保留未改。
+- P0 时保留用户已有的未跟踪 `AnPod_plan_v2.md`；2026-10-11 按用户新要求修订验证政策，文件仍不纳入 Git。
 
 ## 自动检查与构建记录
 
@@ -52,20 +61,20 @@
 |---|---|---|
 | USB 连接并切换到手机输出 | PASS（用户确认） | 用户确认预览包手机播放及电脑/手机输出切换正常。 |
 | 手机输出暂停、恢复 | PASS（用户确认） | 用户确认暂停和恢复正常。 |
-| 断开连接与重连 | PASS（用户确认） | 用户确认断开与重连正常；不等于连续 20 次物理拔插通过。 |
-| USB 物理拔插与设备重新出现 | NOT_TESTED | 本次未确认连续物理拔插或自动恢复的具体次数。 |
+| 断开连接与重连 | PASS（用户确认） | 用户确认断开与重连正常；不据此宣称长时稳定性。 |
+| 连续 USB 物理拔插 | CANCELLED_BY_USER | 取消固定次数重复验证，不再阻断推进；必要的断开/重连纳入受影响主路径。 |
 | 系统托盘退出 | PASS（用户确认） | 用户确认托盘退出正常。 |
 | 系统托盘暂停、恢复 | NOT_TESTED | 暂停和恢复已确认，但未单独确认由托盘入口操作。 |
 | PC 输出静音恢复 | PASS（用户确认） | 用户确认电脑声音可恢复。 |
 | 切换播放模式 / 连接方式 | NOT_TESTED | 验证切换会自动断开并重连，状态提示与实际连接一致。 |
-| 手机锁屏、短时网络中断和恢复 | NOT_TESTED | 记录恢复耗时；区分系统限制与程序错误。 |
-| 长时间播放与设备睡眠/唤醒 | NOT_TESTED | 记录中断、恢复和音频异常，不以短测代替稳定性结论。 |
+| 短时网络中断和恢复 | NOT_TESTED | 仅在相关恢复逻辑实现或变化时纳入合并检查，区分系统限制与程序错误。 |
+| 锁屏长测、长时间播放与睡眠矩阵 | CANCELLED_BY_USER（默认长测取消） | 不安排固定时长测试，不以短测代替长期稳定性结论；已复现问题仅补对应最小检查。 |
 
 ## 阶段审查结论
 
 - P0 基线构建及相关自动检查通过；预览包的关键 USB、输出切换、暂停/恢复、断开/重连、托盘退出与电脑声音恢复经用户确认正常。
 - 满足进入独立 P1 APK 可行性验证的门槛。P1 不改变现有播放路径，也不据此启用新 Receiver 音频。
-- 连续物理拔插、多手机切换、托盘暂停/恢复入口、模式/传输真机切换、锁屏、长期播放与异常静音恢复仍未完整验收；不能将 P0 结论解释为全矩阵通过或 Wi-Fi 稳定。保持为后续集成及发布阻断检查。
+- P0 不代表全矩阵通过或 Wi-Fi/长期稳定性已验证。固定次数拔插、锁屏长测和延迟对照已取消；其他未测场景不统一列为后续阻断项，仅按受影响核心功能和真实风险选择必要检查。
 
 ## 回退与现有包
 
@@ -135,20 +144,23 @@
 | 检查 | 结果 | 说明 |
 |---|---|---|
 | Java PCM framing/mode 检查 | PASS | 编译共享 PCM helper、Legacy `Options` 与 `PcmCheck`；输出 `Android PCM framing and mode checks passed.` |
-| Legacy Android payload 隔离构建 | PASS | JDK 17 + SDK API 35 direct javac/d8；生成 15,004 B `classes.dex`，未覆盖 `deps/server`。 |
-| P2 Receiver APK 与 Manifest 审计 | PASS | Gradle 8.9 / AGP 8.7.3，API 35；`shortService|mediaPlayback`、前台服务权限、DUMP 入口、private Service 与无 Launcher 均通过脚本审计。APK SHA-256：`1d35c5a864c03c548647bdf0bdfe9d83716f922061d7d3491df1b21a62ccb6c1`。 |
+| Legacy Android payload 隔离构建 | PASS | JDK 17 + SDK API 35 direct javac/d8；生成 15,020 B `classes.dex`，未覆盖 `deps/server`。 |
+| Receiver 主代码与生命周期测试编译 | PASS | Gradle 8.9 / AGP 8.7.3，API 35；`compileDebugJavaWithJavac` 与 `compileDebugAndroidTestJavaWithJavac` 成功。设备端生命周期测试已编译，未运行。 |
+| P2 Receiver APK 与 Manifest 审计 | PASS | 独立 Gradle 构建成功；Manifest 身份审计通过。APK SHA-256：`EA71A1257786F3A776C510496C6D51AE370171AF7BED1C2C4C6BFB497EE27480`；临时候选 signer SHA-256：`f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。该 signer 与 P1 不同，未安装或升级。 |
 | Native DLL 隔离 Release 构建 | PASS | CMake/MSVC Release x64；既有 `AudioCapture_*` ABI 导出、架构与本机源码路径扫描通过。 |
-| Rust 自动检查与 Release | PASS | `cargo test --locked --offline`：23/23；Release 编译成功。修正 `CARGO_MANIFEST_DIR` 仅进入 Debug 编译分支后，EXE 本机路径扫描通过。 |
-| Frontend 与便携候选打包 | PASS | Frontend 生产构建成功；最终 P2 ZIP 的 EXE、Native DLL、Legacy payload、APK 及文本资料路径扫描通过。候选 ZIP：`artifacts/AnPod-1.0.4-receiver-p2-candidate-tauri-win-x64-portable.zip`；SHA-256：`A12540214C4AA9A8C04770B07F57277171F63CBB2254BC46988B3D61AA06DB9C`。 |
-| P1 → P2 APK 更新签名兼容性 | BLOCKED | P1 候选 ZIP 中 APK 与其 metadata 及记录签名一致；P2 临时 debug 签名与 P1 不同。未尝试升级、重签或卸载。正式 release keystore 仍未找到。 |
+| Rust 定向 fake-adb 检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline receiver::tests::fake_adb_`：7/7；覆盖错误优先级、管理健康不等于真实音频就绪及既有 fake-adb 管理行为。此前全量 23 项检查未在本轮改动后重跑。 |
+| 前台服务、音频会话与 Provider 诊断修复 | PASS（编译） | 音频会话生命周期由单会话 worker 持有并释放 AudioTrack/focus；取消后阻止新播放/焦点操作；Provider 暴露实际采样率、缓冲与 underrun（未知时显式 unknown）。设备生命周期测试覆盖 stop、EOF 与快速替换，但只编译，真机未运行。 |
+| Cargo 空格路径及环境恢复检查 | PASS | Cargo remap 参数以 `CARGO_ENCODED_RUSTFLAGS` 传递；用含空格的模拟 checkout 路径验证两种既有 flags 来源及 Cargo 环境变量恢复。 |
+| Rust Release 与便携候选打包 | PASS | Release 与 Frontend 生产构建成功；独立 ZIP 共 24 项，包含 Receiver APK/JSON、归属与上游说明；APK 与 JSON 摘要一致，未打入签名密钥，归档文本/二进制扫描未发现 workspace 绝对路径。候选 ZIP：`artifacts/AnPod-1.0.4-receiver-p2-candidate-tauri-win-x64-portable.zip`；SHA-256：`C00506F606C8374469403D57525829ECBD1489C01A0B2318E8811474736C160F`。 |
+| P1 → P2 APK 更新签名兼容性 | BLOCKED | P2 候选临时 signer 与 P1 不同，Package Manager 原位更新无法通过签名校验。未尝试升级、重签或卸载。P1 原签名密钥此前确认无法恢复；需要维护者明确批准一次卸载旧 P1 测试 APK 并安装新 P2 候选的迁移，安装动作尚未执行。 |
 
-升级方案：先由维护者提供/恢复与已安装 P1 相同的私有签名密钥，再重建 P2 并校验 Android Package Manager 所要求的 signer 连续性；随后才安排经用户确认的 `adb install -r` 更新。若无法恢复原密钥，暂停原包内升级，先另行评审迁移方式；不得卸载 P1、绕过签名校验或让本候选覆盖安装。
+升级方案：P1 原签名密钥无法恢复，因此不使用 `adb install -r` 绕过签名检查。候选已完成；仅在用户明确批准后，才卸载现有 P1 测试 Receiver（会清除该应用数据）并安装 P2 候选。批准前保持设备与安装状态不变。
 
 ### 真机前置与验收
 
 - 安装/升级候选 APK 前先由用户确认安装动作；检查候选 signer 与设备当前已安装 Receiver 的 signer 相同。未知或不符时停止，不能卸载或绕过 Package Manager 签名校验。当前正式 release keystore 状态仍需单独确认。
 - P2 硬件验收限定在用户授权的在线 USB ADB 设备；保持默认后端回退操作可用。使用同一唯一设备记录，并仅建立本会话的 `adb reverse localabstract:<本会话名> tcp:<本机端口>` 映射。
-- 安装并启动后检查 Receiver Provider 的 `audioActive` 与 `actualMode`，验证 token 握手成功、PCM 音频头/帧完整、balanced 与 low-latency 实际模式、电脑/手机输出切换、断开后 Receiver/AudioTrack/焦点停止以及电脑音量恢复。
-- 执行 20 次 USB 物理拔插、锁屏连续播放 30 分钟、输出切换及取消/异常退出恢复；记录每轮通过数、系统前台服务状态、实际模式、焦点及 underrun。此清单不是通过记录，完成前均为 NOT_TESTED。
+- 安装并启动后，用一次 USB 核心功能冒烟确认实际手机播放、Provider `audioActive` 与 `actualMode`、两种模式与电脑/手机输出切换、暂停/恢复、断开/停止后资源释放和电脑音量恢复；相关 token/PCM 逻辑引用已有检查，不逐项重复真机验证。
+- 当前核心冒烟仍为 `NOT_TESTED`，不写成已通过。20 次拔插、30 分钟锁屏和延迟对照为 `CANCELLED_BY_USER`，不再等待执行。生命周期/并发等已发现缺陷用最小针对性检查验证，只有真实系统行为仍缺证据时追加相应操作。
 - 若 LocalSocket abstract endpoint 被应用 UID / SELinux 拒绝，先保存脱敏的拒绝证据；只有复现后才评估 TCP reverse adapter。不得仅因假设修改现有 P1 `app_process` 路径。
 - 本地快速回退：关闭启动进程的 `ANPOD_AUDIO_BACKEND` 环境变量并重启 AnPod，即回到默认 `LegacyAppProcess`；保持已安装 APK，不需要设备卸载或数据清理。

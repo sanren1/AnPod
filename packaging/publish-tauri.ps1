@@ -79,24 +79,30 @@ try {
 }
 finally { Pop-Location }
 
-$env:CARGO_TARGET_DIR = $targetDir
+$oldCargoTargetDir = $env:CARGO_TARGET_DIR
 $oldRustFlags = $env:RUSTFLAGS
 $oldEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
 try {
     $remap = "--remap-path-prefix=$root=."
     if (-not [string]::IsNullOrWhiteSpace($oldEncodedRustFlags)) {
         $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags + [char]31 + $remap
-        $env:RUSTFLAGS = $oldRustFlags
     } else {
-        $env:CARGO_ENCODED_RUSTFLAGS = $null
-        $env:RUSTFLAGS = if ([string]::IsNullOrWhiteSpace($oldRustFlags)) { $remap } else { "$oldRustFlags $remap" }
+        $rustFlagArgs = @()
+        if (-not [string]::IsNullOrWhiteSpace($oldRustFlags)) {
+            $rustFlagArgs = @($oldRustFlags -split '\s+' | Where-Object { $_.Length -gt 0 })
+        }
+        $rustFlagArgs += $remap
+        $env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([string][char]31, [string[]]$rustFlagArgs)
     }
+    $env:RUSTFLAGS = $oldRustFlags
+    $env:CARGO_TARGET_DIR = $targetDir
     & $cargo.Source build --release --manifest-path (Join-Path $root 'src-tauri\Cargo.toml')
     if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE." }
 }
 finally {
     $env:RUSTFLAGS = $oldRustFlags
     $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags
+    $env:CARGO_TARGET_DIR = $oldCargoTargetDir
 }
 
 $exe = Join-Path $targetDir 'release\anpod-tauri.exe'

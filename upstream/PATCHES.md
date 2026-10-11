@@ -236,6 +236,23 @@ diagnostic. Pre-roll reads are limited to the actual read-array size even when
 the effective playback buffer is larger. The checks in `tests/` exercise
 fragmented frames, partial writes and large pre-roll targets.
 
+### B9. Installed Receiver service adaptation
+
+`src/AnPod.Receiver/app/src/main/java/app/anpod/receiver/ReceiverService.java`
+adapts the AudioTrack playback path from `Main.java` to an installed Android
+`Service`. The 8-byte little-endian header, abstract `LocalSocket` handshake,
+PCM16 format and playback modes remain compatible with the Windows native
+capture implementation. AnPod changes add the `mediaPlayback` foreground
+service lifecycle, audio focus, cancellation-owned session resources, and a
+protected provider for playback readiness and actual buffer/underrun metrics.
+Resource creation and use belong to the audio worker; stop closes its socket
+and cancels it, while that worker releases its own `AudioTrack` and audio focus.
+
+`src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java`
+is new AnPod code, shared by the installed Receiver and `app_process` path. It preserves complete PCM16
+frames across socket reads and partial AudioTrack writes; it is not copied
+from the upstream repository.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.
@@ -249,6 +266,9 @@ fragmented frames, partial writes and large pre-roll targets.
 ## D. Rebuilding
 
 The corresponding source for the LGPL portions is exactly the contents of
-`src/AnPod.Native/` and `src/AnPod.AndroidServer/` in this repository. Build
-instructions are in `README.md`; `packaging/build-native.ps1` and
-`packaging/build-android.ps1` reproduce the binaries from source.
+`src/AnPod.Native/`, `src/AnPod.AndroidServer/`, and the AudioShare-derived
+playback implementation in `src/AnPod.Receiver/` in this repository. The
+shared PCM helper in `src/AnPod.AndroidProtocol/` is new AnPod code. Build
+instructions are in `README.md`; `packaging/build-native.ps1`,
+`packaging/build-android.ps1`, and `packaging/build-receiver.ps1` reproduce the
+native library and both Android paths from source.

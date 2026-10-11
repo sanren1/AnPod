@@ -11,7 +11,7 @@ public final class Pcm16FrameStream {
     private int tailLength;
 
     public interface Writer {
-        int write(byte[] data, int offset, int length);
+        int write(byte[] data, int offset, int length) throws IOException;
     }
 
     public Pcm16FrameStream() { this(2); }

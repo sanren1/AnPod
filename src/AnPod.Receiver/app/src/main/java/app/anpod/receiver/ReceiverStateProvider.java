@@ -12,7 +12,9 @@ import android.net.Uri;
 public final class ReceiverStateProvider extends ContentProvider {
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
-            "foreground", "healthy", "audioActive", "actualMode", "startedAtElapsedMs", "error"
+            "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
+            "bufferCapacityFrames", "effectiveBufferFrames", "startThresholdFrames", "underrunCount",
+            "startedAtElapsedMs", "error"
     };
 
     @Override
@@ -45,7 +47,8 @@ public final class ReceiverStateProvider extends ContentProvider {
                 break;
             }
         }
-        boolean healthy = active && foreground && ReceiverService.foregroundReady;
+        boolean healthy = active && foreground && ReceiverService.foregroundReady
+                && ReceiverService.startFailure.isEmpty();
         MatrixCursor result = new MatrixCursor(columns, 1);
         Object[] values = new Object[columns.length];
         for (int i = 0; i < columns.length; i++) {
@@ -58,6 +61,11 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "healthy": values[i] = healthy; break;
                 case "audioActive": values[i] = ReceiverService.audioActive; break;
                 case "actualMode": values[i] = ReceiverService.actualMode; break;
+                case "actualSampleRate": values[i] = metric(ReceiverService.actualSampleRate); break;
+                case "bufferCapacityFrames": values[i] = metric(ReceiverService.bufferCapacityFrames); break;
+                case "effectiveBufferFrames": values[i] = metric(ReceiverService.effectiveBufferFrames); break;
+                case "startThresholdFrames": values[i] = metric(ReceiverService.startThresholdFrames); break;
+                case "underrunCount": values[i] = metric(ReceiverService.underrunCount); break;
                 case "startedAtElapsedMs": values[i] = ReceiverService.startedAtElapsedMs; break;
                 case "error": values[i] = ReceiverService.startFailure; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");
@@ -90,5 +98,9 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static boolean contains(String[] values, String value) {
         for (String candidate : values) if (candidate.equals(value)) return true;
         return false;
+    }
+
+    private static String metric(int value) {
+        return value < 0 ? "unknown" : Integer.toString(value);
     }
 }

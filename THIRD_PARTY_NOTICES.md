@@ -9,8 +9,13 @@ pinned revisions plus the exact list of modified files live in
 
 ## 1. ysbing/AudioShare — LGPL-3.0-or-later
 
-Used for: the Windows WASAPI capture algorithm (`src/AnPod.Native/`) and the
-Android `app_process` playback service (`src/AnPod.AndroidServer/`).
+Used for: the Windows WASAPI capture algorithm (`src/AnPod.Native/`), the
+Android `app_process` playback service (`src/AnPod.AndroidServer/`), and the
+installed Android Receiver playback implementation in
+`src/AnPod.Receiver/`. The Receiver's AudioTrack playback path is adapted from
+AudioShare `Main.java`; its service, provider, activity, session lifecycle and
+diagnostics are AnPod changes. Shared PCM frame alignment is AnPod code in
+`src/AnPod.AndroidProtocol/`.
 
 ```
 AudioShare
@@ -21,8 +26,11 @@ Pinned revision: 70db6b531db2c21b5a41a289722aa3996de67ebe
 ```
 
 **This is modified LGPL source.** The modifications are enumerated in
-`upstream/PATCHES.md`, and the complete corresponding source is the contents of
-`src/AnPod.Native/` and `src/AnPod.AndroidServer/` in this repository.
+`upstream/PATCHES.md`. The corresponding modified LGPL sources are the contents
+of `src/AnPod.Native/`, `src/AnPod.AndroidServer/`, and the AudioShare-derived
+playback implementation in `src/AnPod.Receiver/` in this repository. The
+Receiver build entry is `packaging/build-receiver.ps1`; its shared AnPod
+protocol code is in `src/AnPod.AndroidProtocol/`.
 
 ### LGPL compliance notes for redistribution
 

@@ -37,6 +37,7 @@ struct Health {
     service_active: bool,
     foreground: bool,
     healthy: bool,
+    audio_active: bool,
     error: String,
 }
 
@@ -103,6 +104,11 @@ pub async fn start_audio(adb: &Path, serial: &str, apk: &Path, metadata_path: &P
         Some((socket_name, connect_code, playback_mode))).await
 }
 
+pub async fn wait_audio_active(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    wait_audio_active_with(&SystemAdb(adb), serial, apk, metadata_path, cancel, Duration::from_secs(8)).await
+}
+
 async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     start_with_action(adb, serial, apk, metadata_path, cancel, None).await
 }
@@ -116,6 +122,7 @@ async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metad
     verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let before = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&before, &metadata)?;
+    if before.service_active && !before.error.is_empty() { return Err(format!("Receiver 启动失败：{}。", before.error)); }
     if before.healthy && audio.is_none() { return Ok(status_from_health(before)); }
 
     let mut args = vec![
@@ -138,8 +145,8 @@ async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metad
         verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
         let health = read_health(adb, serial, &user, cancel).await?;
         ensure_version(&health, &metadata)?;
-        if health.healthy { return Ok(status_from_health(health)); }
         if !health.error.is_empty() { return Err(format!("Receiver 启动失败：{}。", health.error)); }
+        if health.healthy { return Ok(status_from_health(health)); }
         if Instant::now() >= deadline {
             return Err("Receiver 尚未报告健康状态；请完成手机上的系统通知授权并检查 Android 启动限制。".into());
         }
@@ -147,6 +154,35 @@ async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metad
             _ = cancel.cancelled() => return Err("操作已取消。".into()),
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
+    }
+}
+
+async fn wait_audio_active_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken, limit: Duration) -> Result<ReceiverStatus, String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    match tokio::time::timeout_at(deadline, async {
+        ensure_usb_device(adb, serial, cancel).await?;
+        let user = current_android_user(adb, serial, cancel).await?;
+        let metadata = read_artifact(apk, metadata_path)?;
+        if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
+        loop {
+            if cancel.is_cancelled() { return Err("操作已取消。".into()); }
+            verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+            let health = read_health(adb, serial, &user, cancel).await?;
+            ensure_version(&health, &metadata)?;
+            if !health.error.is_empty() { return Err(format!("Receiver 音频启动失败：{}。", health.error)); }
+            if health.audio_active && health.healthy { return Ok(status_from_health(health)); }
+            if !health.service_active || !health.foreground || !health.healthy {
+                return Err("Receiver 音频会话未保持前台健康状态。".into());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("操作已取消。".into()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    }).await {
+        Ok(result) => result,
+        Err(_) => Err("Receiver 未在时限内确认 AudioTrack 已开始播放。".into()),
     }
 }
 
@@ -303,7 +339,8 @@ fn status_from_health(health: Health) -> ReceiverStatus {
     let message = if !health.error.is_empty() {
         format!("Receiver 服务报告启动错误：{}。", health.error)
     } else if health.healthy {
-        "Receiver 服务正在前台运行；P1 尚未启用音频或网络接收。".into()
+        if health.audio_active { "Receiver 音频服务正在前台播放。".into() }
+        else { "Receiver 管理服务正在前台运行；当前没有确认音频播放。".into() }
     } else if health.service_active {
         "Receiver 服务存在，但 Android 未确认其前台健康状态。".into()
     } else {
@@ -332,6 +369,7 @@ fn parse_health(output: &str) -> Option<Health> {
         service_active: parse_bool(fields.get("serviceActive")?)?,
         foreground: parse_bool(fields.get("foreground")?)?,
         healthy: parse_bool(fields.get("healthy")?)?,
+        audio_active: fields.get("audioActive").and_then(|value| parse_bool(value)).unwrap_or(false),
         error: fields.get("error").copied().unwrap_or("").to_string(),
     })
 }
@@ -375,6 +413,8 @@ mod tests {
         active: bool,
         foreground: bool,
         healthy: bool,
+        audio_active: bool,
+        error: String,
         calls: Vec<Vec<String>>,
     }
 
@@ -431,7 +471,7 @@ mod tests {
                         AdbResult { success: state.installed, stdout: format!("{}  {INSTALLED_PATH}\n", state.installed_hash), stderr: String::new() }
                     }
                     [shell, content, query, user_option, user, flag, uri] if shell == "shell" && content == "content" && query == "query" && user_option == "--user" && user == state.user && flag == "--uri" && uri == HEALTH_URI => {
-                            let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName=0.1.0-p1, versionCode=1, serviceActive={}, foreground={}, healthy={}, startedAtElapsedMs=1, error=\n", state.active, state.foreground, state.healthy);
+                            let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName=0.1.0-p1, versionCode=1, serviceActive={}, foreground={}, healthy={}, audioActive={}, startedAtElapsedMs=1, error={}\n", state.active, state.foreground, state.healthy, state.audio_active, state.error);
                             AdbResult { success: true, stdout, stderr: String::new() }
                         }
                     [install, replace, user_option, user, _apk] if install == "install" && replace == "-r" && user_option == "--user" && user == state.user => {
@@ -579,6 +619,39 @@ mod tests {
             assert!(audio_start.iter().any(|arg| arg == expected), "missing {expected} in {audio_start:?}");
         }
         assert!(audio_start.windows(2).any(|pair| pair[0] == "--user" && pair[1] == TEST_USER));
+    }
+
+    #[tokio::test]
+    async fn fake_adb_rejects_healthy_foreground_state_when_it_contains_an_error() {
+        let files = ArtifactFiles::new();
+        let adb = FakeAdb::new(true, files.digest.clone());
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.active = true;
+            state.foreground = true;
+            state.healthy = true;
+            state.error = "AudioTrackInitializationFailed".into();
+        }
+        let result = start_with_action(&adb, SERIAL, &files.apk, &files.metadata,
+            &CancellationToken::new(), Some(("receiver-test", "test-code", "balanced"))).await;
+        assert!(result.err().unwrap().contains("AudioTrackInitializationFailed"));
+        assert!(adb.call_index(&["shell", "am", "start"]).is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_adb_management_health_is_not_audio_playback_readiness() {
+        let files = ArtifactFiles::new();
+        let adb = FakeAdb::new(true, files.digest.clone());
+        let cancel = CancellationToken::new();
+        let started = start_with_action(&adb, SERIAL, &files.apk, &files.metadata, &cancel,
+            Some(("receiver-test", "test-code", "balanced"))).await.unwrap();
+        assert!(started.healthy);
+        assert!(started.message.contains("没有确认音频播放"));
+        let result = wait_audio_active_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel,
+            Duration::from_millis(1)).await;
+        assert!(result.err().unwrap().contains("未在时限内确认 AudioTrack"));
+        let health = parse_health("Row: 0 applicationId=app.anpod.receiver, versionName=0.1.0-p1, versionCode=1, serviceActive=true, foreground=true, healthy=true, audioActive=false, startedAtElapsedMs=1, error=").unwrap();
+        assert!(!status_from_health(health).message.contains("正在前台播放"));
     }
 
     #[tokio::test]

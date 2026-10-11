@@ -526,7 +526,7 @@ impl AppState {
         // still reporting connected must not override a missing ADB device.
         let device_name = self.snapshot().device_name;
         if let Err(error) = self.teardown(Some(app)).await {
-            self.set_state(app, "error", format!("{reason}；恢复电脑声音失败：{error}"), device_name);
+            self.set_state(app, "error", format!("{reason}；清理连接失败：{error}"), device_name);
             self.recovering.store(false, Ordering::Release);
             return;
         }
@@ -553,7 +553,7 @@ impl AppState {
             if let Some(device) = self.snapshot().devices.iter().find(|device| device.serial == serial && device.connectable).cloned() {
                 if let Ok(result) = self.connect_locked(app, &device.serial, generation, &token, was_playing).await {
                     if result.success {
-                        if !was_playing { let _ = self.set_output_locked("computer").await; self.emit(app); }
+                        if !was_playing { let _ = self.set_output_locked("computer", &token).await; self.emit(app); }
                         self.finish_operation(generation);
                         self.recovering.store(false, Ordering::Release);
                         return;
@@ -673,7 +673,7 @@ impl AppState {
         let result = self.connect_inner(app, &device, token, play_on_phone).await;
         if !self.operation_is_current(generation, token) {
             let cleanup = self.teardown(Some(app)).await;
-            let message = cleanup.as_ref().err().map_or_else(|| "连接已取消。".into(), |error| format!("连接已取消，但恢复电脑声音失败：{error}"));
+            let message = cleanup.as_ref().err().map_or_else(|| "连接已取消。".into(), |error| format!("连接已取消，但清理连接失败：{error}"));
             let idle_state = if cleanup.is_err() { "error" } else if self.view.lock().expect("view lock").devices.is_empty() { "noDevice" } else { "ready" };
             self.set_state(app, idle_state, &message, None);
             self.view.lock().expect("view lock").output = "computer".into();
@@ -684,7 +684,7 @@ impl AppState {
             Ok(message) => Ok(OperationResult { success: true, message, snapshot: self.snapshot() }),
             Err(error) => {
                 let cleanup_error = self.teardown(Some(app)).await.err();
-                let message = cleanup_error.map_or(error.clone(), |cleanup| format!("{error}；恢复电脑声音失败：{cleanup}"));
+                let message = cleanup_error.map_or(error.clone(), |cleanup| format!("{error}；清理连接失败：{cleanup}"));
                 self.set_state(app, "error", &message, Some(device.display_name.clone()));
                 Ok(OperationResult { success: false, message, snapshot: self.snapshot() })
             }
@@ -743,11 +743,16 @@ impl AppState {
         if !installed_receiver && self.session.lock().await.as_mut().and_then(|session| session.child.as_mut()).is_some_and(|child| child.try_wait().map_or(true, |status| status.is_some())) { return Err("手机端音频服务已停止。".into()); }
         if !self.audio.is_connected()? { return Err("手机端音频连接已中断。".into()); }
         token_check(&token)?;
-        if play_on_phone { self.audio.mute_active()?; }
+        if play_on_phone && !installed_receiver { self.audio.mute_active()?; }
         self.audio.set_streaming(play_on_phone)?;
         token_check(&token)?;
         self.audio.start()?;
         token_check(&token)?;
+        if play_on_phone && installed_receiver {
+            receiver::wait_audio_active(&self.adb_path, serial, &self.receiver_apk_path,
+                &self.receiver_metadata_path, token).await?;
+            self.audio.mute_active()?;
+        }
         let output = if play_on_phone { "phone" } else { "computer" }.to_string();
         if let Some(session) = self.session.lock().await.as_mut() { session.output = output.clone(); }
         {
@@ -776,17 +781,21 @@ impl AppState {
         let cleanup = self.teardown(Some(app)).await;
         let mut view = self.view.lock().expect("view lock");
         view.state = if cleanup.is_err() { "error".into() } else if view.devices.is_empty() { "noDevice".into() } else { "ready".into() };
-        view.message = cleanup.as_ref().err().map_or_else(|| "已断开连接".into(), |error| format!("已断开，但恢复电脑声音失败：{error}"));
+        view.message = cleanup.as_ref().err().map_or_else(|| "已断开连接".into(), |error| format!("已断开，但清理连接失败：{error}"));
         if cleanup.is_ok() { view.device_name = None; }
         view.output = "computer".into();
         view.busy = false;
-        view.status_detail = if cleanup.is_ok() { "电脑声音已恢复。选择手机卡片可重新连接。".into() } else { "电脑声音恢复待处理；可从托盘菜单选择“断开连接”重试，或重新启动 AnPod。".into() };
+        view.status_detail = if cleanup.is_ok() || cleanup.as_ref().err().is_some_and(|error| !has_restore_failure(error)) {
+            "电脑声音已恢复。选择手机卡片可重新连接。".into()
+        } else {
+            "电脑声音恢复待处理；可从托盘菜单选择“断开连接”重试，或重新启动 AnPod。".into()
+        };
         drop(view);
         self.log("Audio session disconnected by user");
         self.emit(app);
         match cleanup {
             Ok(()) => Ok(OperationResult { success: true, message: "已断开连接。".into(), snapshot: self.snapshot() }),
-            Err(error) => Ok(OperationResult { success: false, message: format!("已断开，但恢复电脑声音失败：{error}"), snapshot: self.snapshot() }),
+            Err(error) => Ok(OperationResult { success: false, message: format!("已断开，但清理连接失败：{error}"), snapshot: self.snapshot() }),
         }
     }
 
@@ -837,7 +846,7 @@ impl AppState {
 
         self.set_state(app, "connecting", "正在有序切换连接…", old_device.as_ref().map(|device| device.display_name.clone()));
         if let Err(error) = self.teardown(Some(app)).await {
-            self.set_state(app, "error", format!("切换前无法恢复电脑声音：{error}"), old_device.as_ref().map(|device| device.display_name.clone()));
+            self.set_state(app, "error", format!("切换前清理连接失败：{error}"), old_device.as_ref().map(|device| device.display_name.clone()));
             return Err(error);
         }
         {
@@ -870,7 +879,7 @@ impl AppState {
         if let Some(serial) = target {
             let result = self.connect_locked(app, &serial, generation, token, old_output == "phone").await?;
             if !result.success { return Err(result.message); }
-            if old_output == "computer" { self.set_output_locked("computer").await?; }
+            if old_output == "computer" { self.set_output_locked("computer", token).await?; }
         } else {
             let guidance = if transport == "wifi" { "连接方式已切换到 Wi-Fi；请添加手机或搜索无线调试设备。" } else { "连接方式已切换到 USB；请连接并授权手机。" };
             self.view.lock().expect("view lock").output = "computer".into();
@@ -905,13 +914,19 @@ impl AppState {
     }
 
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
-        let mut first_error = None;
+        let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
             { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; }
+            if let Err(error) = self.audio.stop_and_cleanup() {
+                errors.push(format!("本机音频采集停止失败：{error}"));
+            }
+            if let Err(error) = self.audio.restore_muted() {
+                errors.push(format!("电脑声音恢复失败：{error}"));
+            }
             if session.installed_receiver {
                 if let Err(error) = receiver::stop(&self.adb_path, &session.serial, &self.receiver_apk_path,
                     &self.receiver_metadata_path, &CancellationToken::new()).await {
-                    first_error.get_or_insert(error);
+                    errors.push(format!("Receiver 停止失败：{error}"));
                 }
             }
             if let Some(child) = session.child.as_mut() {
@@ -921,14 +936,19 @@ impl AppState {
                 let _ = child.wait().await;
             }
             if let Err(error) = adb_run(&self.adb_path, Some(&session.serial), &["reverse", "--remove", &format!("localabstract:{}", session.reverse)], Duration::from_secs(5), None).await.and_then(|result| if result.success { Ok(()) } else { Err("无法移除本次音频连接映射。".into()) }) {
-                first_error.get_or_insert(error);
+                errors.push(format!("ADB 映射清理失败：{error}"));
+            }
+        } else {
+            if let Err(error) = self.audio.stop_and_cleanup() {
+                errors.push(format!("本机音频采集停止失败：{error}"));
+            }
+            if let Err(error) = self.audio.restore_muted() {
+                errors.push(format!("电脑声音恢复失败：{error}"));
             }
         }
-        if let Err(error) = self.audio.stop_and_cleanup() { first_error.get_or_insert(error); }
-        if let Err(error) = self.audio.restore_muted() { first_error.get_or_insert(error); }
         self.view.lock().expect("view lock").output = "computer".into();
         if let Some(app) = app { self.emit(app); }
-        first_error.map_or(Ok(()), Err)
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("；")) }
     }
 
     pub async fn set_output(&self, app: &AppHandle, output: &str) -> Result<AppSnapshot, String> {
@@ -954,13 +974,15 @@ impl AppState {
             if !result.success { return Err(result.message); }
             return Ok(result.snapshot);
         }
-        self.set_output_locked(output).await?;
+        self.set_output_locked(output, token).await?;
         self.emit(app);
         Ok(self.snapshot())
     }
 
-    async fn set_output_locked(&self, output: &str) -> Result<(), String> {
-        if output == "phone" {
+    async fn set_output_locked(&self, output: &str, token: &CancellationToken) -> Result<(), String> {
+        let receiver_session = self.session.lock().await.as_ref()
+            .map(|session| (session.serial.clone(), session.installed_receiver));
+        if output == "phone" && !receiver_session.as_ref().is_some_and(|(_, installed)| *installed) {
             if let Err(mute_error) = self.audio.mute_active() {
                 return match self.audio.restore_muted() {
                     Ok(()) => Err(format!("无法静音电脑播放端点，已回滚本次静音：{mute_error}")),
@@ -982,6 +1004,48 @@ impl AppState {
             view.message = message;
             view.status_detail = "音频输出状态异常；请断开连接以恢复电脑声音。".into();
             return Err(restore.map_or(error.clone(), |restore| format!("{error}；恢复电脑声音失败：{restore}")));
+        }
+        if output == "phone" {
+            if let Some((serial, true)) = receiver_session {
+                if let Err(error) = receiver::wait_audio_active(&self.adb_path, &serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, token).await {
+                    let stop_stream = self.audio.set_streaming(false).err();
+                    let restore = self.audio.restore_muted().err();
+                    let restore_failed = restore.is_some();
+                    let mut cleanup = Vec::new();
+                    if let Some(error) = stop_stream { cleanup.push(format!("本机音频切换失败：{error}")); }
+                    if let Some(error) = restore { cleanup.push(format!("电脑声音恢复失败：{error}")); }
+                    let message = if cleanup.is_empty() { error } else { format!("{error}；{}", cleanup.join("；")) };
+                    let mut view = self.view.lock().expect("view lock");
+                    view.state = "error".into();
+                    view.message = message.clone();
+                    view.status_detail = if restore_failed {
+                        "电脑声音恢复待处理；可断开连接或从托盘重试。".into()
+                    } else {
+                        "Receiver 未确认音频播放；电脑声音保持在本机。".into()
+                    };
+                    return Err(message);
+                }
+                if let Err(mute_error) = self.audio.mute_active() {
+                    let stop_stream = self.audio.set_streaming(false).err();
+                    let restore = self.audio.restore_muted().err();
+                    let restore_failed = restore.is_some();
+                    let mut cleanup = Vec::new();
+                    if let Some(error) = stop_stream { cleanup.push(format!("本机音频切换失败：{error}")); }
+                    if let Some(error) = restore { cleanup.push(format!("电脑声音恢复失败：{error}")); }
+                    let message = if cleanup.is_empty() { format!("无法静音电脑播放端点：{mute_error}") }
+                        else { format!("无法静音电脑播放端点：{mute_error}；{}", cleanup.join("；")) };
+                    let mut view = self.view.lock().expect("view lock");
+                    view.state = "error".into();
+                    view.message = message.clone();
+                    view.status_detail = if restore_failed {
+                        "电脑声音恢复待处理；可断开连接或从托盘重试。".into()
+                    } else {
+                        "电脑声音静音失败；声音保持在本机。".into()
+                    };
+                    return Err(message);
+                }
+            }
         }
         if output == "computer" {
             if let Err(error) = self.audio.restore_muted() {
@@ -1299,6 +1363,10 @@ where
 fn safe_android_diagnostic(line: &str) -> bool {
     let line = line.strip_prefix("stdout: ").or_else(|| line.strip_prefix("stderr: ")).unwrap_or(line);
     ["ANPOD AUDIO ", "ANPOD BUFFER_", "ANPOD START_THRESHOLD", "ANPOD LOW_LATENCY", "ANPOD PLAYING ", "ANPOD UNDERRUNS "].iter().any(|prefix| line.starts_with(prefix))
+}
+
+fn has_restore_failure(error: &str) -> bool {
+    error.contains("电脑声音恢复失败：")
 }
 
 fn safe_android_tail(lines: &[String]) -> String { lines.iter().filter(|line| safe_android_diagnostic(line)).cloned().collect::<Vec<_>>().join("\n") }
