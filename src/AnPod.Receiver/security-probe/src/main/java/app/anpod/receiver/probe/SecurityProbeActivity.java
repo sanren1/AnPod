@@ -8,8 +8,13 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
 
+import java.io.IOException;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+
 public final class SecurityProbeActivity extends Activity {
     private static final String TAG = "AnPodReceiverProbe";
+    private static final String RESULT_FILE = "security-probe-result.txt";
 
     @Override
     protected void onCreate(Bundle state) {
@@ -36,7 +41,13 @@ public final class SecurityProbeActivity extends Activity {
         } catch (RuntimeException error) {
             bootstrap = "error";
         }
-        Log.i(TAG, "RESULT provider=" + provider + " bootstrap=" + bootstrap);
+        String result = "provider=" + provider + " bootstrap=" + bootstrap;
+        try (FileOutputStream output = openFileOutput(RESULT_FILE, MODE_PRIVATE)) {
+            output.write(result.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException error) {
+            Log.e(TAG, "Could not write private result file " + RESULT_FILE, error);
+        }
+        Log.i(TAG, "RESULT " + result);
         finish();
     }
 }
