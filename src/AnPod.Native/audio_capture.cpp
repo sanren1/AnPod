@@ -37,6 +37,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <mutex>
 
 #include "audio_capture.h"
 #include "send_exact.h"
@@ -69,6 +70,9 @@ static volatile BOOL g_bRunning = FALSE;
 static volatile BOOL g_bListening = FALSE;
 static volatile BOOL g_bConnected = FALSE;
 static volatile LONG64 g_sentPcmBytes = 0;
+static std::mutex g_pcmCallbackMutex;
+static PcmCallback g_pcmCallback = NULL;
+static void* g_pcmCallbackUserData = NULL;
 
 /* What the capture thread forwards. FALSE keeps the socket alive but feeds the
    peer silence, so a session can be muted without being torn down. */
@@ -156,6 +160,7 @@ static const char* DefaultMessageForCode(int code)
         case ANPOD_ERR_HANDSHAKE_TIMEOUT: return "handshake timed out";
         case ANPOD_ERR_DEVICE_INVALIDATED:return "Windows audio output device changed";
         case ANPOD_ERR_SEND_FAILED:       return "audio socket send failed";
+        case ANPOD_ERR_PCM_CALLBACK:      return "PCM sink callback failed";
         default:                          return "unknown audio capture error";
     }
 }
@@ -368,6 +373,7 @@ static void ConvertToStereoPcm16(
 static DWORD WINAPI CaptureThread(LPVOID lpParam)
 {
     (void)lpParam;
+    uint64_t nextFrameIndex = 0;
 
     /* 1 ms timer resolution so Sleep(1) does not become a 15.6 ms burst that
        underruns the Android AudioTrack. Balanced in the exit path below. */
@@ -383,8 +389,14 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
         return 1;
     }
 
-    /* Format header first: Android sizes its AudioTrack from it. */
-    if (g_clientSocket != INVALID_SOCKET)
+    PcmCallback pcmCallback = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        pcmCallback = g_pcmCallback;
+    }
+
+    /* Format header first only for the legacy TCP sink. */
+    if (pcmCallback == NULL && g_clientSocket != INVALID_SOCKET)
     {
         if (!SendFormatHeader(g_clientSocket))
         {
@@ -469,7 +481,26 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
                are blocked on the socket (avoids DATA_DISCONTINUITY). */
             g_pCaptureClient->ReleaseBuffer(numFramesAvailable);
 
-            if (g_clientSocket != INVALID_SOCKET)
+            if (frames > UINT64_MAX - nextFrameIndex)
+            {
+                SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sample frame index exhausted");
+                g_bRunning = FALSE;
+                break;
+            }
+
+            BOOL forwardedToPcmSink = FALSE;
+            {
+                std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+                if (g_pcmCallback != NULL)
+                {
+                    g_pcmCallback((const int16_t*)outBuf, frames, g_nSampleRate,
+                        kOutputChannels, nextFrameIndex, g_pcmCallbackUserData);
+                    forwardedToPcmSink = TRUE;
+                }
+            }
+            nextFrameIndex += frames;
+
+            if (!forwardedToPcmSink && g_clientSocket != INVALID_SOCKET)
             {
                 int result = SendPacket(
                     g_clientSocket,
@@ -767,6 +798,15 @@ int ANPOD_CALL AudioCapture_Initialize(void)
 
 int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
 {
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        if (g_pcmCallback != NULL)
+        {
+            SetLastErrorState(ANPOD_ERR_SOCKET_LISTEN, "TCP listener cannot be used with the PCM sink");
+            return 0;
+        }
+    }
+
     g_bRunning = FALSE;
     g_connectCallback = callback;
     g_bListening = FALSE;
@@ -853,6 +893,30 @@ int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
     return 1;
 }
 
+int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData)
+{
+    std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+    if (g_bRunning)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sink can only change while capture is stopped");
+        return 0;
+    }
+    if (callback != NULL && (g_bListening || g_bConnected))
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sink cannot be selected while the TCP listener is active");
+        return 0;
+    }
+    if ((callback == NULL) != (userData == NULL))
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "callback and userData must both be null or non-null");
+        return 0;
+    }
+    g_pcmCallback = callback;
+    g_pcmCallbackUserData = userData;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
 int ANPOD_CALL AudioCapture_Start(void)
 {
     if (g_pAudioClient == NULL)
@@ -924,7 +988,7 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
 
     if (g_hCaptureThread != NULL)
     {
-        WaitForSingleObject(g_hCaptureThread, 2000);
+        WaitForSingleObject(g_hCaptureThread, INFINITE);
         CloseHandle(g_hCaptureThread);
         g_hCaptureThread = NULL;
     }
@@ -974,6 +1038,12 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
     }
 
     InterlockedExchange64(&g_sentPcmBytes, 0);
+
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        g_pcmCallback = NULL;
+        g_pcmCallbackUserData = NULL;
+    }
 
     g_connectCallback = NULL;
     g_bConnected = FALSE;

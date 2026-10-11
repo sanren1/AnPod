@@ -170,3 +170,13 @@
 - 当前核心冒烟仍为 `NOT_TESTED`，不写成已通过。20 次拔插、30 分钟锁屏和延迟对照为 `CANCELLED_BY_USER`，不再等待执行。生命周期/并发等已发现缺陷用最小针对性检查验证，只有真实系统行为仍缺证据时追加相应操作。
 - 若 LocalSocket abstract endpoint 被应用 UID / SELinux 拒绝，先保存脱敏的拒绝证据；只有复现后才评估 TCP reverse adapter。不得仅因假设修改现有 P1 `app_process` 路径。
 - 本地快速回退：关闭启动进程的 `ANPOD_AUDIO_BACKEND` 环境变量并重启 AnPod，即回到默认 `LegacyAppProcess`；保持已安装 APK，不需要设备卸载或数据清理。
+
+## P3 Rust/C++ PCM Sink + localhost UDP 原型
+
+- `protocol.md` 固定 34-byte BE 头、AES-256-GCM/96-bit nonce/128-bit tag、方向域、PCM16LE 格式、1200-byte datagram 上限和 64 序号重放窗。测试 key 是确定性向量，不可用于会话。
+- Native 新增 `AudioCapture_SetPcmCallback`；Rust 动态加载时将该导出视为可选，旧 DLL 的 TCP 路径仍可加载。PCM sink 仅可在停止采集且 TCP listener 未启用时选择。此方法目前不被产品连接流程调用。
+- Rust `network::tests::loopback_pcm_queue_protocol_auth_replay_pause_and_freshness`：PASS，1/1；覆盖合成 PCM、8-slot 队列溢出与旧块淘汰、loopback UDP、5 ms 分包、统计、认证失败不提交 replay、重复包拒绝、暂停丢弃/恢复、过期帧和 bounded jitter queue。
+- Rust `protocol::tests`：PASS，2/2；覆盖固定 JCA 完整数据报向量，以及版本、类型、flags、长度和 session identity 头边界拒绝。
+- Java 17 `tests/AnPodUdpVectorCheck.java`：PASS；JCA 输出与 Rust 测试的完整 AES-256-GCM 数据报相同。
+- Native MSVC/CMake x64 Release 隔离构建：PASS，输出 `artifacts/p3-native/audio_capture.dll`（23,552 bytes）；`dumpbin /exports` 确认原有导出保留并新增 PCM callback 导出。编译器报告 `audio_capture.h` 的 C4819 代码页警告，DLL 构建成功。
+- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。当前 UDP sender 只允许发往 `127.0.0.1`，mock Receiver 仅在测试中运行；配对、会话密钥生成/传输和远端 Receiver 尚未实现。

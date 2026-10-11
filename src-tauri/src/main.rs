@@ -3,6 +3,10 @@
 mod state;
 mod audio;
 mod receiver;
+#[allow(dead_code)] // P3 prototype stays compiled but is not selected by product connection flows yet.
+mod network;
+#[allow(dead_code)] // P3 protocol is exercised by its focused test receiver for now.
+mod protocol;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};

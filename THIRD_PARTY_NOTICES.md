@@ -75,6 +75,12 @@ MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
 `LICENSES/` where available. Each Rust crate retains the licence terms recorded
 in its published package; see the lockfile for exact versions.
 
+The P3 localhost UDP prototype adds Rust crate `aes-gcm` 0.11.1 for
+AES-256-GCM authenticated encryption. The crate is dual-licensed MIT or
+Apache-2.0; its transitive dependencies and exact locked versions are listed
+in `src-tauri/Cargo.lock`. No AES-GCM implementation source is copied into
+AnPod.
+
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
 .NET 8 application and is not part of the Tauri portable package.

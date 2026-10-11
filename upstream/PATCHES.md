@@ -11,6 +11,16 @@ Base revision: `70db6b531db2c21b5a41a289722aa3996de67ebe`
 
 ## A. `audio_capture.cpp` — native WASAPI capture
 
+### A0. Optional PCM callback sink *(P3 prototype)*
+
+The additive `AudioCapture_SetPcmCallback` C ABI selects a borrowed PCM callback
+before capture starts. When present, the capture thread routes converted PCM to
+that callback instead of the legacy TCP socket; with no callback the original
+TCP path remains unchanged. Callback/user-data lifetime is protected by a
+mutex, and cleanup joins the capture thread before clearing the registration.
+The Rust P3 prototype callback performs a nonblocking copy to a preallocated,
+bounded queue. Product connection flows do not select this sink yet.
+
 Each item maps to a defect identified in plan §3.4.
 
 ### A1. Listener binds to loopback only *(§3.4.3)*

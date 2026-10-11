@@ -1,14 +1,16 @@
 use libloading::Library;
 use std::{
-    ffi::{c_char, CStr, CString},
+    ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{mpsc, Arc, Mutex, OnceLock},
     time::Duration,
 };
+use crate::network::PcmQueue;
 use tokio::sync::{mpsc as async_mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
 type ConnectCallback = unsafe extern "C" fn(*const c_char);
+type PcmCallback = unsafe extern "C" fn(*const i16, u32, u32, u16, u64, *mut c_void);
 static HANDSHAKES: OnceLock<Mutex<Option<async_mpsc::UnboundedSender<String>>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -21,6 +23,8 @@ enum Request {
     Initialize(mpsc::SyncSender<Result<(), String>>),
     Listen(u16, String, mpsc::SyncSender<Result<(), String>>),
     Start(mpsc::SyncSender<Result<(), String>>),
+    #[allow(dead_code)] // P3 prototype API; deliberately not used by product connection flows yet.
+    StartPcmSink(Arc<PcmQueue>, mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
     StopAndCleanup(mpsc::SyncSender<Result<(), String>>),
     Mute(mpsc::SyncSender<Result<(), String>>),
@@ -36,6 +40,7 @@ struct NativeFns {
     initialize: unsafe extern "C" fn() -> i32,
     listen: unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32,
     start: unsafe extern "C" fn() -> i32,
+    set_pcm_callback: Option<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>,
     set_stream: unsafe extern "C" fn(i32),
     stop: unsafe extern "C" fn(),
     cleanup: unsafe extern "C" fn(),
@@ -51,10 +56,13 @@ impl NativeFns {
     unsafe fn load(path: &PathBuf) -> Result<Self, String> {
         let library = Library::new(path).map_err(|_| format!("无法加载音频采集组件：{}", path.display()))?;
         macro_rules! sym { ($name:literal, $ty:ty) => { *library.get::<$ty>(concat!($name, "\0").as_bytes()).map_err(|_| format!("音频采集组件缺少函数 {}", $name))? }; }
+        let set_pcm_callback = library.get::<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>(b"AudioCapture_SetPcmCallback\0")
+            .ok().map(|symbol| *symbol);
         Ok(Self {
             initialize: sym!("AudioCapture_Initialize", unsafe extern "C" fn() -> i32),
             listen: sym!("AudioCapture_Listen", unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32),
             start: sym!("AudioCapture_Start", unsafe extern "C" fn() -> i32),
+            set_pcm_callback,
             set_stream: sym!("AudioCapture_SetStreamingEnabled", unsafe extern "C" fn(i32)),
             stop: sym!("AudioCapture_Stop", unsafe extern "C" fn()),
             cleanup: sym!("AudioCapture_Cleanup", unsafe extern "C" fn()),
@@ -85,6 +93,7 @@ impl AudioActor {
         *HANDSHAKES.get_or_init(|| Mutex::new(None)).lock().expect("handshake callback lock") = Some(handshake_tx);
         std::thread::Builder::new().name("AnPod audio control".into()).spawn(move || {
             let mut native = None;
+            let mut pcm_sink: Option<Arc<PcmQueue>> = None;
             let mut muted_ids = Vec::<String>::new();
             while let Ok(request) = rx.recv() {
                 match request {
@@ -116,12 +125,38 @@ impl AudioActor {
                         };
                         let _ = reply.send(result);
                     }
+                    Request::StartPcmSink(queue, reply) => {
+                        let result = if let Some(native) = native.as_ref() {
+                            let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                            let Some(set_pcm_callback) = native.set_pcm_callback else {
+                                let _ = reply.send(Err("音频采集组件不支持 PCM sink。".into()));
+                                continue;
+                            };
+                            if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
+                                Err(native.describe_error("无法设置 PCM sink"))
+                            } else if unsafe { (native.start)() } == 0 {
+                                unsafe { set_pcm_callback(None, std::ptr::null_mut()); }
+                                Err(native.describe_error("无法开始 PCM sink 采集"))
+                            } else {
+                                pcm_sink = Some(queue);
+                                Ok(())
+                            }
+                        } else { Err("音频采集组件尚未初始化。".into()) };
+                        let _ = reply.send(result);
+                    }
                     Request::Stream(enabled, reply) => {
                         let result = native.as_ref().map(|native| unsafe { (native.set_stream)(i32::from(enabled)); Ok(()) }).unwrap_or_else(|| Err("音频会话尚未初始化。".into()));
                         let _ = reply.send(result);
                     }
                     Request::StopAndCleanup(reply) => {
-                        if let Some(native) = native.as_ref() { unsafe { (native.stop)(); (native.cleanup)(); } }
+                        if let Some(native) = native.as_ref() {
+                            unsafe {
+                                (native.stop)();
+                                if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
+                                (native.cleanup)();
+                            }
+                        }
+                        drop(pcm_sink.take());
                         let _ = reply.send(Ok(()));
                     }
                     Request::Mute(reply) => {
@@ -163,7 +198,14 @@ impl AudioActor {
                     }
                 }
             }
-            if let Some(native) = native { unsafe { (native.stop)(); (native.cleanup)(); } }
+            if let Some(native) = native {
+                unsafe {
+                    (native.stop)();
+                    if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
+                    (native.cleanup)();
+                }
+            }
+            drop(pcm_sink.take());
             let _ = restore_endpoints(&marker_path, &mut muted_ids);
         }).expect("create audio worker thread");
         Self { tx, handshake_rx: std::sync::Arc::new(AsyncMutex::new(handshake_rx)) }
@@ -172,6 +214,8 @@ impl AudioActor {
     pub fn initialize(&self) -> Result<(), String> { self.call(Request::Initialize) }
     pub fn listen(&self, port: u16, token: &str) -> Result<(), String> { self.call(|reply| Request::Listen(port, token.into(), reply)) }
     pub fn start(&self) -> Result<(), String> { self.call(Request::Start) }
+    #[allow(dead_code)] // Kept opt-in until the UDP Receiver is implemented.
+    pub fn start_pcm_sink(&self, queue: Arc<PcmQueue>) -> Result<(), String> { self.call(|reply| Request::StartPcmSink(queue, reply)) }
     pub fn set_streaming(&self, enabled: bool) -> Result<(), String> { self.call(|reply| Request::Stream(enabled, reply)) }
     pub fn stop_and_cleanup(&self) -> Result<(), String> { self.call(Request::StopAndCleanup) }
     pub fn mute_active(&self) -> Result<(), String> { self.call(Request::Mute) }
@@ -213,6 +257,13 @@ unsafe extern "C" fn on_native_connect(code: *const c_char) {
     let text = CStr::from_ptr(code).to_string_lossy();
     if text.len() > 128 { return; }
     if let Some(tx) = HANDSHAKES.get().and_then(|value| value.lock().ok()?.clone()) { let _ = tx.send(text.into_owned()); }
+}
+
+pub(crate) unsafe extern "C" fn on_native_pcm(samples: *const i16, frame_count: u32, sample_rate: u32,
+    channels: u16, frame_index: u64, user_data: *mut c_void) {
+    if user_data.is_null() { return; }
+    let queue = &*user_data.cast::<PcmQueue>();
+    queue.push_raw(samples, frame_count, sample_rate, channels, frame_index);
 }
 
 #[cfg(windows)]
