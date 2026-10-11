@@ -1432,6 +1432,7 @@ pub(crate) async fn adb_run(adb: &Path, serial: Option<&str>, args: &[&str], lim
 pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &[&str], input: &[u8],
     limit: Duration, cancel: &CancellationToken) -> Result<AdbResult, String> {
     use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout_at, Instant as TokioInstant};
 
     if !adb.is_file() { return Err("找不到 ADB。".into()); }
     let mut command = Command::new(adb);
@@ -1443,38 +1444,71 @@ pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &
     let mut stdin = child.stdin.take().ok_or_else(|| "无法打开 ADB 私密输入管道。".to_string())?;
     let stdout = child.stdout.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
-    let stdout_task = tokio::spawn(drain_output_presence(stdout));
-    let stderr_task = tokio::spawn(drain_output_presence(stderr));
+    let mut output_tasks = [
+        tokio::spawn(drain_output_presence(stdout)),
+        tokio::spawn(drain_output_presence(stderr)),
+    ];
+    let deadline = TokioInstant::now() + limit;
 
     let status = tokio::select! {
         _ = cancel.cancelled() => {
-            let _ = child.start_kill();
-            let _ = timeout(Duration::from_secs(2), child.wait()).await;
+            stop_adb_child(&mut child, &mut output_tasks).await;
             return Err("操作已取消。".into());
         }
-        result = timeout(limit, async {
+        result = timeout_at(deadline, async {
             stdin.write_all(input).await?;
             drop(stdin);
             child.wait().await
         }) => match result {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => {
-                let _ = child.start_kill();
-                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                stop_adb_child(&mut child, &mut output_tasks).await;
                 return Err("ADB 私密输入传输失败。".into());
             }
             Err(_) => {
-                let _ = child.start_kill();
-                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                stop_adb_child(&mut child, &mut output_tasks).await;
                 return Err("ADB 私密输入操作超时。".into());
             }
         }
     };
-    let stdout_present = stdout_task.await.map_err(|_| "无法读取 ADB 命令状态。".to_string())?;
-    let stderr_present = stderr_task.await.map_err(|_| "无法读取 ADB 命令状态。".to_string())?;
+    enum DrainResult { Complete(bool, bool), Cancelled, TimedOut, Failed }
+    let drained = tokio::select! {
+        _ = cancel.cancelled() => DrainResult::Cancelled,
+        result = timeout_at(deadline, async {
+            let stdout = (&mut output_tasks[0]).await.map_err(|_| ())?;
+            let stderr = (&mut output_tasks[1]).await.map_err(|_| ())?;
+            Ok::<_, ()>((stdout, stderr))
+        }) => match result {
+            Ok(Ok((stdout, stderr))) => DrainResult::Complete(stdout, stderr),
+            Ok(Err(())) => DrainResult::Failed,
+            Err(_) => DrainResult::TimedOut,
+        },
+    };
+    let (stdout_present, stderr_present) = match drained {
+        DrainResult::Complete(stdout, stderr) => (stdout, stderr),
+        DrainResult::Cancelled => {
+            stop_adb_child(&mut child, &mut output_tasks).await;
+            return Err("操作已取消。".into());
+        }
+        DrainResult::TimedOut => {
+            stop_adb_child(&mut child, &mut output_tasks).await;
+            return Err("ADB 命令超时。".into());
+        }
+        DrainResult::Failed => {
+            stop_adb_child(&mut child, &mut output_tasks).await;
+            return Err("无法读取 ADB 命令状态。".into());
+        }
+    };
     let stdout = if stdout_present { "[output present]" } else { "" };
     let stderr = if stderr_present { "[output present]" } else { "" };
     Ok(AdbResult { success: status.success(), stdout: stdout.into(), stderr: stderr.into() })
+}
+
+async fn stop_adb_child(child: &mut Child, output_tasks: &mut [tokio::task::JoinHandle<bool>; 2]) {
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+    for task in output_tasks.iter() { task.abort(); }
+    for task in output_tasks.iter_mut() { let _ = task.await; }
 }
 
 async fn drain_output_presence<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> bool {
@@ -1612,6 +1646,35 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn adb_stdin_child_helper() {
+        use std::{io::Write, thread};
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        loop {
+            let _ = stdout.write_all(&[b'x'; 1024]);
+            let _ = stderr.write_all(&[b'y'; 1024]);
+            let _ = stdout.flush();
+            let _ = stderr.flush();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn adb_stdin_cancellation_reaps_child_and_output_drains() {
+        let executable = env::current_exe().unwrap();
+        let args = ["--ignored", "--exact", "state::tests::adb_stdin_child_helper", "--nocapture"];
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            adb_run_with_stdin(&executable, None, &args, b"synthetic", Duration::from_secs(20), &child_cancel).await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        assert!(matches!(task.await.unwrap(), Err(error) if error == "操作已取消。"));
+    }
 
     #[test]
     fn pcm_bitrate_uses_successful_byte_deltas_and_resets_between_sessions() {

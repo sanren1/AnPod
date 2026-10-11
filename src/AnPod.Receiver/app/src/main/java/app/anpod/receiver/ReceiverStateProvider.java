@@ -6,17 +6,27 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
+import android.system.ErrnoException;
+import android.system.Os;
+import android.system.OsConstants;
+import android.system.StructPollfd;
 import android.content.pm.ServiceInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import java.io.FileNotFoundException;
+import java.io.FileDescriptor;
+import java.io.InterruptedIOException;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ReceiverStateProvider extends ContentProvider {
     private static final String BINDING_URI = "content://app.anpod.receiver.state/binding";
-    private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment"};
+    private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment", "bindingFailure"};
+    private static final long BINDING_READ_TIMEOUT_MS = 15_000;
+    private static final int POLL_SLICE_MS = 100;
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
             "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
@@ -24,6 +34,8 @@ public final class ReceiverStateProvider extends ContentProvider {
             "startedAtElapsedMs", "error"
     };
     private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
+    private final Object bindingStateLock = new Object();
+    private volatile String bindingFailure = "";
     private BindingStore bindingStore;
 
     @Override
@@ -99,22 +111,39 @@ public final class ReceiverStateProvider extends ContentProvider {
             throws FileNotFoundException {
         if (!BINDING_URI.equals(uri.toString()) || !"w".equals(mode))
             throw new FileNotFoundException("Unsupported receiver binding write");
-        if (!bindingWriteInProgress.compareAndSet(false, true))
-            throw new FileNotFoundException("A receiver binding write is already in progress");
+        synchronized (bindingStateLock) {
+            if (!bindingWriteInProgress.compareAndSet(false, true))
+                throw new FileNotFoundException("A receiver binding write is already in progress");
+            bindingFailure = "";
+        }
+        if (signal != null && signal.isCanceled()) {
+            finishBindingWrite("cancelled");
+            throw new FileNotFoundException("Receiver binding write was cancelled");
+        }
 
         ParcelFileDescriptor[] pipe = null;
         try {
             pipe = ParcelFileDescriptor.createReliablePipe();
             final ParcelFileDescriptor readEnd = pipe[0];
+            final long deadline = SystemClock.elapsedRealtime() + BINDING_READ_TIMEOUT_MS;
             Thread worker = new Thread(() -> {
-                try (ParcelFileDescriptor.AutoCloseInputStream input =
-                        new ParcelFileDescriptor.AutoCloseInputStream(readEnd);
-                        PairingProtocol.BindingMaterial material = PairingProtocol.BindingMaterial.readRecord(input)) {
+                String failure = "";
+                try (ParcelFileDescriptor ownedReadEnd = readEnd;
+                        PairingProtocol.BindingMaterial material = readBindingMaterial(
+                                ownedReadEnd, signal, deadline)) {
+                    checkCancellation(signal);
                     bindingStore.createOrConfirm(material);
-                } catch (IOException | PairingProtocol.Failure | RuntimeException ignored) {
-                    // The caller confirms the persisted binding through the read-only status URI.
+                    bindingFailure = "";
+                } catch (BindingInputException error) {
+                    failure = error.code;
+                } catch (BindingStore.ConflictException error) {
+                    failure = "conflict";
+                } catch (PairingProtocol.Failure error) {
+                    failure = "invalid_record";
+                } catch (IOException | RuntimeException error) {
+                    failure = "storage_error";
                 } finally {
-                    bindingWriteInProgress.set(false);
+                    finishBindingWrite(failure);
                 }
             }, "AnPod-binding-write");
             worker.setDaemon(true);
@@ -125,7 +154,7 @@ public final class ReceiverStateProvider extends ContentProvider {
                 try { pipe[0].close(); } catch (IOException ignored) {}
                 try { pipe[1].close(); } catch (IOException ignored) {}
             }
-            bindingWriteInProgress.set(false);
+            finishBindingWrite("pipe_error");
             throw new FileNotFoundException("Unable to open receiver binding pipe");
         }
     }
@@ -133,9 +162,15 @@ public final class ReceiverStateProvider extends ContentProvider {
     private Cursor queryBinding() {
         try {
             BindingStore.Status stored = bindingStore.status();
-            String state = bindingWriteInProgress.get() ? "pending" : stored.state;
+            String state;
+            String failure;
+            synchronized (bindingStateLock) {
+                state = bindingWriteInProgress.get() ? "pending" : stored.state;
+                failure = bindingFailure;
+            }
+            if ("empty".equals(state) && !failure.isEmpty()) state = "failed";
             MatrixCursor result = new MatrixCursor(BINDING_COLUMNS, 1);
-            result.addRow(new Object[] {state, stored.commitment});
+            result.addRow(new Object[] {state, stored.commitment, failure});
             return result;
         } catch (IOException | PairingProtocol.Failure error) {
             throw new IllegalStateException("Receiver binding status is unavailable");
@@ -175,5 +210,82 @@ public final class ReceiverStateProvider extends ContentProvider {
 
     private static String metric(int value) {
         return value < 0 ? "unknown" : Integer.toString(value);
+    }
+
+    private static byte[] readBindingRecord(ParcelFileDescriptor pipe, CancellationSignal signal,
+            long deadline) throws BindingInputException, PairingProtocol.Failure {
+        byte[] record = new byte[69];
+        FileDescriptor fd = pipe.getFileDescriptor();
+        try {
+            int offset = 0;
+            while (offset < record.length) {
+                int count = readAvailable(fd, record, offset, record.length - offset, signal, deadline);
+                if (count < 0) throw new BindingInputException("invalid_record");
+                offset += count;
+            }
+            byte[] extra = new byte[1];
+            try {
+                if (readAvailable(fd, extra, 0, 1, signal, deadline) != -1)
+                    throw new BindingInputException("invalid_record");
+            } finally {
+                Arrays.fill(extra, (byte) 0);
+            }
+            try { pipe.checkError(); }
+            catch (IOException error) { throw new BindingInputException("pipe_error"); }
+            checkCancellation(signal);
+            byte[] result = record;
+            record = null;
+            return result;
+        } finally {
+            if (record != null) Arrays.fill(record, (byte) 0);
+        }
+    }
+
+    private static PairingProtocol.BindingMaterial readBindingMaterial(ParcelFileDescriptor pipe,
+            CancellationSignal signal, long deadline) throws BindingInputException, PairingProtocol.Failure {
+        byte[] record = readBindingRecord(pipe, signal, deadline);
+        try { return PairingProtocol.BindingMaterial.decode(record); }
+        finally { Arrays.fill(record, (byte) 0); }
+    }
+
+    private static int readAvailable(FileDescriptor fd, byte[] bytes, int offset, int length,
+            CancellationSignal signal, long deadline) throws BindingInputException {
+        while (true) {
+            checkCancellation(signal);
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            if (remaining <= 0) throw new BindingInputException("timeout");
+            StructPollfd pollfd = new StructPollfd();
+            pollfd.fd = fd;
+            pollfd.events = (short) (OsConstants.POLLIN | OsConstants.POLLHUP);
+            try {
+                Os.poll(new StructPollfd[] {pollfd}, (int) Math.min(remaining, POLL_SLICE_MS));
+                if ((pollfd.revents & (OsConstants.POLLERR | OsConstants.POLLNVAL)) != 0)
+                    throw new BindingInputException("pipe_error");
+                if ((pollfd.revents & (OsConstants.POLLIN | OsConstants.POLLHUP)) == 0) continue;
+                int count = Os.read(fd, bytes, offset, length);
+                return count == 0 ? -1 : count;
+            } catch (InterruptedIOException error) {
+                continue;
+            } catch (ErrnoException error) {
+                if (error.errno == OsConstants.EINTR) continue;
+                throw new BindingInputException("pipe_error");
+            }
+        }
+    }
+
+    private static void checkCancellation(CancellationSignal signal) throws BindingInputException {
+        if (signal != null && signal.isCanceled()) throw new BindingInputException("cancelled");
+    }
+
+    private void finishBindingWrite(String failure) {
+        synchronized (bindingStateLock) {
+            bindingFailure = failure;
+            bindingWriteInProgress.set(false);
+        }
+    }
+
+    private static final class BindingInputException extends IOException {
+        final String code;
+        BindingInputException(String code) { super(code); this.code = code; }
     }
 }

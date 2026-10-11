@@ -32,7 +32,7 @@ final class BindingStore {
                         byte[] existingRecord = decoded.encodedRecord();
                         try {
                             if (!MessageDigest.isEqual(record, existingRecord))
-                                throw new IOException("AnPod binding conflict");
+                                throw new ConflictException();
                             return;
                         } finally {
                             Arrays.fill(existingRecord, (byte) 0);
@@ -98,5 +98,9 @@ final class BindingStore {
             this.state = state;
             this.commitment = commitment;
         }
+    }
+
+    static final class ConflictException extends IOException {
+        ConflictException() { super("AnPod binding conflict"); }
     }
 }

@@ -132,6 +132,7 @@ async fn provision_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata
             match read_binding_state(adb, serial, &user, cancel).await? {
                 BindingStatus::Saved(received) if received == commitment_text => return Ok(commitment_text),
                 BindingStatus::Saved(_) => return Err("手机已有不同绑定；未替换材料，本机 DPAPI 副本已保留。".into()),
+                BindingStatus::Failed(message) => return Err(message.into()),
                 BindingStatus::Empty | BindingStatus::Pending => {}
             }
             tokio::select! {
@@ -151,14 +152,14 @@ fn hex_digest(value: &[u8; 32]) -> String {
 }
 
 #[cfg(windows)]
-enum BindingStatus { Empty, Pending, Saved(String) }
+enum BindingStatus { Empty, Pending, Saved(String), Failed(&'static str) }
 
 #[cfg(windows)]
 async fn read_binding_state(adb: &impl AdbRunner, serial: &str, user: &str,
     cancel: &CancellationToken) -> Result<BindingStatus, String> {
     let result = adb.run(Some(serial), &[
         "shell", "content", "query", "--user", user, "--uri", BINDING_URI,
-        "--projection", "bindingState:bindingCommitment",
+        "--projection", "bindingState:bindingCommitment:bindingFailure",
     ], Duration::from_secs(6), Some(cancel)).await?;
     if !result.success { return Err("无法读取手机绑定确认状态；本机 DPAPI 副本已保留。".into()); }
     let row = result.stdout.lines().find(|line| line.trim_start().starts_with("Row: 0 "))
@@ -166,8 +167,22 @@ async fn read_binding_state(adb: &impl AdbRunner, serial: &str, user: &str,
         .ok_or_else(|| "手机绑定状态格式无效；本机 DPAPI 副本已保留。".to_string())?;
     let fields: std::collections::HashMap<_, _> = row.split(", ")
         .filter_map(|field| field.split_once('=')).collect();
+    let failure = match fields.get("bindingFailure").copied() {
+        Some("") => None,
+        Some("cancelled") => Some("操作已取消；本机 DPAPI 绑定材料已保留，可用相同路径重试。"),
+        Some("timeout") => Some("手机绑定写入超时；本机 DPAPI 绑定材料已保留，可用相同路径重试。"),
+        Some("invalid_record") => Some("手机拒绝了绑定记录；本机 DPAPI 绑定材料已保留。"),
+        Some("pipe_error") => Some("手机绑定管道失败；本机 DPAPI 绑定材料已保留，可重试。"),
+        Some("storage_error") => Some("手机未能保存绑定记录；本机 DPAPI 绑定材料已保留。"),
+        Some("conflict") => Some("手机已有不同绑定；未替换材料，本机 DPAPI 副本已保留。"),
+        None => return Err("手机绑定状态缺少失败码；本机 DPAPI 副本已保留。".into()),
+        _ => return Err("手机绑定失败状态无效；本机 DPAPI 副本已保留。".into()),
+    };
+    if let Some(message) = failure { return Ok(BindingStatus::Failed(message)); }
     match fields.get("bindingState").copied() {
         Some("empty") if fields.get("bindingCommitment") == Some(&"") => Ok(BindingStatus::Empty),
+        Some("failed") if fields.get("bindingCommitment") == Some(&"") =>
+            Err("手机绑定失败状态缺少错误码；本机 DPAPI 副本已保留。".into()),
         Some("pending") => {
             let commitment = fields.get("bindingCommitment").copied().unwrap_or("");
             if commitment.is_empty() || valid_digest(commitment) { Ok(BindingStatus::Pending) }
@@ -586,13 +601,13 @@ mod tests {
                         if shell == "shell" && content == "content" && query == "query"
                             && user_option == "--user" && user == state.user && flag == "--uri"
                             && uri == BINDING_URI && projection_flag == "--projection"
-                            && projection == "bindingState:bindingCommitment" => {
+                            && projection == "bindingState:bindingCommitment:bindingFailure" => {
                         let (binding_state, commitment) = match &state.binding_commitment {
                             Some(commitment) => ("saved", commitment.as_str()),
                             None => ("empty", ""),
                         };
                         AdbResult { success: true,
-                            stdout: format!("Row: 0 bindingState={binding_state}, bindingCommitment={commitment}\n"),
+                            stdout: format!("Row: 0 bindingState={binding_state}, bindingCommitment={commitment}, bindingFailure=\n"),
                             stderr: String::new() }
                     }
                     [install, replace, user_option, user, _apk] if install == "install" && replace == "-r" && user_option == "--user" && user == state.user => {

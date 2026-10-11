@@ -128,19 +128,30 @@ other-path, or other-mode writes are rejected before storage. Existing equal
 records are idempotently confirmed; a different saved record is a conflict
 and is never replaced. No clear, unlink, or re-pair operation is defined.
 
-The provider's read-only query on that fixed URI returns only `empty`,
-`pending`, or `saved`, plus `SHA-256(complete 69-byte ANPB record)` when
-available. This digest is a USB provisioning consistency commitment; it does
-not independently authenticate a future network peer. The original health
-query remains unchanged and read-only. Rust checks USB transport, current
-Android user, and installed APK bytes again while waiting for the saved state,
-and returns success only when the reported commitment equals the locally
-persisted record. A `content write` process exit code or its output alone is
-not completion evidence: AOSP `WriteCommand` copies stdin through
+The provider's read-only query on that fixed URI returns `empty`, `pending`,
+`saved`, or `failed`, a fixed `bindingFailure` code, and
+`SHA-256(complete 69-byte ANPB record)` when available. Failure codes are
+limited to `cancelled`, `timeout`, `invalid_record`, `pipe_error`,
+`storage_error`, and `conflict`; no exception text or record bytes are exposed.
+The provider polls the pipe fd in bounded slices against one 15-second total
+deadline, checks `CancellationSignal` while waiting, requires exactly 69 bytes
+and EOF within that deadline, and releases the single-writer slot on every
+worker exit. Cancellation, timeout, malformed input, and storage errors do not
+write a record; an existing Android record is never replaced. The worker owns
+and closes its read descriptor. This digest is a USB provisioning consistency
+commitment; it does not independently authenticate a future network peer. The
+original health query remains unchanged and read-only. Rust checks USB
+transport, current Android user, and installed APK bytes again while waiting
+for the saved state, and returns success only when the reported commitment
+equals the locally persisted record. A `content write` process exit code or
+its output alone is not completion evidence: AOSP `WriteCommand` copies stdin through
 `ContentProvider.openFile(uri, "w")`, while its command wrapper can report an
 exception without propagating it as a process failure. A missing confirmation,
 conflict, identity change, ADB error, or cancellation leaves the Windows DPAPI
-record available for retry. No ADB output is copied to logs or returned as a
+record available for retry. The stdin write, child wait, and both output
+drains share one operation deadline and cancellation token; on failure Rust
+terminates only its own child and aborts and joins both drain tasks. ADB output
+is reduced to presence markers and is not copied to logs or returned as a
 diagnostic.
 
 This remains a USB provisioning path only. It does not add LAN discovery,
