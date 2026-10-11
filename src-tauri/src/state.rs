@@ -518,9 +518,25 @@ impl AppState {
             let device_present = snapshot.as_ref().map(|snapshot| snapshot.devices.iter().any(|device| device.serial == serial && device.state == "device"));
             let connected = self.audio.is_connected().unwrap_or(false);
             let capture_error = self.audio.take_last_error().ok().flatten();
-            let receiver_failure = if installed_receiver && device_present != Some(false) {
-                match receiver::health(&self.adb_path, &serial, &self.receiver_apk_path,
-                    &self.receiver_metadata_path, &CancellationToken::new()).await {
+            if session_is_lost(device_present, exited, connected) || capture_error.is_some() {
+                let detail = if let Some(error) = capture_error {
+                    error
+                } else if exited {
+                    let output = safe_android_tail(&tail.lock().expect("output log lock").iter().cloned().collect::<Vec<_>>());
+                    if output.is_empty() { "手机端音频服务已停止".to_string() } else { format!("手机端音频服务已停止：\n{output}") }
+                } else if device_present == Some(false) { "手机连接已断开".into() } else { "手机端音频连接已中断".into() };
+                self.log(&detail);
+                self.recover_session_locked(app, serial, transport, output == "phone", session_key, detail).await;
+                return;
+            }
+            if receiver_health_needed(installed_receiver, device_present, exited, connected) {
+                let Some((generation, token)) = self.start_background_operation() else { return; };
+                let result = receiver::health(&self.adb_path, &serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, &token).await;
+                let cancelled = !self.operation_is_current(generation, &token);
+                self.finish_operation(generation);
+                if cancelled || !self.operation_is_current(generation, &token) { return; }
+                let receiver_failure = match result {
                     Ok(status) => match status.monitoring_error() {
                         Some(error) => Some(error),
                         None => {
@@ -529,20 +545,13 @@ impl AppState {
                         }
                     },
                     Err(error) => Some(error),
+                };
+                if let Some(error) = receiver_failure {
+                    let detail = format!("Receiver 健康检查失败：{error}");
+                    self.log(&detail);
+                    self.recover_session_locked(app, serial, transport, output == "phone", session_key, detail).await;
+                    return;
                 }
-            } else { None };
-            if session_is_lost(device_present, exited, connected) || capture_error.is_some() || receiver_failure.is_some() {
-                let detail = if let Some(error) = capture_error {
-                    error
-                } else if let Some(error) = receiver_failure {
-                    format!("Receiver 健康检查失败：{error}")
-                } else if exited {
-                    let output = safe_android_tail(&tail.lock().expect("output log lock").iter().cloned().collect::<Vec<_>>());
-                    if output.is_empty() { "手机端音频服务已停止".to_string() } else { format!("手机端音频服务已停止：\n{output}") }
-                } else if device_present == Some(false) { "手机连接已断开".into() } else { "手机端音频连接已中断".into() };
-                self.log(&detail);
-                self.recover_session_locked(app, serial, transport, output == "phone", session_key, detail).await;
-                return;
             }
             return;
         }
@@ -1363,6 +1372,10 @@ fn session_is_lost(device_present: Option<bool>, process_exited: bool, audio_con
     process_exited || !audio_connected || device_present == Some(false)
 }
 
+fn receiver_health_needed(installed_receiver: bool, device_present: Option<bool>, process_exited: bool, audio_connected: bool) -> bool {
+    installed_receiver && !session_is_lost(device_present, process_exited, audio_connected)
+}
+
 fn commit_pcm_bitrate_sample(current_session: Option<&str>, expected_session: &str,
     previous: &mut Option<(String, u64, Instant)>, current_rate: &mut Option<u64>, bytes: u64, now: Instant) -> bool {
     if current_session != Some(expected_session) { return false; }
@@ -1605,6 +1618,15 @@ mod tests {
         assert!(session_is_lost(None, false, false));
         assert!(!session_is_lost(None, false, true));
         assert!(session_is_lost(Some(false), false, true));
+    }
+
+    #[test]
+    fn receiver_health_monitor_skips_known_local_or_transport_failures() {
+        assert!(receiver_health_needed(true, Some(true), false, true));
+        assert!(!receiver_health_needed(false, Some(true), false, true));
+        assert!(!receiver_health_needed(true, Some(false), false, true));
+        assert!(!receiver_health_needed(true, Some(true), true, true));
+        assert!(!receiver_health_needed(true, Some(true), false, false));
     }
 
     #[test]

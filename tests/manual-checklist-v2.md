@@ -152,7 +152,7 @@
 | Native DLL 隔离 Release 构建与 ABI | PASS | CMake/MSVC Release x64；`dumpbin /exports` 确认旧导出保留，并新增 `AudioCapture_GetSentPcmBytes`；本机源码路径扫描通过。 |
 | Native 成功发送计数 | PASS | MSVC 编译并运行 `AnPod.Native.SendCheck.cpp`；确认短写逐段计数，部分发送后失败只保留成功写出的字节数。 |
 | Rust PCM 码率采样 | PASS | `state::tests::pcm_bitrate_uses_successful_byte_deltas_and_resets_between_sessions`：1/1；按单调时间与每秒成功 PCM 字节增量计算，新会话归零。 |
-| Rust 码率采样与 Receiver 低频监控修复 | PASS | `state::tests::stale_pcm_sample_is_rejected_after_session_changes`：1/1；会话锁覆盖身份复核及采样/视图提交。`receiver::tests::fake_adb_health_distinguishes_waiting_playback_and_receiver_failure`：1/1；fake ADB 覆盖无 PCM 就绪、实际播放、音频焦点错误及服务停止。 |
+| Rust 码率采样与 Receiver 低频监控修复 | PASS | `state::tests::stale_pcm_sample_is_rejected_after_session_changes`：1/1；会话锁覆盖身份复核及采样/视图提交。`receiver::tests::fake_adb_health_distinguishes_waiting_playback_and_receiver_failure`：1/1；fake ADB 覆盖无 PCM 就绪、实际播放、音频焦点错误及服务停止。`state::tests::receiver_health_monitor_skips_known_local_or_transport_failures`：1/1；Native/设备已确认故障时不进入远端 Receiver 健康查询。 |
 | Rust Receiver 就绪时序 | PASS | `receiver::tests::fake_adb_receiver_connect_succeeds_before_first_pcm_reaches_audiotrack`：1/1；服务健康即可完成连接，不再因无首批 PCM 而等待 `audioActive` 超时。 |
 | Frontend 生产构建 | PASS | TypeScript 与 Vite 构建通过；码率在原紧凑状态行内显示、使用等宽数字，不增加每秒播报。 |
 | 前台服务、音频会话与 Provider 诊断修复 | PASS（编译） | 音频会话生命周期由单会话 worker 持有并释放 AudioTrack/focus；取消后阻止新播放/焦点操作；Provider 暴露实际采样率、缓冲与 underrun（未知时显式 unknown）。设备生命周期测试覆盖 stop、EOF 与快速替换，但只编译，真机未运行。 |
