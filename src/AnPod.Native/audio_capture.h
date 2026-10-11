@@ -14,6 +14,8 @@
 #ifndef ANPOD_AUDIO_CAPTURE_H
 #define ANPOD_AUDIO_CAPTURE_H
 
+#include <stdint.h>
+
 #if defined(_WIN32)
 #  define ANPOD_API __declspec(dllexport)
 #  define ANPOD_CALL __cdecl
@@ -138,6 +140,9 @@ ANPOD_API const char* ANPOD_CALL AudioCapture_GetLastErrorMessage(void);
 
 /* Clears the pending error. */
 ANPOD_API void ANPOD_CALL AudioCapture_ClearLastError(void);
+
+/* Total PCM payload bytes accepted by successful TCP send calls this session. */
+ANPOD_API uint64_t ANPOD_CALL AudioCapture_GetSentPcmBytes(void);
 
 #ifdef __cplusplus
 }

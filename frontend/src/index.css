@@ -59,11 +59,13 @@ button:disabled { cursor: default; }
 .main-scroll:hover::-webkit-scrollbar-thumb { background-color: #99a4b5; }
 .status-line { min-height: 27px; display: flex; align-items: center; gap: 7px; color: var(--muted); }
 .status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #8190a5; }
-.state-ready .status-dot, .state-connected .status-dot, .state-streaming .status-dot { background: var(--positive); }
+.state-ready .status-dot, .state-connected .status-dot, .state-streaming .status-dot, .state-phoneReady .status-dot { background: var(--positive); }
 .state-connecting .status-dot, .state-reconnecting .status-dot { background: #c1780b; animation: pulse 1.2s ease-in-out infinite alternate; }
 .state-error .status-dot { background: var(--danger); }
 .status-device { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transport-tag { margin-left: auto; padding: 3px 8px; border-radius: 6px; color: var(--muted); background: var(--wash); font-size: 11px; }
+.audio-bitrate { margin-left: auto; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; white-space: nowrap; font-size: 11px; }
+.audio-bitrate-value { width: 10ch; flex: 0 0 10ch; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.transport-tag { padding: 3px 8px; border-radius: 6px; color: var(--muted); background: var(--wash); font-size: 11px; }
 .playback-section { padding: 0 0 12px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; min-height: 32px; }
 .section-title h1, .section-title h2, .mode-row h2 { margin: 0; font-size: 14px; font-weight: 650; line-height: 20px; }

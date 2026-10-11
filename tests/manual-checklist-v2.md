@@ -134,9 +134,11 @@
 
 - 新增 opt-in 后端：只有在启动 AnPod 的进程环境中将 `ANPOD_AUDIO_BACKEND` 设为 `installed-receiver` 时，USB 音频连接才走 APK Receiver；未设置时仍走 `app_process`，Wi-Fi 也继续走原有路径。P2 不自动安装或升级 APK。
 - Receiver version `0.2.0-p2-candidate` / versionCode `2`。音频服务使用 `mediaPlayback` 前台服务类型，管理健康检查继续使用原来的 120 秒 `shortService`；两者不共用短服务时限。
-- 两条 Android 路径复用同一 PCM16 帧对齐实现、8-byte little-endian 音频头及已有随机 token 握手。Native C ABI、静音切换和播放模式接口不变。
+- 两条 Android 路径复用同一 PCM16 帧对齐实现、8-byte little-endian 音频头及已有随机 token 握手。原 Native C ABI 保留，并新增只读本会话 PCM 成功发送字节计数。
 - P2 Native DLL、APK、Legacy Android payload 和 Rust target 都必须在隔离目录构建，例如分别使用 `build-native.ps1 -BuildDirectory artifacts/p2-native-build -OutputDirectory artifacts/p2-native`、`build-receiver.ps1 -OutputDirectory artifacts/p2-receiver`、`build-android.ps1 -ForceSdkDirect -BuildDirectory artifacts/p2-legacy-build -OutputDirectory artifacts/p2-legacy-payload`，再用 `publish-tauri.ps1 -IncludeReceiverCandidate -ReceiverCandidate p2 -NativeArtifactDirectory artifacts/p2-native -LegacyPayloadDirectory artifacts/p2-legacy-payload -ReceiverArtifactDirectory artifacts/p2-receiver -RustTargetDirectory artifacts/p2-tauri-target` 生成独立 portable candidate。不得指向 `deps/` 或原 Rust target，不得覆盖 P1 或稳定包。
 - P2 构建脚本审计 private Service、DUMP 保护、无 Launcher、mediaPlayback 权限及 Android 包身份。桌面 Release 启用 Rust 编译路径重映射，并扫描候选 EXE、Native DLL、APK 与文本资料中的本机源码路径。
+- Receiver 前台健康表示接收服务已就绪，不代表 AudioTrack 已实际播放；连接不等待首批 PCM。状态行的 `手机接收已就绪` 不声称正在出声，Provider 的 `audioActive` 与 `actualMode` 仍分别诊断实际播放和播放模式。
+- 码率按 Native TCP 成功发送的 PCM payload 字节增量及单调时钟计算；新会话/断开后重置采样，包含实际发送的静音帧，不含 8-byte 头和传输层开销。
 - P2 真机音频尚未在本轮编码会话中测试；本轮未安装/升级 APK、未操作 ADB reverse、未重启 AnPod 或手机、未发出真实音频。
 
 ### 构建记录与升级兼容性
@@ -146,12 +148,15 @@
 | Java PCM framing/mode 检查 | PASS | 编译共享 PCM helper、Legacy `Options` 与 `PcmCheck`；输出 `Android PCM framing and mode checks passed.` |
 | Legacy Android payload 隔离构建 | PASS | JDK 17 + SDK API 35 direct javac/d8；生成 15,020 B `classes.dex`，未覆盖 `deps/server`。 |
 | Receiver 主代码与生命周期测试编译 | PASS | Gradle 8.9 / AGP 8.7.3，API 35；`compileDebugJavaWithJavac` 与 `compileDebugAndroidTestJavaWithJavac` 成功。设备端生命周期测试已编译，未运行。 |
-| P2 Receiver APK 与 Manifest 审计 | PASS | 独立 Gradle 构建成功；Manifest 身份审计通过。APK SHA-256：`EA71A1257786F3A776C510496C6D51AE370171AF7BED1C2C4C6BFB497EE27480`；临时候选 signer SHA-256：`f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。该 signer 与 P1 不同，未安装或升级。 |
-| Native DLL 隔离 Release 构建 | PASS | CMake/MSVC Release x64；既有 `AudioCapture_*` ABI 导出、架构与本机源码路径扫描通过。 |
-| Rust 定向 fake-adb 检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline receiver::tests::fake_adb_`：7/7；覆盖错误优先级、管理健康不等于真实音频就绪及既有 fake-adb 管理行为。此前全量 23 项检查未在本轮改动后重跑。 |
+| P2 Receiver APK 与 Manifest 审计 | PASS | 独立 Gradle 构建及 Manifest 身份审计通过；APK SHA-256：`eebb9fe4f566f6e23165f1494d1c5b08491ed2a090653bd56ce6ab78845e988c`；临时候选 signer SHA-256：`f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。该 signer 与 P1 不同，未安装或升级。 |
+| Native DLL 隔离 Release 构建与 ABI | PASS | CMake/MSVC Release x64；`dumpbin /exports` 确认旧导出保留，并新增 `AudioCapture_GetSentPcmBytes`；本机源码路径扫描通过。 |
+| Native 成功发送计数 | PASS | MSVC 编译并运行 `AnPod.Native.SendCheck.cpp`；确认短写逐段计数，部分发送后失败只保留成功写出的字节数。 |
+| Rust PCM 码率采样 | PASS | `state::tests::pcm_bitrate_uses_successful_byte_deltas_and_resets_between_sessions`：1/1；按单调时间与每秒成功 PCM 字节增量计算，新会话归零。 |
+| Rust Receiver 就绪时序 | PASS | `receiver::tests::fake_adb_receiver_connect_succeeds_before_first_pcm_reaches_audiotrack`：1/1；服务健康即可完成连接，不再因无首批 PCM 而等待 `audioActive` 超时。 |
+| Frontend 生产构建 | PASS | TypeScript 与 Vite 构建通过；码率在原紧凑状态行内显示、使用等宽数字，不增加每秒播报。 |
 | 前台服务、音频会话与 Provider 诊断修复 | PASS（编译） | 音频会话生命周期由单会话 worker 持有并释放 AudioTrack/focus；取消后阻止新播放/焦点操作；Provider 暴露实际采样率、缓冲与 underrun（未知时显式 unknown）。设备生命周期测试覆盖 stop、EOF 与快速替换，但只编译，真机未运行。 |
 | Cargo 空格路径及环境恢复检查 | PASS | Cargo remap 参数以 `CARGO_ENCODED_RUSTFLAGS` 传递；用含空格的模拟 checkout 路径验证两种既有 flags 来源及 Cargo 环境变量恢复。 |
-| Rust Release 与便携候选打包 | PASS | Release 与 Frontend 生产构建成功；独立 ZIP 共 24 项，包含 Receiver APK/JSON、归属与上游说明；APK 与 JSON 摘要一致，未打入签名密钥，归档文本/二进制扫描未发现 workspace 绝对路径。候选 ZIP：`artifacts/AnPod-1.0.4-receiver-p2-candidate-tauri-win-x64-portable.zip`；SHA-256：`C00506F606C8374469403D57525829ECBD1489C01A0B2318E8811474736C160F`。 |
+| Rust Release 与便携候选打包 | PASS | Tauri Release、Frontend 生产构建成功。标准 P2 输出目录中的旧 `AnPod.exe` 被其他进程占用，未覆盖它；在独立 `-final` 文件名输出同一隔离 Release，并按发布清单重新打包。归档包含 Receiver APK/JSON、归属与上游说明；APK 与 JSON 摘要一致，未打入签名密钥，归档二进制/文本扫描未发现 workspace 绝对路径。候选 ZIP：`artifacts/AnPod-1.0.4-receiver-p2-candidate-final-tauri-win-x64-portable.zip`；SHA-256：`07C542D496F02AA7B0115C63634F223732D06E6351344AEA3F0B96D0DAB915DB`。 |
 | P1 → P2 APK 更新签名兼容性 | BLOCKED | P2 候选临时 signer 与 P1 不同，Package Manager 原位更新无法通过签名校验。未尝试升级、重签或卸载。P1 原签名密钥此前确认无法恢复；需要维护者明确批准一次卸载旧 P1 测试 APK 并安装新 P2 候选的迁移，安装动作尚未执行。 |
 
 升级方案：P1 原签名密钥无法恢复，因此不使用 `adb install -r` 绕过签名检查。候选已完成；仅在用户明确批准后，才卸载现有 P1 测试 Receiver（会清除该应用数据）并安装 P2 候选。批准前保持设备与安装状态不变。

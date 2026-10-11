@@ -120,9 +120,9 @@ The socket stays open, the peer stays connected, its `AudioTrack` stays alive
 and primed, and resuming is seamless with no re-handshake. Reset to `TRUE` by
 `ResetSessionState` so a new session always starts audible.
 
-This is the one export that is **required** rather than optional on the managed
-side (see `NativeAudioCapture`): an old DLL would silently ignore the call and
-keep playing, which is a worse failure than refusing to load.
+These exports are **required** by the managed side (`NativeAudioCapture`): an
+old DLL would silently ignore the call and keep playing, which is a worse
+failure than refusing to load.
 
 ### A11. Deliberately unchanged
 
@@ -131,6 +131,13 @@ keep playing, which is a worse failure than refusing to load.
 * The 48 kHz stereo PCM16 preferred-format negotiation.
 * `SO_SNDBUF = 32 KiB`, `TCP_NODELAY`.
 * Release-before-send ordering.
+
+### A12. Per-session PCM byte counter
+
+`AudioCapture_GetSentPcmBytes` is an additive C ABI export. Each successful TCP
+write of PCM payload bytes increments the counter, including partial writes;
+the 8-byte format header is excluded. The counter resets before a new capture
+and after cleanup. All original exports remain available.
 
 ---
 

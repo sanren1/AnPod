@@ -13,7 +13,8 @@
  *   4. Sends carry a timeout; an incomplete packet ends the session so the
  *      unframed PCM stream can only resume after a fresh handshake.
  *   5. Endpoint invalidation is reported so the caller can rebuild the session.
- *   6. Diagnostics exports and balanced timeBeginPeriod/CoUninitialize.
+ *   6. Diagnostics exports, per-session PCM byte counts and balanced
+ *      timeBeginPeriod/CoUninitialize.
  *
  * Everything else - including the 1 ms polling loop - is intentionally left as
  * upstream, per plan §3.4.7.
@@ -35,6 +36,7 @@
 #include <mmsystem.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "audio_capture.h"
 #include "send_exact.h"
@@ -66,6 +68,7 @@ static HANDLE g_hListenThread = NULL;
 static volatile BOOL g_bRunning = FALSE;
 static volatile BOOL g_bListening = FALSE;
 static volatile BOOL g_bConnected = FALSE;
+static volatile LONG64 g_sentPcmBytes = 0;
 
 /* What the capture thread forwards. FALSE keeps the socket alive but feeds the
    peer silence, so a session can be muted without being torn down. */
@@ -160,13 +163,15 @@ static const char* DefaultMessageForCode(int code)
 /* -------------------------------------------------------------- socket I/O */
 
 /* A short or timed-out send breaks the unframed PCM byte stream; fail the session. */
-static int SendPacket(SOCKET sock, const char* data, int len)
+static int SendPacket(SOCKET sock, const char* data, int len, BOOL countPcm = FALSE)
 {
     if (sock == INVALID_SOCKET) return -1;
     return SendExactBytes(len, [sock, data](int offset, int remaining) {
         const int sent = send(sock, data + offset, remaining, 0);
         if (sent == SOCKET_ERROR && WSAGetLastError() == WSAETIMEDOUT) return 0;
         return sent;
+    }, [countPcm](int sent) {
+        if (countPcm) InterlockedAdd64(&g_sentPcmBytes, sent);
     });
 }
 
@@ -469,7 +474,8 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
                 int result = SendPacket(
                     g_clientSocket,
                     (const char*)outBuf,
-                    (int)(frames * 2 * sizeof(short)));
+                    (int)(frames * 2 * sizeof(short)),
+                    TRUE);
 
                 if (result < 0)
                 {
@@ -761,6 +767,7 @@ int ANPOD_CALL AudioCapture_Initialize(void)
 
 int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
 {
+    g_bRunning = FALSE;
     g_connectCallback = callback;
     g_bListening = FALSE;
     g_bConnected = FALSE;
@@ -794,6 +801,8 @@ int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
         CloseHandle(g_hListenThread);
         g_hListenThread = NULL;
     }
+
+    InterlockedExchange64(&g_sentPcmBytes, 0);
 
     if (!g_bWsaInitialized)
     {
@@ -860,6 +869,7 @@ int ANPOD_CALL AudioCapture_Start(void)
         return 0;
     }
 
+    InterlockedExchange64(&g_sentPcmBytes, 0);
     g_bRunning = TRUE;
     g_hCaptureThread = CreateThread(NULL, 0, CaptureThread, NULL, 0, NULL);
 
@@ -963,6 +973,8 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
         g_bComInitialized = FALSE;
     }
 
+    InterlockedExchange64(&g_sentPcmBytes, 0);
+
     g_connectCallback = NULL;
     g_bConnected = FALSE;
     g_connectCodeBuf[0] = '\0';
@@ -988,6 +1000,11 @@ int ANPOD_CALL AudioCapture_IsConnected(char* outBuf, int bufSize)
     }
 
     return 1;
+}
+
+uint64_t ANPOD_CALL AudioCapture_GetSentPcmBytes(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_sentPcmBytes, 0, 0);
 }
 
 void ANPOD_CALL AudioCapture_SetConnectToken(const char* token)

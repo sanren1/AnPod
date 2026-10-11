@@ -252,7 +252,7 @@ public final class ReceiverService extends Service {
                                 publishMode(session, mode);
                             }
                         } else publishMode(session, "balanced-fallback");
-                    }
+                    } else publishMode(session, "balanced");
                     int effectiveFrames = track.getBufferSizeInFrames();
                     int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
                     String mode = currentMode(session);

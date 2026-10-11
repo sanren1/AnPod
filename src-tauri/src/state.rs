@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
 use tokio::{process::{Child, Command}, sync::Mutex as AsyncMutex, time::timeout};
@@ -97,6 +97,7 @@ pub struct AppSnapshot {
     pub can_disconnect: bool,
     pub can_change_modes: bool,
     pub status_detail: String,
+    pub audio_bitrate_bps: Option<u64>,
     pub version: String,
 }
 
@@ -142,6 +143,7 @@ struct ViewState {
     status_detail: String,
     busy: bool,
     session_active: bool,
+    audio_bitrate_bps: Option<u64>,
 }
 
 pub struct AppState {
@@ -157,6 +159,7 @@ pub struct AppState {
     last_pairing_endpoint: Mutex<Option<String>>,
     gate: AsyncMutex<()>,
     session: AsyncMutex<Option<Session>>,
+    pcm_rate_sample: Mutex<Option<(String, u64, Instant)>>,
     audio: AudioActor,
     data_dir: PathBuf,
     adb_path: PathBuf,
@@ -197,6 +200,7 @@ impl AppState {
                 status_detail: "连接 USB 手机或切换到 Wi-Fi 添加手机。".into(),
                 busy: false,
                 session_active: false,
+                audio_bitrate_bps: None,
             }),
             operation: Mutex::new(None),
             operation_generation: AtomicU64::new(0),
@@ -209,6 +213,7 @@ impl AppState {
             last_pairing_endpoint: Mutex::new(None),
             gate: AsyncMutex::new(()),
             session: AsyncMutex::new(None),
+            pcm_rate_sample: Mutex::new(None),
             audio: AudioActor::new(audio_path, data_dir.join("muted-endpoints.txt")),
             data_dir,
             adb_path,
@@ -333,8 +338,51 @@ impl AppState {
             can_disconnect,
             can_change_modes,
             status_detail: view.status_detail.clone(),
+            audio_bitrate_bps: view.audio_bitrate_bps,
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
+    }
+
+    pub async fn sample_audio_bitrate(&self, app: &AppHandle) {
+        let session_id = self.session.lock().await.as_ref().map(|session| session.reverse.clone());
+        let Some(session_id) = session_id else {
+            self.clear_audio_bitrate_if_session(None, app).await;
+            return;
+        };
+        let Ok(bytes) = self.audio.sent_pcm_bytes() else {
+            self.clear_audio_bitrate_if_session(Some(&session_id), app).await;
+            return;
+        };
+        let current_session_id = self.session.lock().await.as_ref().map(|session| session.reverse.clone());
+        if current_session_id.as_deref() != Some(session_id.as_str()) { return; }
+
+        let now = Instant::now();
+        let bitrate = {
+            let mut previous = self.pcm_rate_sample.lock().expect("PCM rate sample lock");
+            let rate = calculate_pcm_bitrate(previous.as_ref().map(|(id, count, at)| (id.as_str(), *count, *at)),
+                &session_id, bytes, now);
+            *previous = Some((session_id, bytes, now));
+            rate
+        };
+        let changed = {
+            let mut view = self.view.lock().expect("app view lock");
+            if view.audio_bitrate_bps == Some(bitrate) { false }
+            else { view.audio_bitrate_bps = Some(bitrate); true }
+        };
+        if changed { self.emit(app); }
+    }
+
+    async fn clear_audio_bitrate_if_session(&self, expected_session: Option<&str>, app: &AppHandle) {
+        let session = self.session.lock().await;
+        if session.as_ref().map(|session| session.reverse.as_str()) != expected_session { return; }
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+        let changed = {
+            let mut view = self.view.lock().expect("app view lock");
+            if view.audio_bitrate_bps.is_none() { false }
+            else { view.audio_bitrate_bps = None; true }
+        };
+        drop(session);
+        if changed { self.emit(app); }
     }
 
     fn emit(&self, app: &AppHandle) {
@@ -713,7 +761,9 @@ impl AppState {
             view.session_serial = Some(device.serial.clone());
             view.session_transport = Some(device.transport.clone());
             view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
+            view.audio_bitrate_bps = Some(0);
         }
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
         let mode = self.view.lock().expect("view lock").settings.playback_mode.to_ascii_lowercase();
         if installed_receiver {
             let playback_mode = if mode == "lowlatency" || mode == "low_latency" { "lowlatency" } else { "balanced" };
@@ -749,8 +799,6 @@ impl AppState {
         self.audio.start()?;
         token_check(&token)?;
         if play_on_phone && installed_receiver {
-            receiver::wait_audio_active(&self.adb_path, serial, &self.receiver_apk_path,
-                &self.receiver_metadata_path, token).await?;
             self.audio.mute_active()?;
         }
         let output = if play_on_phone { "phone" } else { "computer" }.to_string();
@@ -761,14 +809,20 @@ impl AppState {
             view.settings.last_device_id = Some(serial.into());
             view.busy = false;
             view.settings.last_wireless_endpoint = if device.transport == "wifi" { Some(serial.into()) } else { view.settings.last_wireless_endpoint.clone() };
-            view.status_detail = if play_on_phone { format!("电脑声音正在通过 {} 传到手机。", device.transport.to_uppercase()) } else { "手机连接保持中；声音继续从电脑播放。".into() };
+            view.status_detail = if play_on_phone && installed_receiver {
+                "手机接收端已就绪；电脑有声音发送后将开始播放。".into()
+            } else if play_on_phone {
+                format!("电脑声音正在通过 {} 传到手机。", device.transport.to_uppercase())
+            } else { "手机连接保持中；声音继续从电脑播放。".into() };
             let settings = view.settings.clone();
             drop(view);
             let _ = self.save_settings(&settings);
         }
-        self.set_state(app, if play_on_phone { "streaming" } else { "connected" }, if play_on_phone { "正在手机播放" } else { "已连接 · 电脑播放" }, Some(device.display_name.clone()));
+        let state = if play_on_phone && installed_receiver { "phoneReady" } else if play_on_phone { "streaming" } else { "connected" };
+        let message = if state == "phoneReady" { "手机接收已就绪" } else if play_on_phone { "正在手机播放" } else { "已连接 · 电脑播放" };
+        self.set_state(app, state, message, Some(device.display_name.clone()));
         self.log("Audio session connected");
-        Ok("已连接并开始播放。".into())
+        Ok(if state == "phoneReady" { "手机接收端已就绪，等待音频数据。".into() } else { "已连接并开始播放。".into() })
     }
 
     pub async fn disconnect(&self, app: &AppHandle) -> Result<OperationResult, String> {
@@ -916,7 +970,7 @@ impl AppState {
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
-            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; }
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -946,7 +1000,8 @@ impl AppState {
                 errors.push(format!("电脑声音恢复失败：{error}"));
             }
         }
-        self.view.lock().expect("view lock").output = "computer".into();
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+        { let mut view = self.view.lock().expect("app view lock"); view.output = "computer".into(); view.audio_bitrate_bps = None; }
         if let Some(app) = app { self.emit(app); }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("；")) }
     }
@@ -982,14 +1037,21 @@ impl AppState {
     async fn set_output_locked(&self, output: &str, token: &CancellationToken) -> Result<(), String> {
         let receiver_session = self.session.lock().await.as_ref()
             .map(|session| (session.serial.clone(), session.installed_receiver));
-        if output == "phone" && !receiver_session.as_ref().is_some_and(|(_, installed)| *installed) {
+        let installed_receiver = receiver_session.as_ref().is_some_and(|(_, installed)| *installed);
+        if output == "phone" && installed_receiver {
+            let (serial, _) = receiver_session.as_ref().expect("installed Receiver session");
+            let status = receiver::health(&self.adb_path, serial, &self.receiver_apk_path,
+                &self.receiver_metadata_path, token).await?;
+            if !status.healthy { return Err(status.message); }
+        }
+        if output == "phone" {
             if let Err(mute_error) = self.audio.mute_active() {
                 return match self.audio.restore_muted() {
                     Ok(()) => Err(format!("无法静音电脑播放端点，已回滚本次静音：{mute_error}")),
                     Err(restore_error) => {
                         let mut view = self.view.lock().expect("view lock");
                         view.state = "error".into();
-                        view.message = format!("切换到手机播放失败，且电脑声音恢复失败：{restore_error}");
+                        view.message = format!("切换到手机输出失败，且电脑声音恢复失败：{restore_error}");
                         view.status_detail = "电脑声音恢复待处理；可断开连接或从托盘重试。".into();
                         Err(format!("{mute_error}；恢复电脑声音失败：{restore_error}"))
                     }
@@ -999,53 +1061,11 @@ impl AppState {
         if let Err(error) = self.audio.set_streaming(output == "phone") {
             let restore = if output == "phone" { self.audio.restore_muted().err() } else { None };
             let message = restore.as_ref().map_or_else(|| format!("无法切换音频输出：{error}"), |restore| format!("无法切换音频输出，恢复电脑声音也失败：{restore}"));
-            let mut view = self.view.lock().expect("view lock");
+            let mut view = self.view.lock().expect("app view lock");
             view.state = "error".into();
             view.message = message;
             view.status_detail = "音频输出状态异常；请断开连接以恢复电脑声音。".into();
             return Err(restore.map_or(error.clone(), |restore| format!("{error}；恢复电脑声音失败：{restore}")));
-        }
-        if output == "phone" {
-            if let Some((serial, true)) = receiver_session {
-                if let Err(error) = receiver::wait_audio_active(&self.adb_path, &serial, &self.receiver_apk_path,
-                    &self.receiver_metadata_path, token).await {
-                    let stop_stream = self.audio.set_streaming(false).err();
-                    let restore = self.audio.restore_muted().err();
-                    let restore_failed = restore.is_some();
-                    let mut cleanup = Vec::new();
-                    if let Some(error) = stop_stream { cleanup.push(format!("本机音频切换失败：{error}")); }
-                    if let Some(error) = restore { cleanup.push(format!("电脑声音恢复失败：{error}")); }
-                    let message = if cleanup.is_empty() { error } else { format!("{error}；{}", cleanup.join("；")) };
-                    let mut view = self.view.lock().expect("view lock");
-                    view.state = "error".into();
-                    view.message = message.clone();
-                    view.status_detail = if restore_failed {
-                        "电脑声音恢复待处理；可断开连接或从托盘重试。".into()
-                    } else {
-                        "Receiver 未确认音频播放；电脑声音保持在本机。".into()
-                    };
-                    return Err(message);
-                }
-                if let Err(mute_error) = self.audio.mute_active() {
-                    let stop_stream = self.audio.set_streaming(false).err();
-                    let restore = self.audio.restore_muted().err();
-                    let restore_failed = restore.is_some();
-                    let mut cleanup = Vec::new();
-                    if let Some(error) = stop_stream { cleanup.push(format!("本机音频切换失败：{error}")); }
-                    if let Some(error) = restore { cleanup.push(format!("电脑声音恢复失败：{error}")); }
-                    let message = if cleanup.is_empty() { format!("无法静音电脑播放端点：{mute_error}") }
-                        else { format!("无法静音电脑播放端点：{mute_error}；{}", cleanup.join("；")) };
-                    let mut view = self.view.lock().expect("view lock");
-                    view.state = "error".into();
-                    view.message = message.clone();
-                    view.status_detail = if restore_failed {
-                        "电脑声音恢复待处理；可断开连接或从托盘重试。".into()
-                    } else {
-                        "电脑声音静音失败；声音保持在本机。".into()
-                    };
-                    return Err(message);
-                }
-            }
         }
         if output == "computer" {
             if let Err(error) = self.audio.restore_muted() {
@@ -1059,9 +1079,14 @@ impl AppState {
         {
             let mut view = self.view.lock().expect("view lock");
             view.output = output.into();
-            view.status_detail = if output == "phone" { "电脑声音正在传到手机。".into() } else { "连接保持中；电脑声音已恢复到本机扬声器。".into() };
-            view.state = if output == "phone" { "streaming".into() } else { "connected".into() };
-            view.message = if output == "phone" { "正在手机播放".into() } else { "已连接 · 电脑播放".into() };
+            view.status_detail = if output == "phone" && installed_receiver {
+                "手机接收端已就绪；电脑有声音发送后将开始播放。".into()
+            } else if output == "phone" { "电脑声音正在传到手机。".into() }
+            else { "连接保持中；电脑声音已恢复到本机扬声器。".into() };
+            view.state = if output == "phone" && installed_receiver { "phoneReady".into() }
+                else if output == "phone" { "streaming".into() } else { "connected".into() };
+            view.message = if output == "phone" && installed_receiver { "手机接收已就绪".into() }
+                else if output == "phone" { "正在手机播放".into() } else { "已连接 · 电脑播放".into() };
         }
         if let Some(session) = self.session.lock().await.as_mut() { session.output = output.into(); }
         Ok(())
@@ -1311,6 +1336,15 @@ fn session_is_lost(device_present: Option<bool>, process_exited: bool, audio_con
     process_exited || !audio_connected || device_present == Some(false)
 }
 
+fn calculate_pcm_bitrate(previous: Option<(&str, u64, Instant)>, session_id: &str, bytes: u64, now: Instant) -> u64 {
+    let Some((previous_session, previous_bytes, previous_at)) = previous else { return 0; };
+    if previous_session != session_id { return 0; }
+    let elapsed_nanos = now.saturating_duration_since(previous_at).as_nanos();
+    if elapsed_nanos == 0 { return 0; }
+    let delta = bytes.saturating_sub(previous_bytes) as u128;
+    (delta.saturating_mul(8_000_000_000) / elapsed_nanos).min(u64::MAX as u128) as u64
+}
+
 fn same_physical_device(left: &Device, right: &Device) -> bool {
     left.physical_id.as_ref().is_some_and(|id| right.physical_id.as_ref() == Some(id))
 }
@@ -1467,6 +1501,14 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_bitrate_uses_successful_byte_deltas_and_resets_between_sessions() {
+        let started = Instant::now();
+        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 0, started)), "session-a", 192_000, started + Duration::from_secs(1)), 1_536_000);
+        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 900_000, started)), "session-b", 192_000, started + Duration::from_secs(1)), 0);
+        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 192_000, started)), "session-a", 192_000, started + Duration::from_secs(1)), 0);
+    }
 
     #[test]
     fn parses_and_filters_adb_device_rows() {

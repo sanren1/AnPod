@@ -27,6 +27,7 @@ enum Request {
     Restore(Vec<String>, mpsc::SyncSender<Result<(), String>>),
     RestoreMuted(mpsc::SyncSender<Result<(), String>>),
     IsConnected(mpsc::SyncSender<Result<bool, String>>),
+    SentPcmBytes(mpsc::SyncSender<Result<u64, String>>),
     TakeLastError(mpsc::SyncSender<Result<Option<String>, String>>),
 }
 
@@ -43,6 +44,7 @@ struct NativeFns {
     error_message: unsafe extern "C" fn() -> *const c_char,
     clear_error: unsafe extern "C" fn(),
     is_connected: unsafe extern "C" fn(*mut c_char, i32) -> i32,
+    sent_pcm_bytes: unsafe extern "C" fn() -> u64,
 }
 
 impl NativeFns {
@@ -61,6 +63,7 @@ impl NativeFns {
             error_message: sym!("AudioCapture_GetLastErrorMessage", unsafe extern "C" fn() -> *const c_char),
             clear_error: sym!("AudioCapture_ClearLastError", unsafe extern "C" fn()),
             is_connected: sym!("AudioCapture_IsConnected", unsafe extern "C" fn(*mut c_char, i32) -> i32),
+            sent_pcm_bytes: sym!("AudioCapture_GetSentPcmBytes", unsafe extern "C" fn() -> u64),
             _library: library,
         })
     }
@@ -141,6 +144,11 @@ impl AudioActor {
                         }).ok_or_else(|| "音频采集组件尚未初始化。".to_string());
                         let _ = reply.send(result);
                     }
+                    Request::SentPcmBytes(reply) => {
+                        let result = native.as_ref().map(|native| unsafe { (native.sent_pcm_bytes)() })
+                            .ok_or_else(|| "音频采集组件尚未初始化。".to_string());
+                        let _ = reply.send(result);
+                    }
                     Request::TakeLastError(reply) => {
                         let result = native.as_ref().map(|native| unsafe {
                             let code = (native.error_code)();
@@ -170,6 +178,7 @@ impl AudioActor {
     pub fn restore_ids(&self, ids: Vec<String>) -> Result<(), String> { self.call(|reply| Request::Restore(ids, reply)) }
     pub fn restore_muted(&self) -> Result<(), String> { self.call(Request::RestoreMuted) }
     pub fn is_connected(&self) -> Result<bool, String> { self.call(Request::IsConnected) }
+    pub fn sent_pcm_bytes(&self) -> Result<u64, String> { self.call(Request::SentPcmBytes) }
     pub fn take_last_error(&self) -> Result<Option<String>, String> { self.call(Request::TakeLastError) }
 
     pub async fn wait_handshake(&self, expected: &str, limit: Duration, cancel: &CancellationToken) -> Result<String, String> {

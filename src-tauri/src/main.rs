@@ -221,6 +221,15 @@ fn main() {
                     } else { break; }
                 }
             });
+            let rate_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if let Some(state) = rate_app.try_state::<AppState>() {
+                        state.sample_audio_bitrate(&rate_app).await;
+                    } else { break; }
+                }
+            });
             #[cfg(windows)]
             {
                 let handle = SHOW_EVENT.load(std::sync::atomic::Ordering::Relaxed);

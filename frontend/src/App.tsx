@@ -21,11 +21,12 @@ type Settings = {
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
 type Snapshot = {
-  state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "reconnecting" | "error";
+  state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "reconnecting" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
   sessionTransport: Device["transport"] | null; sessionAndroidVersion: string | null;
   transport: "usb" | "wifi"; output: "computer" | "phone"; settings: Settings;
-  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string; version: string;
+  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
+  audioBitrateBps: number | null; version: string;
 };
 type Credentials = { instanceName: string; password: string; payload: string };
 type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };
@@ -36,6 +37,8 @@ const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
   return invoke<T>(command, args);
 };
 const byTransport = (snapshot: Snapshot) => snapshot.devices.filter(device => device.transport === snapshot.transport || device.transport === "unknown");
+const formatBitrate = (bps: number | null) => bps === null ? "—" : bps >= 1_000_000 ? `${(bps / 1_000_000).toFixed(2)} Mbps` : bps >= 1_000 ? `${(bps / 1_000).toFixed(1)} kbps` : `${bps} bps`;
+const bitrateHelp = "实际成功发送的 PCM 数据率，包含暂停或电脑输出时发送的静音帧，不含 TCP/ADB 等网络开销；不是压缩编码档位、链路带宽、接收端吞吐或延迟。";
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -196,7 +199,7 @@ function App() {
   const stateLabels: Record<Snapshot["state"], string> = {
     noDevice: empty ? "尚未连接手机" : "等待手机授权", unauthorized: "等待手机授权",
     ready: "准备就绪", connecting: "正在连接", connected: "已连接 · 电脑播放",
-    streaming: "正在手机播放", reconnecting: "正在重新连接", error: "连接失败",
+    streaming: "正在手机播放", phoneReady: "手机接收已就绪", reconnecting: "正在重新连接", error: "连接失败",
   };
 
   return <div className={`app-shell ${largeText ? "large-text" : ""}`}>
@@ -206,10 +209,13 @@ function App() {
     </header>
 
     <main className="main-scroll">
-      <div className={`status-line state-${snapshot.state}`} role="status" aria-live="polite">
+      <div className={`status-line state-${snapshot.state}`}>
         <span className="status-dot" aria-hidden="true" />
-        <span>{stateLabels[snapshot.state]}</span>
+        <span role="status" aria-live="polite">{stateLabels[snapshot.state]}</span>
         {snapshot.deviceName && <span className="status-device">{snapshot.deviceName}</span>}
+        <span className="audio-bitrate" title={bitrateHelp}>
+          <span>音频码率</span><span className="audio-bitrate-value">{formatBitrate(snapshot.audioBitrateBps)}</span>
+        </span>
         <span className="transport-tag">{snapshot.transport.toUpperCase()}</span>
       </div>
 
