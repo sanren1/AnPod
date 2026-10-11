@@ -2,14 +2,22 @@ package app.anpod.receiver;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.util.Arrays;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Test-only Java endpoint used by Rust's merged P5-C localhost check. */
 public final class P5cLoopbackEndpoint {
     public static void main(String[] args) throws Exception {
+        verifyFragmentedControlFrame();
+        verifyHeartbeatDeadline();
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
         FakePlayback playback = new FakePlayback();
@@ -23,6 +31,46 @@ public final class P5cLoopbackEndpoint {
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get());
             System.out.flush();
         }
+    }
+
+    private static void verifyFragmentedControlFrame() throws Exception {
+        byte[] key = new byte[32];
+        byte[] frame = P5cControlProtocol.encode(key, P5cControlProtocol.HOST_TO_RECEIVER,
+                7, 0, P5cControlProtocol.HEARTBEAT, new byte[0]);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (ServerSocket listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            Thread reader = new Thread(() -> {
+                try (Socket socket = listener.accept()) {
+                    socket.setSoTimeout(25);
+                    P5cControlProtocol.Frame parsed = P5cControlProtocol.read(
+                            new DataInputStream(socket.getInputStream()), key,
+                            P5cControlProtocol.HOST_TO_RECEIVER, 7);
+                    if (parsed.type != P5cControlProtocol.HEARTBEAT || parsed.sequence != 0)
+                        throw new AssertionError("fragmented heartbeat changed");
+                } catch (Throwable error) { failure.set(error); }
+            }, "P5-C fragmented-frame parser check");
+            reader.start();
+            try (Socket client = new Socket(InetAddress.getByName("127.0.0.1"), listener.getLocalPort())) {
+                DataOutputStream output = new DataOutputStream(client.getOutputStream());
+                output.writeByte(frame.length >>> 8);
+                output.flush();
+                Thread.sleep(100);
+                output.writeByte(frame.length);
+                output.write(frame);
+                output.flush();
+            }
+            reader.join(2_000);
+            if (reader.isAlive()) throw new AssertionError("fragmented-frame parser did not finish");
+        }
+        if (failure.get() != null) throw new AssertionError("fragmented-frame parser failed", failure.get());
+    }
+
+    private static void verifyHeartbeatDeadline() throws Exception {
+        P5cReceiverCoordinator.checkHeartbeatDeadline(5_000_000_000L, 0);
+        try {
+            P5cReceiverCoordinator.checkHeartbeatDeadline(5_000_000_001L, 0);
+            throw new AssertionError("expired authenticated heartbeat was accepted");
+        } catch (IOException expected) { }
     }
 
     private static byte[] repeated(byte value, int length) {
@@ -42,11 +90,13 @@ public final class P5cLoopbackEndpoint {
         final AtomicBoolean stopped = new AtomicBoolean();
         volatile UdpPcmQueue queue;
         volatile UdpReceiver receiver;
+        volatile UdpSessionContext context;
         volatile Thread receiverThread;
         volatile Thread sinkThread;
 
         @Override public boolean start(UdpSessionContext context) throws IOException {
             starts.incrementAndGet();
+            this.context = context;
             queue = new UdpPcmQueue(context.parameters);
             receiver = new UdpReceiver(context, queue);
             receiverThread = new Thread(receiver, "P5-C test UDP receiver");
@@ -79,6 +129,8 @@ public final class P5cLoopbackEndpoint {
             stops.incrementAndGet();
             UdpReceiver currentReceiver = receiver;
             if (currentReceiver != null) currentReceiver.close();
+            UdpSessionContext currentContext = context;
+            if (currentContext != null) currentContext.destroy();
             UdpPcmQueue currentQueue = queue;
             if (currentQueue != null) currentQueue.stop();
             join(receiverThread);

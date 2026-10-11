@@ -206,5 +206,7 @@
 ## P5-C authenticated localhost session prototype
 
 - `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。单项合并检查由 JDK 17 编译并启动真实 Java P5-A/UDP 接收代码，通过 Rust TCP localhost 完成双向握手、认证 BIND 与 mode、方向控制 HMAC、START/重复 START ACK 去重、旧 session FORMAT 拒绝、合成 PCM 到 fake sink、Streaming 心跳、PAUSE/RESUME 与 STOP；另以错误 receiver identity、错误 binding secret、坏 MAC、旧 session 控制帧确认拒绝。
+- 后续定向复核在同一合并检查中增加了断开控制通道后的 STOP 本地 sender/queue/socket/key 清理、远端 START ACK 后本地 UDP sender handoff 失败清理、25 ms idle timeout 间隔中的分段控制帧读取，以及使用虚拟单调时钟的 5 秒 heartbeat 截止检查。Android 实际 `ReceiverService` UDP 队列也按已认证参数校验 FORMAT；P4 上下文的 `parameters == null` 保持原行为。
+- 双模式沿用同一 5 ms UDP packetization target（48 kHz stereo 的数据报仍受 1200-byte 限制），模式差异由 Android AudioTrack buffer 设置承载；本地 fake 检查不代表音质或时延收益。
 - Rust 定向 Cargo 测试：PASS。Android `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；未执行资源处理或组装 APK。JDK 合并检查只编译 P5-C 所需 Java protocol/UDP 文件及 `tests/P5cLoopbackEndpoint.java`。
 - 所有检查仅在 127.0.0.1 使用合成 binding 与 PCM；没有启动 AnPod 产品入口、真实音频设备、ADB、手机或局域网。P5-C 不接入 UI/IPC、默认 listener 或产品自动启动；真实 WASAPI/AudioTrack 输出和设备行为仍为 NOT_TESTED，P5 尚未完成。

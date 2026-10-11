@@ -196,14 +196,22 @@ impl HostSession {
         }
         let ack = self.command(START, &[])?;
         if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
+            self.close_local();
             return Err("P5-C receiver did not confirm playback start.".into());
         }
-        let socket = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
-            .try_clone().map_err(|_| "Unable to transfer the authenticated UDP socket.".to_string())?;
-        let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
-        let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
-        self.sender = Some(UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
-            material, self.parameters)?);
+        let result = (|| {
+            let socket = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
+                .try_clone().map_err(|_| "Unable to transfer the authenticated UDP socket.".to_string())?;
+            let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
+            let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
+            self.sender = Some(UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
+                material, self.parameters)?);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.close_local();
+            return Err(error);
+        }
         self.state = ack.state;
         Ok(())
     }
@@ -244,17 +252,26 @@ impl HostSession {
 
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         let result = if self.state == ReceiverState::Stopped { Ok(()) } else {
-            let ack = self.command(STOP, &[])?;
-            if ack.result == RESULT_OK && ack.state == ReceiverState::Stopped {
-                self.state = ReceiverState::Stopped;
-                Ok(())
-            } else { Err("P5-C STOP was rejected.".into()) }
+            match self.command(STOP, &[]) {
+                Ok(ack) if ack.result == RESULT_OK && ack.state == ReceiverState::Stopped => {
+                    self.state = ReceiverState::Stopped;
+                    Ok(())
+                }
+                Ok(_) => Err("P5-C STOP was rejected.".into()),
+                Err(error) => Err(error),
+            }
         };
         self.close_local();
         result
     }
 
     fn command(&mut self, kind: u8, payload: &[u8]) -> Result<Ack, String> {
+        let result = self.command_inner(kind, payload);
+        if result.is_err() { self.close_local(); }
+        result
+    }
+
+    fn command_inner(&mut self, kind: u8, payload: &[u8]) -> Result<Ack, String> {
         let sequence = self.command_sequence;
         let frame = encode_control(&self.keys.control_tx, HOST_TO_RECEIVER_CONTROL,
             self.session_id, sequence, kind, payload)?;
@@ -327,6 +344,16 @@ impl HostSession {
             .send_to(&frame, remote).map_err(|_| "unable to send old-session packet")?;
         if sent != frame.len() { return Err("old-session datagram send was incomplete".into()); }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn remove_udp_socket_for_test(&mut self) { drop(self.udp_socket.take()); }
+
+    #[cfg(test)]
+    fn remove_control_for_test(&mut self) {
+        if let Some(tcp) = self.tcp.take() {
+            let _ = tcp.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -550,6 +577,47 @@ mod tests {
         assert_eq!(fields[1..5], ["1", "1", "1", "1"]);
         assert!(fields[5].parse::<usize>().unwrap() >= 3_840, "synthetic PCM was not drained: {result}");
         assert_eq!(fields[6], "true", "STOP must release the receiver UDP socket");
+
+        stop_disconnect_clears_active_local_session(&classes);
+        start_handoff_failure_closes_session(&classes);
         let _ = fs::remove_dir_all(classes);
+    }
+
+    fn stop_disconnect_clears_active_local_session(classes: &Path) {
+        let (child, stdout, peer) = spawn_endpoint(classes);
+        let mut host = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        host.start().unwrap();
+        host.remove_control_for_test();
+        let stop_error = host.stop().expect_err("disconnected STOP must report the control failure");
+        assert!(stop_error.contains("control channel is closed"), "STOP lost its channel diagnostic: {stop_error}");
+        assert_eq!(host.state(), ReceiverState::Stopped);
+        assert!(host.sender.is_none() && host.udp_socket.is_none() && host.tcp.is_none());
+        assert_eq!(host.keys.audio, [0; 32]);
+        assert_eq!(host.keys.control_tx, [0; 32]);
+        assert_eq!(host.keys.control_rx, [0; 32]);
+        let samples = [1i16, 1];
+        assert!(!host.pcm_queue().push_raw(samples.as_ptr(), 1, 48_000, 2, 0));
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,1,0,0,1,"), "remote session did not clean up: {result}");
+    }
+
+    fn start_handoff_failure_closes_session(classes: &Path) {
+        let (child, stdout, peer) = spawn_endpoint(classes);
+        let mut host = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        host.remove_udp_socket_for_test();
+        assert!(host.start().is_err(), "missing UDP socket must fail local START handoff");
+        assert_eq!(host.state(), ReceiverState::Stopped);
+        assert!(host.sender.is_none() && host.udp_socket.is_none() && host.tcp.is_none());
+        assert_eq!(host.keys.audio, [0; 32]);
+        let samples = [1i16, 1];
+        assert!(!host.pcm_queue().push_raw(samples.as_ptr(), 1, 48_000, 2, 0));
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,1,0,0,1,"), "failed START handoff did not stop remote playback: {result}");
     }
 }

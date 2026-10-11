@@ -214,9 +214,11 @@ PCM16LE payload, AES-GCM tag, and the negotiated P5-A session ID. The sender
 uses the P5-A host-to-receiver audio key. The receiver uses that same derived
 direction key and accepts FORMAT only when sample rate and channel count equal
 the authenticated parameters; later PCM payloads must be aligned to that
-format. Balanced mode packetizes at 20 ms and low-latency mode at 5 ms; the
-receiver passes the same authenticated parameters and mode to its existing
-AudioTrack path. START is the first point where the receiver opens the
+Both balanced and low-latency modes use the existing 5 ms target for UDP
+packetization, bounded further by the 1200-byte datagram limit. Mode selection
+does not claim a transport packetization or performance difference; it passes
+the authenticated mode to the existing AudioTrack path for buffer behavior.
+START is the first point where the receiver opens the
 authenticated UDP session for playback; the host starts its sender only after
 the successful START ACK. STOP closes the sender, clears the queue, destroys
 session keys/context, and does not reconnect.

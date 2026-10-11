@@ -6,7 +6,9 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
+import java.net.SocketTimeoutException;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -25,6 +27,7 @@ final class P5cControlProtocol {
     static final int STOP = 6;
     static final int HEARTBEAT = 7;
     static final int ACK = 127;
+    private static final long FRAME_READ_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(3);
 
     private P5cControlProtocol() {}
 
@@ -49,13 +52,29 @@ final class P5cControlProtocol {
     }
 
     static Frame read(DataInputStream input, byte[] key, int direction, long sessionId) throws IOException {
-        int length;
-        try { length = input.readUnsignedShort(); }
-        catch (EOFException error) { throw error; }
+        int high;
+        try { high = input.read(); }
+        catch (SocketTimeoutException idle) { throw new IdleTimeoutException(); }
+        if (high < 0) throw new EOFException();
+        long frameStartedAt = System.nanoTime();
+        int low = readFrameByte(input, frameStartedAt);
+        ensureFrameDeadline(frameStartedAt);
+        int length = (high << 8) | low;
         if (length < HEADER_BYTES + TAG_BYTES || length > MAX_FRAME_BYTES)
             throw new IOException("invalid P5-C control length");
         byte[] frame = new byte[length];
-        input.readFully(frame);
+        int offset = 0;
+        while (offset < frame.length) {
+            try {
+                int count = input.read(frame, offset, frame.length - offset);
+                if (count < 0) throw new EOFException();
+                if (count > 0) offset += count;
+                ensureFrameDeadline(frameStartedAt);
+            } catch (SocketTimeoutException partialFrameTimeout) {
+                if (System.nanoTime() - frameStartedAt >= FRAME_READ_TIMEOUT_NANOS)
+                    throw new SocketTimeoutException("P5-C control frame read deadline expired");
+            }
+        }
         int payloadLength = ((frame[28] & 0xff) << 8) | (frame[29] & 0xff);
         if (frame[0] != 'A' || frame[1] != 'N' || frame[2] != 'P' || frame[3] != 'C'
                 || frame[4] != 1 || frame[6] != 0 || frame[7] != 0
@@ -69,6 +88,29 @@ final class P5cControlProtocol {
         if (!authenticated) throw new IOException("P5-C control authentication failed");
         return new Frame(frame, frame[5] & 0xff, getLong(frame, 20),
                 Arrays.copyOfRange(frame, HEADER_BYTES, HEADER_BYTES + payloadLength));
+    }
+
+    private static int readFrameByte(DataInputStream input, long frameStartedAt) throws IOException {
+        while (true) {
+            try {
+                int value = input.read();
+                if (value < 0) throw new EOFException();
+                ensureFrameDeadline(frameStartedAt);
+                return value;
+            } catch (SocketTimeoutException partialFrameTimeout) {
+                if (System.nanoTime() - frameStartedAt >= FRAME_READ_TIMEOUT_NANOS)
+                    throw new SocketTimeoutException("P5-C control frame read deadline expired");
+            }
+        }
+    }
+
+    private static void ensureFrameDeadline(long frameStartedAt) throws SocketTimeoutException {
+        if (System.nanoTime() - frameStartedAt >= FRAME_READ_TIMEOUT_NANOS)
+            throw new SocketTimeoutException("P5-C control frame read deadline expired");
+    }
+
+    static final class IdleTimeoutException extends SocketTimeoutException {
+        private static final long serialVersionUID = 1L;
     }
 
     static void write(DataOutputStream output, byte[] frame) throws IOException {

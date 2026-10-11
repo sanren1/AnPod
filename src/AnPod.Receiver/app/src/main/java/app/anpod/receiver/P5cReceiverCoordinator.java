@@ -8,7 +8,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -102,43 +101,41 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         byte[] hello = new byte[85];
         input.readFully(hello);
         PairingProtocol.ReceiverHandshake handshake = PairingProtocol.ReceiverHandshake.acceptHello(binding, hello);
-        byte[] challenge = handshake.challenge();
-        output.write(challenge);
-        output.flush();
-        byte[] finish = new byte[38];
-        input.readFully(finish);
-        PairingProtocol.FinishResult complete = handshake.acceptFinish(finish);
-        output.write(complete.ready);
-        output.flush();
-
-        PairingProtocol.AuthenticatedSession authenticated = complete.session;
-        PairingProtocol.SessionKeys keys = authenticated.takeKeys();
-        long sessionId = authenticated.sessionId;
-        PairingProtocol.AudioParameters parameters = authenticated.parameters;
-        byte[] receiverControlKey = keys.hostToReceiverControl.clone();
-        byte[] receiverAckKey = keys.receiverToHostControl.clone();
-        byte[] receiverAudioKey = keys.hostToReceiverAudio.clone();
-        DatagramSocket audioSocket = null;
-        UdpSessionContext context = null;
-        boolean playbackStarted = false;
-        int state = STATE_AUTHENTICATED;
-        long expectedCommandSequence = 0;
-        long ackSequence = 0;
-        byte[] lastCommand = null;
-        byte[] lastAck = null;
-        boolean modeSelected = false;
-        long lastHeartbeatAt = System.nanoTime();
-        try {
+        try (handshake) {
+            output.write(handshake.challenge());
+            output.flush();
+            byte[] finish = new byte[38];
+            input.readFully(finish);
+            PairingProtocol.FinishResult complete = handshake.acceptFinish(finish);
+            try (PairingProtocol.AuthenticatedSession authenticated = complete.session) {
+                PairingProtocol.SessionKeys keys = authenticated.takeKeys();
+                try (keys) {
+                    long sessionId = authenticated.sessionId;
+                    PairingProtocol.AudioParameters parameters = authenticated.parameters;
+                    DatagramSocket audioSocket = null;
+                    UdpSessionContext context = null;
+                    boolean playbackStarted = false;
+                    int state = STATE_AUTHENTICATED;
+                    long expectedCommandSequence = 0;
+                    long ackSequence = 0;
+                    byte[] lastCommand = null;
+                    byte[] lastAck = null;
+                    boolean modeSelected = false;
+                    long lastHeartbeatAt = System.nanoTime();
+                    try {
+                        // Keep the authenticated session/keys owned even if READY cannot be written.
+                        output.write(complete.ready);
+                        output.flush();
             while (true) {
+                checkHeartbeatDeadline(System.nanoTime(), lastHeartbeatAt);
                 P5cControlProtocol.Frame command;
                 try {
-                    command = P5cControlProtocol.read(input, receiverControlKey,
+                    command = P5cControlProtocol.read(input, keys.hostToReceiverControl,
                             P5cControlProtocol.HOST_TO_RECEIVER, sessionId);
-                } catch (SocketTimeoutException timeout) {
-                    if (System.nanoTime() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_NANOS)
-                        throw new IOException("authenticated heartbeat expired");
+                } catch (P5cControlProtocol.IdleTimeoutException idle) {
                     continue;
                 }
+                checkHeartbeatDeadline(System.nanoTime(), lastHeartbeatAt);
                 if (expectedCommandSequence > 0 && command.sequence == expectedCommandSequence - 1 && lastCommand != null
                         && Arrays.equals(command.raw, lastCommand)) {
                     P5cControlProtocol.write(output, lastAck);
@@ -161,7 +158,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             audioSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0));
                             InetSocketAddress expectedPeer = new InetSocketAddress(socket.getInetAddress(), hostPort);
                             context = new UdpSessionContext(audioSocket, expectedPeer, sessionId,
-                                    receiverAudioKey, parameters);
+                                    keys.hostToReceiverAudio, parameters);
                             responsePort = audioSocket.getLocalPort();
                             state = STATE_TRANSPORT_CONNECTED;
                             break;
@@ -226,7 +223,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
                 byte[] ackPayload = P5cControlProtocol.ackPayload(command.type, command.sequence,
                         result, state, responsePort);
-                byte[] ack = P5cControlProtocol.encode(receiverAckKey,
+                byte[] ack = P5cControlProtocol.encode(keys.receiverToHostControl,
                         P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                         P5cControlProtocol.ACK, ackPayload);
                 P5cControlProtocol.write(output, ack);
@@ -235,15 +232,19 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 expectedCommandSequence++;
                 if (command.type == P5cControlProtocol.STOP && result == RESULT_OK) return;
             }
-        } finally {
-            if (playbackStarted) playback.stop();
-            if (context != null) context.destroy();
-            if (audioSocket != null) audioSocket.close();
-            Arrays.fill(receiverControlKey, (byte) 0);
-            Arrays.fill(receiverAckKey, (byte) 0);
-            Arrays.fill(receiverAudioKey, (byte) 0);
-            keys.close();
+                    } finally {
+                        if (playbackStarted) playback.stop();
+                        if (context != null) context.destroy();
+                        if (audioSocket != null) audioSocket.close();
+                    }
+                }
+            }
         }
+    }
+
+    static void checkHeartbeatDeadline(long now, long lastHeartbeatAt) throws IOException {
+        if (now - lastHeartbeatAt > HEARTBEAT_TIMEOUT_NANOS)
+            throw new IOException("authenticated heartbeat expired");
     }
 
     @Override public void close() {

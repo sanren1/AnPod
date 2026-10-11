@@ -225,7 +225,7 @@ public final class ReceiverService extends Service {
             try (ownedSocket) {
                 InputStream input;
                 if (ownedSocket == null) {
-                    udpQueue = new UdpPcmQueue();
+                    udpQueue = new UdpPcmQueue(session.request.udpContext.parameters);
                     udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
                     UdpReceiver receiverForThread = udpReceiver;
                     networkThread = new Thread(() -> {

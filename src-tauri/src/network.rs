@@ -196,19 +196,18 @@ pub struct UdpSender {
 impl UdpSender {
     pub fn spawn(remote: SocketAddr, queue: Arc<PcmQueue>, material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
-        Self::spawn_inner(remote, queue, socket, material, format, 5)
+        Self::spawn_inner(remote, queue, socket, material, format)
     }
 
     pub(crate) fn spawn_authenticated(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
         material: UdpSessionMaterial, parameters: crate::security::AudioParameters) -> Result<Self, String> {
         parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
         let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
-        let packetization_ms = if parameters.mode == 1 { 5 } else { 20 };
-        Self::spawn_inner(remote, queue, socket, material, format, packetization_ms)
+        Self::spawn_inner(remote, queue, socket, material, format)
     }
 
     fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
-        material: UdpSessionMaterial, format: PcmFormat, packetization_ms: usize) -> Result<Self, String> {
+        material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
         if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) { return Err("P3 UDP prototype only permits 127.0.0.1.".into()); }
         if !matches!(format.channels, 1 | 2) || format.sample_rate == 0
             || socket.local_addr().map_err(|error| error.to_string())?.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
@@ -218,7 +217,7 @@ impl UdpSender {
         let worker_stopping = stopping.clone();
         let worker_queue = queue.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
-            send_loop(socket, remote, worker_queue, worker_stopping, material, format, packetization_ms)
+            send_loop(socket, remote, worker_queue, worker_stopping, material, format)
         }).map_err(|error| error.to_string())?;
         Ok(Self { stopping, queue, worker: Some(worker) })
     }
@@ -240,7 +239,7 @@ impl Drop for UdpSender {
 }
 
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
-    material: UdpSessionMaterial, format: PcmFormat, packetization_ms: usize) -> Result<NetworkStats, String> {
+    material: UdpSessionMaterial, format: PcmFormat) -> Result<NetworkStats, String> {
     let mut encoder = PacketEncoder::new(&material.key, material.session_id, HOST_TO_RECEIVER);
     let format_payload = format.encode().map_err(|error| error.to_string())?;
     send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
@@ -250,8 +249,8 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
     let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
     let sample_bytes_per_frame = format.channels as usize * 2;
     let byte_limited_frames = MAX_PAYLOAD_LEN / sample_bytes_per_frame;
-    let target_packet_frames = (format.sample_rate as usize * packetization_ms / 1000).max(1);
-    let frames_per_packet = target_packet_frames.min(byte_limited_frames);
+    let five_ms_frames = (format.sample_rate as usize / 200).max(1);
+    let frames_per_packet = five_ms_frames.min(byte_limited_frames);
 
     while let Some(info) = queue.pop_wait(&stopping, &mut samples) {
         if info.sample_rate != format.sample_rate || info.channels != format.channels {
