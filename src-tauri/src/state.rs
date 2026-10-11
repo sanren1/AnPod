@@ -86,6 +86,9 @@ pub struct AppSnapshot {
     pub device_name: Option<String>,
     pub devices: Vec<Device>,
     pub selected_serial: Option<String>,
+    pub session_serial: Option<String>,
+    pub session_transport: Option<String>,
+    pub session_android_version: Option<String>,
     pub transport: String,
     pub output: String,
     pub settings: AppSettings,
@@ -129,6 +132,9 @@ struct ViewState {
     device_name: Option<String>,
     devices: Vec<Device>,
     selected_serial: Option<String>,
+    session_serial: Option<String>,
+    session_transport: Option<String>,
+    session_android_version: Option<String>,
     output: String,
     settings: AppSettings,
     status_detail: String,
@@ -176,6 +182,9 @@ impl AppState {
                 device_name: None,
                 devices: Vec::new(),
                 selected_serial: None,
+                session_serial: None,
+                session_transport: None,
+                session_android_version: None,
                 output: "computer".into(),
                 settings: AppSettings::default(),
                 status_detail: "连接 USB 手机或切换到 Wi-Fi 添加手机。".into(),
@@ -254,6 +263,9 @@ impl AppState {
             device_name: view.device_name.clone(),
             devices: view.devices.clone(),
             selected_serial: view.selected_serial.clone(),
+            session_serial: view.session_serial.clone(),
+            session_transport: view.session_transport.clone(),
+            session_android_version: view.session_android_version.clone(),
             transport,
             output: view.output.clone(),
             settings: view.settings.clone(),
@@ -352,9 +364,7 @@ impl AppState {
             let preferred = view.settings.preferred_transport.to_ascii_lowercase();
             let previous = view.selected_serial.clone().or_else(|| view.settings.last_device_id.clone());
             view.devices = devices;
-            let visible: Vec<_> = view.devices.iter().filter(|d| d.transport == preferred || d.transport == "unknown").collect();
-            view.selected_serial = previous.filter(|serial| visible.iter().any(|d| &d.serial == serial))
-                .or_else(|| { let candidates: Vec<_> = visible.iter().filter(|d| d.connectable).collect(); (candidates.len() == 1).then(|| candidates[0].serial.clone()) });
+            view.selected_serial = choose_selected_serial(view.session_serial.clone(), previous, &view.devices, &preferred);
             if view.state == "noDevice" || view.state == "ready" || view.state == "unauthorized" {
                 let selected = view.devices.iter().find(|d| Some(&d.serial) == view.selected_serial.as_ref());
                 view.state = if selected.is_some_and(|d| d.connectable) { "ready".into() }
@@ -504,14 +514,86 @@ impl AppState {
         self.connect_device_mode(app, serial, true).await
     }
 
+    pub async fn connect_device_only(&self, app: &AppHandle, serial: String) -> Result<OperationResult, String> {
+        self.connect_device_mode(app, serial, false).await
+    }
+
+    pub async fn switch_device(&self, app: &AppHandle, serial: String) -> Result<OperationResult, String> {
+        let (generation, token) = self.start_operation();
+        let _guard = self.gate.lock().await;
+        let result = async {
+            if !self.operation_is_current(generation, &token) {
+                return Ok(OperationResult { success: false, message: "设备切换已取消。".into(), snapshot: self.snapshot() });
+            }
+            let old_session = self.session.lock().await.as_ref().map(|session| (session.serial.clone(), session.output == "phone"));
+            if old_session.as_ref().is_some_and(|(old_serial, _)| old_serial == &serial) {
+                return Ok(OperationResult { success: true, message: "当前已连接这部手机。".into(), snapshot: self.snapshot() });
+            }
+            let (old_selected, device_available, cleanup_pending) = {
+                let view = self.view.lock().expect("app view lock");
+                let preferred = view.settings.preferred_transport.to_ascii_lowercase();
+                (
+                    view.selected_serial.clone(),
+                    view.devices.iter().any(|device| device.serial == serial && device.connectable && (device.transport == preferred || device.transport == "unknown")),
+                    view.state == "error" && view.device_name.is_some() && !view.session_active,
+                )
+            };
+            if !device_available { return Err("此手机当前不可连接，请刷新设备列表。".into()); }
+            if old_session.is_some() || cleanup_pending {
+                if let Err(error) = self.teardown(Some(app)).await {
+                    let mut view = self.view.lock().expect("app view lock");
+                    view.selected_serial = old_selected;
+                    view.state = "error".into();
+                    view.message = format!("无法切换手机：{error}");
+                    view.status_detail = "连接清理未完成；请断开连接后重试。".into();
+                    drop(view);
+                    self.emit(app);
+                    return Ok(OperationResult { success: false, message: format!("无法切换手机：{error}"), snapshot: self.snapshot() });
+                }
+            }
+            let play_on_phone = old_session.as_ref().is_some_and(|(_, play)| *play);
+            let switched = match self.connect_locked(app, &serial, generation, &token, play_on_phone).await {
+                Ok(result) => result,
+                Err(error) => OperationResult { success: false, message: error, snapshot: self.snapshot() },
+            };
+            if switched.success || old_session.is_none() { return Ok(switched); }
+            let failure = switched.message;
+            let (old_serial, _) = old_session.expect("old session checked above");
+            if token.is_cancelled() {
+                let mut view = self.view.lock().expect("app view lock");
+                view.selected_serial = old_selected;
+                drop(view);
+                return Ok(OperationResult { success: false, message: "设备切换已取消，连接已停止，电脑声音已恢复。".into(), snapshot: self.snapshot() });
+            }
+            let restored = self.connect_locked(app, &old_serial, generation, &token, play_on_phone).await;
+            Ok(match restored {
+                Ok(restored) if restored.success => OperationResult {
+                    success: false,
+                    message: if token.is_cancelled() { "设备切换已取消，原手机连接与输出已恢复。".into() } else { format!("切换失败，已恢复原手机连接：{failure}") },
+                    snapshot: restored.snapshot,
+                },
+                Ok(restored) => OperationResult {
+                    success: false,
+                    message: format!("切换失败：{failure}；恢复原手机也失败：{}", restored.message),
+                    snapshot: restored.snapshot,
+                },
+                Err(error) => OperationResult { success: false, message: format!("切换失败：{failure}；恢复原手机也失败：{error}"), snapshot: self.snapshot() },
+            })
+        }.await;
+        self.finish_operation(generation);
+        result
+    }
+
     async fn connect_device_mode(&self, app: &AppHandle, serial: String, play_on_phone: bool) -> Result<OperationResult, String> {
         *self.failed_auto_connect.lock().expect("auto-connect failure lock") = None;
         let (generation, token) = self.start_operation();
         let _guard = self.gate.lock().await;
-        let result = if self.operation_is_current(generation, &token) {
-            self.connect_locked(app, &serial, generation, &token, play_on_phone).await
-        } else {
+        let result = if !self.operation_is_current(generation, &token) {
             Ok(OperationResult { success: false, message: "连接已取消。".into(), snapshot: self.snapshot() })
+        } else if self.session.lock().await.is_some() {
+            Ok(OperationResult { success: false, message: "已有手机连接；请从设备卡片确认后切换。".into(), snapshot: self.snapshot() })
+        } else {
+            self.connect_locked(app, &serial, generation, &token, play_on_phone).await
         };
         self.finish_operation(generation);
         result
@@ -569,7 +651,13 @@ impl AppState {
         let port_arg = format!("tcp:{port}");
         checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(&token)).await?;
         *self.session.lock().await = Some(Session { serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())) });
-        self.view.lock().expect("view lock").session_active = true;
+        {
+            let mut view = self.view.lock().expect("view lock");
+            view.session_active = true;
+            view.session_serial = Some(device.serial.clone());
+            view.session_transport = Some(device.transport.clone());
+            view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
+        }
         checked_adb(&self.adb_path, Some(serial), &["push", self.server_path.to_string_lossy().as_ref(), "/data/local/tmp/anpod_server"], Duration::from_secs(15), Some(&token)).await?;
         let mode = self.view.lock().expect("view lock").settings.playback_mode.to_ascii_lowercase();
         let mut command = Command::new(&self.adb_path);
@@ -626,7 +714,7 @@ impl AppState {
         let mut view = self.view.lock().expect("view lock");
         view.state = if cleanup.is_err() { "error".into() } else if view.devices.is_empty() { "noDevice".into() } else { "ready".into() };
         view.message = cleanup.as_ref().err().map_or_else(|| "已断开连接".into(), |error| format!("已断开，但恢复电脑声音失败：{error}"));
-        view.device_name = None;
+        if cleanup.is_ok() { view.device_name = None; }
         view.output = "computer".into();
         view.busy = false;
         view.status_detail = if cleanup.is_ok() { "电脑声音已恢复。选择手机卡片可重新连接。".into() } else { "电脑声音恢复待处理；可从托盘菜单选择“断开连接”重试，或重新启动 AnPod。".into() };
@@ -641,22 +729,23 @@ impl AppState {
 
     pub fn select_device(&self, serial: &str) -> Result<AppSnapshot, String> {
         let mut view = self.view.lock().expect("view lock");
-        if view.busy || self.session.try_lock().map_or(true, |session| session.is_some()) {
+        if view.busy {
             return Err("连接期间无法更换手机。请先断开连接。".into());
+        }
+        if let Some(active) = view.session_serial.as_deref() {
+            if active == serial { drop(view); return Ok(self.snapshot()); }
+            return Err("切换已连接的手机需要先确认中断当前连接。".into());
+        }
+        if view.state == "error" && view.device_name.is_some() {
+            return Err("连接清理待完成；请先断开连接后再选择手机。".into());
         }
         if !view.devices.iter().any(|device| device.serial == serial && (device.transport == view.settings.preferred_transport.to_ascii_lowercase() || device.transport == "unknown")) {
             return Err("所选手机不在当前连接方式的设备列表中。".into());
         }
+        if view.selected_serial.as_deref() == Some(serial) { drop(view); return Ok(self.snapshot()); }
         view.selected_serial = Some(serial.to_owned());
-        Ok(AppSnapshot {
-            state: view.state.clone(), message: view.message.clone(), device_name: view.device_name.clone(),
-            devices: view.devices.clone(), selected_serial: view.selected_serial.clone(),
-            transport: view.settings.preferred_transport.to_ascii_lowercase(), output: view.output.clone(),
-            settings: view.settings.clone(), busy: view.busy,
-            can_disconnect: view.busy || view.session_active || (view.state == "error" && view.device_name.is_some()),
-            can_change_modes: !view.busy && !view.session_active,
-            status_detail: view.status_detail.clone(), version: env!("CARGO_PKG_VERSION").to_owned(),
-        })
+        drop(view);
+        Ok(self.snapshot())
     }
 
     pub async fn reconfigure_session(&self, app: &AppHandle, kind: &str, value: &str) -> Result<AppSnapshot, String> {
@@ -755,7 +844,7 @@ impl AppState {
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
         let mut first_error = self.audio.restore_muted().err();
         if let Some(mut session) = self.session.lock().await.take() {
-            self.view.lock().expect("view lock").session_active = false;
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; }
             if let Some(child) = session.child.as_mut() {
                 let tail = safe_android_tail(&session.output_tail.lock().expect("output log lock").iter().cloned().collect::<Vec<_>>());
                 if !tail.is_empty() { self.log(&format!("Android audio process output before teardown:\n{tail}")); }
@@ -938,6 +1027,7 @@ impl AppState {
 
     fn persist_wireless_endpoint(&self, endpoint: &str) -> Result<(), String> {
         let mut view = self.view.lock().expect("view lock");
+        if view.session_active { return Ok(()); }
         let mut settings = view.settings.clone();
         settings.last_wireless_endpoint = Some(endpoint.to_owned());
         self.save_settings(&settings)?;
@@ -1048,7 +1138,9 @@ impl AppState {
         };
         token_check(token)?;
         self.persist_wireless_endpoint(&connect)?;
-        self.view.lock().expect("view lock").selected_serial = Some(device.serial);
+        let mut view = self.view.lock().expect("view lock");
+        if !view.session_active { view.selected_serial = Some(device.serial); }
+        drop(view);
         Ok(OperationResult { success: true, message: "配对并连接完成。".into(), snapshot: self.snapshot() })
     }
 
@@ -1087,6 +1179,13 @@ fn session_is_lost(device_present: Option<bool>, process_exited: bool, audio_con
 
 fn same_physical_device(left: &Device, right: &Device) -> bool {
     left.physical_id.as_ref().is_some_and(|id| right.physical_id.as_ref() == Some(id))
+}
+
+fn choose_selected_serial(session_serial: Option<String>, previous: Option<String>, devices: &[Device], preferred: &str) -> Option<String> {
+    if session_serial.is_some() { return session_serial; }
+    let visible: Vec<_> = devices.iter().filter(|device| device.transport == preferred || device.transport == "unknown").collect();
+    previous.filter(|serial| visible.iter().any(|device| &device.serial == serial))
+        .or_else(|| { let candidates: Vec<_> = visible.iter().filter(|device| device.connectable).collect(); (candidates.len() == 1).then(|| candidates[0].serial.clone()) })
 }
 
 #[derive(Default)]
@@ -1284,6 +1383,50 @@ mod tests {
         assert!(session_is_lost(None, false, false));
         assert!(!session_is_lost(None, false, true));
         assert!(session_is_lost(Some(false), false, true));
+    }
+
+    #[test]
+    fn active_device_selection_is_idempotent_and_cannot_change_session() {
+        let state = AppState::new();
+        let make = |serial: &str| Device {
+            serial: serial.into(), physical_id: None, transport: "usb".into(), state: "device".into(),
+            manufacturer: "Google".into(), model: "Pixel".into(), android_version: "15".into(), api_level: "35".into(),
+            display_name: serial.into(), status_text: "可连接".into(), connectable: true,
+        };
+        {
+            let mut view = state.view.lock().unwrap();
+            view.devices = vec![make("TEST-A"), make("TEST-B")];
+            view.selected_serial = Some("TEST-A".into());
+            view.session_serial = Some("TEST-A".into());
+            view.session_active = true;
+        }
+
+        assert_eq!(state.select_device("TEST-A").unwrap().selected_serial.as_deref(), Some("TEST-A"));
+        assert!(state.select_device("TEST-B").is_err());
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.session_serial.as_deref(), Some("TEST-A"));
+        assert_eq!(snapshot.selected_serial.as_deref(), Some("TEST-A"));
+        let scanned_devices = [make("TEST-B")];
+        assert_eq!(choose_selected_serial(snapshot.session_serial, snapshot.selected_serial, &scanned_devices, "usb").as_deref(), Some("TEST-A"));
+    }
+
+    #[test]
+    fn adding_wireless_device_does_not_replace_active_session_reconnect_target() {
+        let state = AppState::new();
+        {
+            let mut view = state.view.lock().unwrap();
+            view.session_active = true;
+            view.session_serial = Some("TEST-A".into());
+            view.selected_serial = Some("TEST-A".into());
+            view.settings.last_device_id = Some("TEST-A".into());
+            view.settings.last_wireless_endpoint = Some("192.0.2.1:5555".into());
+        }
+
+        state.persist_wireless_endpoint("192.0.2.2:5555").unwrap();
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.selected_serial.as_deref(), Some("TEST-A"));
+        assert_eq!(snapshot.settings.last_device_id.as_deref(), Some("TEST-A"));
+        assert_eq!(snapshot.settings.last_wireless_endpoint.as_deref(), Some("192.0.2.1:5555"));
     }
 
     #[test]

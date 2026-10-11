@@ -24,6 +24,16 @@ async fn connect_device(app: tauri::AppHandle, state: State<'_, AppState>, seria
 }
 
 #[tauri::command]
+async fn connect_device_only(app: tauri::AppHandle, state: State<'_, AppState>, serial: String) -> Result<OperationResult, String> {
+    state.connect_device_only(&app, serial).await
+}
+
+#[tauri::command]
+async fn switch_device(app: tauri::AppHandle, state: State<'_, AppState>, serial: String) -> Result<OperationResult, String> {
+    state.switch_device(&app, serial).await
+}
+
+#[tauri::command]
 async fn disconnect(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<OperationResult, String> {
     state.disconnect(&app).await
 }
@@ -151,6 +161,8 @@ fn main() {
             refresh_devices,
             select_device,
             connect_device,
+            connect_device_only,
+            switch_device,
             disconnect,
             set_output,
             cancel_operation,

@@ -88,12 +88,16 @@ button:disabled { cursor: default; }
 .transport-switch button:disabled, .mode-switch button:disabled { opacity: 0.62; }
 .device-heading { margin: 5px 0 3px; }
 .device-heading h2 { font-size: 13px; }
-.device-select { width: 100%; min-height: 65px; display: grid; grid-template-columns: 26px minmax(0, 1fr) 20px; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); text-align: left; cursor: pointer; }
-.device-select:hover { border-color: var(--accent); }
+.device-card { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 5px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+.device-card:focus-within, .device-card:hover { border-color: var(--accent); }
+.device-select { min-width: 0; width: 100%; min-height: 68px; display: grid; grid-template-columns: 26px minmax(0, 1fr) 20px; align-items: center; gap: 9px; padding: 9px 0 9px 11px; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
+.device-select:disabled { cursor: default; }
 .device-icon { display: grid; place-items: center; color: var(--muted); }
 .device-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.device-copy strong { overflow: hidden; font-size: 13px; line-height: 18px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.device-copy strong { font-size: 13px; line-height: 18px; font-weight: 650; overflow-wrap: anywhere; }
 .device-copy > span { color: var(--muted); line-height: 17px; overflow-wrap: anywhere; }
+.device-copy .device-live-state { color: var(--positive); font-weight: 600; }
+.device-action { align-self: center; min-width: 82px; margin: 6px 7px 6px 0; padding-inline: 10px; white-space: nowrap; }
 .mode-section { padding: 11px 0 0; border-top: 1px solid var(--line); }
 .mode-row { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .mode-row h2 { font-size: 13px; }
