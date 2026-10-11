@@ -43,9 +43,65 @@ Rust loopback sender creates a fresh random 64-bit session ID and 256-bit key
 with the existing `getrandom` dependency. The non-cloneable session material is
 moved into the sender and kept only in memory; rebuilding a sender requires a
 new material value. The loopback mock receives the same material in memory.
-Persistent device binding, HKDF, USB pairing, and remote key transport remain
-for P5. The fixed cross-language vector below remains deterministic test data
-only and is not used as a session key.
+The fixed cross-language vector below remains deterministic test data only and
+is not used as a session key.
+
+## P5-A offline binding and authenticated session derivation
+
+P5-A defines the offline binding record, mutually authenticated handshake, and
+session key derivation used by the Rust and Android implementations. The
+handshake is currently in-memory only: no USB transport, discovery, listener,
+control path, or product connection flow invokes it.
+
+The 69-byte binding record is `ANPB` (4 bytes), version `1` (1 byte), host ID
+(16 random bytes), receiver ID (16 random bytes), and shared secret (32 random
+bytes). Windows stores only the current-user DPAPI-protected record, with UI
+forbidden and no machine-wide protection. Android stores the record under the
+explicit app-private files directory via `AtomicFile`; the Android file is
+app-private storage, not an encrypted-at-rest record. Both stores are
+create-only, and neither creates its parent directory or overwrites an
+existing binding.
+
+Handshake messages use `ANP5`, version `1`, and a one-byte type. All integers
+are big-endian. The caller exchanges complete messages but transport framing
+is not defined here:
+
+| Message | Type | Length | Body |
+|---|---:|---:|---|
+| Hello | 1 | 85 | host ID (16), receiver ID (16), host nonce (32), session ID (8), audio parameters (7) |
+| Challenge | 2 | 86 | receiver ID (16), receiver nonce (32), receiver proof (32) |
+| Finish | 3 | 38 | host proof (32) |
+| Ready | 4 | 38 | ready proof (32) |
+
+Audio parameters are encoding `1` (PCM16LE, 1 byte), channels (1 byte; 1 or
+2), sample rate (u32, 8,000–192,000), and mode (1 byte; `0` balanced, `1` low
+latency). The 118-byte authenticated transcript is `ANP5`, version `1`, host
+role `1`, receiver role `2`, host ID (16), receiver ID (16), host nonce (32),
+receiver nonce (32), session ID (u64), and the seven audio-parameter bytes.
+Both peers verify the paired identities and role-specific proof before
+advancing. A receiver emits Ready and returns session keys only after
+validating Finish; a host returns keys only after validating Ready. A failed
+message does not establish a session.
+
+Proofs are HMAC-SHA256 over `ASCII(label) || 0x00 || transcript`, keyed by the
+shared secret. Labels are `AnPod P5-A proof receiver v1`,
+`AnPod P5-A proof host v1`, and `AnPod P5-A ready v1`; the ready proof appends
+host proof then receiver proof to the transcript input. Session keys use
+HKDF-SHA256 (RFC 5869): `salt = SHA256(ASCII("AnPod P5-A HKDF-SHA256 salt v1")
+|| 0x00 || transcript)`, IKM is the shared secret, and each 32-byte output uses
+one distinct ASCII `info` label:
+
+* `AnPod P5-A key host-to-receiver audio AES-256-GCM v1`
+* `AnPod P5-A key receiver-to-host audio AES-256-GCM v1`
+* `AnPod P5-A key host-to-receiver control HMAC-SHA256 v1`
+* `AnPod P5-A key receiver-to-host control HMAC-SHA256 v1`
+
+The two audio keys are directional keys for the P3 AES-GCM nonce domains
+`ANPH` and `ANPR`. Control keys are reserved for a future control protocol and
+are not used by P5-A. Session and key objects are one-use/non-cloneable at the
+API boundary and wipe their owned key bytes when closed or dropped. Fixed
+cross-language test values verify the transcript, proofs, ready value, and all
+four derived keys.
 
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3

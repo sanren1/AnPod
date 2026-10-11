@@ -185,6 +185,13 @@
 ## P4-A Android UDP parser / playback adapter（未启用）
 
 - 文件边界：新增 `UdpSessionContext.java`、`UdpPacketDecoder.java`、`UdpPcmQueue.java`、`UdpReceiver.java`；只在 `ReceiverService.java` 增加包内 in-memory 启动/暂停 hook，并复用现有单 `AudioSession`、AudioTrack/focus、状态发布和 `Pcm16FrameStream` 播放路径。`AndroidManifest.xml` 未改：没有新增 exported 组件、网络启动 Intent 或默认 UDP listener。
-- `tests/AnPodUdpVectorCheck.java`：本次合并检查 PASS。固定 JCA 向量经真实 `UdpPacketDecoder` 解包；覆盖实际 loopback recv/close、peer/session 检查、坏 tag 后同序号合法重试、重复和乱序、unsigned 序号/帧索引跨 signed 边界、Format 序号约束、64 序号重放窗拒收、坏帧格式不提交 replay、暂停水位拒绝暂停期间晚到帧、丢弃输入流已取出半包的剩余历史、暂停丢帧与 8 包上限。还覆盖 receiver 创建后、接收线程启动前关闭时释放绑定端口。
+- `tests/AnPodUdpVectorCheck.java`：本次合并检查 PASS。固定 JCA 向量经真实 `UdpPacketDecoder` 解包；覆盖实际 loopback recv/close、peer/session 检查、坏 tag 后同序号合法重试、重复和乱序、unsigned 序号/帧索引跨 signed 边界、非零首个 Format 序号拒绝且不提交 replay、64 序号重放窗拒收、坏帧格式不提交 replay、暂停水位拒绝暂停期间晚到帧、丢弃输入流已取出半包的剩余历史、暂停丢帧与 8 包上限。还覆盖 receiver 创建后、接收线程启动前关闭时释放绑定端口。
 - Android 源码接线：Gradle 8.9 / 指定 JDK 17 / API 35 `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS。编译时 AAPT2 资源处理被跳过；此前资源链接曾报 `Unexpected error during link`，本次未改资源。没有组装 APK。
 - 测试只在本机 JDK loopback socket 上运行；没有 Android AudioTrack 真机播放、Android 网络收包、USB/热点/LAN 联通或时延/性能检查。P4-A adapter 只接受包内提供的已解析 peer/session/key 与指定本地 bind 地址；不处理发现、配对、START/STOP/SET_MODE，不接收任意 IP 作为信任依据，也未由产品流程调用。P4 真机联通和音频表现仍为 NOT_TESTED。
+
+## P5-A 离线绑定与会话密钥（未接入产品流程）
+
+- Rust 定向单测：PASS，4 项覆盖双方握手得到相同方向密钥、每次建立会话均使用新材料、固定 transcript/HKDF 跨语言向量，以及错误 identity/role/proof/跨会话响应拒绝。Windows DPAPI 隔离临时目录存取单测：PASS，1 项覆盖当前用户加密后读取、create-only 不覆盖和损坏密文拒绝；只使用合成测试材料，不读写应用配置。
+- Java 17 `tests/AnPodUdpVectorCheck.java`：PASS。和 Rust 比对固定 transcript、双方 HMAC proof、Ready proof 及四把 HKDF 密钥；覆盖双向握手、参数篡改/身份/角色/错误证明/旧响应拒绝及新会话密钥差异。另覆盖前述 UDP parser/queue/loopback 行为。
+- Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；AAPT2 资源处理被跳过，没有组装 APK。`BindingStore` 的真实 Android app-private `AtomicFile` 行为、Android 真机存储、APK 打包均为 NOT_TESTED。
+- Windows DPAPI 绑定存储及 Android app-private 绑定存储实现均是 create-only；Android 记录由系统 app-private 目录隔离，未加密 at rest。Rust/Android 握手 API 目前仅可由内存调用，不做 USB 传输、设备 provisioning、网络 discovery/listen、控制消息或播放器接线。真实 USB 配对、P4-A 手机网络收包、AudioTrack 播放及远程主机交接均为 NOT_TESTED。

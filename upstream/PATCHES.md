@@ -282,6 +282,23 @@ network thread owns only its UDP socket and short-lived packet handling; the
 existing audio worker owns AudioTrack and focus. No Intent, exported component,
 discovery, pairing, network control message, or product flow starts this path.
 
+### B11. Offline binding and authenticated key derivation *(P5-A, not wired)*
+
+`src-tauri/src/security.rs`, Android `PairingProtocol`, and Android
+`BindingStore` are new AnPod code. They define the versioned 69-byte device
+binding, Windows current-user DPAPI storage, Android app-private `AtomicFile`
+storage, matching in-memory mutual-authentication messages, transcript-bound
+proofs, and four direction/purpose-separated HKDF-SHA256 outputs. This work
+does not include USB transport, discovery, network listeners, provisioning,
+control messages, or product-flow integration. The Android record uses
+app-private storage and is not encrypted at rest.
+
+Rust dependencies added for the protocol are `hkdf 0.12.4` and `hmac 0.12.1`
+(`MIT OR Apache-2.0`); `subtle 2.6.1` (`BSD-3-Clause`) is pulled transitively
+for constant-time HMAC verification. Windows DPAPI uses the existing `windows`
+crate with its Cryptography feature enabled; Android uses the platform
+`AtomicFile` and JCA APIs.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.

@@ -7,6 +7,8 @@ mod receiver;
 mod network;
 #[allow(dead_code)] // P3 protocol is exercised by its focused test receiver for now.
 mod protocol;
+#[allow(dead_code)] // P5-A offline binding/handshake is not wired into product flows yet.
+mod security;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};
