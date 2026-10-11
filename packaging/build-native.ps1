@@ -65,12 +65,12 @@ function Build-WithCMake {
 
     $cmake = (Get-Command 'cmake').Source
 
-    & $cmake -S $sourceDir -B $buildDir -A x64
+    & $cmake -S $sourceDir -B $buildDir -A x64 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed with exit code $LASTEXITCODE."
     }
 
-    & $cmake --build $buildDir --config $Configuration
+    & $cmake --build $buildDir --config $Configuration | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "CMake build failed with exit code $LASTEXITCODE."
     }
