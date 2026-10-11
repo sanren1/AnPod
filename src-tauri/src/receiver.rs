@@ -16,7 +16,16 @@ pub struct ReceiverStatus {
     pub service_active: bool,
     pub foreground: bool,
     pub healthy: bool,
+    pub audio_active: bool,
+    pub error: Option<String>,
     pub message: String,
+}
+
+impl ReceiverStatus {
+    pub fn monitoring_error(&self) -> Option<String> {
+        if self.healthy && self.service_active && self.error.is_none() { None }
+        else { Some(self.error.clone().unwrap_or_else(|| self.message.clone())) }
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,6 +75,7 @@ async fn status_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_pa
         return Ok(ReceiverStatus {
             installed: false, version_name: None, version_code: None,
             service_active: false, foreground: false, healthy: false,
+            audio_active: false, error: None,
             message: "Receiver 尚未安装。".into(),
         });
     }
@@ -319,6 +329,8 @@ fn status_from_health(health: Health) -> ReceiverStatus {
         service_active: health.service_active,
         foreground: health.foreground,
         healthy: health.healthy,
+        audio_active: health.audio_active,
+        error: (!health.error.is_empty()).then_some(health.error),
         message,
     }
 }
@@ -616,6 +628,42 @@ mod tests {
         assert!(started.message.contains("前台运行"));
         let health = parse_health("Row: 0 applicationId=app.anpod.receiver, versionName=0.1.0-p1, versionCode=1, serviceActive=true, foreground=true, healthy=true, audioActive=false, startedAtElapsedMs=1, error=").unwrap();
         assert!(!status_from_health(health).message.contains("正在前台播放"));
+    }
+
+    #[tokio::test]
+    async fn fake_adb_health_distinguishes_waiting_playback_and_receiver_failure() {
+        let files = ArtifactFiles::new();
+        let adb = FakeAdb::new(true, files.digest.clone());
+        let cancel = CancellationToken::new();
+        let ready = start_with_action(&adb, SERIAL, &files.apk, &files.metadata, &cancel,
+            Some(("receiver-test", "test-code", "balanced"))).await.unwrap();
+        assert!(!ready.audio_active);
+        assert!(ready.monitoring_error().is_none());
+
+        adb.0.lock().unwrap().audio_active = true;
+        let playing = health_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel).await.unwrap();
+        assert!(playing.audio_active);
+        assert!(playing.monitoring_error().is_none());
+
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.audio_active = false;
+            state.error = "AudioFocusLost".into();
+            state.healthy = false;
+        }
+        let failed = health_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel).await.unwrap();
+        assert_eq!(failed.monitoring_error().as_deref(), Some("AudioFocusLost"));
+
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.active = false;
+            state.foreground = false;
+            state.healthy = false;
+            state.error.clear();
+        }
+        let stopped = health_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel).await.unwrap();
+        assert!(!stopped.service_active);
+        assert!(stopped.monitoring_error().is_some());
     }
 
     #[tokio::test]

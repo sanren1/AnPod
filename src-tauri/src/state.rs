@@ -353,22 +353,16 @@ impl AppState {
             self.clear_audio_bitrate_if_session(Some(&session_id), app).await;
             return;
         };
-        let current_session_id = self.session.lock().await.as_ref().map(|session| session.reverse.clone());
-        if current_session_id.as_deref() != Some(session_id.as_str()) { return; }
-
         let now = Instant::now();
-        let bitrate = {
-            let mut previous = self.pcm_rate_sample.lock().expect("PCM rate sample lock");
-            let rate = calculate_pcm_bitrate(previous.as_ref().map(|(id, count, at)| (id.as_str(), *count, *at)),
-                &session_id, bytes, now);
-            *previous = Some((session_id, bytes, now));
-            rate
-        };
+        let session = self.session.lock().await;
+        let Some(current) = session.as_ref().filter(|session| session.reverse == session_id) else { return; };
         let changed = {
+            let mut previous = self.pcm_rate_sample.lock().expect("PCM rate sample lock");
             let mut view = self.view.lock().expect("app view lock");
-            if view.audio_bitrate_bps == Some(bitrate) { false }
-            else { view.audio_bitrate_bps = Some(bitrate); true }
+            commit_pcm_bitrate_sample(Some(&current.reverse), &session_id, &mut previous,
+                &mut view.audio_bitrate_bps, bytes, now)
         };
+        drop(session);
         if changed { self.emit(app); }
     }
 
@@ -387,6 +381,24 @@ impl AppState {
 
     fn emit(&self, app: &AppHandle) {
         let _ = app.emit("anpod://snapshot", self.snapshot());
+    }
+
+    fn update_receiver_playback_status(&self, phone_output: bool, audio_active: bool) -> bool {
+        if !phone_output { return false; }
+        let mut view = self.view.lock().expect("app view lock");
+        let (state, message, detail) = if audio_active {
+            ("streaming", "正在手机播放", "Receiver 已确认 AudioTrack 正在播放。")
+        } else {
+            ("phoneReady", "手机接收已就绪", "手机接收端已就绪；电脑有声音发送后将开始播放。")
+        };
+        if view.state != state || view.message != message || view.status_detail != detail {
+            view.state = state.into();
+            view.message = message.into();
+            view.status_detail = detail.into();
+            true
+        } else {
+            false
+        }
     }
 
     fn set_state(&self, app: &AppHandle, state: &str, message: impl Into<String>, device: Option<String>) {
@@ -500,15 +512,30 @@ impl AppState {
         }
         let session = self.session.lock().await.as_mut().map(|session| {
             let exited = session.child.as_mut().and_then(|child| child.try_wait().ok().flatten()).is_some();
-            (session.serial.clone(), session.transport.clone(), session.output.clone(), session.output_tail.clone(), session.reverse.clone(), exited)
+            (session.serial.clone(), session.transport.clone(), session.output.clone(), session.output_tail.clone(), session.reverse.clone(), session.installed_receiver, exited)
         });
-        if let Some((serial, transport, output, tail, session_key, exited)) = session {
+        if let Some((serial, transport, output, tail, session_key, installed_receiver, exited)) = session {
             let device_present = snapshot.as_ref().map(|snapshot| snapshot.devices.iter().any(|device| device.serial == serial && device.state == "device"));
             let connected = self.audio.is_connected().unwrap_or(false);
             let capture_error = self.audio.take_last_error().ok().flatten();
-            if session_is_lost(device_present, exited, connected) || capture_error.is_some() {
+            let receiver_failure = if installed_receiver && device_present != Some(false) {
+                match receiver::health(&self.adb_path, &serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, &CancellationToken::new()).await {
+                    Ok(status) => match status.monitoring_error() {
+                        Some(error) => Some(error),
+                        None => {
+                            if self.update_receiver_playback_status(output == "phone", status.audio_active) { self.emit(app); }
+                            None
+                        }
+                    },
+                    Err(error) => Some(error),
+                }
+            } else { None };
+            if session_is_lost(device_present, exited, connected) || capture_error.is_some() || receiver_failure.is_some() {
                 let detail = if let Some(error) = capture_error {
                     error
+                } else if let Some(error) = receiver_failure {
+                    format!("Receiver 健康检查失败：{error}")
                 } else if exited {
                     let output = safe_android_tail(&tail.lock().expect("output log lock").iter().cloned().collect::<Vec<_>>());
                     if output.is_empty() { "手机端音频服务已停止".to_string() } else { format!("手机端音频服务已停止：\n{output}") }
@@ -1336,6 +1363,16 @@ fn session_is_lost(device_present: Option<bool>, process_exited: bool, audio_con
     process_exited || !audio_connected || device_present == Some(false)
 }
 
+fn commit_pcm_bitrate_sample(current_session: Option<&str>, expected_session: &str,
+    previous: &mut Option<(String, u64, Instant)>, current_rate: &mut Option<u64>, bytes: u64, now: Instant) -> bool {
+    if current_session != Some(expected_session) { return false; }
+    let bitrate = calculate_pcm_bitrate(previous.as_ref().map(|(id, count, at)| (id.as_str(), *count, *at)),
+        expected_session, bytes, now);
+    *previous = Some((expected_session.to_owned(), bytes, now));
+    if *current_rate == Some(bitrate) { false }
+    else { *current_rate = Some(bitrate); true }
+}
+
 fn calculate_pcm_bitrate(previous: Option<(&str, u64, Instant)>, session_id: &str, bytes: u64, now: Instant) -> u64 {
     let Some((previous_session, previous_bytes, previous_at)) = previous else { return 0; };
     if previous_session != session_id { return 0; }
@@ -1508,6 +1545,17 @@ mod tests {
         assert_eq!(calculate_pcm_bitrate(Some(("session-a", 0, started)), "session-a", 192_000, started + Duration::from_secs(1)), 1_536_000);
         assert_eq!(calculate_pcm_bitrate(Some(("session-a", 900_000, started)), "session-b", 192_000, started + Duration::from_secs(1)), 0);
         assert_eq!(calculate_pcm_bitrate(Some(("session-a", 192_000, started)), "session-a", 192_000, started + Duration::from_secs(1)), 0);
+    }
+
+    #[test]
+    fn stale_pcm_sample_is_rejected_after_session_changes() {
+        let started = Instant::now();
+        let mut previous = Some(("session-b".into(), 10, started));
+        let mut current_rate = None;
+        assert!(!commit_pcm_bitrate_sample(Some("session-b"), "session-a", &mut previous,
+            &mut current_rate, 192_010, started + Duration::from_secs(1)));
+        assert_eq!(previous.as_ref().map(|(id, count, _)| (id.as_str(), *count)), Some(("session-b", 10)));
+        assert_eq!(current_rate, None);
     }
 
     #[test]
