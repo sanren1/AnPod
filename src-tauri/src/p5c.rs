@@ -1067,7 +1067,7 @@ mod tests {
             sample_rate: 48_000, channels: 2, mode: 0,
         }).is_err());
         let result = finish_endpoint(child, stdout);
-        assert!(result.starts_with("session_failed,0,0,0,1,"), "unexpected rejected-handshake result: {result}");
+        assert!(result.starts_with("session_failed,0,0,0,0,"), "unauthenticated handshake must not stop playback: {result}");
     }
 
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
             else { host.send_old_session_for_test().unwrap(); }
             drop(host);
             let result = finish_endpoint(child, stdout);
-            assert!(result.starts_with("session_failed,0,0,0,1,"), "unexpected invalid-control result: {result}");
+            assert!(result.starts_with("session_failed,0,0,0,0,"), "authenticated but unstarted session must not stop playback: {result}");
         }
 
         let mut interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
@@ -1108,6 +1108,21 @@ mod tests {
             Duration::from_millis(120), &CancellationToken::new());
         unrelated.join().unwrap();
         assert!(no_candidates.is_err(), "a response with an unrelated probe token is not a candidate");
+
+        let flood_responder = UdpSocket::bind((Ipv4Addr::LOCALHOST, crate::discovery::DISCOVERY_PORT)).unwrap();
+        let flood = thread::spawn(move || {
+            let mut probe = [0; 128];
+            let (length, target) = flood_responder.recv_from(&mut probe).unwrap();
+            assert_eq!(length, 26);
+            let token: [u8; 16] = probe[8..24].try_into().unwrap();
+            for port in 10_000..10_032 {
+                flood_responder.send_to(&crate::discovery::candidate_for_test(token, port), target).unwrap();
+            }
+        });
+        let bounded_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST],
+            Duration::from_millis(250), &CancellationToken::new()).unwrap();
+        flood.join().unwrap();
+        assert_eq!(bounded_candidates.len(), 16, "discovery caps candidates and stops accepting a response flood");
 
         let discovery_cancel = CancellationToken::new();
         let cancel_token = discovery_cancel.clone();

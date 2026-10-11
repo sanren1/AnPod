@@ -13,7 +13,7 @@ import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/** Explicitly started, one-session localhost P5-C endpoint. */
+/** Explicitly started, one-session localhost or selected-interface P5-C endpoint. */
 final class P5cReceiverCoordinator implements AutoCloseable {
     static final int STATE_AUTHENTICATED = 0;
     static final int STATE_TRANSPORT_CONNECTED = 1;
@@ -39,6 +39,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private final PairingProtocol.BindingMaterial binding;
     private final PlaybackEndpoint playback;
     private final boolean loopbackOnly;
+    private final int discoveryPrefixLength;
     private final CountDownLatch finished = new CountDownLatch(1);
     private volatile Socket activeSocket;
     private volatile Thread worker;
@@ -47,25 +48,31 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopback(PairingProtocol.BindingMaterial existingBinding,
             PlaybackEndpoint playback) throws IOException {
-        return open(existingBinding, playback, InetAddress.getByName("127.0.0.1"), true);
+        return open(existingBinding, playback, InetAddress.getByName("127.0.0.1"), true, 32);
     }
 
     /** Explicit internal LAN entry; it never starts discovery or playback by itself. */
     static P5cReceiverCoordinator openOnInterface(PairingProtocol.BindingMaterial existingBinding,
-            PlaybackEndpoint playback, InetAddress localAddress) throws IOException {
-        if (!(localAddress instanceof Inet4Address)
-                || (!localAddress.isLoopbackAddress() && !localAddress.isSiteLocalAddress()))
-            throw new IOException("P5-C requires an explicit private IPv4 interface address");
-        return open(existingBinding, playback, localAddress, false);
+            PlaybackEndpoint playback, InetAddress localAddress, int prefixLength) throws IOException {
+        if (!validInterfaceAddress(localAddress, prefixLength))
+            throw new IOException("P5-C requires an explicit private IPv4 interface address and prefix");
+        return open(existingBinding, playback, localAddress, false, prefixLength);
+    }
+
+    static boolean validInterfaceAddress(InetAddress localAddress, int prefixLength) {
+        return localAddress instanceof Inet4Address
+                && (localAddress.isLoopbackAddress() || localAddress.isSiteLocalAddress())
+                && prefixLength >= 1 && prefixLength <= 32
+                && (!localAddress.isLoopbackAddress() || prefixLength == 32);
     }
 
     private static P5cReceiverCoordinator open(PairingProtocol.BindingMaterial existingBinding,
-            PlaybackEndpoint playback, InetAddress localAddress, boolean loopbackOnly) throws IOException {
+            PlaybackEndpoint playback, InetAddress localAddress, boolean loopbackOnly, int prefixLength) throws IOException {
         ServerSocket listener = new ServerSocket();
         try {
             listener.setReuseAddress(false);
             listener.bind(new InetSocketAddress(localAddress, 0));
-            return new P5cReceiverCoordinator(listener, existingBinding, playback, loopbackOnly);
+            return new P5cReceiverCoordinator(listener, existingBinding, playback, loopbackOnly, prefixLength);
         } catch (IOException | RuntimeException error) {
             listener.close();
             throw error;
@@ -73,12 +80,13 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     private P5cReceiverCoordinator(ServerSocket listener, PairingProtocol.BindingMaterial binding,
-            PlaybackEndpoint playback, boolean loopbackOnly) {
+            PlaybackEndpoint playback, boolean loopbackOnly, int discoveryPrefixLength) {
         if (binding == null || playback == null) throw new IllegalArgumentException("P5-C inputs are required");
         this.listener = listener;
         this.binding = binding;
         this.playback = playback;
         this.loopbackOnly = loopbackOnly;
+        this.discoveryPrefixLength = discoveryPrefixLength;
     }
 
     int port() { return listener.getLocalPort(); }
@@ -93,7 +101,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     synchronized void startDiscovery() throws IOException {
         if (worker == null) throw new IllegalStateException("P5-C control listener must be started first");
         if (discovery != null) throw new IllegalStateException("P5-C discovery already started");
-        P5cDiscovery service = P5cDiscovery.open(listener.getInetAddress(), listener.getLocalPort());
+        P5cDiscovery service = P5cDiscovery.open(listener.getInetAddress(), discoveryPrefixLength, listener.getLocalPort());
         service.start();
         discovery = service;
     }
@@ -113,7 +121,6 @@ final class P5cReceiverCoordinator implements AutoCloseable {
             serveSession(socket);
         } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
             failure = "session_failed";
-            playback.stop();
         } finally {
             stopDiscovery();
             activeSocket = null;
@@ -181,12 +188,19 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                 throw new IOException("invalid BIND state");
                             int hostPort = P5cControlProtocol.getUnsignedShort(command.payload, 0);
                             if (hostPort == 0) throw new IOException("invalid BIND port");
-                            audioSocket = new DatagramSocket(null);
-                            audioSocket.setReuseAddress(false);
-                            audioSocket.bind(new InetSocketAddress(listener.getInetAddress(), 0));
-                            InetSocketAddress expectedPeer = new InetSocketAddress(socket.getInetAddress(), hostPort);
-                            context = new UdpSessionContext(audioSocket, expectedPeer, sessionId,
-                                    keys.hostToReceiverAudio, parameters);
+                            DatagramSocket candidateSocket = new DatagramSocket(null);
+                            try {
+                                candidateSocket.setReuseAddress(false);
+                                candidateSocket.bind(new InetSocketAddress(listener.getInetAddress(), 0));
+                                InetSocketAddress expectedPeer = new InetSocketAddress(socket.getInetAddress(), hostPort);
+                                UdpSessionContext candidateContext = new UdpSessionContext(candidateSocket, expectedPeer, sessionId,
+                                        keys.hostToReceiverAudio, parameters);
+                                audioSocket = candidateSocket;
+                                context = candidateContext;
+                            } catch (IOException | RuntimeException error) {
+                                candidateSocket.close();
+                                throw error;
+                            }
                             responsePort = audioSocket.getLocalPort();
                             state = STATE_TRANSPORT_CONNECTED;
                             break;
@@ -285,7 +299,6 @@ final class P5cReceiverCoordinator implements AutoCloseable {
             try { thread.join(2_000); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
         }
         binding.close();
-        playback.stop();
     }
 
     private synchronized void stopDiscovery() {

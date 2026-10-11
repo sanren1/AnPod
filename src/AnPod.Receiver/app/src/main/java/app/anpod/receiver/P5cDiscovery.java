@@ -18,25 +18,42 @@ final class P5cDiscovery implements AutoCloseable {
     private static final int FRAME_BYTES = 26;
 
     private final DatagramSocket socket;
+    private final DatagramSocket responseSocket;
+    private final InetAddress localAddress;
+    private final int prefixLength;
     private final int controlPort;
     private volatile Thread worker;
 
-    static P5cDiscovery open(InetAddress localAddress, int controlPort) throws IOException {
+    static P5cDiscovery open(InetAddress localAddress, int prefixLength, int controlPort) throws IOException {
+        if (!(localAddress instanceof Inet4Address) || prefixLength < 1 || prefixLength > 32
+                || (!localAddress.isLoopbackAddress() && !localAddress.isSiteLocalAddress()))
+            throw new IOException("Discovery requires an explicit private IPv4 address and prefix");
+        if (localAddress.isLoopbackAddress() && prefixLength != 32)
+            throw new IOException("Loopback discovery test interface must use prefix length 32");
         DatagramSocket socket = new DatagramSocket(null);
+        DatagramSocket responseSocket = null;
         try {
+            responseSocket = new DatagramSocket(null);
             socket.setReuseAddress(false);
             socket.setBroadcast(true);
             socket.setSoTimeout(250);
-            socket.bind(new InetSocketAddress(localAddress, PORT));
-            return new P5cDiscovery(socket, controlPort);
+            socket.bind(new InetSocketAddress(PORT));
+            responseSocket.setReuseAddress(false);
+            responseSocket.bind(new InetSocketAddress(localAddress, 0));
+            return new P5cDiscovery(socket, responseSocket, localAddress, prefixLength, controlPort);
         } catch (IOException | RuntimeException error) {
             socket.close();
+            if (responseSocket != null) responseSocket.close();
             throw error;
         }
     }
 
-    private P5cDiscovery(DatagramSocket socket, int controlPort) {
+    private P5cDiscovery(DatagramSocket socket, DatagramSocket responseSocket,
+            InetAddress localAddress, int prefixLength, int controlPort) {
         this.socket = socket;
+        this.responseSocket = responseSocket;
+        this.localAddress = localAddress;
+        this.prefixLength = prefixLength;
         this.controlPort = controlPort;
     }
 
@@ -55,16 +72,31 @@ final class P5cDiscovery implements AutoCloseable {
                 socket.receive(request);
                 InetAddress source = request.getAddress();
                 if (!(source instanceof Inet4Address)
-                        || (!source.isLoopbackAddress() && !source.isSiteLocalAddress())) continue;
+                        || !isInSelectedPrefix(localAddress, prefixLength, source)) continue;
                 if (!isProbe(request.getData(), request.getOffset(), request.getLength())) continue;
                 byte[] response = response(request.getData(), request.getOffset(), controlPort);
-                socket.send(new DatagramPacket(response, response.length, request.getAddress(), request.getPort()));
+                responseSocket.send(new DatagramPacket(response, response.length, request.getAddress(), request.getPort()));
             } catch (SocketTimeoutException ignored) {
                 // Recheck closure without busy polling.
             } catch (IOException error) {
                 if (!socket.isClosed()) close();
             }
         }
+    }
+
+    static boolean isInSelectedPrefix(InetAddress localAddress, int prefixLength, InetAddress source) {
+        if (!(localAddress instanceof Inet4Address) || !(source instanceof Inet4Address)
+                || prefixLength < 1 || prefixLength > 32) return false;
+        byte[] local = localAddress.getAddress();
+        byte[] remote = source.getAddress();
+        int fullBytes = prefixLength / 8;
+        int remainingBits = prefixLength % 8;
+        for (int index = 0; index < fullBytes; index++) {
+            if (local[index] != remote[index]) return false;
+        }
+        if (remainingBits == 0) return true;
+        int mask = 0xff << (8 - remainingBits);
+        return (local[fullBytes] & mask) == (remote[fullBytes] & mask);
     }
 
     private static boolean isProbe(byte[] packet, int offset, int length) {
@@ -89,6 +121,7 @@ final class P5cDiscovery implements AutoCloseable {
 
     @Override public void close() {
         socket.close();
+        responseSocket.close();
         Thread thread = worker;
         if (thread != null && thread != Thread.currentThread()) {
             try { thread.join(1_000); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }

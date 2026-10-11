@@ -26,7 +26,7 @@ public final class P5cLoopbackEndpoint {
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
         FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"));
         P5cReceiverCoordinator opened = Arrays.asList(args).contains("--discovery")
-                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"))
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : P5cReceiverCoordinator.openLoopback(binding, playback);
         try (P5cReceiverCoordinator endpoint = opened) {
             endpoint.start();
@@ -41,6 +41,7 @@ public final class P5cLoopbackEndpoint {
                 endpoint.close();
             }
             if (!endpoint.await(15, TimeUnit.SECONDS)) throw new IOException("P5-C test endpoint timed out");
+            endpoint.close();
             System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
                     + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get());
@@ -49,6 +50,24 @@ public final class P5cLoopbackEndpoint {
     }
 
     private static void verifyInvalidDiscoveryDoesNotStartPlayback(FakePlayback playback) throws IOException {
+        try {
+            P5cReceiverCoordinator.openOnInterface(null, playback, InetAddress.getByName("127.0.0.1"), 24);
+            throw new AssertionError("loopback test interface accepted a mismatched prefix");
+        } catch (IOException expected) { }
+        try {
+            if (!P5cReceiverCoordinator.validInterfaceAddress(InetAddress.getByName("192.168.41.12"), 24))
+                throw new AssertionError("synthetic private IPv4 address/prefix was rejected");
+        } catch (IOException unexpected) {
+            throw new AssertionError("synthetic interface contract check failed", unexpected);
+        }
+        if (!UdpSessionContext.isPrivateIpv4(InetAddress.getByName("192.168.41.12"))
+                || UdpSessionContext.isPrivateIpv4(InetAddress.getByName("203.0.113.8")))
+            throw new AssertionError("authenticated UDP context address contract changed");
+        if (!P5cDiscovery.isInSelectedPrefix(InetAddress.getByName("192.168.41.12"), 24,
+                InetAddress.getByName("192.168.41.200"))
+                || P5cDiscovery.isInSelectedPrefix(InetAddress.getByName("192.168.41.12"), 24,
+                        InetAddress.getByName("192.168.42.1")))
+            throw new AssertionError("discovery accepted a source outside the selected prefix");
         try (DatagramSocket probe = new DatagramSocket(0, InetAddress.getByName("127.0.0.1"))) {
             probe.setSoTimeout(100);
             byte[] malformed = new byte[26];
@@ -59,7 +78,8 @@ public final class P5cLoopbackEndpoint {
                 throw new AssertionError("malformed discovery probe received a response");
             } catch (SocketTimeoutException expected) { }
         }
-        if (playback.starts.get() != 0) throw new AssertionError("discovery started playback before authentication");
+        if (playback.starts.get() != 0 || playback.stops.get() != 0)
+            throw new AssertionError("discovery or malformed traffic changed playback before authentication");
     }
 
     private static void verifyFragmentedControlFrame() throws Exception {
@@ -161,8 +181,8 @@ public final class P5cLoopbackEndpoint {
         @Override public boolean streaming() { return streaming.get(); }
 
         @Override public void stop() {
-            if (!stopped.compareAndSet(false, true)) return;
             stops.incrementAndGet();
+            if (!stopped.compareAndSet(false, true)) return;
             UdpReceiver currentReceiver = receiver;
             if (currentReceiver != null) currentReceiver.close();
             UdpSessionContext currentContext = context;

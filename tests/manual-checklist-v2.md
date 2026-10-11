@@ -180,7 +180,7 @@
 - Java 17 `tests/AnPodUdpVectorCheck.java`：PASS；JCA 输出与 Rust 测试的完整 AES-256-GCM 数据报相同。
 - Native MSVC/CMake x64 Release 隔离构建：PASS，输出 `artifacts/p3-native/audio_capture.dll`（23,552 bytes）；`dumpbin /exports` 确认原有导出保留并新增 PCM callback 导出。编译器报告 `audio_capture.h` 的 C4819 代码页警告，DLL 构建成功。
 - Rust loopback sender 每次消费由 `getrandom` 生成的独立 session ID/key；mock 只在内存中接收同一材料。固定 JCA 向量仍仅作测试，不作为会话密钥。设备绑定、HKDF、USB 配对和远程密钥传输留到 P5。
-- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。Windows UDP sender 只允许发往 `127.0.0.1`；后续 P4-A 添加的 Android adapter 仍未接入产品启动/发现/配对流程。
+- P3 不构建 Android APK，不启用默认连接路径，不发送真实系统音频，不连接或操作手机；未做真机、网络性能或单向时延测试。P3 Windows UDP mock sender 只允许发往 `127.0.0.1`；后续 P4-A Android adapter 仍未接入产品启动/发现/配对流程。P5 authenticated sender 的显式 private IPv4 路径见下节。
 
 ## P4-A Android UDP parser / playback adapter（未启用）
 
@@ -220,7 +220,7 @@
 
 ## P4-B / P5-E explicit IPv4 and discovery backend
 
-- Rust 合并入口 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1，8.23 秒。加入合成 adapter address/prefix/gateway 转换检查、无关 token 响应拒绝、畸形探测被忽略、发现取消在 250 ms 内结束、Java Receiver 对显式 localhost discovery 返回候选、候选经真实 P5-A/BIND/START 后到达 fake sink 的 synthetic PCM，以及 explicit-interface owner 重建/STOP 清理。所有 socket 测试目标均为 127.0.0.1；未执行真实接口枚举、广播到 LAN、网关探测或热点传输。
+- Rust 合并入口 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1，8.24 秒。覆盖合成 private IPv4 地址/前缀契约、selected-prefix 内外来源校验、发现伪造候选上限（16 项后停止接收）、无关 token 拒绝、畸形探测忽略、取消，以及候选经 P5-A/BIND/START 后 synthetic PCM 到 fake sink。错误 HELLO、错误绑定身份/密钥和认证后但未 START 的错误控制帧均不调用 playback.stop；成功 START 后合法 STOP 只调用一次。其余 explicit-interface owner 重建/STOP 清理仍受覆盖。所有 socket 目标均为 127.0.0.1；未执行真实接口枚举、LAN 广播、网关探测或热点传输。
 - Windows 接口枚举使用现有 `windows` crate 的 IP Helper API；只在运行时返回当前启用的私有 IPv4 地址、前缀、gateway、接口索引/名称，未写入日志、协议或持久配置。发现最多对调用方选定接口的 directed broadcast 和第一项已报告 gateway 各发一个 26-byte 探测；响应仍是候选，后续 P5-A 互认证才允许 BIND/START。手动 literal IPv4 路径不调用 discovery。
-- 本地 Cargo 检查内的 JDK 17 `javac`：PASS，编译 P5 discovery/coordinator 与 UDP/认证源文件。因机器未设置 `ANDROID_HOME`/`ANDROID_SDK_ROOT`、项目也无 `local.properties`，`:app:compileDebugJavaWithJavac -x :app:processDebugResources` 无法评估 `app/build.gradle`（SDK location not found）；没有组装 APK。未改 Tauri UI/IPC、设置持久化、默认 listener 或启动流。
-- P4/P5 本地代码尚未在 Android runtime、真实 LAN/热点、ADB、真实网卡切换、WASAPI、AudioTrack 或可听输出上验证；未自动启动热点、改防火墙或连接真实网络。发现失败只报告未响应/端点不可达或可能需要 USB/bootstrap，不推断 ForceStop/防火墙原因。上述仍为 NOT_TESTED，P4/P5 整体未完成。
+- Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources --offline --no-daemon`：PASS，JDK 17、Android SDK 35 显式环境变量，9 秒，3 个任务（compileDebugJavaWithJavac 实际执行）；未执行资源处理或组装 APK。先前未配置 SDK 环境时的失败不是外部阻塞。本轮未改 Tauri UI/IPC、设置持久化、默认 listener 或启动流。
+- P4/P5 本地代码尚未在 Android runtime、真实 LAN/热点广播、ADB、真实网卡切换、WASAPI、AudioTrack 或可听输出上验证；未自动启动热点、改防火墙或连接真实网络。发现失败只报告未响应/端点不可达或可能需要 USB/bootstrap，不推断 ForceStop/防火墙原因。上述仍为 NOT_TESTED，P4/P5 整体未完成。

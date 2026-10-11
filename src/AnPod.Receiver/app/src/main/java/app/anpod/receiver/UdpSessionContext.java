@@ -2,6 +2,8 @@ package app.anpod.receiver;
 
 import java.net.InetSocketAddress;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.util.Arrays;
 
 /** In-memory input from a future authenticated session coordinator; never built from a discovery packet. */
@@ -33,8 +35,10 @@ final class UdpSessionContext {
 
     UdpSessionContext(DatagramSocket socket, InetSocketAddress expectedPeer,
             long sessionId, byte[] key, PairingProtocol.AudioParameters parameters) {
-        if (socket == null || socket.isClosed() || !(socket.getLocalSocketAddress() instanceof InetSocketAddress)
-                || expectedPeer == null || expectedPeer.getAddress() == null || !expectedPeer.getAddress().isLoopbackAddress()
+        if (socket == null || socket.isClosed() || !socket.isBound()
+                || !(socket.getLocalSocketAddress() instanceof InetSocketAddress)
+                || !isPrivateIpv4(socket.getLocalAddress())
+                || expectedPeer == null || !isPrivateIpv4(expectedPeer.getAddress())
                 || expectedPeer.getPort() < 1 || expectedPeer.getPort() > 65535
                 || key == null || key.length != 32 || parameters == null)
             throw new IllegalArgumentException("Invalid authenticated UDP session context");
@@ -45,6 +49,11 @@ final class UdpSessionContext {
         this.key = key.clone();
         this.parameters = parameters;
         this.playbackMode = parameters.mode == 1 ? "lowlatency" : "balanced";
+    }
+
+    static boolean isPrivateIpv4(InetAddress address) {
+        return address instanceof Inet4Address
+                && (address.isLoopbackAddress() || address.isSiteLocalAddress());
     }
 
     synchronized byte[] copyKey() {

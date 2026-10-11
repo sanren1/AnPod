@@ -1,9 +1,9 @@
 # P3 UDP prototype protocol
 
 This document fixes the P3 wire format used by the localhost prototype and the
-P4-A Android parser/adapter. No product connection flow selects the Android
-adapter: it requires an in-memory session context from a future authenticated
-coordinator, and the Windows prototype still sends only to `127.0.0.1`.
+P4-A Android parser/adapter. The P3 mock sender remains loopback-only. The
+separate P5 authenticated session can use a caller-selected private IPv4
+interface and literal peer; no product connection flow selects either path.
 
 ## Datagram
 
@@ -159,19 +159,21 @@ listeners, automatic reconnect, audio/control startup, product IPC/UI,
 unbinding, or reconfiguration. Real USB, system DUMP permission enforcement,
 and Android private storage remain NOT_TESTED.
 
-## P5-C authenticated localhost session prototype
+## P5-C authenticated session prototype
 
 P5-C composes the existing P5-A handshake and P3 ANPD audio datagrams; it does
 not change either format. The prototype is explicitly started by an internal
-caller and binds its temporary TCP listener and UDP sockets to `127.0.0.1`.
-There is no default listener or discovery. The host connects to the explicit
-loopback TCP address returned by that caller. The receiver accepts only a
-loopback TCP peer. The host creates its UDP socket before authentication so
+caller. Its legacy check path binds its temporary TCP listener and UDP
+sockets to `127.0.0.1`; the explicit interface path binds each to the caller's
+selected private IPv4 address. There is no default listener; optional discovery
+is a separately started caller action. The host connects to the explicit literal IPv4 TCP address. The receiver accepts
+loopback peers on the legacy check path and private IPv4 peers on the explicit
+path. The host creates its UDP socket before authentication so
 its local port is known; the receiver selects its UDP port after authentication.
 The authenticated BIND exchange fixes the host UDP port, while the receiver
 UDP port is returned in the authenticated ACK. The receiver's expected UDP
-peer is exactly the accepted TCP peer's loopback address plus the authenticated
-host UDP port. No UDP source or discovery packet can change either endpoint.
+peer is exactly the accepted TCP peer address plus the authenticated host UDP
+port. No UDP source or discovery packet can change either endpoint.
 
 P5-A's four TCP handshake frames remain byte-for-byte unchanged and are read
 with their existing fixed lengths: HELLO 85 bytes, CHALLENGE 86 bytes, FINISH
@@ -235,12 +237,13 @@ operation and never claim that the Receiver is running. Invalid UDP datagrams
 are dropped by the existing parser; they cannot commit replay state or enter
 the PCM queue.
 
-P5-C currently exposes only an internal localhost exchange and controlled
-playback callback. It adds no UI/IPC/default listener, LAN discovery,
-firewall/hotspot changes, WASAPI/AudioTrack startup, or product bootstrap. The
-local cross-language test uses synthetic PCM and a fake playback endpoint;
-real USB/network transport, real WASAPI/AudioTrack output, and device behavior
-remain NOT_TESTED. This section does not mark P5 complete.
+P5-C exposes an internal localhost exchange and a separate explicit
+private-IPv4 exchange with controlled playback callback. It adds no
+UI/IPC/default listener, firewall/hotspot changes, WASAPI/AudioTrack startup,
+or product bootstrap. The local cross-language test uses synthetic PCM and a
+fake playback endpoint; real USB/LAN/hotspot transport, Android runtime,
+WASAPI/AudioTrack output, and device behavior remain NOT_TESTED. This section
+does not mark P5 complete.
 
 ## P5-D local single-session recovery owner
 
@@ -307,10 +310,14 @@ An explicit discovery call sends at most two UDP probes on that interface: the
 first actual gateway reported for that interface, then its directed broadcast
 (when the prefix supports one). There is no subnet scan, mDNS dependency, default
 probe, listener, or automatic hotspot/firewall change. The Receiver's internal
-`openOnInterface` and `startDiscovery` calls bind its P5-C listener and optional
-discovery responder to one explicitly supplied private IPv4 address. Closing or
-replacing the interface/session closes the responder and old authenticated
-session; the caller must supply the replacement endpoint for a fresh handshake.
+`openOnInterface` accepts one explicitly supplied private IPv4 address and
+prefix for its P5-C listener. Optional discovery binds only the fixed discovery
+receive port to wildcard for broadcast reception, accepts probes only from the
+selected address prefix, and sends each response through a socket bound to the
+selected address. Control and audio sockets remain bound to that explicit
+address. Closing or replacing the interface/session closes the responder and
+old authenticated session; the caller must supply the replacement endpoint for
+a fresh handshake.
 
 Discovery uses one fixed 26-byte UDP record on port 49772:
 
@@ -325,9 +332,11 @@ Discovery uses one fixed 26-byte UDP record on port 49772:
 
 The receiver replies only to a correctly sized, versioned probe with zero flags
 and a zero port. It copies the correlation token and advertises its already
-bound temporary TCP port. The host accepts a response only when the token,
-record shape, response source port, and source IPv4 prefix match the current
-probe and selected interface. A response is only an unauthenticated endpoint
+bound temporary TCP port. Discovery receives on the fixed wildcard UDP port;
+responses originate from a separate socket bound to the selected private IPv4
+address. The host accepts a response only when the token, record shape, nonzero
+UDP source port, and source IPv4 prefix match the current probe and selected
+interface. A response is only an unauthenticated endpoint
 candidate: it carries no key, serial, or persistent identity and cannot bind a
 UDP peer or start playback. The caller must continue with the existing P5-A
 mutual authentication and P5-C BIND/START. A caller can instead supply a
@@ -335,7 +344,8 @@ literal private IPv4 endpoint directly without discovery; it still must pass
 the same authentication before playback.
 
 Discovery is cancellable, polls at 50 ms, sends to no more than those two
-targets, and has a maximum two-second window. An empty result reports that no
+targets, has a maximum two-second window, retains at most 16 unique candidates,
+and stops receiving once that cap is reached. An empty result reports that no
 Receiver answered and says it may be unreachable or stopped and require an
 authorized USB/bootstrap path; the result does not infer ForceStop or firewall
 state. Interface bind errors, unreachable endpoints, and P5-A identity/proof
@@ -343,8 +353,8 @@ failure have separate diagnostics. None of these paths claim `phoneReady`.
 Discovery and the direct session remain explicit internal backend calls with
 no Tauri IPC/UI, persisted network choice, default listener, or automatic
 startup. Local checks exercise the wire exchange and full authenticated PCM
-handoff only on loopback with a fake sink; real LAN/hotspot, Android runtime,
-ADB, WASAPI, AudioTrack, and audible output remain NOT_TESTED. P4/P5 are not
+handoff only on loopback with a fake sink; real LAN/hotspot broadcast, Android
+runtime, ADB, WASAPI, AudioTrack, and audible output remain NOT_TESTED. P4/P5 are not
 complete.
 
 The receiver checks bounds, version, type, flags, and session identity. The
@@ -361,8 +371,9 @@ reusing a nonce.
 The Native PCM callback copies into eight preallocated stereo slots, each sized
 for at most 4096 frames. It never waits for the queue lock or a socket; a busy
 lock drops the incoming block, and a full queue drops its oldest block to keep
-latency bounded. Rust packetizes on a dedicated worker and sends only to IPv4
-loopback. Android uses a separate receive thread to authenticate and enqueue
+latency bounded. The P3 mock sender remains loopback-only; the authenticated
+P5 sender binds to the explicitly selected private IPv4 address and literal
+peer. Android uses a separate receive thread to authenticate and enqueue
 packets; a queue-backed `InputStream` supplies the negotiated format header and
 PCM bytes to the existing `Pcm16FrameStream` / single AudioTrack playback
 worker. Its eight-packet queue sorts by unsigned sample frame index and drops

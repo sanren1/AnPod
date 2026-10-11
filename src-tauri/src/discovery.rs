@@ -15,6 +15,7 @@ const CANDIDATE: u8 = 2;
 const FRAME_BYTES: usize = 26;
 const IO_POLL: Duration = Duration::from_millis(50);
 const MAX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CANDIDATES: usize = 16;
 
 /// Unauthenticated network hint. Callers must authenticate it with P5-A before START.
 pub(crate) struct Candidate {
@@ -73,11 +74,12 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) => {
                 let SocketAddr::V4(source) = source else { continue; };
-                if source.port() != DISCOVERY_PORT || !interface.contains(*source.ip()) { continue; }
+                if source.port() == 0 || !interface.contains(*source.ip()) { continue; }
                 let Some(port) = decode_candidate(&bytes[..length], &token) else { continue; };
                 let endpoint = SocketAddr::new((*source.ip()).into(), port);
                 if !candidates.iter().any(|item: &Candidate| item.endpoint == endpoint) {
                     candidates.push(Candidate { endpoint });
+                    if candidates.len() == MAX_CANDIDATES { break; }
                 }
             }
             Err(error) if is_poll_timeout(&error) => {}
