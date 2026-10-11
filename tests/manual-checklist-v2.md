@@ -73,3 +73,45 @@
 - 现有稳定便携包：`artifacts/AnPod-1.0.4-tauri-win-x64-portable.zip`。
 - 本轮未覆盖稳定包或预览包。预览包中的 Android `server` 载荷已检查，ZIP 根目录包含 `classes.dex`。
 - 若真机验收失败，停止使用候选构建，保留日志与失败步骤并回到稳定包；不要覆盖现有包或设备数据。
+
+## P1 Receiver Spike
+
+### 实现与信任边界
+
+- P1 包身份：`app.anpod.receiver`，version `0.1.0-p1` / versionCode `1`，`compileSdk=35`、`targetSdk=35`、`minSdk=23`。
+- P1 只验证独立 APK、短时前台管理服务和健康读取；不启用音频、UDP 或常驻服务。Receiver 使用 `shortService`，应用自身在 120 秒停止，另实现系统超时回调；Android 23 的 `onDestroy` 路径使用旧版 `stopForeground(boolean)`。
+- Bootstrap Activity 和健康 Provider 均由 `android.permission.DUMP` 保护；Receiver Service 不导出、无 Launcher。APK 申请通知权限时必须由用户处理，不执行 `pm grant`。
+- Windows 端先读取 Android 当前 user ID，仅在该用户范围内查询 Receiver；未安装状态用 `pm list packages --user <当前用户>` 判断。安装后，先用 Package Manager 返回的单一 `/data/app/.../base.apk` 路径，再由设备 `toybox sha256sum` 比较该 APK 与随包受信 APK 的 SHA-256。每次读取 Provider 或发送 START/STOP 前都重验 APK 字节。旧版本升级只提交 `adb install -r` 给 Package Manager 校验签名；签名不符时不卸载、不调用旧 APK 的入口。
+- 已留 fake-adb 管理路径检查：同版本伪造健康但 APK 不同则在 Provider/START/STOP 前拒绝；安装失败不继续；覆盖未安装→安装→健康→启动→停止；未授权及 Wi-Fi 目标被拒绝。
+
+### 构建与自动检查
+
+| 检查 | 结果 | 说明 |
+|---|---|---|
+| Android API 35 编译与 merged Manifest | PASS | Google SDK `platform-35_r02.zip`，SHA-1 `0bb560a90a7a2cbd0dd8348224d518b638fe7949`，仅放入忽略的 `.tmp-android-sdk35/`；AGP 8.7.3 官方支持最高 API 35，Gradle 8.9。 |
+| Receiver Gradle 构建 | PASS | 在 Windows PowerShell 5.1 执行；apksigner 验证成功。merged Manifest 确认通知/前台服务权限、DUMP 边界、private `shortService`，无 Launcher、无媒体播放 FGS、无局域网权限。 |
+| Receiver APK 摘要 / 签名 | PASS | APK SHA-256：`b32eeaf06d40372c4a243eadf3b1c48067875af44f9e3a7b1d23d67628004f62`；证书 SHA-256：`fea24331dc877cb9537ef3596a42374871104b0b949a4cdc88b64b1ad6a45436`。当前为本机临时 debug 签名，未生成 release 密钥、未声称 release 签名。 |
+| PowerShell 5.1 JSON → Rust `read_artifact` | PASS | `receiver.json` 为无 BOM UTF-8；Rust 对由脚本实际生成的 APK/JSON 调用 `read_artifact` 成功。 |
+| Rust 离线检查 | PASS | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`：22/22 通过，含 fake-adb 生命周期、安全拒绝及当前用户路径。 |
+| Android 普通应用权限 Probe | NOT_TESTED | 无权限 Probe APK 已构建；Receiver 首次安装被系统拒绝，未运行真实权限探测。 |
+
+### target 与兼容范围
+
+- 真实构建目标是 targetSdk 35，不沿用早先 API 34 APK。Android 16 / API 36 设备只能覆盖该 APK 在 API 36 系统上的运行，不覆盖 targetSdk 36 专属行为。
+- API 35 对音频焦点有 targetSdk 35+ 规则；P1 不请求音频焦点。P2 音频实现必须单独验证前台服务/音频焦点约束。
+- Android 16 / targetSdk 36 的专属行为为 NOT_TESTED；API 36 目标构建尚未选择为 P1 目标。Android 12/14/15 真机也为 NOT_TESTED。
+- Android 17 / targetSdk 37 的局域网权限兼容差异仍未解决；P1 不请求 `ACCESS_LOCAL_NETWORK`，也不启用网络接收。
+- 锁屏后短时服务、force-stop 后状态及合法 USB 恢复路径尚未真机验证。短时服务不能作为 P2 音频服务方案。
+
+### 真机记录
+
+- 目标设备：Android 16 / API 36，省略型号和 ADB 标识；ADB 同时显示 USB 与 Wi-Fi 两条连接记录，使用 `adb -d get-serialno` 唯一确认 USB 目标。
+- 安装前只读检查：当前 Android user 为 0，Receiver 未安装，旧 `com.anpod.server.Main` 音频服务进程为 0。没有启动或停止旧 AnPod 音频。
+- install：**FAIL / 需人工排查确认提示**。Rust 管理路径执行首次 `adb install -r` 时收到 `INSTALL_FAILED_ABORTED: User rejected permissions`；用户反馈未看到 USB 安装提示，Receiver 未安装，未尝试绕过提示。health/start/stop 真实设备流程及 Probe 调用因此为 NOT_TESTED。
+- 安装后只读复查：Receiver 仍未安装，旧 `com.anpod.server.Main` 音频服务进程为 0。待系统确认提示原因解决并由用户允许后，再从 uninstalled 开始运行 `p1_real_usb_install_health_start_stop_when_explicitly_requested`。不执行 `pm grant`，不触发 `adb kill-server`。
+
+### 候选包与回退
+
+- 普通旧 Tauri 包只要求原有五个桌面运行文件和 Platform-Tools notice；Receiver APK/JSON 不再是 `tauri.conf` 或普通打包路径的强制依赖。
+- Receiver 候选包已构建：`artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip`，SHA-256 `C6E3E9A6EB0627732EE6CACF24F5A03B269BA396E5E86E0CF6120AE2EA464B70`。ZIP 包含 APK、JSON、README 图标 `icon.png`、原有桌面运行文件和 notices/licenses/upstream；稳定 ZIP `AnPod-1.0.4-tauri-win-x64-portable.zip` 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
+- 回退继续使用既有稳定 ZIP。Receiver 不自动卸载；若候选验收未完成，停止使用候选包并等待系统确认/人工复测，不进入 P2。

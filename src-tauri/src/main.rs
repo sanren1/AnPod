@@ -2,6 +2,7 @@
 
 mod state;
 mod audio;
+mod receiver;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};
@@ -82,6 +83,31 @@ fn qr_credentials(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
 #[tauri::command]
 async fn pair_qr(app: tauri::AppHandle, state: State<'_, AppState>, instance_name: String, password: String) -> Result<OperationResult, String> {
     state.pair_qr(&app, instance_name, password).await
+}
+
+#[tauri::command]
+async fn receiver_status(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_status(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_install(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_install(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_start(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_start(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_health(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_health(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_stop(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_stop(&serial).await
 }
 
 #[tauri::command]
@@ -172,6 +198,11 @@ fn main() {
             discover_wifi,
             qr_credentials,
             pair_qr,
+            receiver_status,
+            receiver_install,
+            receiver_start,
+            receiver_health,
+            receiver_stop,
             cancel_qr_pairing,
             reconfigure_session,
             show_main_window,

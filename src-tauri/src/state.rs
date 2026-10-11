@@ -1,4 +1,5 @@
 use crate::audio::AudioActor;
+use crate::receiver::{self, ReceiverStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -159,6 +160,8 @@ pub struct AppState {
     data_dir: PathBuf,
     adb_path: PathBuf,
     server_path: PathBuf,
+    receiver_apk_path: PathBuf,
+    receiver_metadata_path: PathBuf,
 }
 
 impl AppState {
@@ -168,12 +171,12 @@ impl AppState {
             .unwrap_or_else(env::temp_dir)
             .join("AnPod");
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let (adb_path, server_path, audio_path) = if cfg!(debug_assertions) {
+        let (adb_path, server_path, receiver_apk_path, receiver_metadata_path, audio_path) = if cfg!(debug_assertions) {
             let deps = root.join("../deps");
-            (deps.join("adb.exe"), deps.join("server"), deps.join("audio_capture.dll"))
+            (deps.join("adb.exe"), deps.join("server"), deps.join("receiver.apk"), deps.join("receiver.json"), deps.join("audio_capture.dll"))
         } else {
             let app_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
-            (app_dir.join("adb.exe"), app_dir.join("server"), app_dir.join("audio_capture.dll"))
+            (app_dir.join("adb.exe"), app_dir.join("server"), app_dir.join("receiver.apk"), app_dir.join("receiver.json"), app_dir.join("audio_capture.dll"))
         };
         Self {
             view: Mutex::new(ViewState {
@@ -206,7 +209,60 @@ impl AppState {
             data_dir,
             adb_path,
             server_path,
+            receiver_apk_path,
+            receiver_metadata_path,
         }
+    }
+
+    async fn begin_receiver_operation<'a>(&'a self, reject_active_audio: bool) -> Result<(u64, CancellationToken, tokio::sync::MutexGuard<'a, ()>), String> {
+        let (generation, token) = begin_operation_slot(&self.operation_generation, &self.operation, true)
+            .ok_or_else(|| "AnPod 正在执行其他设备操作。".to_string())?;
+        let guard = self.gate.lock().await;
+        if !self.operation_is_current(generation, &token) {
+            self.finish_operation(generation);
+            return Err("Receiver 管理操作已取消。".into());
+        }
+        let audio_active = self.session.try_lock().map_or(true, |session| session.is_some());
+        if reject_active_audio && audio_active {
+            self.finish_operation(generation);
+            return Err("AnPod 音频会话正在使用此设备；Receiver 管理不会打断它。".into());
+        }
+        Ok((generation, token, guard))
+    }
+
+    pub async fn receiver_status(&self, serial: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let result = receiver::status(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        self.finish_operation(generation);
+        result
+    }
+
+    pub async fn receiver_install(&self, serial: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(true).await?;
+        let result = receiver::install(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        self.finish_operation(generation);
+        result
+    }
+
+    pub async fn receiver_start(&self, serial: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(true).await?;
+        let result = receiver::start(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        self.finish_operation(generation);
+        result
+    }
+
+    pub async fn receiver_health(&self, serial: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let result = receiver::health(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        self.finish_operation(generation);
+        result
+    }
+
+    pub async fn receiver_stop(&self, serial: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(true).await?;
+        let result = receiver::stop(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        self.finish_operation(generation);
+        result
     }
 
     fn start_operation(&self) -> (u64, CancellationToken) {
@@ -1189,9 +1245,9 @@ fn choose_selected_serial(session_serial: Option<String>, previous: Option<Strin
 }
 
 #[derive(Default)]
-struct AdbResult { success: bool, stdout: String, stderr: String }
+pub(crate) struct AdbResult { pub(crate) success: bool, pub(crate) stdout: String, pub(crate) stderr: String }
 
-async fn adb_run(adb: &Path, serial: Option<&str>, args: &[&str], limit: Duration, cancel: Option<&CancellationToken>) -> Result<AdbResult, String> {
+pub(crate) async fn adb_run(adb: &Path, serial: Option<&str>, args: &[&str], limit: Duration, cancel: Option<&CancellationToken>) -> Result<AdbResult, String> {
     if !adb.is_file() { return Err(format!("找不到 ADB：{}", adb.display())); }
     let mut command = Command::new(adb);
     if let Some(serial) = serial { command.args(["-s", serial]); }
@@ -1252,7 +1308,7 @@ async fn checked_adb(adb: &Path, serial: Option<&str>, args: &[&str], limit: Dur
 
 fn token_check(token: &CancellationToken) -> Result<(), String> { if token.is_cancelled() { Err("操作已取消。".into()) } else { Ok(()) } }
 
-fn parse_devices(text: &str) -> Vec<Device> {
+pub(crate) fn parse_devices(text: &str) -> Vec<Device> {
     text.lines().skip_while(|line| !line.starts_with("List of devices")).skip(1).filter_map(|line| {
         let fields: Vec<_> = line.split_whitespace().collect();
         let serial = (*fields.first()?).to_owned();

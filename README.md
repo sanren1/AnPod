@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="frontend/public/icon.png" alt="AnPod 图标" width="160">
+  <img src="icon.png" alt="AnPod 图标" width="160">
 </p>
 
 <h1 align="center">AnPod</h1>
@@ -98,7 +98,7 @@ AnPod 需要可用的 Windows 默认音频输出设备。手机不会显示为 W
 
 - Rust stable（至少 1.90）、Cargo 和 MSVC x64 C++ Build Tools。
 - Node.js 与 npm。
-- JDK 17 与 Android SDK API 34 / Build-Tools，用于重建 Android 服务。
+- JDK 17 与 Android SDK API 34 / Build-Tools，用于重建 Android 音频服务；独立 Receiver Spike 使用 API 35。
 - Android SDK Platform-Tools，用于准备 ADB 运行文件。
 
 准备本机运行依赖：
@@ -126,6 +126,14 @@ powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.
 ```
 
 ZIP 和解压目录会写入 `artifacts/`。脚本会检查运行依赖、构建 React 前端和 Rust 桌面程序，并将许可证、上游记录和运行文件放进同一目录。打包脚本只构建 Tauri 主应用；WPF 回退版本保留在 `src/AnPod.Desktop/`，其旧打包入口为 `packaging/publish.ps1`。
+
+Receiver P1 候选包使用单独名称，不覆盖上面的稳定 ZIP。先运行 `packaging/build-receiver.ps1` 生成本机 debug 签名的 `deps/receiver.apk` 和校验清单，再执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.0.4 -IncludeReceiverCandidate
+```
+
+候选包会额外携带 Receiver APK 和 README 所用的 `icon.png`。Receiver 文件对常规旧版便携包是可选的，原有五个桌面运行依赖仍可独立构建。P1 APK 以 targetSdk 35 验收；targetSdk 36 的 target 专属行为尚未覆盖。debug 签名只用于本地 Spike，不代表 release 签名。
 
 开发运行时由 Tauri 启动 Vite，在仓库根目录中执行：
 

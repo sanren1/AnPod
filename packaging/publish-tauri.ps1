@@ -1,12 +1,15 @@
 [CmdletBinding()]
-param([string]$Version = '1.0.4')
+param(
+    [string]$Version = '1.0.4',
+    [switch]$IncludeReceiverCandidate
+)
 
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 $root = Split-Path -Parent $PSScriptRoot
 $deps = Join-Path $root 'deps'
 $artifacts = Join-Path $root 'artifacts'
-$packageName = "AnPod-$Version-tauri-win-x64-portable"
+$packageName = if ($IncludeReceiverCandidate) { "AnPod-$Version-receiver-p1-candidate-tauri-win-x64-portable" } else { "AnPod-$Version-tauri-win-x64-portable" }
 $manifest = Get-Content -Raw (Join-Path $root 'src-tauri\Cargo.toml')
 $config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 $manifestVersion = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -31,6 +34,11 @@ if (-not $npm) { throw 'npm was not found on PATH. Install Node.js.' }
 if (-not $cargo) { throw 'cargo was not found on PATH. Install Rust stable 1.90 or newer.' }
 
 $required = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'audio_capture.dll', 'server', 'PLATFORM_TOOLS_NOTICE.txt')
+$receiverFiles = @('receiver.apk', 'receiver.json')
+if ($IncludeReceiverCandidate) {
+    $missingReceiver = @($receiverFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $deps $_) -PathType Leaf) })
+    if ($missingReceiver.Count) { throw "Receiver candidate needs both files in deps/: $($missingReceiver -join ', ')" }
+}
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $deps $_) -PathType Leaf) })
 if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ', ')" }
 
@@ -63,9 +71,13 @@ Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { Copy-Item -LiteralPath (Join-Path $deps $name) -Destination (Join-Path $packageDir $name) }
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $packageDir
+Copy-Item -LiteralPath (Join-Path $root 'frontend\public\icon.png') -Destination (Join-Path $packageDir 'icon.png')
 Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $packageDir -Recurse
 Copy-Item -LiteralPath (Join-Path $deps 'PLATFORM_TOOLS_NOTICE.txt') -Destination (Join-Path $packageDir 'LICENSES\PLATFORM_TOOLS_NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'upstream') -Destination $packageDir -Recurse
+if ($IncludeReceiverCandidate) {
+    foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $deps $name) -Destination (Join-Path $packageDir $name) }
+}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $sourceRoot = (Resolve-Path -LiteralPath $packageDir).Path.TrimEnd('\', '/')

@@ -1,0 +1,57 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseStoreFile = System.getenv('ANPOD_RECEIVER_RELEASE_STORE_FILE')
+def releaseStorePassword = System.getenv('ANPOD_RECEIVER_RELEASE_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('ANPOD_RECEIVER_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('ANPOD_RECEIVER_RELEASE_KEY_PASSWORD')
+def releaseSigningValues = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+def hasAnyReleaseSigningValue = releaseSigningValues.any { it != null && !it.isBlank() }
+
+if (hasAnyReleaseSigningValue && releaseSigningValues.any { it == null || it.isBlank() }) {
+    throw new GradleException('Receiver release signing requires all ANPOD_RECEIVER_RELEASE_* environment variables; no secret values were printed.')
+}
+
+android {
+    namespace 'app.anpod.receiver'
+    compileSdk 35
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId 'app.anpod.receiver'
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-p1'
+    }
+
+    if (hasAnyReleaseSigningValue) {
+        signingConfigs {
+            localRelease {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // The Android Gradle Plugin's local debug key is for testing only.
+        }
+        release {
+            minifyEnabled false
+            if (hasAnyReleaseSigningValue) signingConfig signingConfigs.localRelease
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
