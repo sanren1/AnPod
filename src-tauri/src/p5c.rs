@@ -533,6 +533,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
     status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>, timing: SessionTiming) {
     let mut peer = peer;
     let mut paused = false;
+    let mut desired_paused = false;
     let mut generation = 0u64;
     let mut attempts = 0u64;
     let mut retry_index = 0;
@@ -553,7 +554,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
                 publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                     None, paused, last_error.clone());
                 match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                    &enabled, &mut peer, &mut paused) {
+                    &enabled, &mut peer, &mut desired_paused) {
                     RetryWait::Stop => break,
                     RetryWait::ReconnectNow => retry_index = 0,
                     RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
@@ -570,14 +571,14 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut peer, &mut paused) {
+                &enabled, &mut peer, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
             }
             continue 'owner;
         }
-        match apply_pending_commands(&commands, &mut peer, &mut paused, &enabled) {
+        match apply_pending_commands(&commands, &mut peer, &mut desired_paused, &enabled) {
             PendingCommands::Stop => break,
             PendingCommands::EndpointChanged => {
                 drop(session);
@@ -589,19 +590,20 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
         if cancellation.is_cancelled() || !enabled.load(Ordering::Acquire) { break; }
         publish_session(&status, SessionLifecycleState::TransportConnected, generation, attempts,
             Some(session.session_id()), paused, None);
-        if let Err(error) = session.start().and_then(|_| if paused { session.pause() } else { Ok(()) }) {
+        if let Err(error) = session.start().and_then(|_| if desired_paused { session.pause() } else { Ok(()) }) {
             last_error = Some(error);
             drop(session);
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut peer, &mut paused) {
+                &enabled, &mut peer, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
             }
             continue 'owner;
         }
+        paused = desired_paused;
         let session_id = session.session_id();
         let session_queue = session.pcm_queue();
         *queue.lock().expect("P5-D PCM queue lock poisoned") = Some(session_queue);
@@ -624,6 +626,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             let until_heartbeat = next_heartbeat.saturating_duration_since(Instant::now());
             match commands.recv_timeout(until_heartbeat.min(SESSION_IO_POLL)) {
                 Ok(OwnerCommand::SetPaused(value)) => {
+                    desired_paused = value;
                     if value == paused { continue; }
                     let result = if value { session.pause() } else { session.resume() };
                     match result {
@@ -657,7 +660,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             None, paused, last_error.clone());
         if endpoint_changed { retry_index = 0; continue 'owner; }
         match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-            &enabled, &mut peer, &mut paused) {
+            &enabled, &mut peer, &mut desired_paused) {
             RetryWait::Stop => break,
             RetryWait::ReconnectNow => retry_index = 0,
             RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
@@ -830,7 +833,11 @@ fn connect_cancellable(peer: SocketAddr, cancellation: &CancellationToken) -> st
                 std::io::ErrorKind::Interrupted, "P5-C connection cancelled")),
             result = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(peer)) => {
                 match result {
-                    Ok(result) => result?.into_std(),
+                    Ok(result) => {
+                        let tcp = result?.into_std()?;
+                        tcp.set_nonblocking(false)?;
+                        Ok(tcp)
+                    }
                     Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "P5-C connect deadline expired")),
                 }
             },
@@ -901,6 +908,7 @@ mod tests {
     use std::{
         fs,
         io::{BufRead, BufReader},
+        net::TcpListener,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         thread,
@@ -940,19 +948,20 @@ mod tests {
     }
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false)
+        spawn_endpoint_mode(classes, false, false)
     }
 
-    fn spawn_endpoint_until_disconnect(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true)
+    fn spawn_endpoint_until_disconnect(classes: &Path, fail_resume: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        spawn_endpoint_mode(classes, true, fail_resume)
     }
 
-    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool)
+    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool)
         -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         let (_, java) = java_paths();
         let mut command = Command::new(java);
         command.arg("-cp").arg(classes).arg("app.anpod.receiver.P5cLoopbackEndpoint");
         if wait_for_disconnect { command.arg("--drop-on-stdin"); }
+        if fail_resume { command.arg("--fail-resume"); }
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut stdout = stdout;
@@ -1050,6 +1059,32 @@ mod tests {
     }
 
     fn lifecycle_owner_recovers_fresh_session_and_stops(classes: &Path) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = listener.local_addr().unwrap();
+        let silent_peer = thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let mut tcp = connect_cancellable(peer, &CancellationToken::new()).unwrap();
+        tcp.set_read_timeout(Some(SESSION_IO_POLL)).unwrap();
+        let start = Instant::now();
+        let read = tcp.read(&mut [0]);
+        assert!(is_poll_timeout(&read.unwrap_err()), "silent peer read did not wait for its poll timeout");
+        assert!(start.elapsed() >= Duration::from_millis(25), "nonblocking socket spun through WouldBlock immediately");
+        let cancellation = CancellationToken::new();
+        let cancel_after = cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            cancel_after.cancel();
+        });
+        let start = Instant::now();
+        let cancelled = read_exact_cancellable(&mut tcp, &mut [0], &cancellation);
+        assert_eq!(cancelled.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(start.elapsed() < Duration::from_millis(250), "blocking poll did not end promptly after cancellation");
+        cancel_thread.join().unwrap();
+        drop(tcp);
+        silent_peer.join().unwrap();
+
         let timing = SessionTiming {
             heartbeat_interval: Duration::from_millis(20),
             reconnect_delays: [Duration::from_millis(20), Duration::from_millis(30),
@@ -1061,7 +1096,7 @@ mod tests {
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 3), Duration::from_secs(10));
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 8), Duration::from_secs(10));
 
-        let (mut first, first_stdout, first_peer) = spawn_endpoint_until_disconnect(classes);
+        let (mut first, first_stdout, first_peer) = spawn_endpoint_until_disconnect(classes, true);
         let cancellation = CancellationToken::new();
         let mut owner = SessionOwner::start_with_timing(first_peer, test_binding_material(), AudioParameters {
             sample_rate: 48_000, channels: 2, mode: 0,
@@ -1071,6 +1106,11 @@ mod tests {
         let old_queue = owner.pcm_queue().unwrap();
         owner.set_paused(true).unwrap();
         wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Paused);
+        owner.set_paused(false).unwrap();
+        let failed_resume = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Reconnecting && status.session_id.is_none());
+        assert!(failed_resume.paused, "failed RESUME must not claim the receiver is running");
+        assert_eq!(failed_resume.last_error.as_deref(), Some("P5-C RESUME was rejected."),
+            "Java fake endpoint must return the deterministic failed RESUME ACK");
         first.stdin.as_mut().unwrap().write_all(b"drop").unwrap();
         let first_result = finish_endpoint(first, first_stdout);
         assert!(first_result.starts_with("session_failed,1,"), "first endpoint did not drop the session: {first_result}");
@@ -1082,7 +1122,7 @@ mod tests {
         let (second, second_stdout, second_peer) = spawn_endpoint(classes);
         owner.update_endpoint(second_peer).unwrap();
         let recovered = wait_for_owner(&owner, |status| status.session_id.is_some()
-            && status.session_id != Some(old_session) && status.state == SessionLifecycleState::Paused);
+            && status.session_id != Some(old_session) && status.state == SessionLifecycleState::ReceiverRunning);
         assert!(recovered.generation > initial.generation);
         assert!(recovered.attempts > initial.attempts);
         let new_queue = owner.pcm_queue().unwrap();

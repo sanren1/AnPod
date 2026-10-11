@@ -213,7 +213,7 @@
 
 ## P5-D local single-session recovery owner
 
-- 同一个 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。新增专用 owner 场景：对 one-shot Java localhost endpoint 建立 session、暂停后模拟 control EOF、确认旧 queue 已停止并进入 Reconnecting；显式供给重建 endpoint 的新端口后，owner 完成 fresh P5-A session、session ID 与 queue 更新并恢复暂停状态，再恢复 synthetic PCM 到 fake sink。另检查生产退避表为 1/2/5/10 秒且上限 10 秒，测试实例注入短间隔；显式 owner stop 收到认证 STOP ACK，attempt 数不再增长；对失败连接 owner 在退避中传入 caller cancellation 并 join 到 Stopped。
-- `SessionOwner` 在单独线程拥有唯一 HostSession，运行 1 秒认证心跳；对每次恢复复制并清零由调用方提供的现有 binding，使用新 nonce/session/key/queue。只向显式提供的 IPv4 loopback endpoint 重连；`update_endpoint` 是切换端口的唯一入口。用户停止或 token 取消后禁恢复；不会清除/覆盖 binding。
-- P5-D Rust 合并 Cargo 检查：PASS，1/1。没有改 Android 生产源码，因此未重复 Gradle；Java 合并 helper 在该 Rust 检查中按 JDK 17 编译。退避测试注入短时间，不实耗 1/2/5/10 秒。
+- 同一个 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。新增场景使用静默 localhost peer 检查同步 socket 会等待 50 ms poll timeout，并检查取消可在 250 ms 内结束；Java fake endpoint 对 RESUME 返回确定失败 ACK，确认重连期间 snapshot 仍保持上次已确认的 paused 状态。显式供给重建 endpoint 后，fresh P5-A session 依最新 RESUME 意图恢复为 ReceiverRunning，再将 synthetic PCM 送到 fake sink。另检查生产退避表为 1/2/5/10 秒且上限 10 秒，测试实例注入短间隔；显式 owner stop 收到认证 STOP ACK，attempt 数不再增长；失败连接 owner 在退避中收到 caller cancellation 并 join 到 Stopped。
+- `SessionOwner` 在单独线程拥有唯一 HostSession，运行 1 秒认证心跳；对每次恢复复制并清零由调用方提供的现有 binding，使用新 nonce/session/key/queue。只向显式提供的 IPv4 loopback endpoint 重连；`update_endpoint` 是切换端口的唯一入口。用户 pause/resume 意图与最近已 ACK 确认状态分开保存，失败命令不会虚报状态，重连后按最新意图操作；停止或 token 取消后禁恢复，不会清除/覆盖 binding。
+- 本轮受影响的 Rust 合并 Cargo 检查：PASS，1/1，耗时 8.35 秒。静默 peer 及失败 RESUME ACK 场景在该入口一并执行。没有改 Android 生产源码，因此未重复 Gradle；Java 合并 helper 在该 Rust 检查中按 JDK 17 编译。退避测试注入短时间，不实耗 1/2/5/10 秒。
 - 此 owner 尚未接入产品状态、Tauri IPC、WASAPI、真实 PCM callback 或默认连接流程。Android 仍是 one-shot listener，测试通过显式重建并重新供给 endpoint 验证恢复；没有启动/重启真实 Receiver、没有 USB/bootstrap 或真实设备、局域网、音量、AudioTrack/WASAPI 测试。ACK/UDP/合成 PCM 不代表实际出声，以上均为 NOT_TESTED；P5 整体未完成。

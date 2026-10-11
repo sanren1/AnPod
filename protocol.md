@@ -248,6 +248,10 @@ remain NOT_TESTED. This section does not mark P5 complete.
 trusted `BindingMaterial`, PCM parameters, a caller `CancellationToken`, and an
 explicit `127.0.0.1` endpoint. It starts one dedicated standard thread to own
 all synchronous session I/O; it does not block Tauri or PCM callback threads.
+Tokio's cancellable connect is converted to a standard TCP socket and switched
+to blocking mode before synchronous I/O. A 50 ms socket timeout bounds each
+read/write poll while the absolute operation deadline and cancellation checks
+remain in force.
 The owner reuses the supplied binding by making and wiping one private copy per
 fresh P5-A handshake. Every recovery derives a new session ID and directional
 keys and creates a new PCM queue; it never provisions, overwrites, or clears
@@ -258,8 +262,10 @@ heartbeat closes the old sender, UDP/TCP sockets, queue, and session keys,
 publishes `Reconnecting`, and waits on the bounded 1/2/5/10 second schedule
 (10 seconds maximum) before trying the currently supplied endpoint again.
 `update_endpoint` is the only way to change that target; discovery and address
-guessing are not implemented. The requested pause state is retained and
-reapplied after the next authenticated START. `SessionSnapshot` distinguishes
+guessing are not implemented. The latest requested pause state is tracked
+separately from the last ACK-confirmed receiver state and is reapplied after
+the next authenticated START. A failed PAUSE/RESUME does not claim the requested
+state was applied. `SessionSnapshot` distinguishes
 authenticated, transport-connected, receiver-running, streaming, paused,
 reconnecting, and stopped; streaming still comes only from the authenticated
 receiver's PCM output callback reflected by a heartbeat ACK.

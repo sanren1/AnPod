@@ -20,7 +20,7 @@ public final class P5cLoopbackEndpoint {
         verifyHeartbeatDeadline();
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
-        FakePlayback playback = new FakePlayback();
+        FakePlayback playback = new FakePlayback(args.length > 1 && "--fail-resume".equals(args[1]));
         try (P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openLoopback(binding, playback)) {
             endpoint.start();
             System.out.println("PORT=" + endpoint.port());
@@ -92,11 +92,14 @@ public final class P5cLoopbackEndpoint {
         final AtomicBoolean streaming = new AtomicBoolean();
         final AtomicBoolean udpClosed = new AtomicBoolean();
         final AtomicBoolean stopped = new AtomicBoolean();
+        final AtomicBoolean failResume;
         volatile UdpPcmQueue queue;
         volatile UdpReceiver receiver;
         volatile UdpSessionContext context;
         volatile Thread receiverThread;
         volatile Thread sinkThread;
+
+        FakePlayback(boolean failResume) { this.failResume = new AtomicBoolean(failResume); }
 
         @Override public boolean start(UdpSessionContext context) throws IOException {
             starts.incrementAndGet();
@@ -125,7 +128,11 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public void pause() { pauses.incrementAndGet(); if (queue != null) queue.setPaused(true); }
-        @Override public void resume() { resumes.incrementAndGet(); if (queue != null) queue.setPaused(false); }
+        @Override public void resume() throws IOException {
+            resumes.incrementAndGet();
+            if (failResume.compareAndSet(true, false)) throw new IOException("P5-D test RESUME failure");
+            if (queue != null) queue.setPaused(false);
+        }
         @Override public boolean streaming() { return streaming.get(); }
 
         @Override public void stop() {
