@@ -1429,6 +1429,67 @@ pub(crate) async fn adb_run(adb: &Path, serial: Option<&str>, args: &[&str], lim
     Ok(AdbResult { success: output.status.success(), stdout: String::from_utf8_lossy(&output.stdout).into_owned(), stderr: String::from_utf8_lossy(&output.stderr).into_owned() })
 }
 
+pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &[&str], input: &[u8],
+    limit: Duration, cancel: &CancellationToken) -> Result<AdbResult, String> {
+    use tokio::io::AsyncWriteExt;
+
+    if !adb.is_file() { return Err("找不到 ADB。".into()); }
+    let mut command = Command::new(adb);
+    if let Some(serial) = serial { command.args(["-s", serial]); }
+    command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn().map_err(|_| "无法启动 ADB。".to_string())?;
+    let mut stdin = child.stdin.take().ok_or_else(|| "无法打开 ADB 私密输入管道。".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
+    let stdout_task = tokio::spawn(drain_output_presence(stdout));
+    let stderr_task = tokio::spawn(drain_output_presence(stderr));
+
+    let status = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = child.start_kill();
+            let _ = timeout(Duration::from_secs(2), child.wait()).await;
+            return Err("操作已取消。".into());
+        }
+        result = timeout(limit, async {
+            stdin.write_all(input).await?;
+            drop(stdin);
+            child.wait().await
+        }) => match result {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => {
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                return Err("ADB 私密输入传输失败。".into());
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                return Err("ADB 私密输入操作超时。".into());
+            }
+        }
+    };
+    let stdout_present = stdout_task.await.map_err(|_| "无法读取 ADB 命令状态。".to_string())?;
+    let stderr_present = stderr_task.await.map_err(|_| "无法读取 ADB 命令状态。".to_string())?;
+    let stdout = if stdout_present { "[output present]" } else { "" };
+    let stderr = if stderr_present { "[output present]" } else { "" };
+    Ok(AdbResult { success: status.success(), stdout: stdout.into(), stderr: stderr.into() })
+}
+
+async fn drain_output_presence<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 1024];
+    let mut present = false;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => present |= count > 0,
+        }
+    }
+    present
+}
+
 async fn capture_child_output<R>(reader: R, stream: &'static str, tail: Arc<Mutex<VecDeque<String>>>, log_path: PathBuf)
 where
     R: tokio::io::AsyncRead + Unpin,

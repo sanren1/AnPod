@@ -282,22 +282,34 @@ network thread owns only its UDP socket and short-lived packet handling; the
 existing audio worker owns AudioTrack and focus. No Intent, exported component,
 discovery, pairing, network control message, or product flow starts this path.
 
-### B11. Offline binding and authenticated key derivation *(P5-A, not wired)*
+### B11. Offline binding and authenticated key derivation *(P5-A, in-memory)*
 
 `src-tauri/src/security.rs`, Android `PairingProtocol`, and Android
 `BindingStore` are new AnPod code. They define the versioned 69-byte device
 binding, Windows current-user DPAPI storage, Android app-private `AtomicFile`
 storage, matching in-memory mutual-authentication messages, transcript-bound
-proofs, and four direction/purpose-separated HKDF-SHA256 outputs. This work
-does not include USB transport, discovery, network listeners, provisioning,
-control messages, or product-flow integration. The Android record uses
-app-private storage and is not encrypted at rest.
+proofs, and four direction/purpose-separated HKDF-SHA256 outputs. The Android
+record uses app-private storage and is not encrypted at rest.
 
 Rust dependencies added for the protocol are `hkdf 0.12.4` and `hmac 0.12.1`
 (`MIT OR Apache-2.0`); `subtle 2.6.1` (`BSD-3-Clause`) is pulled transitively
 for constant-time HMAC verification. Windows DPAPI uses the existing `windows`
 crate with its Cryptography feature enabled; Android uses the platform
 `AtomicFile` and JCA APIs.
+
+### B12. USB binding stream and remote confirmation *(P5-B, no product entry)*
+
+`receiver::provision` accepts an explicit DPAPI binding path and reuses its
+persisted material on retry. It sends the ANPB record only through stdin to
+the existing selected USB ADB child, then verifies the fixed provider status
+URI against the record commitment while rechecking current user and installed
+APK bytes. The existing DUMP-protected `ReceiverStateProvider` accepts only
+the fixed binding URI and write mode, uses one bounded in-progress pipe
+worker, validates exact record length/version, and writes under the fixed
+app-private files directory. Same-record writes confirm idempotently;
+different records conflict without replacement. The Rust entry is not
+registered with Tauri IPC. No real-device ADB or Android storage test is
+claimed.
 
 ## C. Not modified
 

@@ -1,4 +1,4 @@
-use crate::state::{adb_run, parse_devices, AdbResult};
+use crate::state::{adb_run, adb_run_with_stdin, parse_devices, AdbResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{future::Future, fs, path::Path, time::{Duration, Instant}};
@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 const PACKAGE: &str = "app.anpod.receiver";
 const HEALTH_URI: &str = "content://app.anpod.receiver.state/health";
+const BINDING_URI: &str = "content://app.anpod.receiver.state/binding";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +54,8 @@ struct Health {
 trait AdbRunner {
     fn run<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], limit: Duration,
         cancel: Option<&'a CancellationToken>) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a;
+    fn run_with_stdin<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], input: &'a [u8],
+        limit: Duration, cancel: &'a CancellationToken) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a;
 }
 
 struct SystemAdb<'a>(&'a Path);
@@ -61,6 +64,121 @@ impl AdbRunner for SystemAdb<'_> {
     fn run<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], limit: Duration,
         cancel: Option<&'a CancellationToken>) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a {
         adb_run(self.0, serial, args, limit, cancel)
+    }
+
+    fn run_with_stdin<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], input: &'a [u8],
+        limit: Duration, cancel: &'a CancellationToken) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a {
+        adb_run_with_stdin(self.0, serial, args, input, limit, cancel)
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub async fn provision(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    binding_path: &Path, cancel: &CancellationToken) -> Result<String, String> {
+    provision_with(&SystemAdb(adb), serial, apk, metadata_path, binding_path, cancel,
+        Duration::from_secs(8)).await
+}
+
+#[cfg(windows)]
+async fn provision_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    binding_path: &Path, cancel: &CancellationToken, confirmation_timeout: Duration) -> Result<String, String> {
+    use crate::security::{BindingMaterial, BindingStore, SecurityError};
+
+    ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
+    let metadata = read_artifact(apk, metadata_path)?;
+    if !is_installed(adb, serial, &user, cancel).await? {
+        return Err("Receiver 尚未安装；没有发送绑定材料。".into());
+    }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+
+    let material = match BindingStore::load(binding_path) {
+        Ok(material) => material,
+        Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let generated = BindingMaterial::generate().map_err(|_| "无法创建安全绑定材料。".to_string())?;
+            BindingStore::create_or_confirm(binding_path, &generated)
+                .map_err(|_| "无法安全保存或确认本机绑定材料。".to_string())?;
+            generated
+        }
+        Err(_) => return Err("无法读取本机 DPAPI 绑定材料；没有发送绑定材料。".into()),
+    };
+    let commitment = material.commitment();
+    let commitment_text = hex_digest(&commitment);
+    let mut record = material.encode();
+
+    ensure_usb_device(adb, serial, cancel).await?;
+    if current_android_user(adb, serial, cancel).await? != user {
+        record.0.fill(0);
+        return Err("Android 当前用户已变化；本机绑定材料已保留，未继续写入。".into());
+    }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let write_result = adb.run_with_stdin(Some(serial), &[
+        "shell", "-T", "content", "write", "--user", &user, "--uri", BINDING_URI,
+    ], &record.0, Duration::from_secs(15), cancel).await;
+    record.0.fill(0);
+    // content's WriteCommand can print provider errors while leaving the shell exit code successful.
+    // Only the fixed URI's digest-matched status query below completes provisioning.
+    let _write_result = write_result?;
+
+    tokio::time::timeout(confirmation_timeout, async {
+        loop {
+            if cancel.is_cancelled() { return Err("操作已取消；本机 DPAPI 绑定材料已保留，可用相同路径重试。".into()); }
+            ensure_usb_device(adb, serial, cancel).await?;
+            if current_android_user(adb, serial, cancel).await? != user {
+                return Err("Android 当前用户已变化；本机 DPAPI 绑定材料已保留，未确认远端绑定。".into());
+            }
+            verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+            match read_binding_state(adb, serial, &user, cancel).await? {
+                BindingStatus::Saved(received) if received == commitment_text => return Ok(commitment_text),
+                BindingStatus::Saved(_) => return Err("手机已有不同绑定；未替换材料，本机 DPAPI 副本已保留。".into()),
+                BindingStatus::Empty | BindingStatus::Pending => {}
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("操作已取消；本机 DPAPI 绑定材料已保留，可用相同路径重试。".into()),
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+    }).await.map_err(|_| "手机未确认绑定；本机 DPAPI 材料已保留，可用相同路径重试。".to_string())?
+}
+
+#[cfg(windows)]
+fn hex_digest(value: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(64);
+    for byte in value { result.push(HEX[(byte >> 4) as usize] as char); result.push(HEX[(byte & 15) as usize] as char); }
+    result
+}
+
+#[cfg(windows)]
+enum BindingStatus { Empty, Pending, Saved(String) }
+
+#[cfg(windows)]
+async fn read_binding_state(adb: &impl AdbRunner, serial: &str, user: &str,
+    cancel: &CancellationToken) -> Result<BindingStatus, String> {
+    let result = adb.run(Some(serial), &[
+        "shell", "content", "query", "--user", user, "--uri", BINDING_URI,
+        "--projection", "bindingState:bindingCommitment",
+    ], Duration::from_secs(6), Some(cancel)).await?;
+    if !result.success { return Err("无法读取手机绑定确认状态；本机 DPAPI 副本已保留。".into()); }
+    let row = result.stdout.lines().find(|line| line.trim_start().starts_with("Row: 0 "))
+        .and_then(|line| line.trim().strip_prefix("Row: 0 "))
+        .ok_or_else(|| "手机绑定状态格式无效；本机 DPAPI 副本已保留。".to_string())?;
+    let fields: std::collections::HashMap<_, _> = row.split(", ")
+        .filter_map(|field| field.split_once('=')).collect();
+    match fields.get("bindingState").copied() {
+        Some("empty") if fields.get("bindingCommitment") == Some(&"") => Ok(BindingStatus::Empty),
+        Some("pending") => {
+            let commitment = fields.get("bindingCommitment").copied().unwrap_or("");
+            if commitment.is_empty() || valid_digest(commitment) { Ok(BindingStatus::Pending) }
+            else { Err("手机绑定摘要无效；本机 DPAPI 副本已保留。".into()) }
+        }
+        Some("saved") => {
+            let commitment = fields.get("bindingCommitment").copied().unwrap_or("");
+            if valid_digest(commitment) { Ok(BindingStatus::Saved(commitment.to_ascii_lowercase())) }
+            else { Err("手机绑定摘要无效；本机 DPAPI 副本已保留。".into()) }
+        }
+        _ => Err("手机绑定状态不受支持；本机 DPAPI 副本已保留。".into()),
     }
 }
 
@@ -394,6 +512,18 @@ mod tests {
         audio_active: bool,
         error: String,
         calls: Vec<Vec<String>>,
+        binding_commitment: Option<String>,
+        binding_write_mode: FakeBindingWrite,
+        binding_input_commitments: Vec<String>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum FakeBindingWrite {
+        #[default]
+        Store,
+        Cancel,
+        ErrorText,
+        WrongUser,
     }
 
     #[derive(Default)]
@@ -452,6 +582,19 @@ mod tests {
                             let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName=0.1.0-p1, versionCode=1, serviceActive={}, foreground={}, healthy={}, audioActive={}, startedAtElapsedMs=1, error={}\n", state.active, state.foreground, state.healthy, state.audio_active, state.error);
                             AdbResult { success: true, stdout, stderr: String::new() }
                         }
+                    [shell, content, query, user_option, user, flag, uri, projection_flag, projection]
+                        if shell == "shell" && content == "content" && query == "query"
+                            && user_option == "--user" && user == state.user && flag == "--uri"
+                            && uri == BINDING_URI && projection_flag == "--projection"
+                            && projection == "bindingState:bindingCommitment" => {
+                        let (binding_state, commitment) = match &state.binding_commitment {
+                            Some(commitment) => ("saved", commitment.as_str()),
+                            None => ("empty", ""),
+                        };
+                        AdbResult { success: true,
+                            stdout: format!("Row: 0 bindingState={binding_state}, bindingCommitment={commitment}\n"),
+                            stderr: String::new() }
+                    }
                     [install, replace, user_option, user, _apk] if install == "install" && replace == "-r" && user_option == "--user" && user == state.user => {
                         if state.install_fails {
                             AdbResult { success: false, stdout: String::new(), stderr: "INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match".into() }
@@ -481,6 +624,43 @@ mod tests {
                     _ => AdbResult { success: false, stdout: String::new(), stderr: format!("unexpected fake ADB args: {args:?}") },
                 };
                 Ok(result)
+            }
+        }
+
+        fn run_with_stdin<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], input: &'a [u8],
+            _limit: Duration, cancel: &'a CancellationToken) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a {
+            async move {
+                let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+                let mut state = self.0.lock().unwrap();
+                state.calls.push(args.clone());
+                let target_matches = args.len() == 8 && args[0] == "shell" && args[1] == "-T"
+                    && args[2] == "content" && args[3] == "write" && args[4] == "--user"
+                    && args[5] == state.user && args[6] == "--uri" && args[7] == BINDING_URI;
+                if serial != Some(SERIAL) || !target_matches {
+                    return Ok(AdbResult { success: false, stdout: String::new(), stderr: "invalid fake provision target".into() });
+                }
+                let commitment = format!("{:x}", Sha256::digest(input));
+                state.binding_input_commitments.push(commitment.clone());
+                match state.binding_write_mode {
+                    FakeBindingWrite::Store => {
+                        if state.binding_commitment.as_deref().is_none_or(|existing| existing == commitment) {
+                            state.binding_commitment = Some(commitment);
+                        }
+                        Ok(AdbResult { success: true, stdout: String::new(), stderr: String::new() })
+                    }
+                    FakeBindingWrite::Cancel => {
+                        state.binding_write_mode = FakeBindingWrite::Store;
+                        cancel.cancel();
+                        Err("操作已取消。".into())
+                    }
+                    FakeBindingWrite::ErrorText => Ok(AdbResult { success: true,
+                        stdout: String::new(), stderr: format!("Error while accessing provider: {}",
+                            input[37..69].iter().map(|byte| format!("{byte:02x}")).collect::<String>()) }),
+                    FakeBindingWrite::WrongUser => {
+                        state.user = "11";
+                        Ok(AdbResult { success: true, stdout: String::new(), stderr: String::new() })
+                    }
+                }
             }
         }
     }
@@ -701,6 +881,105 @@ mod tests {
         let wifi = FakeAdb::new(false, files.digest.clone());
         assert!(start_with(&wifi, "192.0.2.3:5555", &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap().contains("USB ADB 设备"));
         assert!(wifi.calls().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_adb_secure_provision_confirms_persists_and_rejects_failures_without_leaks() {
+        use crate::security::BindingStore;
+
+        let files = ArtifactFiles::new();
+        let cancel = CancellationToken::new();
+        let timeout = Duration::from_millis(40);
+
+        let successful = FakeAdb::new(true, files.digest.clone());
+        let binding_path = files.dir.join("binding.dpapi");
+        let commitment = provision_with(&successful, SERIAL, &files.apk, &files.metadata,
+            &binding_path, &cancel, timeout).await.unwrap();
+        assert_eq!(successful.0.lock().unwrap().binding_commitment.as_deref(), Some(commitment.as_str()));
+        let calls = successful.calls();
+        let write_index = calls.iter().position(|call| call.starts_with(&[
+            "shell".into(), "-T".into(), "content".into(), "write".into(),
+        ])).unwrap();
+        assert!(calls[write_index].windows(2).any(|pair| pair[0] == "--user" && pair[1] == TEST_USER));
+        assert!(calls[write_index].windows(2).any(|pair| pair[0] == "--uri" && pair[1] == BINDING_URI));
+        assert!(calls.iter().flat_map(|call| call.iter()).all(|arg| !arg.contains(&commitment)));
+
+        let retry_commitment = provision_with(&successful, SERIAL, &files.apk, &files.metadata,
+            &binding_path, &cancel, timeout).await.unwrap();
+        assert_eq!(retry_commitment, commitment);
+        let successful_inputs = successful.0.lock().unwrap().binding_input_commitments.clone();
+        assert_eq!(successful_inputs.len(), 2);
+        assert_eq!(successful_inputs[0], successful_inputs[1]);
+
+        let cancelled_path = files.dir.join("cancelled.dpapi");
+        let cancelled_adb = FakeAdb::new(true, files.digest.clone());
+        cancelled_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::Cancel;
+        let cancelled_token = CancellationToken::new();
+        let cancelled = provision_with(&cancelled_adb, SERIAL, &files.apk, &files.metadata,
+            &cancelled_path, &cancelled_token, timeout).await.unwrap_err();
+        assert!(cancelled.contains("取消"));
+        let saved_before_retry = BindingStore::load(&cancelled_path).unwrap().commitment();
+        assert!(cancelled_path.exists(), "cancellation discarded the only DPAPI binding copy");
+        let retry = provision_with(&cancelled_adb, SERIAL, &files.apk, &files.metadata,
+            &cancelled_path, &CancellationToken::new(), timeout).await.unwrap();
+        assert_eq!(retry, hex_digest(&saved_before_retry));
+        let seen = &cancelled_adb.0.lock().unwrap().binding_input_commitments;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1], "retry generated different binding material");
+
+        let conflict_path = files.dir.join("conflict.dpapi");
+        let conflict_adb = FakeAdb::new(true, files.digest.clone());
+        conflict_adb.0.lock().unwrap().binding_commitment = Some("f".repeat(64));
+        let conflict = provision_with(&conflict_adb, SERIAL, &files.apk, &files.metadata,
+            &conflict_path, &cancel, timeout).await.unwrap_err();
+        assert!(conflict.contains("已有不同绑定"));
+        assert!(conflict_path.exists(), "remote conflict removed the local DPAPI copy");
+        let expected_conflict = "f".repeat(64);
+        assert_eq!(conflict_adb.0.lock().unwrap().binding_commitment.as_deref(), Some(expected_conflict.as_str()));
+
+        let failed_write_path = files.dir.join("failed-write.dpapi");
+        let failed_write_adb = FakeAdb::new(true, files.digest.clone());
+        failed_write_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::ErrorText;
+        let failed_write = provision_with(&failed_write_adb, SERIAL, &files.apk, &files.metadata,
+            &failed_write_path, &cancel, timeout).await.unwrap_err();
+        assert!(failed_write.contains("未确认"));
+        assert!(!failed_write.contains("Error while accessing provider"));
+        assert!(failed_write_path.exists(), "remote error discarded the local DPAPI copy");
+        let failed_material = BindingStore::load(&failed_write_path).unwrap();
+        let mut failed_record = failed_material.encode();
+        let secret_hex = failed_record.0[37..69].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert!(!failed_write.contains(&secret_hex), "remote error leaked the binding secret");
+        failed_record.0.fill(0);
+
+        let wrong_user_path = files.dir.join("wrong-user.dpapi");
+        let wrong_user_adb = FakeAdb::new(true, files.digest.clone());
+        wrong_user_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::WrongUser;
+        let wrong_user = provision_with(&wrong_user_adb, SERIAL, &files.apk, &files.metadata,
+            &wrong_user_path, &cancel, timeout).await.unwrap_err();
+        assert!(wrong_user.contains("当前用户已变化"));
+        assert!(!wrong_user_adb.calls().iter().any(|call| call.starts_with(&[
+            "shell".into(), "content".into(), "query".into(),
+        ])));
+
+        let non_usb = FakeAdb::new(false, files.digest.clone());
+        non_usb.0.lock().unwrap().device_state = "unauthorized";
+        let non_usb_path = files.dir.join("non-usb.dpapi");
+        assert!(provision_with(&non_usb, SERIAL, &files.apk, &files.metadata,
+            &non_usb_path, &cancel, timeout).await.is_err());
+        assert!(!non_usb_path.exists());
+        assert!(!non_usb.calls().iter().any(|call| call.starts_with(&[
+            "shell".into(), "content".into(), "write".into(),
+        ])));
+
+        let wrong_apk = FakeAdb::new(true, "a".repeat(64));
+        let wrong_apk_path = files.dir.join("wrong-apk.dpapi");
+        assert!(provision_with(&wrong_apk, SERIAL, &files.apk, &files.metadata,
+            &wrong_apk_path, &cancel, timeout).await.is_err());
+        assert!(!wrong_apk_path.exists());
+        assert!(!wrong_apk.calls().iter().any(|call| call.starts_with(&[
+            "shell".into(), "content".into(), "write".into(),
+        ])));
     }
 
     #[tokio::test]

@@ -81,6 +81,14 @@ Apache-2.0; its transitive dependencies and exact locked versions are listed
 in `src-tauri/Cargo.lock`. No AES-GCM implementation source is copied into
 AnPod.
 
+The P5-A/B pairing and USB binding code adds Rust crates `hmac` 0.12.1 and
+`hkdf` 0.12.4 (MIT OR Apache-2.0) for HMAC-SHA256 proofs and RFC 5869
+HKDF-SHA256 session key derivation. `subtle` 2.6.1 (BSD-3-Clause) is a
+transitive dependency used by HMAC tag verification. Exact locked versions
+are in `src-tauri/Cargo.lock`; no cryptographic implementation source is
+copied into AnPod. Android uses platform JCA, `AtomicFile`, and
+`ParcelFileDescriptor` APIs and adds no Android dependency.
+
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
 .NET 8 application and is not part of the Tauri portable package.

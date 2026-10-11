@@ -2,6 +2,7 @@ package app.anpod.receiver;
 
 import com.anpod.server.Pcm16FrameStream;
 import java.io.DataInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -35,6 +36,21 @@ public final class AnPodUdpVectorCheck {
         byte[] generatedRecordOne = generatedOne.encodedRecord();
         byte[] generatedRecordTwo = generatedTwo.encodedRecord();
         check(!Arrays.equals(generatedRecordOne, generatedRecordTwo), "new binding material was not random");
+        PairingProtocol.BindingMaterial streamCopy = PairingProtocol.BindingMaterial.readRecord(
+                new ByteArrayInputStream(generatedRecordOne));
+        byte[] streamCopyRecord = streamCopy.encodedRecord();
+        check(Arrays.equals(streamCopyRecord, generatedRecordOne), "binding stdin parser changed the record");
+        Arrays.fill(streamCopyRecord, (byte) 0);
+        streamCopy.close();
+        expectBindingReadFailure(Arrays.copyOf(generatedRecordOne, generatedRecordOne.length - 1),
+                "short binding stdin was accepted");
+        byte[] longRecord = Arrays.copyOf(generatedRecordOne, generatedRecordOne.length + 1);
+        longRecord[longRecord.length - 1] = 1;
+        expectBindingReadFailure(longRecord, "long binding stdin was accepted");
+        byte[] unknownVersion = generatedRecordOne.clone();
+        unknownVersion[4]++;
+        expectBindingReadFailure(unknownVersion, "unknown binding version was accepted");
+        Arrays.fill(unknownVersion, (byte) 0);
         generatedOne.close();
         generatedTwo.close();
         Arrays.fill(generatedRecordOne, (byte) 0);
@@ -43,6 +59,12 @@ public final class AnPodUdpVectorCheck {
         byte[] secret = sequence(0, 32);
         byte[] hostId = sequence(0x10, 16);
         byte[] receiverId = sequence(0x20, 16);
+        PairingProtocol.BindingMaterial vectorBinding = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
+        byte[] vectorCommitment = vectorBinding.commitment();
+        check(hex(vectorCommitment).equals("dcb02a268976be74a08d28d7124724dbeef4c130715d6544ad8b7eb74f79eda4"),
+                "binding commitment differs from the Rust vector");
+        Arrays.fill(vectorCommitment, (byte) 0);
+        vectorBinding.close();
         byte[] hostNonce = sequence(0x30, 32);
         byte[] receiverNonce = sequence(0x50, 32);
         PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
@@ -153,6 +175,19 @@ public final class AnPodUdpVectorCheck {
         finally { noReadyReceiver.close(); }
 
         Arrays.fill(secret, (byte) 0);
+    }
+
+    private static void expectBindingReadFailure(byte[] record, String message) throws Exception {
+        try {
+            PairingProtocol.BindingMaterial unexpected = PairingProtocol.BindingMaterial.readRecord(
+                    new ByteArrayInputStream(record));
+            unexpected.close();
+            throw new AssertionError(message);
+        } catch (PairingProtocol.Failure expected) {
+            // Exact length and version are rejected before any material is stored.
+        } finally {
+            Arrays.fill(record, (byte) 0);
+        }
     }
 
     private static PairingSession completePairing(byte[] hostId, byte[] receiverId, byte[] secret) throws Exception {

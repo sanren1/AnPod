@@ -30,6 +30,7 @@ pub(crate) enum SecurityError {
     InvalidParameters,
     Io(std::io::Error),
     Protection,
+    BindingConflict,
 }
 
 impl fmt::Display for SecurityError {
@@ -42,6 +43,7 @@ impl fmt::Display for SecurityError {
             Self::InvalidParameters => "unsupported P5-A audio parameters",
             Self::Io(_) => "P5-A binding storage I/O failed",
             Self::Protection => "Windows current-user DPAPI operation failed",
+            Self::BindingConflict => "P5-A binding conflict",
         })
     }
 }
@@ -73,7 +75,7 @@ impl BindingMaterial {
         Ok(Self { host_id, receiver_id, secret })
     }
 
-    fn encode(&self) -> SensitiveBytes {
+    pub(crate) fn encode(&self) -> SensitiveBytes {
         let mut bytes = [0u8; BINDING_BYTES];
         bytes[..4].copy_from_slice(BINDING_MAGIC);
         bytes[4] = BINDING_VERSION;
@@ -95,6 +97,17 @@ impl BindingMaterial {
         secret.copy_from_slice(&bytes[37..69]);
         Ok(Self { host_id, receiver_id, secret })
     }
+
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        let record = self.encode();
+        Sha256::digest(&record.0).into()
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.host_id.iter().chain(&self.receiver_id).chain(&self.secret)
+            .zip(other.host_id.iter().chain(&other.receiver_id).chain(&other.secret))
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right)) == 0
+    }
 }
 
 impl Drop for BindingMaterial {
@@ -105,7 +118,7 @@ impl Drop for BindingMaterial {
     }
 }
 
-struct SensitiveBytes(Vec<u8>);
+pub(crate) struct SensitiveBytes(pub(crate) Vec<u8>);
 
 impl Drop for SensitiveBytes {
     fn drop(&mut self) { self.0.fill(0); }
@@ -117,6 +130,20 @@ pub(crate) struct BindingStore;
 
 #[cfg(windows)]
 impl BindingStore {
+    pub(crate) fn create_or_confirm(
+        path: &std::path::Path,
+        material: &BindingMaterial,
+    ) -> Result<(), SecurityError> {
+        match Self::create_if_absent(path, material) {
+            Ok(()) => Ok(()),
+            Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = Self::load(path)?;
+                if material.matches(&existing) { Ok(()) } else { Err(SecurityError::BindingConflict) }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn create_if_absent(
         path: &std::path::Path,
         material: &BindingMaterial,
@@ -570,6 +597,9 @@ mod storage_tests {
         let material = BindingMaterial::generate().unwrap();
         BindingStore::create_if_absent(&path, &material).unwrap();
         let first_ciphertext = fs::read(&path).unwrap();
+        BindingStore::create_or_confirm(&path, &material).unwrap();
+        assert!(matches!(BindingStore::create_or_confirm(&path, &BindingMaterial::generate().unwrap()),
+            Err(SecurityError::BindingConflict)));
         assert!(!first_ciphertext.windows(32).any(|window| window == &material.secret[..]));
         assert!(BindingStore::create_if_absent(&path, &BindingMaterial::generate().unwrap()).is_err());
         assert_eq!(fs::read(&path).unwrap(), first_ciphertext);
@@ -671,6 +701,7 @@ mod tests {
         let host_nonce = core::array::from_fn(|index| 0x30 + index as u8);
         let receiver_nonce = core::array::from_fn(|index| 0x50 + index as u8);
         let params = parameters();
+        assert_eq!(hex(&value.commitment()), "dcb02a268976be74a08d28d7124724dbeef4c130715d6544ad8b7eb74f79eda4");
         let transcript = transcript(&value, &host_nonce, &receiver_nonce, 0x0102_0304_0506_0708, params);
         assert_eq!(hex(&transcript), "414e5035010102101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f010203040506070801020000bb8000");
         let proof_h = proof_host(&transcript, &value.secret);

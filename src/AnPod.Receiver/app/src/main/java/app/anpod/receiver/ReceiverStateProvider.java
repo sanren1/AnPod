@@ -4,31 +4,50 @@ import android.app.ActivityManager;
 import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
+import android.os.CancellationSignal;
+import android.os.ParcelFileDescriptor;
 import android.content.pm.ServiceInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ReceiverStateProvider extends ContentProvider {
+    private static final String BINDING_URI = "content://app.anpod.receiver.state/binding";
+    private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment"};
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
             "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
             "bufferCapacityFrames", "effectiveBufferFrames", "startThresholdFrames", "underrunCount",
             "startedAtElapsedMs", "error"
     };
+    private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
+    private BindingStore bindingStore;
 
     @Override
     public boolean onCreate() {
+        Context context = getContext();
+        bindingStore = new BindingStore(context.getFilesDir());
         return true;
     }
 
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
             String[] selectionArgs, String sortOrder) {
-        if (!"app.anpod.receiver.state".equals(uri.getAuthority())
+        if (!BINDING_URI.equals(uri.toString())
+                && (!"app.anpod.receiver.state".equals(uri.getAuthority())
                 || uri.getPathSegments().size() != 1
-                || !"health".equals(uri.getPathSegments().get(0))) {
+                || !"health".equals(uri.getPathSegments().get(0)))) {
             throw new IllegalArgumentException("Unsupported receiver status URI");
+        }
+
+        if (BINDING_URI.equals(uri.toString())) {
+            if (projection == null || !sameColumns(projection, BINDING_COLUMNS)
+                    || selection != null || selectionArgs != null || sortOrder != null)
+                throw new IllegalArgumentException("Unsupported receiver binding query");
+            return queryBinding();
         }
 
         String[] columns = projection == null ? COLUMNS : projection;
@@ -76,6 +95,54 @@ public final class ReceiverStateProvider extends ContentProvider {
     }
 
     @Override
+    public ParcelFileDescriptor openFile(Uri uri, String mode, CancellationSignal signal)
+            throws FileNotFoundException {
+        if (!BINDING_URI.equals(uri.toString()) || !"w".equals(mode))
+            throw new FileNotFoundException("Unsupported receiver binding write");
+        if (!bindingWriteInProgress.compareAndSet(false, true))
+            throw new FileNotFoundException("A receiver binding write is already in progress");
+
+        ParcelFileDescriptor[] pipe = null;
+        try {
+            pipe = ParcelFileDescriptor.createReliablePipe();
+            final ParcelFileDescriptor readEnd = pipe[0];
+            Thread worker = new Thread(() -> {
+                try (ParcelFileDescriptor.AutoCloseInputStream input =
+                        new ParcelFileDescriptor.AutoCloseInputStream(readEnd);
+                        PairingProtocol.BindingMaterial material = PairingProtocol.BindingMaterial.readRecord(input)) {
+                    bindingStore.createOrConfirm(material);
+                } catch (IOException | PairingProtocol.Failure | RuntimeException ignored) {
+                    // The caller confirms the persisted binding through the read-only status URI.
+                } finally {
+                    bindingWriteInProgress.set(false);
+                }
+            }, "AnPod-binding-write");
+            worker.setDaemon(true);
+            worker.start();
+            return pipe[1];
+        } catch (IOException | RuntimeException error) {
+            if (pipe != null) {
+                try { pipe[0].close(); } catch (IOException ignored) {}
+                try { pipe[1].close(); } catch (IOException ignored) {}
+            }
+            bindingWriteInProgress.set(false);
+            throw new FileNotFoundException("Unable to open receiver binding pipe");
+        }
+    }
+
+    private Cursor queryBinding() {
+        try {
+            BindingStore.Status stored = bindingStore.status();
+            String state = bindingWriteInProgress.get() ? "pending" : stored.state;
+            MatrixCursor result = new MatrixCursor(BINDING_COLUMNS, 1);
+            result.addRow(new Object[] {state, stored.commitment});
+            return result;
+        } catch (IOException | PairingProtocol.Failure error) {
+            throw new IllegalStateException("Receiver binding status is unavailable");
+        }
+    }
+
+    @Override
     public String getType(Uri uri) {
         return "vnd.android.cursor.item/vnd.app.anpod.receiver.health";
     }
@@ -98,6 +165,12 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static boolean contains(String[] values, String value) {
         for (String candidate : values) if (candidate.equals(value)) return true;
         return false;
+    }
+
+    private static boolean sameColumns(String[] actual, String[] expected) {
+        if (actual.length != expected.length) return false;
+        for (int i = 0; i < actual.length; i++) if (!expected[i].equals(actual[i])) return false;
+        return true;
     }
 
     private static String metric(int value) {

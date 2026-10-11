@@ -195,3 +195,9 @@
 - Java 17 `tests/AnPodUdpVectorCheck.java`：PASS。和 Rust 比对固定 transcript、双方 HMAC proof、Ready proof 及四把 HKDF 密钥；覆盖双向握手、参数篡改/身份/角色/错误证明/旧响应拒绝及新会话密钥差异。另覆盖前述 UDP parser/queue/loopback 行为。
 - Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；AAPT2 资源处理被跳过，没有组装 APK。`BindingStore` 的真实 Android app-private `AtomicFile` 行为、Android 真机存储、APK 打包均为 NOT_TESTED。
 - Windows DPAPI 绑定存储及 Android app-private 绑定存储实现均是 create-only；Android 记录由系统 app-private 目录隔离，未加密 at rest。Rust/Android 握手 API 目前仅可由内存调用，不做 USB 传输、设备 provisioning、网络 discovery/listen、控制消息或播放器接线。真实 USB 配对、P4-A 手机网络收包、AudioTrack 播放及远程主机交接均为 NOT_TESTED。
+
+## P5-B USB binding provision（仅源码与 fake 检查）
+
+- `receiver::tests::fake_adb_secure_provision_confirms_persists_and_rejects_failures_without_leaks`：PASS。fake runner 覆盖固定 USB `content write` 参数与 stdin 承诺匹配、`content write` 错误文本但退出码为 0 时仍须远端摘要确认、远端已有不同材料、取消后使用同一 DPAPI 记录重试、非 USB/current-user 改变/APK 字节不匹配拒绝；错误诊断不回显合成 secret。所有文件仅位于隔离测试临时目录，没有运行真实 ADB。
+- `tests/AnPodUdpVectorCheck.java`：PASS；增加 stdin 记录恰好 69 字节、短包/长包/未知版本拒绝检查。Android Provider 与 `BindingStore` 源码使用 Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources` 编译通过；未执行 AAPT2、未组装 APK。
+- Provider 使用已有 `android.permission.DUMP` 读写保护，只扩展固定绑定 URI；health 查询保持只读。Rust `provision` 未注册 IPC，没有 UI、网络入口或播放器接线。真实 USB、系统 DUMP 鉴权、Android `filesDir`/AtomicFile 落盘及设备端状态确认均为 NOT_TESTED。

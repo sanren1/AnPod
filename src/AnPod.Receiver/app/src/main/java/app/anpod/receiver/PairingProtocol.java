@@ -1,5 +1,7 @@
 package app.anpod.receiver;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.GeneralSecurityException;
@@ -67,6 +69,29 @@ final class PairingProtocol {
             ByteBuffer bytes = ByteBuffer.allocate(BINDING_BYTES);
             bytes.put(BINDING_MAGIC).put((byte) 1).put(hostId).put(receiverId).put(secret);
             return bytes.array();
+        }
+
+        byte[] commitment() throws Failure {
+            byte[] record = encodedRecord();
+            try { return MessageDigest.getInstance("SHA-256").digest(record); }
+            catch (GeneralSecurityException error) { throw new Failure("SHA-256 unavailable"); }
+            finally { Arrays.fill(record, (byte) 0); }
+        }
+
+        static BindingMaterial readRecord(InputStream input) throws IOException, Failure {
+            byte[] record = new byte[BINDING_BYTES];
+            try {
+                int offset = 0;
+                while (offset < record.length) {
+                    int count = input.read(record, offset, record.length - offset);
+                    if (count < 0) throw new Failure("truncated binding record");
+                    if (count > 0) offset += count;
+                }
+                if (input.read() != -1) throw new Failure("oversized binding record");
+                return decode(record);
+            } finally {
+                Arrays.fill(record, (byte) 0);
+            }
         }
 
         private BindingMaterial transfer() {

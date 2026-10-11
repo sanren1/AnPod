@@ -103,6 +103,51 @@ API boundary and wipe their owned key bytes when closed or dropped. Fixed
 cross-language test values verify the transcript, proofs, ready value, and all
 four derived keys.
 
+## P5-B USB binding provision path
+
+The explicit Rust `receiver::provision` entry point is not registered with
+Tauri IPC and has no product UI caller. It accepts an explicit host binding
+file path, verifies the selected target as authorized USB, reads the active
+Android user, and rechecks the installed APK identity against the local
+trusted artifact before sending anything. If the DPAPI file is absent, Rust
+creates and durably publishes the current-user protected record first. If it
+already exists, provisioning loads and reuses that exact record, so a failed
+or cancelled attempt can retry without generating a replacement secret. A
+conflicting or unreadable local record fails closed.
+
+The only write command is
+`adb -s <USB serial> shell -T content write --user <current user> --uri content://app.anpod.receiver.state/binding`.
+The 69-byte ANPB v1 record is sent only on the child process stdin pipe; it is
+not passed in command arguments, URI parameters, shell extras, a temporary
+plaintext file, or logs. Android reuses the existing DUMP-protected
+`ReceiverStateProvider`. Only this exact URI and exact `w` mode opens the
+single in-progress pipe worker. It accepts exactly 69 bytes followed by EOF,
+checks the ANPB magic/version, and stores only under the Receiver's fixed
+app-private files directory. Short, oversized, malformed, unknown-version,
+other-path, or other-mode writes are rejected before storage. Existing equal
+records are idempotently confirmed; a different saved record is a conflict
+and is never replaced. No clear, unlink, or re-pair operation is defined.
+
+The provider's read-only query on that fixed URI returns only `empty`,
+`pending`, or `saved`, plus `SHA-256(complete 69-byte ANPB record)` when
+available. This digest is a USB provisioning consistency commitment; it does
+not independently authenticate a future network peer. The original health
+query remains unchanged and read-only. Rust checks USB transport, current
+Android user, and installed APK bytes again while waiting for the saved state,
+and returns success only when the reported commitment equals the locally
+persisted record. A `content write` process exit code or its output alone is
+not completion evidence: AOSP `WriteCommand` copies stdin through
+`ContentProvider.openFile(uri, "w")`, while its command wrapper can report an
+exception without propagating it as a process failure. A missing confirmation,
+conflict, identity change, ADB error, or cancellation leaves the Windows DPAPI
+record available for retry. No ADB output is copied to logs or returned as a
+diagnostic.
+
+This remains a USB provisioning path only. It does not add LAN discovery,
+listeners, automatic reconnect, audio/control startup, product IPC/UI,
+unbinding, or reconfiguration. Real USB, system DUMP permission enforcement,
+and Android private storage remain NOT_TESTED.
+
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3
 mock checks replay eligibility before AEAD. Both commit a sequence only after
