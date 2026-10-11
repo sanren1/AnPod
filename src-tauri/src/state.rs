@@ -1445,8 +1445,8 @@ pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &
     let stdout = child.stdout.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "无法读取 ADB 命令状态。".to_string())?;
     let mut output_tasks = [
-        tokio::spawn(drain_output_presence(stdout)),
-        tokio::spawn(drain_output_presence(stderr)),
+        Some(tokio::spawn(drain_output_presence(stdout))),
+        Some(tokio::spawn(drain_output_presence(stderr))),
     ];
     let deadline = TokioInstant::now() + limit;
 
@@ -1471,30 +1471,17 @@ pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &
             }
         }
     };
-    enum DrainResult { Complete(bool, bool), Cancelled, TimedOut, Failed }
-    let drained = tokio::select! {
-        _ = cancel.cancelled() => DrainResult::Cancelled,
-        result = timeout_at(deadline, async {
-            let stdout = (&mut output_tasks[0]).await.map_err(|_| ())?;
-            let stderr = (&mut output_tasks[1]).await.map_err(|_| ())?;
-            Ok::<_, ()>((stdout, stderr))
-        }) => match result {
-            Ok(Ok((stdout, stderr))) => DrainResult::Complete(stdout, stderr),
-            Ok(Err(())) => DrainResult::Failed,
-            Err(_) => DrainResult::TimedOut,
-        },
-    };
-    let (stdout_present, stderr_present) = match drained {
-        DrainResult::Complete(stdout, stderr) => (stdout, stderr),
-        DrainResult::Cancelled => {
+    let (stdout_present, stderr_present) = match drain_output_tasks(&mut output_tasks, deadline, cancel).await {
+        Ok(presence) => presence,
+        Err(DrainError::Cancelled) => {
             stop_adb_child(&mut child, &mut output_tasks).await;
             return Err("操作已取消。".into());
         }
-        DrainResult::TimedOut => {
+        Err(DrainError::TimedOut) => {
             stop_adb_child(&mut child, &mut output_tasks).await;
             return Err("ADB 命令超时。".into());
         }
-        DrainResult::Failed => {
+        Err(DrainError::Failed) => {
             stop_adb_child(&mut child, &mut output_tasks).await;
             return Err("无法读取 ADB 命令状态。".into());
         }
@@ -1504,11 +1491,45 @@ pub(crate) async fn adb_run_with_stdin(adb: &Path, serial: Option<&str>, args: &
     Ok(AdbResult { success: status.success(), stdout: stdout.into(), stderr: stderr.into() })
 }
 
-async fn stop_adb_child(child: &mut Child, output_tasks: &mut [tokio::task::JoinHandle<bool>; 2]) {
+async fn stop_adb_child(child: &mut Child, output_tasks: &mut [Option<tokio::task::JoinHandle<bool>>; 2]) {
     let _ = child.start_kill();
     let _ = timeout(Duration::from_secs(2), child.wait()).await;
-    for task in output_tasks.iter() { task.abort(); }
-    for task in output_tasks.iter_mut() { let _ = task.await; }
+    stop_output_tasks(output_tasks).await;
+}
+
+enum DrainError { Cancelled, TimedOut, Failed }
+
+async fn drain_output_tasks(tasks: &mut [Option<tokio::task::JoinHandle<bool>>; 2],
+    deadline: tokio::time::Instant, cancel: &CancellationToken) -> Result<(bool, bool), DrainError> {
+    let stdout = await_output_task(&mut tasks[0], deadline, cancel).await?;
+    let stderr = await_output_task(&mut tasks[1], deadline, cancel).await?;
+    Ok((stdout, stderr))
+}
+
+async fn await_output_task(task: &mut Option<tokio::task::JoinHandle<bool>>,
+    deadline: tokio::time::Instant, cancel: &CancellationToken) -> Result<bool, DrainError> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(DrainError::Cancelled),
+        result = tokio::time::timeout_at(deadline, join_output_task(task)) => match result {
+            Ok(Ok(presence)) => Ok(presence),
+            Ok(Err(())) => Err(DrainError::Failed),
+            Err(_) => Err(DrainError::TimedOut),
+        },
+    }
+}
+
+async fn join_output_task(task: &mut Option<tokio::task::JoinHandle<bool>>) -> Result<bool, ()> {
+    let Some(handle) = task.as_mut() else { return Err(()); };
+    let result = handle.await.map_err(|_| ());
+    task.take();
+    result
+}
+
+async fn stop_output_tasks(tasks: &mut [Option<tokio::task::JoinHandle<bool>>; 2]) {
+    for task in tasks.iter().flatten() { task.abort(); }
+    for task in tasks.iter_mut() {
+        if let Some(task) = task.take() { let _ = task.await; }
+    }
 }
 
 async fn drain_output_presence<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> bool {
@@ -1647,6 +1668,14 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 mod tests {
     use super::*;
 
+    struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() { let _ = signal.send(()); }
+        }
+    }
+
     #[test]
     #[ignore]
     fn adb_stdin_child_helper() {
@@ -1674,6 +1703,34 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         cancel.cancel();
         assert!(matches!(task.await.unwrap(), Err(error) if error == "操作已取消。"));
+
+        let (stderr_started, mut stderr_started_rx) = tokio::sync::oneshot::channel();
+        let (stderr_dropped, stderr_dropped_rx) = tokio::sync::oneshot::channel();
+        let stdout_task = tokio::spawn(async { true });
+        let stderr_task = tokio::spawn(async move {
+            let _signal_on_drop = SignalOnDrop(Some(stderr_dropped));
+            let _ = stderr_started.send(());
+            std::future::pending::<bool>().await
+        });
+        let mut drains = [Some(stdout_task), Some(stderr_task)];
+        let drain_cancel = CancellationToken::new();
+        let (stdout_result, stderr_result) = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let stdout_result = await_output_task(&mut drains[0], deadline, &drain_cancel).await;
+            let stderr_future = await_output_task(&mut drains[1], deadline, &drain_cancel);
+            tokio::pin!(stderr_future);
+            tokio::select! {
+                _ = &mut stderr_started_rx => drain_cancel.cancel(),
+                result = &mut stderr_future => panic!("blocked stderr drain completed unexpectedly: {}", result.is_ok()),
+            }
+            (stdout_result, stderr_future.await)
+        };
+        assert!(matches!(stdout_result, Ok(true)));
+        assert!(matches!(stderr_result, Err(DrainError::Cancelled)));
+        assert!(drains[0].is_none(), "completed stdout handle must be consumed once");
+        assert!(drains[1].is_some(), "blocked stderr handle must remain available for cleanup");
+        stop_output_tasks(&mut drains).await;
+        assert!(stderr_dropped_rx.await.is_ok(), "aborted stderr drain must be joined and dropped");
     }
 
     #[test]

@@ -199,6 +199,6 @@
 ## P5-B USB binding provision（仅源码与 fake 检查）
 
 - `receiver::tests::fake_adb_secure_provision_confirms_persists_and_rejects_failures_without_leaks`：PASS。fake runner 覆盖固定 USB `content write` 参数与 stdin 承诺匹配、`content write` 错误文本但退出码为 0 时仍须远端摘要确认、远端已有不同材料、取消后使用同一 DPAPI 记录重试、非 USB/current-user 改变/APK 字节不匹配拒绝；错误诊断不回显合成 secret。所有文件仅位于隔离测试临时目录，没有运行真实 ADB。
-- `state::tests::adb_stdin_cancellation_reaps_child_and_output_drains`：检查 fake 子进程持续写 stdout/stderr 时取消 stdin runner 会停止并回收本进程及两条 drain task；不调用 ADB、不访问设备。
+- `state::tests::adb_stdin_cancellation_reaps_child_and_output_drains`：检查 fake 子进程取消，以及 stdout JoinHandle 已消费、stderr drain 阻塞时取消会返回错误并 abort/join 剩余 drain；不调用 ADB、不访问设备。
 - `tests/AnPodUdpVectorCheck.java`：既有纯 Java 记录解析检查 PASS，覆盖 69-byte 记录解析、短包/长包/未知版本拒绝。本次 Android 源码使用 Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources` 编译 PASS；未执行 AAPT2、未组装 APK。Android fd poll、CancellationSignal、15 秒 EOF 截止时间及设备 pipe 错误行为仅编译检查，运行行为 NOT_TESTED。
 - Provider 使用已有 `android.permission.DUMP` 读写保护，只扩展固定绑定 URI；health 查询保持只读。Rust `provision` 未注册 IPC，没有 UI、网络入口或播放器接线。真实 USB、系统 DUMP 鉴权、Android `filesDir`/AtomicFile 落盘及设备端状态确认均为 NOT_TESTED。
