@@ -202,3 +202,9 @@
 - `state::tests::adb_stdin_cancellation_reaps_child_and_output_drains`：检查 fake 子进程取消，以及 stdout JoinHandle 已消费、stderr drain 阻塞时取消会返回错误并 abort/join 剩余 drain；不调用 ADB、不访问设备。
 - `tests/AnPodUdpVectorCheck.java`：既有纯 Java 记录解析检查 PASS，覆盖 69-byte 记录解析、短包/长包/未知版本拒绝。本次 Android 源码使用 Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources` 编译 PASS；未执行 AAPT2、未组装 APK。Android fd poll、CancellationSignal、15 秒 EOF 截止时间及设备 pipe 错误行为仅编译检查，运行行为 NOT_TESTED。
 - Provider 使用已有 `android.permission.DUMP` 读写保护，只扩展固定绑定 URI；health 查询保持只读。Rust `provision` 未注册 IPC，没有 UI、网络入口或播放器接线。真实 USB、系统 DUMP 鉴权、Android `filesDir`/AtomicFile 落盘及设备端状态确认均为 NOT_TESTED。
+
+## P5-C authenticated localhost session prototype
+
+- `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。单项合并检查由 JDK 17 编译并启动真实 Java P5-A/UDP 接收代码，通过 Rust TCP localhost 完成双向握手、认证 BIND 与 mode、方向控制 HMAC、START/重复 START ACK 去重、旧 session FORMAT 拒绝、合成 PCM 到 fake sink、Streaming 心跳、PAUSE/RESUME 与 STOP；另以错误 receiver identity、错误 binding secret、坏 MAC、旧 session 控制帧确认拒绝。
+- Rust 定向 Cargo 测试：PASS。Android `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；未执行资源处理或组装 APK。JDK 合并检查只编译 P5-C 所需 Java protocol/UDP 文件及 `tests/P5cLoopbackEndpoint.java`。
+- 所有检查仅在 127.0.0.1 使用合成 binding 与 PCM；没有启动 AnPod 产品入口、真实音频设备、ADB、手机或局域网。P5-C 不接入 UI/IPC、默认 listener 或产品自动启动；真实 WASAPI/AudioTrack 输出和设备行为仍为 NOT_TESTED，P5 尚未完成。

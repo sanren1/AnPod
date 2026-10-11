@@ -38,6 +38,8 @@ pub struct PcmQueue {
     state: Mutex<QueueState>,
     wake: Condvar,
     dropped_frames: AtomicU64,
+    target_format: Option<PcmFormat>,
+    stopped: AtomicBool,
 }
 
 impl PcmQueue {
@@ -47,16 +49,34 @@ impl PcmQueue {
             samples: vec![0; samples_per_slot].into_boxed_slice(),
             info: PcmBlockInfo { frame_count: 0, sample_rate: 0, channels: PCM_CHANNELS, frame_index: 0 },
         }).collect();
-        Self { state: Mutex::new(QueueState { slots, head: 0, len: 0 }), wake: Condvar::new(), dropped_frames: AtomicU64::new(0) }
+        Self { state: Mutex::new(QueueState { slots, head: 0, len: 0 }), wake: Condvar::new(),
+            dropped_frames: AtomicU64::new(0), target_format: None, stopped: AtomicBool::new(false) }
     }
 
     pub fn dropped_frames(&self) -> u64 { self.dropped_frames.load(Ordering::Relaxed) }
+
+    pub(crate) fn for_session(format: PcmFormat) -> Self {
+        let mut queue = Self::new();
+        queue.target_format = Some(format);
+        queue
+    }
+
+    pub(crate) fn stop_and_clear(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            for slot in &mut state.slots { slot.samples.fill(0); }
+        }
+        self.wake.notify_all();
+    }
 
     pub(crate) fn push_raw(&self, samples: *const i16, frame_count: u32, sample_rate: u32,
         channels: u16, frame_index: u64) -> bool {
         let frames = frame_count as usize;
         let sample_count = frames.checked_mul(channels as usize);
-        if samples.is_null() || sample_rate == 0 || channels != PCM_CHANNELS
+        if self.stopped.load(Ordering::Acquire) || samples.is_null() || sample_rate == 0
+            || !matches!(channels, 1 | 2)
             || frames == 0 || frames > MAX_CAPTURE_FRAMES || sample_count.is_none() {
             self.add_dropped(frame_count as u64);
             return false;
@@ -69,6 +89,19 @@ impl PcmQueue {
                 return false;
             }
         };
+        if self.stopped.load(Ordering::Acquire) {
+            self.add_dropped(frame_count as u64);
+            return false;
+        }
+        let target_channels = match self.target_format {
+            Some(format) if format.sample_rate != sample_rate => {
+                self.add_dropped(frame_count as u64);
+                return false;
+            }
+            Some(format) => format.channels,
+            None => channels,
+        };
+        let target_count = frames * target_channels as usize;
         if state.len == PCM_QUEUE_CAPACITY {
             let stale = &state.slots[state.head].info;
             self.add_dropped(stale.frame_count as u64);
@@ -80,8 +113,17 @@ impl PcmQueue {
         // The native pointer is borrowed only for this callback. Copy directly
         // into the slot allocated when the session queue was created.
         let source = unsafe { std::slice::from_raw_parts(samples, sample_count) };
-        slot.samples[..sample_count].copy_from_slice(source);
-        slot.info = PcmBlockInfo { frame_count, sample_rate, channels, frame_index };
+        match (channels, target_channels) {
+            (1, 2) => for (frame, mono) in source.iter().enumerate() {
+                slot.samples[frame * 2] = *mono;
+                slot.samples[frame * 2 + 1] = *mono;
+            },
+            (2, 1) => for frame in 0..frames {
+                slot.samples[frame] = ((source[frame * 2] as i32 + source[frame * 2 + 1] as i32) / 2) as i16;
+            },
+            _ => slot.samples[..target_count].copy_from_slice(source),
+        }
+        slot.info = PcmBlockInfo { frame_count, sample_rate, channels: target_channels, frame_index };
         state.len += 1;
         drop(state);
         self.wake.notify_one();
@@ -127,6 +169,10 @@ pub struct UdpSessionMaterial {
 }
 
 impl UdpSessionMaterial {
+    pub(crate) fn from_authenticated(session_id: u64, key: &[u8; 32]) -> Self {
+        Self { session_id, key: *key }
+    }
+
     pub fn generate() -> Result<Self, String> {
         let mut bytes = [0; 40];
         getrandom::fill(&mut bytes).map_err(|_| "Unable to generate a fresh UDP session.".to_string())?;
@@ -137,6 +183,10 @@ impl UdpSessionMaterial {
     }
 }
 
+impl Drop for UdpSessionMaterial {
+    fn drop(&mut self) { self.key.fill(0); }
+}
+
 pub struct UdpSender {
     stopping: Arc<AtomicBool>,
     queue: Arc<PcmQueue>,
@@ -145,14 +195,30 @@ pub struct UdpSender {
 
 impl UdpSender {
     pub fn spawn(remote: SocketAddr, queue: Arc<PcmQueue>, material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
-        if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) { return Err("P3 UDP prototype only permits 127.0.0.1.".into()); }
-        if format.channels != PCM_CHANNELS || format.sample_rate == 0 { return Err("Unsupported PCM format for the native sink.".into()); }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        Self::spawn_inner(remote, queue, socket, material, format, 5)
+    }
+
+    pub(crate) fn spawn_authenticated(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
+        material: UdpSessionMaterial, parameters: crate::security::AudioParameters) -> Result<Self, String> {
+        parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
+        let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
+        let packetization_ms = if parameters.mode == 1 { 5 } else { 20 };
+        Self::spawn_inner(remote, queue, socket, material, format, packetization_ms)
+    }
+
+    fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
+        material: UdpSessionMaterial, format: PcmFormat, packetization_ms: usize) -> Result<Self, String> {
+        if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) { return Err("P3 UDP prototype only permits 127.0.0.1.".into()); }
+        if !matches!(format.channels, 1 | 2) || format.sample_rate == 0
+            || socket.local_addr().map_err(|error| error.to_string())?.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            return Err("Unsupported PCM format or UDP source for the native sink.".into());
+        }
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let worker_queue = queue.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
-            send_loop(socket, remote, worker_queue, worker_stopping, material, format)
+            send_loop(socket, remote, worker_queue, worker_stopping, material, format, packetization_ms)
         }).map_err(|error| error.to_string())?;
         Ok(Self { stopping, queue, worker: Some(worker) })
     }
@@ -174,7 +240,7 @@ impl Drop for UdpSender {
 }
 
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
-    material: UdpSessionMaterial, format: PcmFormat) -> Result<NetworkStats, String> {
+    material: UdpSessionMaterial, format: PcmFormat, packetization_ms: usize) -> Result<NetworkStats, String> {
     let mut encoder = PacketEncoder::new(&material.key, material.session_id, HOST_TO_RECEIVER);
     let format_payload = format.encode().map_err(|error| error.to_string())?;
     send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
@@ -184,8 +250,8 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
     let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
     let sample_bytes_per_frame = format.channels as usize * 2;
     let byte_limited_frames = MAX_PAYLOAD_LEN / sample_bytes_per_frame;
-    let five_ms_frames = (format.sample_rate as usize / 200).max(1);
-    let frames_per_packet = five_ms_frames.min(byte_limited_frames);
+    let target_packet_frames = (format.sample_rate as usize * packetization_ms / 1000).max(1);
+    let frames_per_packet = target_packet_frames.min(byte_limited_frames);
 
     while let Some(info) = queue.pop_wait(&stopping, &mut samples) {
         if info.sample_rate != format.sample_rate || info.channels != format.channels {

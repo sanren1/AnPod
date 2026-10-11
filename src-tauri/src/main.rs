@@ -9,6 +9,8 @@ mod network;
 mod protocol;
 #[allow(dead_code)] // P5-A offline binding/handshake is not wired into product flows yet.
 mod security;
+#[allow(dead_code)] // P5-C is an explicit localhost prototype; product connection flows do not invoke it.
+mod p5c;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};
@@ -180,6 +182,7 @@ fn claim_single_instance() -> Result<bool, String> {
 #[cfg(not(windows))]
 fn claim_single_instance() -> Result<bool, String> { Ok(true) }
 
+#[cfg(not(test))]
 fn main() {
     match claim_single_instance() {
         Ok(true) => {}

@@ -6,6 +6,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.SocketAddress;
+import java.util.Arrays;
 
 /** Explicit per-session UDP socket; it has no discovery, control, or service-start path. */
 final class UdpReceiver implements Runnable, AutoCloseable {
@@ -18,22 +19,31 @@ final class UdpReceiver implements Runnable, AutoCloseable {
     UdpReceiver(UdpSessionContext context, UdpPcmQueue queue) throws IOException {
         this.queue = queue;
         expectedPeer = context.expectedPeer;
-        decoder = new UdpPacketDecoder(context.sessionId, context.copyKey());
-        DatagramSocket bound = new DatagramSocket(null);
-        try {
-            bound.setReuseAddress(false);
-            bound.bind(context.bindAddress);
-        } catch (IOException error) {
-            bound.close();
-            decoder.destroy();
-            throw error;
+        byte[] key = context.copyKey();
+        try { decoder = new UdpPacketDecoder(context.sessionId, key); }
+        finally { Arrays.fill(key, (byte) 0); }
+        DatagramSocket transferred = context.takeSocket();
+        if (transferred != null) {
+            socket = transferred;
+        } else {
+            DatagramSocket bound = new DatagramSocket(null);
+            try {
+                bound.setReuseAddress(false);
+                bound.bind(context.bindAddress);
+            } catch (IOException error) {
+                bound.close();
+                decoder.destroy();
+                throw error;
+            }
+            socket = bound;
         }
-        socket = bound;
     }
 
     InetSocketAddress localAddress() {
         return (InetSocketAddress) socket.getLocalSocketAddress();
     }
+
+    boolean isClosed() { return socket.isClosed(); }
 
     @Override
     public void run() {

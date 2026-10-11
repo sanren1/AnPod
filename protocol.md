@@ -159,6 +159,87 @@ listeners, automatic reconnect, audio/control startup, product IPC/UI,
 unbinding, or reconfiguration. Real USB, system DUMP permission enforcement,
 and Android private storage remain NOT_TESTED.
 
+## P5-C authenticated localhost session prototype
+
+P5-C composes the existing P5-A handshake and P3 ANPD audio datagrams; it does
+not change either format. The prototype is explicitly started by an internal
+caller and binds its temporary TCP listener and UDP sockets to `127.0.0.1`.
+There is no default listener or discovery. The host connects to the explicit
+loopback TCP address returned by that caller. The receiver accepts only a
+loopback TCP peer. The host creates its UDP socket before authentication so
+its local port is known; the receiver selects its UDP port after authentication.
+The authenticated BIND exchange fixes the host UDP port, while the receiver
+UDP port is returned in the authenticated ACK. The receiver's expected UDP
+peer is exactly the accepted TCP peer's loopback address plus the authenticated
+host UDP port. No UDP source or discovery packet can change either endpoint.
+
+P5-A's four TCP handshake frames remain byte-for-byte unchanged and are read
+with their existing fixed lengths: HELLO 85 bytes, CHALLENGE 86 bytes, FINISH
+38 bytes, READY 38 bytes. Their `ANP5`, version 1, and message type bytes are
+followed by the existing identity, nonce, session, parameter, and proof bytes.
+The existing transcript authenticates host/receiver IDs, both nonces, session
+ID, and PCM parameters. No binding is created or replaced during a handshake;
+each side must receive an already-loaded binding record.
+
+After READY, control is carried on the same TCP connection. Each control frame
+has a two-byte big-endian length prefix, then a 30-byte header, payload, and
+32-byte HMAC-SHA256 tag. The header is `ANPC` (4 bytes), version 1 (1), type
+(1), zero flags (2), direction (4), session ID (8), sequence (8), and payload
+length (2), all multi-byte integers big-endian. The HMAC covers the complete
+header and payload; the length prefix is checked against the header and frame
+size. Directions reuse `ANPH` host-to-receiver and `ANPR` receiver-to-host.
+The selected P5-A directional control key authenticates every field, including
+peer role, session, sequence, type, and length. Control frames are limited to
+1200 bytes. The control sequence starts at zero independently in each
+direction and must increase by exactly one. Repeating the exact immediately
+previous command returns its cached ACK without applying it again; changing a
+frame while reusing its sequence, skipping a sequence, or using an old session
+is rejected. TCP provides transport retransmission, so the prototype does not
+add application retries or UDP rate limiting.
+
+Control types are BIND (1), SELECT_MODE (2), START (3), PAUSE (4), RESUME (5),
+STOP (6), HEARTBEAT (7), and ACK (127). BIND carries the host UDP port as an
+unsigned 16-bit integer. SELECT_MODE carries the one-byte P5-A mode and is
+accepted only when it exactly matches the authenticated handshake parameters;
+changing mode requires a fresh authenticated session. START/PAUSE/RESUME/STOP
+and HEARTBEAT carry no payload. ACK carries the acknowledged command type
+(1 byte), command sequence (8), result (1), receiver state (1), and receiver
+UDP port (2). The port is nonzero only in the successful BIND ACK. Results are
+OK (0), rejected (1), or failed (2). States are authenticated (0),
+TransportConnected (1), ReceiverRunning (2), Streaming (3), paused (4), and
+stopped (5). ACK has its own receiver-to-host sequence and HMAC.
+
+Audio remains the existing ANPD v1 UDP datagram: 34-byte authenticated header,
+PCM16LE payload, AES-GCM tag, and the negotiated P5-A session ID. The sender
+uses the P5-A host-to-receiver audio key. The receiver uses that same derived
+direction key and accepts FORMAT only when sample rate and channel count equal
+the authenticated parameters; later PCM payloads must be aligned to that
+format. Balanced mode packetizes at 20 ms and low-latency mode at 5 ms; the
+receiver passes the same authenticated parameters and mode to its existing
+AudioTrack path. START is the first point where the receiver opens the
+authenticated UDP session for playback; the host starts its sender only after
+the successful START ACK. STOP closes the sender, clears the queue, destroys
+session keys/context, and does not reconnect.
+
+TransportConnected means authentication and BIND completed. ReceiverRunning
+means the controlled playback endpoint reports successful start. Streaming
+means that endpoint reports a PCM write/output callback; neither READY, a
+received UDP packet, nor queued PCM alone means Streaming or audible output.
+Only an authenticated HEARTBEAT can refresh receiver liveness or return a newer
+playback state. A heartbeat deadline is checked from local monotonic time.
+Unknown commands, invalid control state transitions, bad control identity or
+authentication, replay, and sequence failures terminate or reject the control
+operation and never claim that the Receiver is running. Invalid UDP datagrams
+are dropped by the existing parser; they cannot commit replay state or enter
+the PCM queue.
+
+P5-C currently exposes only an internal localhost exchange and controlled
+playback callback. It adds no UI/IPC/default listener, LAN discovery,
+firewall/hotspot changes, WASAPI/AudioTrack startup, or product bootstrap. The
+local cross-language test uses synthetic PCM and a fake playback endpoint;
+real USB/network transport, real WASAPI/AudioTrack output, and device behavior
+remain NOT_TESTED. This section does not mark P5 complete.
+
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3
 mock checks replay eligibility before AEAD. Both commit a sequence only after

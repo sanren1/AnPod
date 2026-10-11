@@ -304,7 +304,7 @@ impl AudioParameters {
         Ok(value)
     }
 
-    fn validate(self) -> Result<(), SecurityError> {
+    pub(crate) fn validate(self) -> Result<(), SecurityError> {
         if !(8_000..=192_000).contains(&self.sample_rate)
             || !matches!(self.channels, 1 | 2)
             || self.mode > 1
@@ -484,6 +484,25 @@ impl Drop for SessionKeys {
         self.host_to_receiver_control.fill(0);
         self.receiver_to_host_control.fill(0);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_binding_material() -> BindingMaterial {
+    BindingMaterial { host_id: [0x11; 16], receiver_id: [0x22; 16], secret: [0x33; 32] }
+}
+
+#[cfg(test)]
+pub(crate) fn test_binding_material_with_wrong_identity() -> BindingMaterial {
+    let mut material = test_binding_material();
+    material.receiver_id[0] ^= 1;
+    material
+}
+
+#[cfg(test)]
+pub(crate) fn test_binding_material_with_wrong_secret() -> BindingMaterial {
+    let mut material = test_binding_material();
+    material.secret[0] ^= 1;
+    material
 }
 
 fn encode_hello(material: &BindingMaterial, host_nonce: &[u8; 32], session_id: u64, parameters: AudioParameters) -> Vec<u8> {

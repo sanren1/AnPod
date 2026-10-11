@@ -9,6 +9,7 @@ import java.util.ArrayList;
 final class UdpPcmQueue {
     static final int CAPACITY_PACKETS = 8;
     private final ArrayList<AudioPacket> packets = new ArrayList<>(CAPACITY_PACKETS);
+    private final PairingProtocol.AudioParameters expectedParameters;
     private UdpPacketDecoder.Format format;
     private boolean paused;
     private boolean stopped;
@@ -18,6 +19,12 @@ final class UdpPcmQueue {
     private long payloadGeneration;
     private long droppedFrames;
 
+    UdpPcmQueue() { this(null); }
+
+    UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters) {
+        this.expectedParameters = expectedParameters;
+    }
+
     synchronized void accept(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder)
             throws UdpPacketDecoder.ProtocolException {
         if (stopped) throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.AUDIO);
@@ -25,6 +32,9 @@ final class UdpPcmQueue {
             if (format != null || packet.sequence != 0)
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
             UdpPacketDecoder.Format acceptedFormat = UdpPacketDecoder.decodeFormat(packet);
+            if (expectedParameters != null && (acceptedFormat.sampleRate != expectedParameters.sampleRate
+                    || acceptedFormat.channels != expectedParameters.channels))
+                throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
             decoder.commit(packet.sequence);
             format = acceptedFormat;
             notifyAll();
