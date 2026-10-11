@@ -28,4 +28,6 @@ public interface ILog
     /// (device serial, session token). See <see cref="LogRedactor"/>.
     /// </summary>
     void AddSecret(string? secret);
+
+    void RemoveSecret(string? secret);
 }

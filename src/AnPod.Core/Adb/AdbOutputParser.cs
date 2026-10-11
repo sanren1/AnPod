@@ -12,6 +12,9 @@ public static partial class AdbOutputParser
     [GeneratedRegex(@"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$", RegexOptions.CultureInvariant)]
     private static partial Regex NetworkSerialRegex();
 
+    [GeneratedRegex(@"^adb-.+\._adb-tls-connect\._tcp\.?$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex TlsMdnsSerialRegex();
+
     /// <summary>
     /// Parses <c>adb devices -l</c>. Unknown/garbage lines are ignored rather
     /// than mis-parsed, because ADB interleaves daemon banners on the same stream.
@@ -116,11 +119,12 @@ public static partial class AdbOutputParser
     }
 
     /// <summary>
-    /// True when the ADB serial is an <c>ip:port</c> network endpoint. Used to
-    /// positively rule out USB; the inverse is NOT a USB proof (plan §5.2).
+    /// True when the ADB serial is an <c>ip:port</c> endpoint or Android's TLS
+    /// wireless-debugging mDNS serial. The inverse is NOT a USB proof.
     /// </summary>
     public static bool IsNetworkSerial(string? serial) =>
-        !string.IsNullOrWhiteSpace(serial) && NetworkSerialRegex().IsMatch(serial);
+        !string.IsNullOrWhiteSpace(serial) &&
+        (NetworkSerialRegex().IsMatch(serial) || TlsMdnsSerialRegex().IsMatch(serial));
 
     /// <summary>
     /// Prefix shared by every abstract socket name AnPod creates. Only names

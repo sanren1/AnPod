@@ -47,6 +47,15 @@ public sealed class FileLogger : ILog, IDisposable
         }
     }
 
+    public void RemoveSecret(string? secret)
+    {
+        if (string.IsNullOrWhiteSpace(secret)) return;
+        lock (_gate)
+        {
+            _secrets.RemoveAll(value => string.Equals(value, secret, StringComparison.Ordinal));
+        }
+    }
+
     public void Debug(string message) => Write(LogLevel.Debug, message, null);
 
     public void Info(string message) => Write(LogLevel.Info, message, null);

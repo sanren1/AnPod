@@ -1,35 +1,18 @@
-# deps/ — runtime dependencies (not source-controlled)
+# deps/ — local runtime dependencies
 
-Everything in this folder is **produced by another toolchain** and is deliberately
-absent from version control. `AnPod.Desktop.csproj` copies each file next to
-`AnPod.exe` when it exists, so a clean checkout still compiles and starts.
+These files are generated or obtained from their upstream distributions and are excluded from Git. The Tauri portable build copies them beside `AnPod.exe`; the retained WPF fallback can also use the same runtime files.
 
-| File | Produced by | Notes |
-|---|---|---|
-| `audio_capture.dll` | `packaging/build-native.ps1` | x64 WASAPI capture, from `src/AnPod.Native/` |
-| `server` | `packaging/build-android.ps1` | Android payload (APK used as a classes.dex container) |
-| `adb.exe` | Android SDK Platform-Tools | must be a trusted, recorded version |
-| `AdbWinApi.dll` | Android SDK Platform-Tools | ships with `adb.exe` |
-| `AdbWinUsbApi.dll` | Android SDK Platform-Tools | ships with `adb.exe` |
+| File | Source | Notes |
+| --- | --- | --- |
+| `audio_capture.dll` | `packaging/build-native.ps1` | x64 WASAPI capture from `src/AnPod.Native/` |
+| `server` | `packaging/build-android.ps1` | Android `app_process` payload built from `src/AnPod.AndroidServer/` |
+| `adb.exe` | Android SDK Platform-Tools | Record the exact version in `upstream/SOURCE_VERSIONS.md` |
+| `AdbWinApi.dll` | Same Platform-Tools archive | Keep the version matched to `adb.exe` |
+| `AdbWinUsbApi.dll` | Same Platform-Tools archive | Keep the version matched to `adb.exe` |
+| `PLATFORM_TOOLS_NOTICE.txt` | Same Platform-Tools archive | Shipped as `LICENSES/PLATFORM_TOOLS_NOTICE.txt` |
 
-## Rules
+Do not download the Android payload separately; build it from repository source. Do not commit runtime binaries. Before redistribution, retain the ADB archive's notice and verify the terms for the selected Platform-Tools release.
 
-1. **Do not download the Android payload from the internet.** It must be built
-   from `src/AnPod.AndroidServer/` so the version is known and reproducible
-   (plan §7.1).
-2. Record the platform-tools version in `upstream/SOURCE_VERSIONS.md` before any
-   redistribution.
-3. Verify `server` is a zip whose root contains `classes.dex`:
-   `unzip -l deps/server | grep classes.dex`
-4. Do not commit these binaries. `.gitignore` excludes everything here except
-   this file.
-
-## Quick check
-
-```bash
-# Are all five present?
-ls deps/{audio_capture.dll,adb.exe,AdbWinApi.dll,AdbWinUsbApi.dll,server}
-
-# Is the DLL the right architecture?
-dumpbin /headers deps/audio_capture.dll | grep -i machine   # expect: x64
+```powershell
+Get-ChildItem deps\adb.exe, deps\AdbWinApi.dll, deps\AdbWinUsbApi.dll, deps\audio_capture.dll, deps\server, deps\PLATFORM_TOOLS_NOTICE.txt
 ```

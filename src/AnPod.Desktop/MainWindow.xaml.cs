@@ -8,65 +8,111 @@ namespace AnPod.Desktop;
 public partial class MainWindow : Window
 {
     private bool _forceClose;
+    private bool _trayHintShown;
     private WirelessHelpWindow? _helpWindow;
+    private QrPairingWindow? _addPhoneWindow;
+    private SettingsWindow? _settingsWindow;
+    private DiagnosticsWindow? _diagnosticsWindow;
 
     public MainWindow()
     {
         InitializeComponent();
-
-        // Set here rather than in XAML: the source is a static property, and a
-        // {x:Static} binding to it would be resolved before the resource is
-        // loaded in the designer.
         Icon = AppIcon.WindowIcon;
-
-        // SizeToContent grows the window to its content, and the Wi-Fi panel is
-        // taller than the work area on a small screen. Cap it to whatever is
-        // actually available so the ScrollViewer takes over instead of the footer
-        // being pushed past the bottom edge.
-        MaxHeight = SystemParameters.WorkArea.Height;
+        DataContextChanged += OnDataContextChanged;
     }
 
-    /// <summary>
-    /// Shows the wireless help. Handled here rather than through a command
-    /// because the view model has no business owning a window, and the reused
-    /// instance is what makes a second click bring the existing help forward
-    /// instead of stacking another copy behind it.
-    /// </summary>
-    private void OnWifiHelpClick(object sender, RoutedEventArgs e)
+    public void ShowHelp()
     {
-        if (_helpWindow is { IsLoaded: true })
-        {
-            _helpWindow.Activate();
-            return;
-        }
-
-        // The main view model is the data context, so the hotspot button inside
-        // the help reuses the command that already exists.
+        if (_helpWindow is { IsLoaded: true }) { _helpWindow.Activate(); return; }
         _helpWindow = new WirelessHelpWindow { Owner = this, DataContext = DataContext };
-        _helpWindow.Closed += (_, _) => _helpWindow = null;
+        _helpWindow.Closed += (_, _) => { _helpWindow = null; FocusMain(); };
         _helpWindow.ShowDialog();
     }
 
-    /// <summary>Closes the window for real, bypassing the minimise-to-tray rule.</summary>
+    public void ShowAddPhone()
+    {
+        if (DataContext is not MainViewModel viewModel) return;
+        if (_addPhoneWindow is { IsLoaded: true }) { _addPhoneWindow.Activate(); return; }
+        _addPhoneWindow = new QrPairingWindow(viewModel) { Owner = this };
+        _addPhoneWindow.Closed += (_, _) => { _addPhoneWindow = null; AddPhoneButton.Focus(); };
+        _addPhoneWindow.ShowDialog();
+    }
+
+    private void OnSettingsClick(object sender, RoutedEventArgs e)
+    {
+        ShowSettings();
+    }
+
+    public void ShowSettings()
+    {
+        if (_settingsWindow is { IsLoaded: true }) { _settingsWindow.Activate(); return; }
+        _settingsWindow = new SettingsWindow { Owner = this, DataContext = DataContext };
+        _settingsWindow.Closed += (_, _) => { _settingsWindow = null; FocusMain(); };
+        _settingsWindow.ShowDialog();
+    }
+
+    private void OnDiagnosticsClick(object sender, RoutedEventArgs e)
+    {
+        if (_diagnosticsWindow is { IsLoaded: true }) { _diagnosticsWindow.Activate(); return; }
+        _diagnosticsWindow = new DiagnosticsWindow { Owner = this, DataContext = DataContext };
+        _diagnosticsWindow.Closed += (_, _) => { _diagnosticsWindow = null; FocusMain(); };
+        _diagnosticsWindow.ShowDialog();
+    }
+
+    private void OnHelpClick(object sender, RoutedEventArgs e) => ShowHelp();
+
+    private void OnAddPhoneClick(object sender, RoutedEventArgs e) => ShowAddPhone();
+
+    private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (e.OldValue is MainViewModel oldViewModel)
+        {
+            oldViewModel.HelpRequested -= OnHelpRequested;
+            oldViewModel.AddPhoneRequested -= OnAddPhoneRequested;
+        }
+        if (e.NewValue is MainViewModel newViewModel)
+        {
+            newViewModel.HelpRequested += OnHelpRequested;
+            newViewModel.AddPhoneRequested += OnAddPhoneRequested;
+        }
+    }
+
+    private void OnHelpRequested(object? sender, EventArgs e) => Dispatcher.BeginInvoke(ShowHelp);
+    private void OnAddPhoneRequested(object? sender, EventArgs e) => Dispatcher.BeginInvoke(ShowAddPhone);
+
+    private void FocusMain()
+    {
+        Activate();
+        Focus();
+    }
+
     public void ForceClose()
     {
         _forceClose = true;
         _helpWindow?.Close();
+        _addPhoneWindow?.Close();
+        _settingsWindow?.Close();
+        _diagnosticsWindow?.Close();
         Close();
     }
 
     protected override void OnClosing(CancelEventArgs e)
     {
-        var minimizeToTray = (DataContext as MainViewModel)?.MinimizeToTray ?? true;
+        if (_forceClose) { base.OnClosing(e); return; }
 
-        // Plan §5.7: closing hides to the tray; only the tray "退出" ends the app.
-        if (!_forceClose && minimizeToTray)
+        if ((DataContext as MainViewModel)?.MinimizeToTray ?? true)
         {
             e.Cancel = true;
             Hide();
+            if (!_trayHintShown)
+            {
+                _trayHintShown = true;
+                (System.Windows.Application.Current as App)?.ShowTrayHint();
+            }
             return;
         }
 
-        base.OnClosing(e);
+        e.Cancel = true;
+        (System.Windows.Application.Current as App)?.RequestExit();
     }
 }

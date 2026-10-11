@@ -13,14 +13,14 @@ public static class DeviceInfoFactory
     /// Classifies the transport. USB is asserted when ADB reported a <c>usb:</c>
     /// tag, or — because recent platform-tools releases omit that tag even for
     /// real USB transports — when the device's own <c>sys.usb.state</c> lists
-    /// <c>adb</c> as an active USB function. An <c>ip:port</c> serial proves
+    /// <c>adb</c> as an active USB function. An IP or TLS mDNS serial proves
     /// network. Anything else stays <see cref="TransportKind.Unknown"/> and must
     /// not auto-connect (plan §5.2).
     /// </summary>
     /// <remarks>
-    /// USB is checked first: a phone can be reachable over TCP while still
-    /// plugged in (legacy <c>adb tcpip</c>), and in that case the cable is the
-    /// transport the user is looking at.
+    /// The ADB row identifies its own transport. In particular, global
+    /// <c>sys.usb.state</c> must not override an IP/TLS network serial when the
+    /// same phone is also plugged in.
     /// </remarks>
     public static DeviceInfo Create(
         AdbDeviceEntry entry,
@@ -34,12 +34,12 @@ public static class DeviceInfoFactory
         bool networkConfirmed = AdbOutputParser.IsNetworkSerial(entry.Serial);
         bool usbStateConfirmed = IsUsbStateConfirmed(props);
 
-        bool usbConfirmed = usbTagConfirmed || usbStateConfirmed;
-
-        TransportKind transport = usbConfirmed
+        TransportKind transport = usbTagConfirmed
             ? TransportKind.Usb
             : networkConfirmed
                 ? TransportKind.Wifi
+                : usbStateConfirmed
+                    ? TransportKind.Usb
                 : TransportKind.Unknown;
 
         return new DeviceInfo

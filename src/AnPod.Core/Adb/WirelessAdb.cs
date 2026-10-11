@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 
 namespace AnPod.Core.Adb;
@@ -52,6 +53,9 @@ public enum AdbMdnsKind
 /// <param name="Endpoint">Normalised <c>ip:port</c>.</param>
 public sealed record AdbMdnsService(string Name, string Endpoint, AdbMdnsKind Kind);
 
+/// <summary>Ephemeral credentials encoded in an Android Studio compatible ADB QR.</summary>
+public sealed record AdbQrPairingCredentials(string InstanceName, string Password, string Payload);
+
 /// <summary>
 /// The wireless-ADB pieces that are pure logic and therefore testable without a
 /// phone: validating what the user typed, and classifying what <c>adb pair</c>,
@@ -96,6 +100,60 @@ public static partial class WirelessAdb
 
     [GeneratedRegex(@"^\d{1,3}(?:\.\d{1,3}){3}$", RegexOptions.CultureInvariant)]
     private static partial Regex Ipv4Regex();
+
+    private const string QrAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+
+    public static AdbQrPairingCredentials CreateQrPairingCredentials()
+    {
+        static string RandomText(int length)
+        {
+            var chars = new char[length];
+            for (var i = 0; i < chars.Length; i++)
+            {
+                chars[i] = QrAlphabet[RandomNumberGenerator.GetInt32(QrAlphabet.Length)];
+            }
+            return new string(chars);
+        }
+
+        var instance = "studio-" + RandomText(10);
+        var password = RandomText(20);
+        return new AdbQrPairingCredentials(instance, password, BuildQrPayload(instance, password));
+    }
+
+    public static string BuildQrPayload(string instanceName, string password)
+    {
+        if (!Regex.IsMatch(instanceName, @"^studio-[A-Za-z0-9]{10}$", RegexOptions.CultureInvariant) ||
+            !Regex.IsMatch(password, @"^[A-Za-z0-9]{20}$", RegexOptions.CultureInvariant))
+        {
+            throw new ArgumentException("ADB QR credentials contain unsupported characters or lengths.");
+        }
+
+        return $"WIFI:T:ADB;S:{instanceName};P:{password};;";
+    }
+
+    public static bool IsSameMdnsInstance(string? actual, string expected) =>
+        string.Equals(NormalizeMdnsInstance(actual), NormalizeMdnsInstance(expected), StringComparison.Ordinal);
+
+    public static string? TlsConnectInstance(string? serial)
+    {
+        const string suffix = "._adb-tls-connect._tcp";
+        var normalized = serial?.Trim().TrimEnd('.');
+        return normalized is not null && normalized.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+            ? normalized[..^suffix.Length]
+            : null;
+    }
+
+    private static string? NormalizeMdnsInstance(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = value.Trim().TrimEnd('.');
+        foreach (var suffix in new[] { "._adb-tls-pairing._tcp", "._adb-tls-connect._tcp", "._adb._tcp" })
+        {
+            if (normalized.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return normalized[..^suffix.Length];
+        }
+        return normalized;
+    }
 
     /// <summary>
     /// Normalises user input into a bare <c>ip:port</c> endpoint.
@@ -305,12 +363,15 @@ public static partial class WirelessAdb
                 continue;
             }
 
+            var tokens = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
             string? endpoint = null;
-            foreach (var token in line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            var endpointIndex = -1;
+            for (var i = 0; i < tokens.Length; i++)
             {
-                if (TryNormalizeEndpoint(token, out var normalized, out _))
+                if (TryNormalizeEndpoint(tokens[i], out var normalized, out _))
                 {
                     endpoint = normalized;
+                    endpointIndex = i;
                 }
             }
 
@@ -319,11 +380,13 @@ public static partial class WirelessAdb
                 continue;
             }
 
-            // The instance name is whatever precedes the endpoint; it is only used
-            // for display, so an unusual layout degrades to the endpoint itself.
-            var name = line[..line.LastIndexOf(endpoint, StringComparison.Ordinal)].Trim();
+            // adb mdns services prints instance, service type and endpoint in
+            // separate columns. Some platform-tools versions combine instance
+            // and type in the first column; keep only the instance in both forms.
+            var name = endpointIndex > 0 ? tokens[0] : endpoint;
+            name = NormalizeMdnsInstance(name) ?? endpoint;
             services.Add(new AdbMdnsService(
-                name.Length == 0 ? endpoint : name,
+                name,
                 endpoint,
                 ClassifyMdnsService(line)));
         }
@@ -389,7 +452,7 @@ public static partial class WirelessAdb
             return null;
         }
 
-        if (connect.Count == 1)
+        if (string.IsNullOrEmpty(preferredHost) && connect.Count == 1)
         {
             return connect[0].Endpoint;
         }

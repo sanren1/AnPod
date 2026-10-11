@@ -79,7 +79,8 @@ must be copied into `deps/` are `adb.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll`.
 * Sizes at this revision: `adb.exe` 8 273 560 B, `AdbWinApi.dll` 108 184 B,
   `AdbWinUsbApi.dll` 73 368 B.
 * `NOTICE.txt` from the archive is kept at `deps/PLATFORM_TOOLS_NOTICE.txt` and
-  is copied into the published package by `packaging/publish.ps1`.
+  is copied into Tauri packages by `packaging/publish-tauri.ps1` (and into the
+  optional WPF fallback package by `packaging/publish.ps1`).
 
 > **Still required before release:** re-read the SDK terms for revision 37.0.1
 > and confirm the redistribution clause permits bundling (plan §7.3/§P5.4).

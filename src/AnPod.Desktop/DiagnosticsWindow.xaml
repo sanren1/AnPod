@@ -1,0 +1,29 @@
+<Window x:Class="AnPod.Desktop.DiagnosticsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AnPod 诊断" Width="560" Height="500" MinWidth="440" MinHeight="380"
+        ResizeMode="CanResize" ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}" Background="{DynamicResource AppBackgroundBrush}"
+        UseLayoutRounding="True">
+    <DockPanel Margin="20">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,12,0,0">
+            <Button Content="复制诊断" Command="{Binding CopyDiagnosticsCommand}" Style="{StaticResource SecondaryButtonStyle}"
+                    AutomationProperties.Name="复制脱敏诊断信息" />
+            <Button Content="日志文件夹" Margin="8,0,0,0" Command="{Binding OpenLogsCommand}" Style="{StaticResource LinkButtonStyle}"
+                    AutomationProperties.Name="打开日志文件夹" />
+            <Button Content="配置文件夹" Margin="8,0,0,0" Command="{Binding OpenSettingsFileLocationCommand}" Style="{StaticResource LinkButtonStyle}"
+                    AutomationProperties.Name="打开配置文件夹" />
+            <Button Content="关闭" Margin="8,0,0,0" HorizontalAlignment="Right" IsCancel="True"
+                    Style="{StaticResource SecondaryButtonStyle}" AutomationProperties.Name="关闭诊断窗口" />
+        </StackPanel>
+        <StackPanel>
+            <TextBlock Text="诊断与关于" FontSize="19" FontWeight="SemiBold" Foreground="{DynamicResource ForegroundBrush}" />
+            <TextBlock Margin="0,5,0,12" Text="当前版本与实际组件状态；复制内容不包含设备序列号、配对码或密钥。"
+                       FontSize="13" Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+            <TextBox Text="{Binding DiagnosticsText, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" MinHeight="250"
+                     FontSize="13" Padding="10" Background="{DynamicResource CardBrush}" Foreground="{DynamicResource ForegroundBrush}"
+                     BorderBrush="{DynamicResource BorderBrush}" AutomationProperties.Name="可阅读的诊断详情" />
+        </StackPanel>
+    </DockPanel>
+</Window>

@@ -36,3 +36,12 @@ desktop.ini
 # Local agent state and temporary development toolchains
 .workbuddy-ai/
 .tmp-*
+
+# Tauri generated platform schemas and non-Windows app icon outputs
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/icon.icns
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png

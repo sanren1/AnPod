@@ -4,6 +4,19 @@ using AnPod.Core.Adb;
 
 namespace AnPod.Core.Models;
 
+public enum PlaybackMode
+{
+    Balanced,
+    LowLatency,
+}
+
+public enum AppearanceTheme
+{
+    System,
+    Light,
+    Dark,
+}
+
 /// <summary>
 /// Persisted user settings (plan §5.8/§5.10). Deliberately tiny — every field
 /// here changes observable behaviour, so there is nothing speculative to prune.
@@ -66,6 +79,15 @@ public sealed class AppSettings
     [JsonPropertyName("lastWirelessEndpoint")]
     public string? LastWirelessEndpoint { get; set; }
 
+    /// <summary>Shared USB/Wi-Fi AudioTrack tuning; older settings use balanced mode.</summary>
+    [JsonPropertyName("playbackMode")]
+    [JsonConverter(typeof(JsonStringEnumConverter<PlaybackMode>))]
+    public PlaybackMode PlaybackMode { get; set; } = PlaybackMode.Balanced;
+
+    [JsonPropertyName("appearanceTheme")]
+    [JsonConverter(typeof(JsonStringEnumConverter<AppearanceTheme>))]
+    public AppearanceTheme AppearanceTheme { get; set; } = AppearanceTheme.System;
+
     public AppSettings Clone() => new()
     {
         SchemaVersion = SchemaVersion,
@@ -76,6 +98,8 @@ public sealed class AppSettings
         PreferredTransport = PreferredTransport,
         AutoReconnectWifi = AutoReconnectWifi,
         LastWirelessEndpoint = LastWirelessEndpoint,
+        PlaybackMode = PlaybackMode,
+        AppearanceTheme = AppearanceTheme,
     };
 }
 
@@ -138,6 +162,12 @@ public static class AppSettingsSerializer
             PreferredTransport = NormalizeTransport(source.PreferredTransport),
             AutoReconnectWifi = source.AutoReconnectWifi,
             LastWirelessEndpoint = NormalizeEndpoint(source.LastWirelessEndpoint),
+            PlaybackMode = source.PlaybackMode is PlaybackMode.Balanced or PlaybackMode.LowLatency
+                ? source.PlaybackMode
+                : PlaybackMode.Balanced,
+            AppearanceTheme = source.AppearanceTheme is AppearanceTheme.System or AppearanceTheme.Light or AppearanceTheme.Dark
+                ? source.AppearanceTheme
+                : AppearanceTheme.System,
         };
     }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Builds src/AnPod.Desktop/Assets/icon.ico from the repository's icon.png.
+"""Builds shared WPF/Tauri Windows icons from the repository's icon.png.
 
 Windows asks for several icon sizes and picks one per context: 16 px in the
 notification area, 24/32 px in the title bar and Explorer's small views, 256 px
@@ -14,8 +14,8 @@ and re-centring with a small uniform border buys about 20 % more glyph for the
 same slot without redrawing anything. icon.png itself is left untouched: it stays
 the source of truth, and the .ico is the build product.
 
-The .ico is committed (the app embeds it), so this only has to run when
-icon.png changes.
+The WPF fallback and Tauri desktop both embed the generated .ico. The web UI
+uses the matching tightened PNG. Run this only when icon.png changes.
 
 Run:  <python> packaging/make-icon.py
 """
@@ -32,7 +32,12 @@ except ImportError:  # pragma: no cover - operator guidance, not a code path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "icon.png"
-TARGET = ROOT / "src" / "AnPod.Desktop" / "Assets" / "icon.ico"
+TARGETS = [
+    ROOT / "src" / "AnPod.Desktop" / "Assets" / "icon.ico",
+    ROOT / "src-tauri" / "icons" / "icon.ico",
+]
+TAURI_ICON_DIR = ROOT / "src-tauri" / "icons"
+FRONTEND_ICON = ROOT / "frontend" / "public" / "icon.png"
 
 # 16 tray, 24/32 title bar, 48/64 Explorer large, 128/256 extra large.
 SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
@@ -80,7 +85,9 @@ def main() -> int:
     if not SOURCE.exists():
         sys.exit(f"missing source image: {SOURCE}")
 
-    TARGET.parent.mkdir(parents=True, exist_ok=True)
+    for target in TARGETS:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    TAURI_ICON_DIR.mkdir(parents=True, exist_ok=True)
 
     with Image.open(SOURCE) as source:
         image = source.convert("RGBA")
@@ -99,13 +106,25 @@ def main() -> int:
         print(f"trim   : {width}x{height} -> {trimmed.width}x{trimmed.height}")
 
         # The 256 px frame is stored as PNG (Vista and later), the rest as BMP.
-        trimmed.save(TARGET, format="ICO", sizes=SIZES)
+        for target in TARGETS:
+            trimmed.save(target, format="ICO", sizes=SIZES)
+        trimmed.save(TAURI_ICON_DIR / "icon.png", format="PNG")
+        for edge in (32, 64, 128, 256):
+            trimmed.resize((edge, edge), Image.Resampling.LANCZOS).save(
+                TAURI_ICON_DIR / f"{edge}x{edge}.png", format="PNG"
+            )
+        trimmed.resize((256, 256), Image.Resampling.LANCZOS).save(
+            TAURI_ICON_DIR / "128x128@2x.png", format="PNG"
+        )
+        FRONTEND_ICON.parent.mkdir(parents=True, exist_ok=True)
+        trimmed.resize((256, 256), Image.Resampling.LANCZOS).save(FRONTEND_ICON, format="PNG")
 
-    with Image.open(TARGET) as written:
+    with Image.open(TARGETS[0]) as written:
         frames = sorted(written.ico.sizes())
 
     print(f"source : {SOURCE.name} {width}x{height}")
-    print(f"target : {TARGET.relative_to(ROOT)} ({TARGET.stat().st_size} bytes)")
+    for target in TARGETS:
+        print(f"target : {target.relative_to(ROOT)} ({target.stat().st_size} bytes)")
     print(f"frames : {', '.join(f'{w}x{h}' for w, h in frames)}")
     return 0
 

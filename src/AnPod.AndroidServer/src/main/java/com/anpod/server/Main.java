@@ -70,7 +70,7 @@ public final class Main {
 
                 log("FORMAT sampleRate=" + sampleRate + " channels=" + channels + " bits=" + bitsPerSample);
 
-                play(input, sampleRate, channelMask);
+                play(input, sampleRate, channelMask, options.playbackMode);
             }
 
             log("STOP");
@@ -139,7 +139,7 @@ public final class Main {
         return (buffer[offset] & 0xFF) | ((buffer[offset + 1] & 0xFF) << 8);
     }
 
-    private static void play(InputStream input, int sampleRate, int channelMask) throws IOException {
+    private static void play(InputStream input, int sampleRate, int channelMask, String requestedMode) throws IOException {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
 
         int minBuffer = AudioTrack.getMinBufferSize(
@@ -149,8 +149,8 @@ public final class Main {
             throw new IOException("AUDIO_TRACK_UNSUPPORTED_FORMAT");
         }
 
-        // One minimum buffer of pre-roll plus one of headroom covers engine
-        // jitter without queueing several hundred milliseconds of audio.
+        // Keep the current track capacity in balanced mode; low latency reduces
+        // only the effective application buffer after the track is built.
         int trackBufferBytes = minBuffer * 2;
 
         AudioTrack.Builder builder = new AudioTrack.Builder()
@@ -183,31 +183,109 @@ public final class Main {
                         + " bufferBytes=" + trackBufferBytes);
             }
 
+            // getBufferCapacityInFrames() was added in API 24. On API 23 the
+            // configured size is the best available capacity for this track.
+            int capacityFrames = Build.VERSION.SDK_INT >= 24
+                    ? audioTrack.getBufferCapacityInFrames()
+                    : audioTrack.getBufferSizeInFrames();
+            int frameBytes = channelsForMask(channelMask) * 2;
+            int minBufferFrames = Math.max(1, (minBuffer + frameBytes - 1) / frameBytes);
+            String actualMode = requestedMode;
+            int requestedEffectiveFrames = capacityFrames;
+            int requestedStartFrames = capacityFrames;
+            boolean lowLatencyBufferApplied = false;
+            if ("low-latency".equals(requestedMode)) {
+                if (Build.VERSION.SDK_INT >= 24) {
+                    requestedEffectiveFrames = Math.min(capacityFrames, Math.max(1, sampleRate * 15 / 1000));
+                    int accepted = audioTrack.setBufferSizeInFrames(requestedEffectiveFrames);
+                    if (accepted < 0) {
+                        actualMode = "balanced-fallback";
+                        log("BUFFER_SIZE_REQUEST_REJECTED result=" + accepted + "; retaining system buffer");
+                    } else {
+                        lowLatencyBufferApplied = true;
+                        if (accepted != requestedEffectiveFrames) {
+                            actualMode = "low-latency-limited";
+                            log("BUFFER_SIZE_LIMITED requested=" + requestedEffectiveFrames + " accepted=" + accepted);
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= 31 && !"balanced-fallback".equals(actualMode)) {
+                        requestedStartFrames = Math.min(requestedEffectiveFrames, Math.max(1, sampleRate * 5 / 1000));
+                        int threshold = audioTrack.setStartThresholdInFrames(requestedStartFrames);
+                        if (threshold < 0) log("START_THRESHOLD_REQUEST_REJECTED result=" + threshold);
+                    }
+                } else {
+                    actualMode = "balanced-fallback";
+                    log("LOW_LATENCY_UNSUPPORTED api=" + Build.VERSION.SDK_INT + "; retaining system buffer");
+                }
+            }
+
+            int effectiveFrames = audioTrack.getBufferSizeInFrames();
+            int startThresholdFrames = Build.VERSION.SDK_INT >= 31
+                    ? audioTrack.getStartThresholdInFrames() : -1;
+            if (lowLatencyBufferApplied && effectiveFrames != requestedEffectiveFrames) {
+                actualMode = "low-latency-limited";
+                log("BUFFER_SIZE_ACTUAL requested=" + requestedEffectiveFrames + " actual=" + effectiveFrames);
+            }
+            if (Build.VERSION.SDK_INT >= 31 && lowLatencyBufferApplied
+                    && startThresholdFrames != requestedStartFrames) {
+                log("START_THRESHOLD_LIMITED requested=" + requestedStartFrames + " actual=" + startThresholdFrames);
+            }
+            int preRollFrames = lowLatencyBufferApplied
+                    ? (startThresholdFrames > 0
+                            ? Math.min(effectiveFrames, startThresholdFrames) : effectiveFrames)
+                    : Math.min(effectiveFrames, minBufferFrames);
+            log("AUDIO requestedMode=" + requestedMode
+                    + " actualMode=" + actualMode
+                    + " actualSampleRate=" + audioTrack.getSampleRate()
+                    + " actualChannels=" + audioTrack.getChannelCount()
+                    + " minBufferBytes=" + minBuffer
+                    + " capacityFrames=" + capacityFrames
+                    + " effectiveFrames=" + effectiveFrames
+                    + " effectiveRequestFrames=" + requestedEffectiveFrames
+                    + " preRollFrames=" + preRollFrames
+                    + " startThresholdFrames=" + startThresholdFrames
+                    + " performance=" + getActualPerformanceMode(audioTrack));
+
             attachPlayerContext(audioTrack);
 
-            byte[] readBuffer = new byte[minBuffer];
-            preRoll(input, audioTrack, readBuffer, minBuffer);
+            byte[] readBuffer = new byte[Math.max(Pcm16FrameStream.FRAME_BYTES, minBuffer + 3)];
+            Pcm16FrameStream pcm = new Pcm16FrameStream();
+            int preRollTargetBytes = preRollFrames * frameBytes;
+            int preRolledBytes = 0;
+            while (preRolledBytes < preRollTargetBytes) {
+                int read = pcm.readFrames(input, readBuffer,
+                        Math.min(readBuffer.length, preRollTargetBytes - preRolledBytes));
+                if (read < 0) break;
+                writeFrames(audioTrack, readBuffer, read);
+                preRolledBytes += read;
+            }
 
             audioTrack.play();
-            log("PLAYING");
+            int initialUnderruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+            log("PLAYING preRollFrames=" + (preRolledBytes / frameBytes)
+                    + " underruns=" + initialUnderruns);
+            long lastUnderrunLog = System.currentTimeMillis();
 
             while (!Thread.currentThread().isInterrupted()) {
-                int bytesRead = input.read(readBuffer, 0, readBuffer.length);
-                if (bytesRead == -1) {
+                int bytesRead = pcm.readFrames(input, readBuffer, readBuffer.length);
+                if (bytesRead < 0) {
                     break;
                 }
-
-                int offset = 0;
-                while (offset < bytesRead) {
-                    int written = audioTrack.write(readBuffer, offset, bytesRead - offset);
-                    if (written < 0) {
-                        log("WRITE_FAILED " + written);
-                        return;
-                    }
-                    offset += written;
+                writeFrames(audioTrack, readBuffer, bytesRead);
+                long now = System.currentTimeMillis();
+                if (Build.VERSION.SDK_INT >= 24 && now - lastUnderrunLog >= 5000) {
+                    log("UNDERRUNS count=" + audioTrack.getUnderrunCount());
+                    lastUnderrunLog = now;
                 }
             }
         } finally {
+            if (Build.VERSION.SDK_INT >= 24) {
+                try {
+                    log("UNDERRUNS final=" + audioTrack.getUnderrunCount());
+                } catch (Throwable unavailable) {
+                    log("UNDERRUNS final=unavailable");
+                }
+            }
             // Teardown must never replace the real failure. Under app_process
             // there is no ActivityThread application, so AudioTrack.stop() can
             // throw NullPointerException out of PlayerBase (it dereferences a
@@ -306,26 +384,24 @@ public final class Main {
         }
     }
 
-    private static void preRoll(InputStream input, AudioTrack track, byte[] buffer, int target)
-            throws IOException {
-        int buffered = 0;
+    private static int channelsForMask(int channelMask) {
+        return channelMask == AudioFormat.CHANNEL_OUT_MONO ? 1 : 2;
+    }
 
-        while (buffered < target) {
-            int read = input.read(buffer, 0, Math.min(buffer.length, target - buffered));
-            if (read == -1) {
-                return;
-            }
+    private static void writeFrames(final AudioTrack track, byte[] buffer, int length) throws IOException {
+        Pcm16FrameStream.writeFrames((data, offset, count) -> track.write(data, offset, count), buffer, length);
+    }
 
-            int offset = 0;
-            while (offset < read) {
-                int written = track.write(buffer, offset, read - offset);
-                if (written < 0) {
-                    return;
-                }
-                offset += written;
-            }
-
-            buffered += read;
+    private static String getActualPerformanceMode(AudioTrack track) {
+        if (Build.VERSION.SDK_INT < 26) return "unsupported";
+        try {
+            Method method = AudioTrack.class.getMethod("getPerformanceMode");
+            int mode = ((Integer) method.invoke(track)).intValue();
+            if (mode == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY) return "low-latency";
+            if (mode == AudioTrack.PERFORMANCE_MODE_NONE) return "none";
+            return "" + mode;
+        } catch (Throwable unavailable) {
+            return "unavailable";
         }
     }
 

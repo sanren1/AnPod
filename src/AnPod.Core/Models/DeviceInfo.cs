@@ -93,7 +93,7 @@ public sealed record DeviceInfo
 
             return State switch
             {
-                AdbDeviceState.Device => IsWifi ? "已连接 Wi-Fi" : "已连接 USB",
+                AdbDeviceState.Device => "可连接",
                 AdbDeviceState.Unauthorized => "等待手机授权",
                 AdbDeviceState.Offline => "设备暂时离线",
                 AdbDeviceState.NoPermissions => "缺少 USB 驱动权限",

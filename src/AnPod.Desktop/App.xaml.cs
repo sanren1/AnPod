@@ -2,7 +2,9 @@ using System.IO;
 using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
+using Microsoft.Win32;
 using AnPod.Core.Logging;
+using AnPod.Core.Models;
 using AnPod.Desktop.Services;
 using AnPod.Desktop.ViewModels;
 
@@ -80,6 +82,8 @@ public partial class App : Application
 
         _settings = new SettingsService(_logger);
         _settings.Load();
+        ThemeService.Apply(_settings.Current.AppearanceTheme);
+        SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
 
         _adb = new AdbRunner(Path.Combine(AppPaths.ApplicationDirectory, "adb.exe"), _logger);
         _discovery = new DeviceDiscoveryService(_adb, _logger);
@@ -130,9 +134,12 @@ public partial class App : Application
 
         _tray = new TrayService();
         _tray.ShowRequested += (_, _) => ShowMainWindow();
-        _tray.ToggleConnectionRequested += (_, _) => viewModel.PrimaryCommand.Execute(null);
+        _tray.PrimaryActionRequested += (_, _) => viewModel.PrimaryCommand.Execute(null);
+        _tray.DisconnectRequested += (_, _) => viewModel.DisconnectCommand.Execute(null);
+        _tray.SettingsRequested += (_, _) => _window.ShowSettings();
         _tray.ExitRequested += (_, _) => ExitApplication();
-        _connection.StateChanged += (_, args) => _tray.UpdateStatus(args.State, args.Message);
+        _connection.StateChanged += (_, args) => _tray.UpdateStatus(args.State, args.Message, viewModel.PrimaryActionText);
+        _tray.UpdateStatus(viewModel.State, viewModel.StatusMessage, viewModel.PrimaryActionText);
 
         ReportMissingDependencies();
 
@@ -277,6 +284,16 @@ public partial class App : Application
     /// The only exit path. Stops capture, removes AnPod's own reverse mapping,
     /// kills the Android shell, then shuts down (plan §1.1.7/§5.7).
     /// </summary>
+    public void RequestExit() => ExitApplication();
+
+    public void ShowTrayHint() => _tray?.ShowHideHint();
+
+    private void OnUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        if (_settings?.Current.AppearanceTheme == AppearanceTheme.System)
+            Dispatcher.BeginInvoke(() => ThemeService.Apply(AppearanceTheme.System));
+    }
+
     private async void ExitApplication()
     {
         if (_exiting)
@@ -303,6 +320,7 @@ public partial class App : Application
         }
 
         _tray?.Dispose();
+        SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
         _window?.ForceClose();
 
         _logger?.Info("AnPod exited");

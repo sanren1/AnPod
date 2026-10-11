@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AnPod",
+  "version": "1.0.4",
+  "identifier": "app.anpod.desktop",
+  "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../frontend" },
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../frontend" },
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AnPod",
+        "width": 420,
+        "height": 590,
+        "minWidth": 360,
+        "minHeight": 500,
+        "resizable": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "resources": {
+      "../deps/audio_capture.dll": "audio_capture.dll",
+      "../deps/adb.exe": "adb.exe",
+      "../deps/AdbWinApi.dll": "AdbWinApi.dll",
+      "../deps/AdbWinUsbApi.dll": "AdbWinUsbApi.dll",
+      "../deps/server": "server"
+    },
+    "icon": ["icons/icon.ico"]
+  }
+}

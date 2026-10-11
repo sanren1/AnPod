@@ -10,8 +10,8 @@
  *   2. Handshake connect code is verified against an expected token.
  *   3. Format fallback validates the sample subtype/bit depth instead of
  *      reinterpreting unknown data as float32 (which produced noise).
- *   4. Sends carry a timeout and abandon a packet rather than queueing
- *      unbounded latency behind a slow consumer.
+ *   4. Sends carry a timeout; an incomplete packet ends the session so the
+ *      unframed PCM stream can only resume after a fresh handshake.
  *   5. Endpoint invalidation is reported so the caller can rebuild the session.
  *   6. Diagnostics exports and balanced timeBeginPeriod/CoUninitialize.
  *
@@ -37,6 +37,7 @@
 #include <stdio.h>
 
 #include "audio_capture.h"
+#include "send_exact.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
@@ -93,10 +94,9 @@ static ConnectCallback g_connectCallback = NULL;
 /* Short consumer backlog: ~170 ms of 48 kHz stereo PCM16. */
 static const int kSocketAudioBufferBytes = 32 * 1024;
 
-/* Abandon a packet that cannot be flushed within this budget. */
+/* A send beyond this budget ends the session; the next stream starts fresh. */
 static const DWORD kSendTimeoutMs = 200;
 
-static volatile LONG g_droppedPacketCount = 0;
 
 /* Error reporting ---------------------------------------------------------- */
 
@@ -159,65 +159,18 @@ static const char* DefaultMessageForCode(int code)
 
 /* -------------------------------------------------------------- socket I/O */
 
-/*
- * Sends len bytes, honouring kSendTimeoutMs. Returns the number of bytes
- * written. A timeout is not a fatal error: the remainder of the packet is
- * discarded so playback latency cannot grow without bound, and -1 is returned
- * only for a genuinely broken socket.
- */
+/* A short or timed-out send breaks the unframed PCM byte stream; fail the session. */
 static int SendPacket(SOCKET sock, const char* data, int len)
 {
-    int total = 0;
-
-    while (total < len && sock != INVALID_SOCKET)
-    {
-        int sent = send(sock, data + total, len - total, 0);
-
-        if (sent > 0)
-        {
-            total += sent;
-            continue;
-        }
-
-        if (sent == SOCKET_ERROR)
-        {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT)
-            {
-                /* Consumer is behind: drop the rest of this packet so playback
-                   latency cannot grow without bound. Reported on the debug
-                   channel only - it is a self-correcting condition, not a
-                   session failure, and must not surface as an error code. */
-                LONG dropped = InterlockedIncrement(&g_droppedPacketCount);
-
-                if ((dropped & 0x1F) == 0)
-                {
-                    char message[96];
-                    snprintf(message, sizeof(message),
-                        "AnPod: dropped %ld audio packet(s), consumer behind\n",
-                        (long)dropped);
-                    OutputDebugStringA(message);
-                }
-
-                return total;
-            }
-
-            if (err == WSAENOTSOCK || err == WSAECONNRESET || err == WSAECONNABORTED)
-            {
-                return -1;
-            }
-
-            return -1;
-        }
-
-        /* sent == 0 is not expected for a blocking socket; treat as fatal. */
-        return -1;
-    }
-
-    return total;
+    if (sock == INVALID_SOCKET) return -1;
+    return SendExactBytes(len, [sock, data](int offset, int remaining) {
+        const int sent = send(sock, data + offset, remaining, 0);
+        if (sent == SOCKET_ERROR && WSAGetLastError() == WSAETIMEDOUT) return 0;
+        return sent;
+    });
 }
 
-static void SendFormatHeader(SOCKET sock)
+static BOOL SendFormatHeader(SOCKET sock)
 {
     BYTE header[8];
     UINT32 sampleRate = g_nSampleRate;
@@ -228,7 +181,7 @@ static void SendFormatHeader(SOCKET sock)
     memcpy(header + 4, &channels, 2);
     memcpy(header + 6, &bits, 2);
 
-    SendPacket(sock, (const char*)header, 8);
+    return SendPacket(sock, (const char*)header, 8) == (int)sizeof(header);
 }
 
 /* ------------------------------------------------------------ listen thread */
@@ -428,7 +381,14 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
     /* Format header first: Android sizes its AudioTrack from it. */
     if (g_clientSocket != INVALID_SOCKET)
     {
-        SendFormatHeader(g_clientSocket);
+        if (!SendFormatHeader(g_clientSocket))
+        {
+            SetLastErrorState(ANPOD_ERR_SEND_FAILED, "audio format header was not sent completely");
+            g_bRunning = FALSE;
+            closesocket(g_clientSocket);
+            g_clientSocket = INVALID_SOCKET;
+            g_bConnected = FALSE;
+        }
     }
 
     while (g_bRunning)
@@ -514,8 +474,11 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
                 if (result < 0)
                 {
                     SetLastErrorState(ANPOD_ERR_SEND_FAILED,
-                        DefaultMessageForCode(ANPOD_ERR_SEND_FAILED));
+                        "audio send timed out or ended before the PCM packet was complete");
                     g_bRunning = FALSE;
+                    closesocket(g_clientSocket);
+                    g_clientSocket = INVALID_SOCKET;
+                    g_bConnected = FALSE;
                     break;
                 }
             }
@@ -637,7 +600,6 @@ static void ResetSessionState()
     g_nSourceChannels = 2;
     g_bSourceIsPcm16 = FALSE;
     g_nSampleRate = 48000;
-    InterlockedExchange(&g_droppedPacketCount, 0);
 }
 
 int ANPOD_CALL AudioCapture_Initialize(void)

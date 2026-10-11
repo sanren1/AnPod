@@ -15,15 +15,18 @@ public final class Options {
 
     final String socketName;
     final String connectCode;
+    final String playbackMode;
 
-    private Options(String socketName, String connectCode) {
+    private Options(String socketName, String connectCode, String playbackMode) {
         this.socketName = socketName;
         this.connectCode = connectCode;
+        this.playbackMode = playbackMode;
     }
 
     public static Options parse(String... args) {
         String socketName = null;
         String connectCode = null;
+        String playbackMode = "balanced";
 
         for (String arg : args) {
             if (arg == null) {
@@ -42,6 +45,8 @@ public final class Options {
                 socketName = value;
             } else if ("connectCode".equals(key)) {
                 connectCode = value;
+            } else if ("playbackMode".equals(key)) {
+                playbackMode = value;
             }
         }
 
@@ -61,6 +66,10 @@ public final class Options {
             throw new IllegalArgumentException("CONNECT_CODE_TOO_LONG");
         }
 
-        return new Options(socketName, connectCode);
+        if (!"balanced".equals(playbackMode) && !"low-latency".equals(playbackMode)) {
+            throw new IllegalArgumentException("PLAYBACK_MODE_INVALID");
+        }
+
+        return new Options(socketName, connectCode, playbackMode);
     }
 }

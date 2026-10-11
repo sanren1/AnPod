@@ -50,11 +50,12 @@ playing garbage. Sample rate is range-checked to 8000–192000 Hz.
 stalled the capture thread, and because WASAPI kept buffering, playback drifted
 further behind real time with every packet.
 
-**After:** the client socket gets `SO_SNDTIMEO = 200 ms`. `SendPacket` abandons
-the remainder of a packet on `WSAETIMEDOUT` (dropping the oldest audio, which is
-the correct remedy) and only reports a fatal error for a genuinely broken
-socket. Drops are counted in `g_droppedPacketCount` and surfaced via
-`OutputDebugString` for the P4 performance work.
+**After:** the client socket gets `SO_SNDTIMEO = 200 ms`. Both the format header
+and PCM payload use `SendExactBytes` from `send_exact.h` to finish partial
+writes. A timeout or failed write closes the audio session and reports the
+failure. The PCM stream has no packet framing, so skipping an unsent remainder
+would corrupt sample alignment. The desktop can reconnect instead of allowing
+the capture backlog to grow indefinitely.
 
 ### A5. Endpoint invalidation is reported *(§3.4.8)*
 
@@ -221,13 +222,27 @@ Cannot create AudioTrack` on these builds.
 
 ---
 
+### B8. Playback buffer modes and complete PCM frames
+
+`playbackMode` selects balanced or low-latency playback. Balanced retains the
+existing track capacity and minimum-buffer pre-roll. On API 24+, low-latency
+requests a 15 ms effective buffer; API 31+ also requests a 5 ms start threshold.
+Actual sizes, rejected requests, fallback mode and underruns are logged. API 23
+uses the supported buffer-size getter and retains balanced playback.
+
+`Pcm16FrameStream.java` retains incomplete frames across socket reads and finishes
+partial AudioTrack writes. Zero or failed writes stop the session with a
+diagnostic. Pre-roll reads are limited to the actual read-array size even when
+the effective playback buffer is larger. The checks in `tests/` exercise
+fragmented frames, partial writes and large pre-roll targets.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.
 * The `LocalSocket` abstract-namespace handshake ordering.
 * `MODE_STREAM` + `ENCODING_PCM_16BIT` + `PERFORMANCE_MODE_LOW_LATENCY` on
   Android 8.0+.
-* Pre-roll of one minimum buffer before `play()`.
+* Balanced-mode pre-roll of one minimum buffer before `play()`.
 
 ---
 

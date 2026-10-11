@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Windows.Threading;
 using AnPod.Core.Adb;
+using AnPod.Core.Logging;
 using AnPod.Core.Models;
 using AnPod.Desktop.Services;
 
@@ -57,6 +58,7 @@ public sealed class MainViewModel : ObservableObject
     private bool _isRefreshing;
     private bool _isWifiBusy;
     private string _wifiEndpoint = string.Empty;
+    private string _pairingEndpoint = string.Empty;
     private string _pairingCode = string.Empty;
     private string _wifiStatusMessage = string.Empty;
     private string? _lastProblem;
@@ -79,12 +81,14 @@ public sealed class MainViewModel : ObservableObject
         _wireless = wireless;
         _dispatcher = Dispatcher.CurrentDispatcher;
 
-        PrimaryCommand = new AsyncRelayCommand(ToggleSessionAsync, () => CanToggleSession);
-        TogglePhoneOutputCommand = new AsyncRelayCommand(TogglePhoneOutputAsync, () => CanTogglePhoneOutput);
+        PrimaryCommand = new RelayCommand(() => _ = ExecutePrimaryActionAsync(), () => CanExecutePrimaryAction);
+        DisconnectCommand = new AsyncRelayCommand(() => _connection.DisconnectAsync(userInitiated: true), () => IsSessionUp || IsBusy);
+        CancelReconnectCommand = new AsyncRelayCommand(() => _connection.DisconnectAsync(userInitiated: true), () => State == ConnectionState.Reconnecting);
         RefreshCommand = new AsyncRelayCommand(RefreshDevicesAsync, () => CanRefresh);
         PairCommand = new AsyncRelayCommand(PairAsync, () => CanPairWifi);
         ConnectWifiCommand = new AsyncRelayCommand(ConnectWifiAsync, () => CanConnectWifi);
         DiscoverCommand = new AsyncRelayCommand(DiscoverAsync, () => CanDiscoverWifi);
+        ConnectOrDiscoverCommand = new AsyncRelayCommand(ConnectOrDiscoverAsync, () => CanDiscoverWifi);
         ForgetWifiCommand = new AsyncRelayCommand(ForgetWifiAsync, () => CanForgetWifi);
         OpenLogsCommand = new RelayCommand(OpenLogFolder);
         CopyDiagnosticsCommand = new RelayCommand(CopyDiagnostics);
@@ -95,6 +99,7 @@ public sealed class MainViewModel : ObservableObject
         AutoConnectLastDevice = _settings.Current.AutoConnectLastDevice;
         MinimizeToTray = _settings.Current.MinimizeToTray;
         AutoReconnectWifi = _settings.Current.AutoReconnectWifi;
+        AppearanceTheme = _settings.Current.AppearanceTheme;
 
         // Seed the remembered address so a returning user only has to press
         // 「连接」 — plan §1.1a allows re-entry but should not require it.
@@ -109,6 +114,7 @@ public sealed class MainViewModel : ObservableObject
         _connection.LastDeviceId = _settings.Current.LastDeviceId;
         _connection.AutoReconnectWifi = _settings.Current.AutoReconnectWifi;
         _connection.PreferredTransport = _settings.Current.PreferredTransport;
+        _connection.PlaybackMode = _settings.Current.PlaybackMode;
         _connection.LastWirelessEndpoint = _settings.Current.LastWirelessEndpoint;
 
         _connection.StateChanged += OnConnectionStateChanged;
@@ -129,6 +135,7 @@ public sealed class MainViewModel : ObservableObject
         {
             if (SetProperty(ref _selectedDevice, value))
             {
+                OnPropertyChanged(nameof(CanExecutePrimaryAction));
                 RefreshCommands();
             }
         }
@@ -144,7 +151,7 @@ public sealed class MainViewModel : ObservableObject
     /// under a running session is not supported, so the control is disabled
     /// rather than silently ignoring the click.
     /// </summary>
-    public bool IsDeviceListEnabled => IsIdle;
+    public bool IsDeviceListEnabled => IsIdle && !_isWifiBusy;
 
     /// <summary>Nothing is running, so the user is free to change how we connect.</summary>
     public bool IsIdle => !IsSessionUp && !IsBusy;
@@ -154,14 +161,16 @@ public sealed class MainViewModel : ObservableObject
     /// requires the old channel to be stopped in order first, and the window only
     /// shows one mode at a time.
     /// </summary>
-    public bool IsTransportSwitchEnabled => IsIdle;
+    public bool IsTransportSwitchEnabled => IsIdle && !_isWifiBusy;
+
+    public bool IsPlaybackModeSwitchEnabled => IsIdle && !_isWifiBusy;
 
     /// <summary>
     /// What to do about an empty device list. Depends on the mode, because "plug
     /// in a cable" is useless advice to someone who chose Wi-Fi (plan §5.10).
     /// </summary>
     public string EmptyDeviceHint => IsWifiMode
-        ? "还没有设备。请在上面填写手机「无线调试」里的 IP:端口 并点「连接」；若提示需要配对，先点「配对」。"
+        ? "还没有设备。点“添加手机”，通过扫码、配对码或手动连接添加手机。"
         : "未检测到设备。请用 USB 数据线连接手机、在手机上允许 USB 调试，然后点「刷新」。";
 
     public bool IsRefreshing
@@ -180,7 +189,7 @@ public sealed class MainViewModel : ObservableObject
     public string RefreshButtonText => IsRefreshing ? "刷新中…" : "刷新";
 
     /// <summary>A refresh while connecting would race the handshake; block it.</summary>
-    public bool CanRefresh => !IsRefreshing && !IsBusy;
+    public bool CanRefresh => !IsRefreshing && !IsBusy && !_isWifiBusy;
 
     // ------------------------------------------------------------ status
 
@@ -192,6 +201,8 @@ public sealed class MainViewModel : ObservableObject
             if (SetProperty(ref _state, value))
             {
                 OnPropertyChanged(nameof(StatusTitle));
+                OnPropertyChanged(nameof(IsSessionUp));
+                OnPropertyChanged(nameof(IsDisconnectEnabled));
                 OnPropertyChanged(nameof(IsBusy));
                 OnPropertyChanged(nameof(StatusBrushKey));
                 OnPropertyChanged(nameof(IsPhoneOutputEnabled));
@@ -201,8 +212,15 @@ public sealed class MainViewModel : ObservableObject
                 OnPropertyChanged(nameof(IsDeviceListEnabled));
                 OnPropertyChanged(nameof(IsIdle));
                 OnPropertyChanged(nameof(IsTransportSwitchEnabled));
+                OnPropertyChanged(nameof(IsPlaybackModeSwitchEnabled));
+                OnPropertyChanged(nameof(IsConnectionChangeHintVisible));
                 OnPropertyChanged(nameof(IsWifiPanelEnabled));
                 OnPropertyChanged(nameof(IsWifiInputEnabled));
+                OnPropertyChanged(nameof(PrimaryActionText));
+                OnPropertyChanged(nameof(CanExecutePrimaryAction));
+                OnPropertyChanged(nameof(StatusDetails));
+                OnPropertyChanged(nameof(OutputRouteText));
+                OnPropertyChanged(nameof(PlaybackModeHint));
                 RefreshCommands();
             }
         }
@@ -211,11 +229,22 @@ public sealed class MainViewModel : ObservableObject
     public string StatusMessage
     {
         get => _statusMessage;
-        private set => SetProperty(ref _statusMessage, value);
+        private set
+        {
+            if (SetProperty(ref _statusMessage, value))
+            {
+                OnPropertyChanged(nameof(StatusDetails));
+                OnPropertyChanged(nameof(DiagnosticsText));
+            }
+        }
     }
 
     /// <summary>True while a session exists, with or without audio flowing.</summary>
     public bool IsSessionUp => State is ConnectionState.Connected or ConnectionState.Streaming;
+
+    public bool IsDisconnectEnabled => IsSessionUp || IsBusy;
+
+    public bool IsConnectionChangeHintVisible => IsSessionUp || IsBusy;
 
     /// <summary>
     /// The "从手机播放声音" switch. True while audio is routed to the phone —
@@ -275,6 +304,67 @@ public sealed class MainViewModel : ObservableObject
         _ => "未知状态",
     };
 
+    public string StatusDetails => State switch
+    {
+        ConnectionState.NoDevice => IsWifiMode
+            ? "先添加并配对手机，或连接已配对的手机。"
+            : "用 USB 数据线连接手机，在手机上允许此电脑进行 USB 调试。",
+        ConnectionState.Unauthorized => "请解锁手机并在 USB 调试提示中允许此电脑，然后刷新设备。",
+        ConnectionState.Ready => "手机已就绪。连接成功后可将声音切到手机。",
+        ConnectionState.Connecting => StatusMessage,
+        ConnectionState.Connected => "手机已连接，声音仍从电脑播放。",
+        ConnectionState.Streaming => "手机会话已建立，声音正在从手机播放。",
+        ConnectionState.Reconnecting => StatusMessage,
+        ConnectionState.Error => StatusMessage,
+        _ => StatusMessage,
+    };
+
+    public string OutputRouteText => State switch
+    {
+        ConnectionState.Streaming => "声音从手机播放",
+        ConnectionState.Connected => "声音从电脑播放",
+        ConnectionState.Connecting when _connection.WantsPhoneOutput => "连接成功后将从手机播放",
+        ConnectionState.Reconnecting when _connection.WantsPhoneOutput => "重连成功后将恢复手机播放",
+        ConnectionState.Reconnecting => "重连期间声音从电脑播放",
+        _ => "声音从电脑播放",
+    };
+
+    public string PrimaryActionText => State switch
+    {
+        ConnectionState.NoDevice => IsWifiMode ? "添加无线手机" : "查看连接步骤",
+        ConnectionState.Unauthorized => "查看授权步骤",
+        ConnectionState.Ready => "连接并播放",
+        ConnectionState.Connecting => "取消连接",
+        ConnectionState.Connected => "切到手机播放",
+        ConnectionState.Streaming => "切回电脑播放",
+        ConnectionState.Reconnecting => "停止重连",
+        ConnectionState.Error => "重试连接",
+        _ => "连接并播放",
+    };
+
+    public bool CanExecutePrimaryAction => State switch
+    {
+        ConnectionState.NoDevice or ConnectionState.Unauthorized => true,
+        ConnectionState.Connecting or ConnectionState.Reconnecting => true,
+        ConnectionState.Ready or ConnectionState.Error => SelectedDevice?.IsConnectable == true && !_isWifiBusy,
+        ConnectionState.Connected or ConnectionState.Streaming => true,
+        _ => false,
+    };
+
+    public string PlaybackModeHint => _settings.Current.PlaybackMode == PlaybackMode.Balanced
+        ? "均衡更稳定；低延迟更快，断续时切回均衡。"
+        : "低延迟更快；若声音断续，切回均衡。";
+
+    public string PlaybackModeLabel => _settings.Current.PlaybackMode == PlaybackMode.Balanced ? "均衡" : "低延迟";
+
+    public bool CanReconnectWifi => AutoConnectLastDevice;
+
+    public bool CanForgetSavedWifiAddress => !string.IsNullOrWhiteSpace(_settings.Current.LastWirelessEndpoint);
+
+    public string ReconnectWifiHint => AutoConnectLastDevice
+        ? "仅在自动连接上次设备开启时生效。"
+        : "先开启自动连接上次设备，此选项才会生效。";
+
     /// <summary>Key into the view's status brush dictionary; text always accompanies it.</summary>
     public string StatusBrushKey => State switch
     {
@@ -293,7 +383,8 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     public bool CanToggleSession =>
         IsSessionUp ||
-        (State is ConnectionState.Ready or ConnectionState.NoDevice or ConnectionState.Error &&
+        (!_isWifiBusy &&
+         (State is ConnectionState.Ready or ConnectionState.NoDevice or ConnectionState.Error) &&
          SelectedDevice?.IsConnectable == true);
 
     // ------------------------------------------------------------ settings
@@ -312,6 +403,8 @@ public sealed class MainViewModel : ObservableObject
             _connection.AutoConnectLastDevice = value;
             _settings.Save(_settings.Current);
             OnPropertyChanged();
+            OnPropertyChanged(nameof(CanReconnectWifi));
+            OnPropertyChanged(nameof(ReconnectWifiHint));
         }
     }
 
@@ -329,6 +422,47 @@ public sealed class MainViewModel : ObservableObject
             _settings.Save(_settings.Current);
             OnPropertyChanged();
         }
+    }
+
+    public bool IsBalancedPlaybackMode
+    {
+        get => _settings.Current.PlaybackMode == PlaybackMode.Balanced;
+        set { if (value) SetPlaybackMode(PlaybackMode.Balanced); }
+    }
+
+    public bool IsLowLatencyPlaybackMode
+    {
+        get => _settings.Current.PlaybackMode == PlaybackMode.LowLatency;
+        set { if (value) SetPlaybackMode(PlaybackMode.LowLatency); }
+    }
+
+    public AppearanceTheme AppearanceTheme
+    {
+        get => _settings.Current.AppearanceTheme;
+        set
+        {
+            if (_settings.Current.AppearanceTheme == value) return;
+            _settings.Current.AppearanceTheme = value;
+            _settings.Save(_settings.Current);
+            ThemeService.Apply(value);
+            OnPropertyChanged();
+        }
+    }
+
+    private void SetPlaybackMode(PlaybackMode mode)
+    {
+        if (!IsPlaybackModeSwitchEnabled || _settings.Current.PlaybackMode == mode)
+        {
+            return;
+        }
+
+        _settings.Current.PlaybackMode = mode;
+        _connection.PlaybackMode = mode;
+        _settings.Save(_settings.Current);
+        OnPropertyChanged(nameof(IsBalancedPlaybackMode));
+        OnPropertyChanged(nameof(IsLowLatencyPlaybackMode));
+        OnPropertyChanged(nameof(PlaybackModeLabel));
+        OnPropertyChanged(nameof(PlaybackModeHint));
     }
 
     public bool IsSettingsOpen
@@ -385,6 +519,8 @@ public sealed class MainViewModel : ObservableObject
             OnPropertyChanged(nameof(IsUsbMode));
             OnPropertyChanged(nameof(IsWifiMode));
             OnPropertyChanged(nameof(EmptyDeviceHint));
+            OnPropertyChanged(nameof(StatusDetails));
+            OnPropertyChanged(nameof(PrimaryActionText));
 
             // The device list belongs to the mode, so switching modes re-filters
             // it from the last scan rather than waiting for the next one.
@@ -435,6 +571,18 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
+    public string PairingEndpoint
+    {
+        get => _pairingEndpoint;
+        set
+        {
+            if (SetProperty(ref _pairingEndpoint, value))
+            {
+                RefreshWifiCommands();
+            }
+        }
+    }
+
     /// <summary>
     /// The 6-digit pairing code from the phone's dialog. Held in memory only —
     /// never written to settings, logs or diagnostics (plan §5.9).
@@ -465,7 +613,7 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     public bool IsWifiPanelEnabled => !IsSessionUp && !IsBusy && !_isWifiBusy;
 
-    public bool CanPairWifi => IsWifiPanelEnabled && !string.IsNullOrWhiteSpace(WifiEndpoint);
+    public bool CanPairWifi => IsWifiPanelEnabled && !string.IsNullOrWhiteSpace(PairingEndpoint);
 
     /// <summary>
     /// Connect needs an address too, but not a code — pairing is a one-time step
@@ -508,6 +656,12 @@ public sealed class MainViewModel : ObservableObject
                 // Only the panel — the input boxes are deliberately left alone
                 // while an operation runs (see IsWifiInputEnabled).
                 OnPropertyChanged(nameof(IsWifiPanelEnabled));
+                OnPropertyChanged(nameof(IsDeviceListEnabled));
+                OnPropertyChanged(nameof(IsTransportSwitchEnabled));
+                OnPropertyChanged(nameof(IsPlaybackModeSwitchEnabled));
+                OnPropertyChanged(nameof(CanExecutePrimaryAction));
+                PrimaryCommand.RaiseCanExecuteChanged();
+                RefreshCommand.RaiseCanExecuteChanged();
                 RefreshWifiCommands();
             }
         }
@@ -516,10 +670,11 @@ public sealed class MainViewModel : ObservableObject
     // ------------------------------------------------------------ commands
 
     /// <summary>Connect / disconnect the phone. The tray entry shares this.</summary>
-    public AsyncRelayCommand PrimaryCommand { get; }
+    public RelayCommand PrimaryCommand { get; }
 
-    /// <summary>Route the sound through the phone, without dropping the session.</summary>
-    public AsyncRelayCommand TogglePhoneOutputCommand { get; }
+    public AsyncRelayCommand DisconnectCommand { get; }
+
+    public AsyncRelayCommand CancelReconnectCommand { get; }
 
     /// <summary>Re-read the ADB device list. The only thing that scans when idle.</summary>
     public AsyncRelayCommand RefreshCommand { get; }
@@ -532,6 +687,8 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>Asks ADB which wireless-debugging phones are on the local network.</summary>
     public AsyncRelayCommand DiscoverCommand { get; }
+
+    public AsyncRelayCommand ConnectOrDiscoverCommand { get; }
 
     /// <summary>Releases the remembered wireless endpoint from the ADB server.</summary>
     public AsyncRelayCommand ForgetWifiCommand { get; }
@@ -552,6 +709,32 @@ public sealed class MainViewModel : ObservableObject
     /// the hotspot guidance lives.
     /// </summary>
     public RelayCommand OpenHotspotSettingsCommand { get; }
+
+    public string DiagnosticsText
+    {
+        get
+        {
+            var text = string.Join(
+                Environment.NewLine,
+                "AnPod diagnostics",
+                $"version: {VersionText}",
+                $"connection state: {State}",
+                $"status: {StatusMessage}",
+                $"transport: {SelectedTransport}",
+                $"devices: {Devices.Count}",
+                $"adb.exe: {(_adb.AdbPresent ? "available" : "missing")}",
+                $"audio capture: {(_capture.IsAvailable ? "available" : "unavailable")}",
+                $"audio capture detail: {_capture.LoadError ?? "not reported"}",
+                "Android AudioTrack buffer: not read by this build (buffer duration is not end-to-end latency)",
+                $"log folder: {_logger.Directory}",
+                _lastProblem is null ? string.Empty : $"last discovery problem: {_lastProblem}");
+            var secrets = Devices.Select(device => device.Serial)
+                .Append(_settings.Current.LastDeviceId)
+                .Append(_settings.Current.LastWirelessEndpoint)
+                .OfType<string>();
+            return LogRedactor.Redact(text, secrets);
+        }
+    }
 
     /// <summary>
     /// One scan of the device list. Public because startup calls it once so the
@@ -580,7 +763,7 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    private async Task ConnectAsync()
+    private async Task ConnectAsync(bool startPlayback = true)
     {
         var device = SelectedDevice;
         if (device is null || !device.IsConnectable)
@@ -588,23 +771,72 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        await _connection.ConnectAsync(device);
+        await _connection.ConnectAsync(device, startPlayback: startPlayback);
     }
 
-    private async Task ToggleSessionAsync()
+    public event EventHandler? HelpRequested;
+
+    public event EventHandler? AddPhoneRequested;
+
+    private async Task ExecutePrimaryActionAsync()
     {
-        if (IsSessionUp)
+        if (State == ConnectionState.Connecting || State == ConnectionState.Reconnecting)
         {
             await _connection.DisconnectAsync(userInitiated: true);
+            return;
         }
-        else
+
+        switch (State)
         {
-            await ConnectAsync();
+            case ConnectionState.NoDevice:
+                if (IsWifiMode) AddPhoneRequested?.Invoke(this, EventArgs.Empty);
+                else HelpRequested?.Invoke(this, EventArgs.Empty);
+                return;
+            case ConnectionState.Unauthorized:
+                HelpRequested?.Invoke(this, EventArgs.Empty);
+                return;
+            case ConnectionState.Connected:
+                await _connection.SetAudioEnabledAsync(true);
+                return;
+            case ConnectionState.Streaming:
+                await _connection.SetAudioEnabledAsync(false);
+                return;
+            case ConnectionState.Ready:
+            case ConnectionState.Error:
+                await ConnectAsync(startPlayback: true);
+                return;
         }
     }
 
-    private Task TogglePhoneOutputAsync() =>
-        _connection.SetAudioEnabledAsync(!IsPhoneOutputEnabled);
+    public async Task<bool> PairWirelessCodeAsync()
+    {
+        if (!WirelessAdb.IsValidPairingCode(PairingCode)) return false;
+        IsWifiBusy = true;
+        try
+        {
+            WifiStatusMessage = "正在配对……";
+            var result = await _wireless.PairAsync(PairingEndpoint, PairingCode, CancellationToken.None);
+            WifiStatusMessage = result.Message;
+            if (!result.Success) return false;
+            PairingCode = string.Empty;
+            await DiscoverAsync();
+            return true;
+        }
+        finally { IsWifiBusy = false; }
+    }
+
+    public async Task<bool> ConnectRememberedWifiAsync()
+    {
+        await ConnectWifiAsync();
+        return WifiStatusMessage.StartsWith("已连接到手机", StringComparison.Ordinal);
+    }
+
+    public void ForgetSavedWifiAddress()
+    {
+        _connection.RememberWirelessEndpoint(null);
+        WifiEndpoint = string.Empty;
+        OnPropertyChanged(nameof(CanForgetSavedWifiAddress));
+    }
 
     // ------------------------------------------------------------ wireless actions
 
@@ -631,14 +863,9 @@ public sealed class MainViewModel : ObservableObject
         try
         {
             WifiStatusMessage = "正在配对…";
-            var result = await _wireless.PairAsync(WifiEndpoint, PairingCode, CancellationToken.None);
+            var result = await _wireless.PairAsync(PairingEndpoint, PairingCode, CancellationToken.None);
             WifiStatusMessage = result.Message;
             paired = result.Success;
-
-            if (result.Endpoint is not null)
-            {
-                WifiEndpoint = result.Endpoint;
-            }
 
             if (paired)
             {
@@ -709,6 +936,47 @@ public sealed class MainViewModel : ObservableObject
             // choice would send audio to someone else's phone (plan §6).
             WifiStatusMessage =
                 $"找到 {discovery.Connect.Count} 个设备，请把要用的那个填进地址栏：{string.Join("、", discovery.Connect.Select(s => s.Endpoint))}";
+        }
+        finally
+        {
+            IsWifiBusy = false;
+        }
+    }
+
+    private Task ConnectOrDiscoverAsync() => string.IsNullOrWhiteSpace(WifiEndpoint)
+        ? DiscoverAsync()
+        : ConnectWifiAsync();
+
+    public AdbQrPairingCredentials CreateQrPairingCredentials() => WirelessAdb.CreateQrPairingCredentials();
+
+    public async Task<QrPairingResult> PairQrAsync(
+        AdbQrPairingCredentials credentials,
+        Action<string> reportStatus,
+        CancellationToken cancellationToken)
+    {
+        if (!IsWifiPanelEnabled)
+        {
+            return new(false, "当前连接或会话正在进行，请结束后再扫码配对。");
+        }
+
+        IsWifiBusy = true;
+        try
+        {
+            var result = await _wireless.PairQrAsync(credentials, reportStatus, cancellationToken);
+            if (result.ConnectEndpoint is not null)
+            {
+                WifiEndpoint = result.ConnectEndpoint;
+                if (result.Success)
+                {
+                    _connection.RememberWirelessEndpoint(result.ConnectEndpoint);
+                }
+            }
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                WifiStatusMessage = result.Message;
+                await RefreshDevicesAsync();
+            }
+            return result;
         }
         finally
         {
@@ -803,11 +1071,14 @@ public sealed class MainViewModel : ObservableObject
     {
         State = e.State;
         StatusMessage = e.Message;
+        OnPropertyChanged(nameof(DiagnosticsText));
+        OnPropertyChanged(nameof(CanForgetSavedWifiAddress));
 
         _connection.AutoConnectLastDevice = _settings.Current.AutoConnectLastDevice;
         _connection.LastDeviceId = _settings.Current.LastDeviceId;
         _connection.AutoReconnectWifi = _settings.Current.AutoReconnectWifi;
         _connection.PreferredTransport = _settings.Current.PreferredTransport;
+        _connection.PlaybackMode = _settings.Current.PlaybackMode;
 
         // The endpoint is not re-seeded here on purpose: a session may have just
         // written a newer one, and clobbering it with the stored value would undo
@@ -821,6 +1092,7 @@ public sealed class MainViewModel : ObservableObject
     private void OnDiscoveryProblem(object? sender, string message)
     {
         _lastProblem = message;
+        OnPropertyChanged(nameof(DiagnosticsText));
         _dispatcher.BeginInvoke(() => StatusMessage = message);
     }
 
@@ -878,7 +1150,8 @@ public sealed class MainViewModel : ObservableObject
     private void RefreshCommands()
     {
         PrimaryCommand.RaiseCanExecuteChanged();
-        TogglePhoneOutputCommand.RaiseCanExecuteChanged();
+        DisconnectCommand.RaiseCanExecuteChanged();
+        CancelReconnectCommand.RaiseCanExecuteChanged();
         RefreshCommand.RaiseCanExecuteChanged();
         RefreshWifiCommands();
     }
@@ -915,22 +1188,9 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     private void CopyDiagnostics()
     {
-        var text = string.Join(
-            Environment.NewLine,
-            "AnPod diagnostics",
-            $"version: {VersionText}",
-            $"state: {State}",
-            $"status: {StatusMessage}",
-            $"transport: {SelectedTransport}",
-            $"devices: {Devices.Count}",
-            $"adb present: {_adb.AdbPresent}",
-            $"native capture loaded: {_capture.IsAvailable}",
-            $"log folder: {_logger.Directory}",
-            _lastProblem is null ? string.Empty : $"last problem: {_lastProblem}");
-
         try
         {
-            Clipboard.SetText(text);
+            Clipboard.SetText(DiagnosticsText);
             StatusMessage = "诊断信息已复制";
         }
         catch (Exception)

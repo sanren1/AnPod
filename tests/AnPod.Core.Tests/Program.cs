@@ -10,6 +10,7 @@ var checks = new List<(string Name, Action Body)>
     ("devices: reads the usb: tag", ReadsUsbTag),
     ("devices: recognises 'no permissions'", RecognisesNoPermissions),
     ("serial: network endpoint detection", DetectsNetworkSerial),
+    ("classify: TLS mDNS serial overrides device USB property", TlsMdnsSerialWinsUsbProperty),
     ("properties: order-independent parsing", ParsesLabelledProperties),
     ("classify: usb tag proves USB", UsbTagProvesUsb),
     ("classify: sys.usb.state proves USB without a usb: tag", UsbStateProvesUsb),
@@ -39,8 +40,11 @@ var checks = new List<(string Name, Action Body)>
     ("wireless: mdns parse survives layout changes and junk", ParsesMdnsRobustly),
     ("wireless: mdns check gates the device list", ProbesMdnsHealth),
     ("wireless: connect endpoint is only auto-picked when unambiguous", PicksConnectEndpoint),
+    ("wireless: QR payload and exact instance matching", QrCredentialsAreSpecific),
     ("settings: wireless fields round-trip", SettingsWirelessRoundTrip),
     ("settings: v1.0 config without wireless fields still loads", OldSettingsStillLoad),
+    ("settings: playback mode round-trips and old configs default balanced", PlaybackModeSettings),
+    ("settings: appearance theme round-trips and defaults to system", AppearanceThemeSettings),
     ("settings: bogus transport and endpoint normalise", BogusWirelessSettingsNormalise),
 };
 
@@ -128,6 +132,15 @@ static void DetectsNetworkSerial()
     False(AdbOutputParser.IsNetworkSerial("R58M12345AB"), "hardware serial is not network");
     False(AdbOutputParser.IsNetworkSerial("emulator-5554"), "emulator is not an ip:port");
     False(AdbOutputParser.IsNetworkSerial(null), "null is not network");
+    True(AdbOutputParser.IsNetworkSerial("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp"), "TLS mDNS serial is network");
+}
+
+static void TlsMdnsSerialWinsUsbProperty()
+{
+    var info = DeviceInfoFactory.Create(
+        new AdbDeviceEntry("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp", AdbDeviceState.Device, null),
+        new Dictionary<string, string> { ["us"] = "mtp,adb" });
+    Equal(TransportKind.Wifi, info.Transport, "network serial takes precedence over device-wide USB state");
 }
 
 static void ParsesLabelledProperties()
@@ -346,8 +359,8 @@ static void WifiTransportIsLabelled()
 
     Equal("Wi-Fi", wifi.TransportText, "wifi label");
     Equal("USB", usb.TransportText, "usb label");
-    Equal("已连接 Wi-Fi", wifi.StatusText, "wifi status line");
-    Equal("已连接 USB", usb.StatusText, "usb status line");
+    Equal("可连接", wifi.StatusText, "wifi device is available for an AnPod session");
+    Equal("可连接", usb.StatusText, "usb device is available for an AnPod session");
 
     // An unauthorised wireless device behaves exactly like an unauthorised USB
     // one: visible, with its transport stated, but not connectable (plan §6).
@@ -623,6 +636,8 @@ static void PicksConnectEndpoint()
     // user did not mean (plan §6).
     Equal(null, WirelessAdb.PickConnectEndpoint(two, "10.0.0.99"),
         "an unrelated host does not justify a guess");
+    Equal(null, WirelessAdb.PickConnectEndpoint(one, "10.0.0.99"),
+        "a single unrelated endpoint is not the paired target");
     Equal(null, WirelessAdb.PickConnectEndpoint(two, null),
         "two phones and no hint is ambiguous");
 
@@ -631,6 +646,20 @@ static void PicksConnectEndpoint()
 
     Equal("10.0.0.5", WirelessAdb.HostOf("10.0.0.5:5555"), "host extraction");
     Equal(null, WirelessAdb.HostOf("nonsense"), "host of nonsense is null");
+}
+
+static void QrCredentialsAreSpecific()
+{
+    const string instance = "studio-AbCdEf1234";
+    const string password = "AbCdEf1234567890GhJk";
+    Equal("WIFI:T:ADB;S:studio-AbCdEf1234;P:AbCdEf1234567890GhJk;;",
+        WirelessAdb.BuildQrPayload(instance, password), "Android ADB QR payload");
+    True(WirelessAdb.IsSameMdnsInstance("studio-AbCdEf1234._adb-tls-pairing._tcp.", instance),
+        "service type column is excluded for exact instance matching");
+    False(WirelessAdb.IsSameMdnsInstance("studio-AbCdEf12345", instance),
+        "prefix match is not sufficient");
+    False(WirelessAdb.IsValidPairingCode(password), "QR shared password is not a six-digit code");
+    Equal("adb-43081FDAS000VS-QXjCrW", WirelessAdb.TlsConnectInstance("adb-43081FDAS000VS-QXjCrW._adb-tls-connect._tcp."), "TLS serial instance");
 }
 
 static void SettingsWirelessRoundTrip(){
@@ -646,6 +675,26 @@ static void SettingsWirelessRoundTrip(){
     Equal(TransportKind.Wifi, restored.PreferredTransport, "transport");
     Equal(false, restored.AutoReconnectWifi, "auto reconnect wifi");
     Equal("192.168.1.20:5555", restored.LastWirelessEndpoint, "endpoint");
+}
+
+static void PlaybackModeSettings()
+{
+    var original = new AppSettings { PlaybackMode = PlaybackMode.LowLatency };
+    var restored = AppSettingsSerializer.Deserialize(AppSettingsSerializer.Serialize(original));
+    Equal(PlaybackMode.LowLatency, restored.PlaybackMode, "saved playback mode");
+
+    var oldSettings = AppSettingsSerializer.Deserialize("{\"schemaVersion\":1,\"autoConnectLastDevice\":false}");
+    Equal(PlaybackMode.Balanced, oldSettings.PlaybackMode, "missing mode defaults to balanced");
+}
+
+static void AppearanceThemeSettings()
+{
+    var original = new AppSettings { AppearanceTheme = AppearanceTheme.Dark };
+    var restored = AppSettingsSerializer.Deserialize(AppSettingsSerializer.Serialize(original));
+    Equal(AppearanceTheme.Dark, restored.AppearanceTheme, "saved appearance theme");
+
+    var oldSettings = AppSettingsSerializer.Deserialize("{\"schemaVersion\":1}");
+    Equal(AppearanceTheme.System, oldSettings.AppearanceTheme, "missing theme defaults to system");
 }
 
 static void OldSettingsStillLoad()

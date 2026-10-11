@@ -26,19 +26,19 @@ Pinned revision: 70db6b531db2c21b5a41a289722aa3996de67ebe
 
 ### LGPL compliance notes for redistribution
 
-AnPod is a personal-use tool and is not currently distributed. **If it is ever
-distributed, the following must be reviewed first** (plan §2.2.5, §11):
+The Windows audio DLL is dynamically loaded from beside `AnPod.exe`; it is not
+statically linked into the Rust desktop executable. **Before redistributing a
+modified build:**
 
 1. The modified LGPL sources above must be made available, or the build scripts
    must let the recipient rebuild and relink the LGPL portions.
 2. Because `audio_capture.dll` is loaded dynamically at runtime (not statically
    linked), the "work that uses the library" is AnPod.exe and the "library" is
    `audio_capture.dll`; the recipient must be able to replace the library and
-   still run. The current `NativeAudioCapture` implementation satisfies this —
+   still run. The current Rust `AudioActor` implementation satisfies this —
    it resolves every export dynamically from the DLL file next to the
    executable, with no static link and no signature check.
-3. No LGPL code is inlined into the managed assembly.
-4. This notice must ship with the binaries.
+3. Include this notice and the applicable licence files with the binaries.
 
 ---
 
@@ -52,25 +52,26 @@ if that ever changes.
 
 ## 3. Android SDK Platform-Tools (`adb`)
 
-Redistributed as a runtime dependency in `deps/` (not part of this repository).
-See `LICENSES/ADB-NOTICE.txt` for the terms that must be verified before any
-release.
+Redistributed as a runtime dependency in the portable package. The package
+includes the `NOTICE.txt` supplied with the exact Platform-Tools archive as
+`LICENSES/PLATFORM_TOOLS_NOTICE.txt`. Keep that upstream notice with `adb.exe`
+and verify the archive's current distribution terms before publishing.
 
----
+## 4. Tauri desktop and frontend dependencies
 
-## 4. .NET 8 runtime and Windows Desktop runtime
+The shipped Windows application uses Tauri 2 (MIT or Apache-2.0), Rust crates
+listed in `src-tauri/Cargo.lock`, React and ReactDOM (MIT), `lucide-react`
+(ISC, with Feather-derived icon attribution), and `qrcode.react` (ISC; it also
+bundles Project Nayuki's QR Code Generator under MIT). Their notices and the
+MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
+`LICENSES/` where available. Each Rust crate retains the licence terms recorded
+in its published package; see the lockfile for exact versions.
 
-AnPod targets `net8.0-windows` and is published as a framework-dependent
-application. The .NET runtime is distributed by Microsoft under the MIT licence
-and its own third-party notices, which are not bundled here because AnPod does
-not redistribute the runtime.
+The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
+the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
+.NET 8 application and is not part of the Tauri portable package.
 
----
+## 5. Project code
 
-## 5. No other dependencies
-
-The Windows application has **no NuGet package references**. WPF and Windows
-Forms are part of the .NET SDK's Windows Desktop workload. This is deliberate:
-plan §8 forbids unnecessary third-party dependencies, and every problem solved
-here (MVVM plumbing, logging, settings) was smaller than the dependency that
-would have solved it.
+AnPod's own code has no declared project-wide licence. Third-party notices do
+not grant a licence to the rest of the project.

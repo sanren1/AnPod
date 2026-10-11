@@ -1,0 +1,32 @@
+[package]
+name = "anpod-tauri"
+version = "1.0.4"
+description = "Windows system audio to Android over ADB"
+authors = ["AnPod"]
+edition = "2021"
+rust-version = "1.90"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+libloading = "0.8"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["process", "sync", "time", "rt-multi-thread", "macros", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

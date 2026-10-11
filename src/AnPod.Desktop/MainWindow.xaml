@@ -2,456 +2,176 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="AnPod"
-        Width="380"
-        MinWidth="280"
-        MaxWidth="420"
-        SizeToContent="Height"
-        ResizeMode="CanMinimize"
+        Width="420" Height="580" MinWidth="360" MinHeight="500" MaxWidth="480"
+        ResizeMode="CanResize"
         WindowStartupLocation="CenterScreen"
         FontFamily="{StaticResource AppFontFamily}"
-        Background="{StaticResource AppBackgroundBrush}"
+        Background="{DynamicResource AppBackgroundBrush}"
         TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True">
-
     <Grid>
-    <Border Padding="18,16,18,14">
-        <!-- The Wi-Fi panel plus its expanded help is the tallest the window ever
-             gets. SizeToContent grows to it; MainWindow caps the height to the
-             work area (see the constructor), at which point this scrolls instead
-             of pushing the footer off-screen. -->
-        <ScrollViewer VerticalScrollBarVisibility="Auto"
-                      HorizontalScrollBarVisibility="Disabled"
-                      Focusable="False">
-        <StackPanel>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="52" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="40" />
+        </Grid.RowDefinitions>
 
-            <!-- ======================= header ======================= -->
+        <Border Grid.Row="0" Padding="20,0" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
             <Grid>
-                <TextBlock Text="AnPod"
-                           VerticalAlignment="Center"
-                           FontSize="16"
-                           FontWeight="SemiBold"
-                           Foreground="{StaticResource ForegroundBrush}" />
-                <Button x:Name="SettingsButton"
-                        Content="设置"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding ToggleSettingsCommand}"
-                        AutomationProperties.Name="设置与诊断" />
-            </Grid>
-
-            <Border Height="1"
-                    Margin="0,12,0,0"
-                    Background="{StaticResource BorderBrush}" />
-
-            <!-- ======================= transport =======================
-                 Which control path the window is showing (plan §5.10). Choosing
-                 Wi-Fi does not open anything by itself: plan §1.3 forbids
-                 reaching for network ADB without an explicit user action, and the
-                 panel below is where that action lives. -->
-            <Border Margin="0,14,0,0"
-                    Padding="2"
-                    Background="{StaticResource MutedBrush}"
-                    BorderBrush="{StaticResource BorderBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-
-                    <RadioButton Grid.Column="0"
-                                 Content="USB 连接"
-                                 GroupName="Transport"
-                                 Style="{StaticResource ModeSegmentStyle}"
-                                 IsChecked="{Binding IsUsbMode, Mode=TwoWay}"
-                                 IsEnabled="{Binding IsTransportSwitchEnabled}"
-                                 AutomationProperties.Name="使用 USB 连接" />
-
-                    <RadioButton Grid.Column="1"
-                                 Content="Wi-Fi 无线"
-                                 GroupName="Transport"
-                                 Style="{StaticResource ModeSegmentStyle}"
-                                 IsChecked="{Binding IsWifiMode, Mode=TwoWay}"
-                                 IsEnabled="{Binding IsTransportSwitchEnabled}"
-                                 AutomationProperties.Name="使用 Wi-Fi 无线连接" />
-                </Grid>
-            </Border>
-
-            <!-- ======================= wireless setup =======================
-                 Shown only in Wi-Fi mode. Pairing and connecting are deliberately
-                 two buttons: they are two different ADB commands with two
-                 different ports, and merging them is the single most common way
-                 users get stuck (plan §5.10, W02). -->
-            <Border Margin="0,10,0,0"
-                    Padding="12,12"
-                    Background="{StaticResource CardBrush}"
-                    BorderBrush="{StaticResource BorderBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Visibility="{Binding IsWifiMode, Converter={StaticResource BoolToVisibility}}">
-                <StackPanel>
-
-                    <TextBlock Text="① 手机上开启「开发者选项 → 无线调试」"
-                               FontSize="11.5"
-                               LineHeight="17"
-                               TextWrapping="Wrap"
-                               Foreground="{StaticResource MutedForegroundBrush}" />
-
-                    <Grid Margin="0,8,0,0">
-                        <TextBlock Text="手机地址  IP:端口"
-                                   VerticalAlignment="Center"
-                                   FontSize="11.5"
-                                   FontWeight="SemiBold"
-                                   Foreground="{StaticResource MutedForegroundBrush}" />
-                        <!-- Discovery is how the user finds out what to type, so it
-                             must not require an address to already be present. -->
-                        <Button Content="搜索设备"
-                                HorizontalAlignment="Right"
-                                VerticalAlignment="Center"
-                                Style="{StaticResource LinkButtonStyle}"
-                                Command="{Binding DiscoverCommand}"
-                                AutomationProperties.Name="搜索局域网上的无线调试设备" />
-                    </Grid>
-                    <TextBox Margin="0,4,0,0"
-                             Text="{Binding WifiEndpoint, UpdateSourceTrigger=PropertyChanged}"
-                             Style="{StaticResource AppTextBoxStyle}"
-                             IsEnabled="{Binding IsWifiInputEnabled}"
-                             AutomationProperties.Name="手机的 IP 地址与端口" />
-                    <TextBlock Margin="0,4,0,0"
-                               FontSize="11"
-                               LineHeight="16"
-                               TextWrapping="Wrap"
-                               Foreground="{StaticResource MutedForegroundBrush}"
-                               Text="配对时填「配对端口」，连接时填「连接端口」——两个端口不一样。" />
-
-                    <TextBlock Margin="0,8,0,0"
-                               Text="配对码  6 位数字"
-                               FontSize="11.5"
-                               FontWeight="SemiBold"
-                               Foreground="{StaticResource MutedForegroundBrush}" />
-                    <TextBox Margin="0,4,0,0"
-                             MaxLength="6"
-                             Text="{Binding PairingCode, UpdateSourceTrigger=PropertyChanged}"
-                             Style="{StaticResource AppTextBoxStyle}"
-                             IsEnabled="{Binding IsWifiInputEnabled}"
-                             AutomationProperties.Name="手机弹窗里的 6 位配对码" />
-
-                    <Grid Margin="0,10,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="8" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-
-                        <Button Grid.Column="0"
-                                Content="配对"
-                                HorizontalContentAlignment="Center"
-                                Style="{StaticResource SecondaryButtonStyle}"
-                                Command="{Binding PairCommand}"
-                                AutomationProperties.Name="用配对码完成配对" />
-
-                        <Button Grid.Column="2"
-                                Content="连接"
-                                HorizontalContentAlignment="Center"
-                                Style="{StaticResource SecondaryButtonStyle}"
-                                Command="{Binding ConnectWifiCommand}"
-                                AutomationProperties.Name="连接到手机" />
-                    </Grid>
-
-                    <!-- Result of the last pair/connect call. Collapsed when empty
-                         so an idle panel does not carry a blank line. -->
-                    <TextBlock Margin="0,8,0,0"
-                               Text="{Binding WifiStatusMessage}"
-                               FontSize="11.5"
-                               LineHeight="17"
-                               TextWrapping="Wrap"
-                               Foreground="{StaticResource MutedForegroundBrush}">
-                        <TextBlock.Style>
-                            <Style TargetType="TextBlock">
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding WifiStatusMessage}" Value="">
-                                        <Setter Property="Visibility" Value="Collapsed" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </TextBlock.Style>
-                    </TextBlock>
-
-                    <CheckBox Margin="0,10,0,0"
-                              Content="无线掉线后自动重连"
-                              IsChecked="{Binding AutoReconnectWifi, Mode=TwoWay}"
-                              Style="{StaticResource AppCheckBoxStyle}"
-                              IsEnabled="{Binding IsWifiInputEnabled}"
-                              AutomationProperties.Name="无线掉线后自动重连" />
-
-                    <Grid Margin="0,6,0,0">
-                        <Button x:Name="WifiHelpButton"
-                                Content="连接帮助"
-                                HorizontalAlignment="Left"
-                                Style="{StaticResource LinkButtonStyle}"
-                                Click="OnWifiHelpClick"
-                                AutomationProperties.Name="显示无线连接帮助" />
-                        <Button Content="断开无线连接"
-                                HorizontalAlignment="Right"
-                                Style="{StaticResource LinkButtonStyle}"
-                                Command="{Binding ForgetWifiCommand}"
-                                AutomationProperties.Name="断开无线连接并忘记该地址" />
-                    </Grid>
-
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Width="24" Height="24" Source="/AnPod;component/Assets/icon.ico" />
+                    <TextBlock Text="AnPod" Margin="9,0,0,0" VerticalAlignment="Center" FontSize="19" FontWeight="SemiBold" Foreground="{DynamicResource ForegroundBrush}" />
                 </StackPanel>
-            </Border>
-
-            <!-- ======================= device picker =======================
-                 Scanning is manual. An idle AnPod with no phone attached has
-                 nothing to watch, so it does not spin adb on a timer. -->
-            <Grid Margin="0,14,0,0">
-                <TextBlock Text="手机设备"
-                           VerticalAlignment="Center"
-                           FontSize="12.5"
-                           FontWeight="SemiBold"
-                           Foreground="{StaticResource MutedForegroundBrush}" />
-                <Button Content="{Binding RefreshButtonText}"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding RefreshCommand}"
-                        AutomationProperties.Name="刷新设备列表" />
+                <Button Content="设置" HorizontalAlignment="Right" VerticalAlignment="Center"
+                        Style="{StaticResource LinkButtonStyle}" Click="OnSettingsClick"
+                        AutomationProperties.Name="打开设置" />
             </Grid>
-
-            <ListBox Margin="0,8,0,0"
-                     MaxHeight="132"
-                     ItemsSource="{Binding Devices}"
-                     SelectedItem="{Binding SelectedDevice, Mode=TwoWay}"
-                     IsEnabled="{Binding IsDeviceListEnabled}"
-                     Style="{StaticResource DeviceListStyle}"
-                     Visibility="{Binding HasDevices, Converter={StaticResource BoolToVisibility}}"
-                     AutomationProperties.Name="选择要连接的手机">
-                <ListBox.ItemTemplate>
-                    <DataTemplate>
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-
-                            <!-- One dot per row: green only when the device can
-                                 actually be used, amber when it is waiting for
-                                 the phone-side prompt, red when it is broken. -->
-                            <Ellipse Grid.Column="0"
-                                     Width="8" Height="8"
-                                     VerticalAlignment="Center">
-                                <Ellipse.Style>
-                                    <Style TargetType="Ellipse">
-                                        <Setter Property="Fill" Value="{StaticResource StatusIdleBrush}" />
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding IsConnectable}" Value="True">
-                                                <Setter Property="Fill" Value="{StaticResource StatusOkBrush}" />
-                                            </DataTrigger>
-                                            <DataTrigger Binding="{Binding State}" Value="Unauthorized">
-                                                <Setter Property="Fill" Value="{StaticResource StatusWarnBrush}" />
-                                            </DataTrigger>
-                                            <DataTrigger Binding="{Binding State}" Value="Offline">
-                                                <Setter Property="Fill" Value="{StaticResource StatusErrorBrush}" />
-                                            </DataTrigger>
-                                            <DataTrigger Binding="{Binding State}" Value="NoPermissions">
-                                                <Setter Property="Fill" Value="{StaticResource StatusErrorBrush}" />
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </Ellipse.Style>
-                            </Ellipse>
-
-                            <TextBlock Grid.Column="1"
-                                       Margin="9,0,8,0"
-                                       VerticalAlignment="Center"
-                                       FontSize="13"
-                                       FontWeight="SemiBold"
-                                       Text="{Binding DisplayName}"
-                                       TextTrimming="CharacterEllipsis">
-                                <TextBlock.Style>
-                                    <Style TargetType="TextBlock">
-                                        <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding IsConnectable}" Value="False">
-                                                <Setter Property="Foreground" Value="{StaticResource MutedForegroundBrush}" />
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </TextBlock.Style>
-                            </TextBlock>
-
-                            <TextBlock Grid.Column="2"
-                                       VerticalAlignment="Center"
-                                       FontSize="11.5"
-                                       Foreground="{StaticResource MutedForegroundBrush}"
-                                       Text="{Binding StatusText}" />
-                        </Grid>
-                    </DataTemplate>
-                </ListBox.ItemTemplate>
-            </ListBox>
-
-            <!-- Empty state: says what to do, not just that the list is empty. -->
-            <Border Margin="0,8,0,0"
-                    Padding="12,11"
-                    Background="{StaticResource CardBrush}"
-                    BorderBrush="{StaticResource BorderBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Visibility="{Binding IsDeviceListEmpty, Converter={StaticResource BoolToVisibility}}">
-                <TextBlock Text="{Binding EmptyDeviceHint}"
-                           FontSize="12"
-                           LineHeight="18"
-                           TextWrapping="Wrap"
-                           Foreground="{StaticResource MutedForegroundBrush}" />
-            </Border>
-
-            <!-- ======================= status line ======================= -->
-            <Grid Margin="0,12,0,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
-
-                <Ellipse Grid.Column="0"
-                         Width="8" Height="8"
-                         VerticalAlignment="Center">
-                    <Ellipse.Style>
-                        <Style TargetType="Ellipse">
-                            <Setter Property="Fill" Value="{StaticResource StatusIdleBrush}" />
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding State}" Value="Streaming">
-                                    <Setter Property="Fill" Value="{StaticResource StatusOkBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Connected">
-                                    <Setter Property="Fill" Value="{StaticResource StatusOkBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Ready">
-                                    <Setter Property="Fill" Value="{StaticResource StatusOkBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Connecting">
-                                    <Setter Property="Fill" Value="{StaticResource StatusBusyBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Reconnecting">
-                                    <Setter Property="Fill" Value="{StaticResource StatusBusyBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Unauthorized">
-                                    <Setter Property="Fill" Value="{StaticResource StatusWarnBrush}" />
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding State}" Value="Error">
-                                    <Setter Property="Fill" Value="{StaticResource StatusErrorBrush}" />
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Ellipse.Style>
-                </Ellipse>
-
-                <TextBlock Grid.Column="1"
-                           Margin="7,0,0,0"
-                           VerticalAlignment="Center"
-                           FontSize="12.5"
-                           Foreground="{StaticResource MutedForegroundBrush}"
-                           Text="{Binding StatusMessage}"
-                           TextTrimming="CharacterEllipsis" />
-            </Grid>
-
-            <!-- ======================= session action =======================
-                 Connect / disconnect the phone. Separate from the switch below
-                 so that turning the sound off never drops the connection. -->
-            <Button Margin="0,12,0,0"
-                    Content="{Binding SessionActionText}"
-                    HorizontalAlignment="Stretch"
-                    HorizontalContentAlignment="Center"
-                    Style="{StaticResource PrimaryButtonStyle}"
-                    Command="{Binding PrimaryCommand}"
-                    AutomationProperties.Name="连接或断开手机" />
-
-            <!-- ======================= phone output switch =======================
-                 One control for one action. The label and the hint line are both
-                 required: the hint states the routing in words so the switch
-                 position is never the only carrier of meaning. -->
-            <Button Margin="0,10,0,0"
-                    Command="{Binding TogglePhoneOutputCommand}"
-                    Style="{StaticResource SwitchRowStyle}"
-                    AutomationProperties.Name="从手机播放声音">
-                <StackPanel>
-                    <TextBlock Text="从手机播放声音"
-                               FontSize="13.5"
-                               FontWeight="SemiBold"
-                               Foreground="{StaticResource ForegroundBrush}" />
-                    <TextBlock Text="{Binding PhoneOutputHint}"
-                               Margin="0,3,0,0"
-                               FontSize="11.5"
-                               Foreground="{StaticResource MutedForegroundBrush}"
-                               TextTrimming="CharacterEllipsis" />
-                </StackPanel>
-            </Button>
-
-            <!-- ======================= settings toggles ======================= -->
-            <CheckBox Margin="2,16,0,0"
-                      Content="自动连接上次设备"
-                      IsChecked="{Binding AutoConnectLastDevice, Mode=TwoWay}"
-                      Style="{StaticResource AppCheckBoxStyle}"
-                      AutomationProperties.Name="自动连接上次设备" />
-
-            <CheckBox Margin="2,9,0,0"
-                      Content="关闭窗口时最小化到托盘"
-                      IsChecked="{Binding MinimizeToTray, Mode=TwoWay}"
-                      Style="{StaticResource AppCheckBoxStyle}"
-                      AutomationProperties.Name="关闭窗口时最小化到托盘" />
-
-            <!-- ======================= footer ======================= -->
-            <Grid Margin="0,16,0,0">
-                <Button Content="查看日志"
-                        HorizontalAlignment="Left"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding OpenLogsCommand}"
-                        AutomationProperties.Name="查看日志" />
-                <TextBlock Text="{Binding VersionText}"
-                           HorizontalAlignment="Right"
-                           VerticalAlignment="Center"
-                           FontSize="11.5"
-                           Foreground="{StaticResource MutedForegroundBrush}" />
-            </Grid>
-
-        </StackPanel>
-        </ScrollViewer>
-    </Border>
-
-    <!-- Settings / diagnostics flyout. -->
-    <Popup IsOpen="{Binding IsSettingsOpen, Mode=TwoWay}"
-           StaysOpen="False"
-           AllowsTransparency="True"
-           PlacementTarget="{Binding ElementName=SettingsButton}"
-           Placement="Bottom"
-           HorizontalOffset="-118"
-           VerticalOffset="4">
-        <Border Padding="6"
-                Background="{StaticResource CardBrush}"
-                BorderBrush="{StaticResource BorderBrush}"
-                BorderThickness="1"
-                CornerRadius="8">
-            <StackPanel Width="168">
-                <Button Content="打开日志文件夹"
-                        HorizontalContentAlignment="Left"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding OpenLogsCommand}" />
-                <Button Content="复制诊断信息"
-                        Margin="0,2,0,0"
-                        HorizontalContentAlignment="Left"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding CopyDiagnosticsCommand}" />
-                <Button Content="打开配置文件夹"
-                        Margin="0,2,0,0"
-                        HorizontalContentAlignment="Left"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding OpenSettingsFileLocationCommand}" />
-            </StackPanel>
         </Border>
-    </Popup>
 
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Disabled" Focusable="False">
+            <ScrollViewer.Resources>
+                <Style TargetType="ScrollBar">
+                    <Setter Property="Opacity" Value="0" />
+                    <Style.Triggers>
+                        <Trigger Property="IsEnabled" Value="True"><Setter Property="Opacity" Value="1" /></Trigger>
+                    </Style.Triggers>
+                </Style>
+            </ScrollViewer.Resources>
+            <StackPanel Margin="20,12,20,8">
+                <Border Padding="3" Background="{DynamicResource MutedBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="9">
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <RadioButton Grid.Column="0" Content="USB" GroupName="Transport" Style="{StaticResource ModeSegmentStyle}"
+                                     IsChecked="{Binding IsUsbMode, Mode=TwoWay}" IsEnabled="{Binding IsTransportSwitchEnabled}"
+                                     AutomationProperties.Name="使用 USB 连接" />
+                        <RadioButton Grid.Column="1" Content="Wi-Fi" GroupName="Transport" Style="{StaticResource ModeSegmentStyle}"
+                                     IsChecked="{Binding IsWifiMode, Mode=TwoWay}" IsEnabled="{Binding IsTransportSwitchEnabled}"
+                                     AutomationProperties.Name="使用 Wi-Fi 连接" />
+                    </Grid>
+                </Border>
+
+                <Grid Margin="0,14,0,0">
+                    <TextBlock Text="手机" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold" Foreground="{DynamicResource ForegroundBrush}" />
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="刷新" Command="{Binding RefreshCommand}" Style="{StaticResource LinkButtonStyle}"
+                                AutomationProperties.Name="刷新手机设备列表" />
+                        <Button x:Name="AddPhoneButton" Content="添加手机" Margin="10,0,0,0" Click="OnAddPhoneClick"
+                                Style="{StaticResource LinkButtonStyle}" Visibility="{Binding IsWifiMode, Converter={StaticResource BoolToVisibility}}"
+                                AutomationProperties.Name="添加无线手机" />
+                        <Button Content="连接帮助" Margin="10,0,0,0" Click="OnHelpClick"
+                                Style="{StaticResource LinkButtonStyle}" Visibility="{Binding IsUsbMode, Converter={StaticResource BoolToVisibility}}"
+                                AutomationProperties.Name="查看 USB 连接帮助" />
+                    </StackPanel>
+                </Grid>
+
+                <Grid Margin="0,8,0,0" Height="64">
+                    <ComboBox Height="64" Padding="10,5"
+                          ItemsSource="{Binding Devices}"
+                          SelectedItem="{Binding SelectedDevice, Mode=TwoWay}"
+                          IsEnabled="{Binding IsDeviceListEnabled}"
+                          Style="{StaticResource AppComboBoxStyle}"
+                          Background="{DynamicResource CardBrush}" Foreground="{DynamicResource ForegroundBrush}"
+                          BorderBrush="{DynamicResource BorderBrush}" FontSize="14"
+                          AutomationProperties.Name="选择连接手机；下拉可查看型号、连接方式和状态">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="2,4">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding DisplayName}" FontSize="14" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource ForegroundBrush}" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding Serial}" />
+                                    <TextBlock Text="{Binding StatusText}" Margin="0,2,0,0" FontSize="12"
+                                               Foreground="{DynamicResource MutedForegroundBrush}" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="1" Text="{Binding TransportText}" VerticalAlignment="Center" Margin="12,0,2,0"
+                                           FontSize="12" Foreground="{DynamicResource MutedForegroundBrush}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Text="{Binding EmptyDeviceHint}" Margin="12,6,42,6" FontSize="12.5" LineHeight="17"
+                               Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap"
+                               VerticalAlignment="Center" IsHitTestVisible="False"
+                               Visibility="{Binding IsDeviceListEmpty, Converter={StaticResource BoolToVisibility}}" />
+                </Grid>
+
+                <Border Margin="0,12,0,0" Padding="14,10" Background="{DynamicResource CardBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="9">
+                    <StackPanel>
+                        <Grid>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <Ellipse Width="9" Height="9" VerticalAlignment="Center" Fill="{DynamicResource StatusIdleBrush}" Margin="0,0,8,0">
+                                    <Ellipse.Style>
+                                        <Style TargetType="Ellipse">
+                                            <Setter Property="Fill" Value="{DynamicResource StatusIdleBrush}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding State}" Value="Ready"><Setter Property="Fill" Value="{DynamicResource StatusOkBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Connected"><Setter Property="Fill" Value="{DynamicResource StatusOkBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Streaming"><Setter Property="Fill" Value="{DynamicResource StatusOkBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Connecting"><Setter Property="Fill" Value="{DynamicResource StatusBusyBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Reconnecting"><Setter Property="Fill" Value="{DynamicResource StatusBusyBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Unauthorized"><Setter Property="Fill" Value="{DynamicResource StatusWarnBrush}"/></DataTrigger>
+                                                <DataTrigger Binding="{Binding State}" Value="Error"><Setter Property="Fill" Value="{DynamicResource StatusErrorBrush}"/></DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Ellipse.Style>
+                                </Ellipse>
+                                <TextBlock Text="{Binding StatusTitle}" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource ForegroundBrush}" AutomationProperties.LiveSetting="Polite" />
+                            </StackPanel>
+                            <Button Content="诊断" HorizontalAlignment="Right" Style="{StaticResource LinkButtonStyle}"
+                                    Click="OnDiagnosticsClick" AutomationProperties.Name="打开诊断详情" />
+                        </Grid>
+                        <TextBlock Text="{Binding StatusDetails}" Margin="0,8,0,0" FontSize="14" LineHeight="20"
+                                   Foreground="{DynamicResource ForegroundBrush}" TextWrapping="Wrap" MaxHeight="96"
+                                   AutomationProperties.LiveSetting="Polite" />
+                        <Border Height="1" Margin="0,8,0,6" Background="{DynamicResource BorderBrush}" />
+                        <TextBlock Text="{Binding OutputRouteText}" FontSize="18" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource ForegroundBrush}" AutomationProperties.Name="声音输出位置" />
+                    </StackPanel>
+                </Border>
+
+                <Button Margin="0,10,0,0" Content="{Binding PrimaryActionText}" Command="{Binding PrimaryCommand}"
+                        IsEnabled="{Binding CanExecutePrimaryAction}" Height="42"
+                        Style="{StaticResource PrimaryButtonStyle}" AutomationProperties.Name="{Binding PrimaryActionText}" />
+                <Button Margin="0,4,0,0" Content="断开连接" Command="{Binding DisconnectCommand}"
+                        IsEnabled="{Binding IsDisconnectEnabled}" Height="32"
+                        Style="{StaticResource SecondaryButtonStyle}" AutomationProperties.Name="断开手机音频连接" />
+
+                <Grid Margin="0,10,0,0">
+                    <TextBlock Text="播放模式" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold"
+                               Foreground="{DynamicResource ForegroundBrush}" />
+                    <Border Width="192" HorizontalAlignment="Right" Padding="2" Background="{DynamicResource MutedBrush}"
+                            BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="8">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                            <RadioButton Grid.Column="0" Content="均衡" GroupName="PlaybackMode" Style="{StaticResource ModeSegmentStyle}"
+                                         IsChecked="{Binding IsBalancedPlaybackMode, Mode=TwoWay}" IsEnabled="{Binding IsPlaybackModeSwitchEnabled}"
+                                         AutomationProperties.Name="均衡播放模式" />
+                            <RadioButton Grid.Column="1" Content="低延迟" GroupName="PlaybackMode" Style="{StaticResource ModeSegmentStyle}"
+                                         IsChecked="{Binding IsLowLatencyPlaybackMode, Mode=TwoWay}" IsEnabled="{Binding IsPlaybackModeSwitchEnabled}"
+                                         AutomationProperties.Name="低延迟播放模式" />
+                        </Grid>
+                    </Border>
+                </Grid>
+                <TextBlock Text="{Binding PlaybackModeHint}" Margin="0,4,0,0" FontSize="12" LineHeight="16"
+                           Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+                <TextBlock Text="请先断开连接以切换播放模式或连接方式。" Margin="0,3,0,0" FontSize="12.5"
+                           Foreground="{DynamicResource MutedForegroundBrush}"
+                           Visibility="{Binding IsConnectionChangeHintVisible, Converter={StaticResource BoolToVisibility}}" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border Grid.Row="2" Padding="20,0" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0">
+            <Grid>
+                <Button Content="帮助" HorizontalAlignment="Left" VerticalAlignment="Center" Style="{StaticResource LinkButtonStyle}"
+                        Click="OnHelpClick" AutomationProperties.Name="打开连接帮助" />
+                <TextBlock Text="{Binding VersionText}" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12"
+                           Foreground="{DynamicResource MutedForegroundBrush}" />
+                <Button Content="查看日志" HorizontalAlignment="Right" VerticalAlignment="Center" Style="{StaticResource LinkButtonStyle}"
+                        Command="{Binding OpenLogsCommand}" AutomationProperties.Name="打开日志文件夹" />
+            </Grid>
+        </Border>
     </Grid>
-
 </Window>

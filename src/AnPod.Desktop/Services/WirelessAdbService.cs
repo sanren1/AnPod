@@ -1,5 +1,7 @@
 using AnPod.Core.Adb;
 using AnPod.Core.Logging;
+using AnPod.Core.Models;
+using System.Text.RegularExpressions;
 
 namespace AnPod.Desktop.Services;
 
@@ -38,6 +40,8 @@ public sealed record WirelessDiscovery(
     public static WirelessDiscovery Unavailable(string message) =>
         new(false, message, Array.Empty<AdbMdnsService>(), Array.Empty<AdbMdnsService>());
 }
+
+public sealed record QrPairingResult(bool Success, string Message, string? ConnectEndpoint = null, string? TargetSerial = null);
 
 /// <summary>
 /// The wireless half of the ADB control path (plan §5.9): pairing, connecting
@@ -160,6 +164,154 @@ public sealed class WirelessAdbService
         return WirelessResult.Fail(
             "配对没有成功。请确认手机上「使用配对码配对设备」的弹窗仍然开着，配对码没有过期，然后重试。",
             normalized);
+    }
+
+    /// <summary>Waits for the exact QR instance, pairs it, and verifies its wireless ADB device.</summary>
+    public async Task<QrPairingResult> PairQrAsync(
+        AdbQrPairingCredentials credentials,
+        Action<string> reportStatus,
+        CancellationToken cancellationToken)
+    {
+        var pairingDeadline = DateTime.UtcNow.AddMinutes(2);
+        AdbMdnsService? pairing = null;
+        reportStatus("等待手机扫码…");
+
+        while (DateTime.UtcNow < pairingDeadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var discovery = await DiscoverAsync(cancellationToken).ConfigureAwait(false);
+            if (!discovery.Available)
+            {
+                return new(false, discovery.Message);
+            }
+
+            var matches = discovery.Pairing
+                .Where(s => WirelessAdb.IsSameMdnsInstance(s.Name, credentials.InstanceName))
+                .ToList();
+            if (matches.Count == 1)
+            {
+                pairing = matches[0];
+                break;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(800), cancellationToken).ConfigureAwait(false);
+        }
+
+        if (pairing is null)
+        {
+            return new(false, "等待扫码超时。请重新打开二维码，再用手机「无线调试 → 使用二维码配对设备」扫码。");
+        }
+
+        reportStatus($"PAIRING_ENDPOINT:{pairing.Endpoint}");
+        reportStatus("已识别扫码设备，正在安全配对…");
+        var pair = await PairQrSecretAsync(pairing.Endpoint, credentials.Password, cancellationToken).ConfigureAwait(false);
+        if (!pair.Success)
+        {
+            return new(false, pair.Message);
+        }
+        LastPairingEndpoint = pairing.Endpoint;
+
+        reportStatus("配对成功，正在确认连接地址…");
+        var preferredHost = WirelessAdb.HostOf(pairing.Endpoint);
+        var connectDeadline = DateTime.UtcNow.AddSeconds(15);
+        string? connectEndpoint = null;
+        AdbMdnsService? connectService = null;
+
+        while (DateTime.UtcNow < connectDeadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var discovery = await DiscoverAsync(cancellationToken).ConfigureAwait(false);
+            if (!discovery.Available)
+            {
+                return new(false, "配对成功，但 mDNS 搜索不可用，无法确认这台手机的连接地址。请在「连接选项」中手动填写连接地址。");
+            }
+
+            var matching = discovery.Connect
+                .Where(s => string.Equals(WirelessAdb.HostOf(s.Endpoint), preferredHost, StringComparison.Ordinal))
+                .ToList();
+            if (matching.Count == 1)
+            {
+                connectService = matching[0];
+                connectEndpoint = connectService.Endpoint;
+                break;
+            }
+
+            if (matching.Count > 1)
+            {
+                return new(false, "配对成功，但扫码设备对应多个连接地址；为避免选错手机，请在「连接选项」中手动选择。");
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(800), cancellationToken).ConfigureAwait(false);
+        }
+
+        if (connectEndpoint is null || connectService is null)
+        {
+            return new(false, "配对成功，但暂未发现扫码手机的连接地址。请确认无线调试仍开启，再点「搜索设备」。");
+        }
+
+        reportStatus($"CONNECT_ENDPOINT:{connectEndpoint}");
+        reportStatus("正在建立扫码手机的 ADB 连接…");
+        var connected = await ConnectAsync(connectEndpoint, cancellationToken).ConfigureAwait(false);
+        if (!connected.Success)
+        {
+            return new(false, $"配对成功，但连接扫码手机失败：{connected.Message}", connectEndpoint);
+        }
+
+        var verifyDeadline = DateTime.UtcNow.AddSeconds(8);
+        while (DateTime.UtcNow < verifyDeadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var devices = await _adb.RunAsync(null, new[] { "devices", "-l" }, TimeSpan.FromSeconds(5), cancellationToken)
+                .ConfigureAwait(false);
+            if (devices.Success)
+            {
+                var target = AdbOutputParser.ParseDevices(devices.StdOut)
+                    .FirstOrDefault(d => string.Equals(
+                        WirelessAdb.TlsConnectInstance(d.Serial), connectService.Name, StringComparison.Ordinal));
+                if (target is not null)
+                {
+                    return new(true, "二维码配对成功，扫码手机已出现在无线设备列表中。", connectEndpoint, target.Serial);
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
+        }
+
+        return new(false, "配对和连接命令已完成，但尚未确认扫码手机的 ADB 设备。请点「刷新」查看状态。", connectEndpoint);
+    }
+
+    private async Task<WirelessResult> PairQrSecretAsync(string endpoint, string password, CancellationToken cancellationToken)
+    {
+        if (!WirelessAdb.TryNormalizeEndpoint(endpoint, out var normalized, out _) ||
+            !Regex.IsMatch(password, @"^[A-Za-z0-9]{20}$", RegexOptions.CultureInvariant))
+        {
+            return WirelessResult.Fail("二维码配对信息无效，请关闭并重新打开二维码窗口。");
+        }
+
+        _log.AddSecret(password);
+        try
+        {
+            var result = await _adb.RunAsync(null, new[] { "pair", normalized, password }, PairTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            var outcome = WirelessAdb.ParsePairResult(result.StdOut, result.StdErr, out _);
+            if (outcome == AdbPairOutcome.Succeeded)
+            {
+                _log.Info("Wireless QR pairing succeeded");
+                return WirelessResult.Ok("配对成功。", normalized);
+            }
+
+            // Do not surface adb output here: a faulty adb build could echo the shared secret.
+            _log.Warn($"Wireless QR pairing failed ({result.DescribeFailure()})");
+            return WirelessResult.Fail(result.Canceled
+                ? "二维码配对已取消。"
+                : result.TimedOut
+                    ? "二维码配对超时。请确认手机仍停留在二维码扫码流程，然后重试。"
+                    : "二维码配对失败。请确认手机无线调试已开启，并重新打开二维码重试。");
+        }
+        finally
+        {
+            _log.RemoveSecret(password);
+        }
     }
 
     /// <summary>

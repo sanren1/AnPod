@@ -1,92 +1,54 @@
 <Window x:Class="AnPod.Desktop.WirelessHelpWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="无线连接帮助"
-        Width="420"
-        SizeToContent="Height"
-        ResizeMode="NoResize"
-        ShowInTaskbar="False"
-        WindowStartupLocation="CenterOwner"
-        FontFamily="{StaticResource AppFontFamily}"
-        Background="{StaticResource AppBackgroundBrush}"
-        TextOptions.TextFormattingMode="Display"
+        Title="连接帮助" Width="520" Height="440" MinWidth="440" MinHeight="360"
+        ResizeMode="CanResize" ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}" Background="{DynamicResource AppBackgroundBrush}"
         UseLayoutRounding="True">
-
-    <Border Padding="20,18,20,16">
-        <StackPanel>
-
-            <TextBlock Text="无线连接帮助"
-                       FontSize="15"
-                       FontWeight="SemiBold"
-                       Foreground="{StaticResource ForegroundBrush}" />
-
-            <Border Height="1"
-                    Margin="0,12,0,0"
-                    Background="{StaticResource BorderBrush}" />
-
-            <!-- Ordered because these are steps, not a list of facts. The first
-                 one is the trap that actually stops people: the phone shows two
-                 different ports and both look like "the port". -->
-            <TextBlock Margin="0,14,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="1.  配对端口和连接端口不是同一个数字。&#x0a;配对成功后，手机「无线调试」页面上的端口会变成另一个——那个才是「连接」要用的。点「搜索设备」可以自动填上，不用手抄。" />
-
-            <TextBlock Margin="0,12,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="2.  两台设备必须在同一网络。&#x0a;用 Windows 移动热点时，先在系统设置里开启热点，再让手机加入，然后回到这里配对。" />
-
-            <TextBlock Margin="0,12,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="3.  公共 Wi-Fi 常开启「客户端隔离」，设备之间互相看不见，会一直连不上。换成手机热点或家庭网络再试。AnPod 不会去关你的防火墙。" />
-
-            <TextBlock Margin="0,12,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="4.  提示需要重新配对，说明手机上的「无线调试」被关过或手机重启过。重新配对一次即可，已配对的记录会失效。" />
-
-            <TextBlock Margin="0,12,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="5.  手机息屏后无线调试可能被系统挂起，导致掉线。把 AnPod 的「无线掉线后自动重连」和「自动连接上次设备」都打开，并把手机的省电策略设为「无限制」。" />
-
-            <TextBlock Margin="0,12,0,0"
-                       FontSize="12.5"
-                       LineHeight="20"
-                       TextWrapping="Wrap"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="6.  无线实在连不上时，改用 USB 连接（数据线）。USB 模式不依赖网络，也不需要配对。" />
-
-            <Border Margin="0,16,0,0"
-                    Height="1"
-                    Background="{StaticResource BorderBrush}" />
-
-            <Grid Margin="0,14,0,0">
-                <Button Content="打开 Windows 移动热点设置"
-                        HorizontalAlignment="Left"
-                        Style="{StaticResource LinkButtonStyle}"
-                        Command="{Binding OpenHotspotSettingsCommand}"
-                        AutomationProperties.Name="打开 Windows 移动热点设置" />
-                <Button Content="关闭"
-                        HorizontalAlignment="Right"
-                        IsCancel="True"
-                        Style="{StaticResource SecondaryButtonStyle}"
-                        AutomationProperties.Name="关闭帮助" />
-            </Grid>
-
+    <DockPanel Margin="20">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="打开 Windows 移动热点设置" Command="{Binding OpenHotspotSettingsCommand}"
+                    Style="{StaticResource LinkButtonStyle}" AutomationProperties.Name="打开 Windows 移动热点设置" />
+            <Button Content="关闭" Margin="8,0,0,0" IsCancel="True" Style="{StaticResource SecondaryButtonStyle}"
+                    AutomationProperties.Name="关闭帮助" />
         </StackPanel>
-    </Border>
-
+        <StackPanel>
+            <TextBlock Text="连接帮助" FontSize="19" FontWeight="SemiBold" Foreground="{DynamicResource ForegroundBrush}" />
+            <TextBlock Margin="0,4,0,12" Text="按当前连接方式查看步骤。AnPod 不会修改防火墙、热点或手机省电设置。"
+                       FontSize="13" Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+            <TabControl Background="{DynamicResource AppBackgroundBrush}" BorderBrush="{DynamicResource BorderBrush}"
+                        AutomationProperties.Name="连接帮助分类">
+                <TabItem Header="USB">
+                    <StackPanel Margin="14">
+                        <TextBlock Text="1. 用支持数据传输的 USB 线连接手机与电脑。&#x0a;2. 解锁手机，在开发者选项中开启 USB 调试。&#x0a;3. 手机弹出 RSA 授权提示时，核对电脑后选择允许。&#x0a;4. 回到 AnPod 点「刷新」，选中手机后点「连接并播放」。"
+                                   FontSize="13.5" LineHeight="22" Foreground="{DynamicResource ForegroundBrush}" TextWrapping="Wrap" />
+                        <TextBlock Margin="0,14,0,0" Text="如列表显示未授权，保持手机解锁并重新插拔数据线。"
+                                   FontSize="12.5" Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                </TabItem>
+                <TabItem Header="无线调试">
+                    <StackPanel Margin="14">
+                        <TextBlock Text="首次使用：手机与电脑接入同一网络，在手机「开发者选项 → 无线调试」中保持开启；点「添加手机」，用二维码或六位配对码完成配对。配对只授权 ADB，不会开始播放。&#x0a;&#x0a;已配对：填写无线调试首页显示的连接 IP 和端口，再连接。配对端口与连接端口不同；配对完成后可重新搜索连接地址。"
+                                   FontSize="13.5" LineHeight="21" Foreground="{DynamicResource ForegroundBrush}" TextWrapping="Wrap" />
+                        <TextBlock Margin="0,12,0,0" Text="公共 Wi-Fi 可能启用了设备隔离。若设备互相不可见，可改用家庭网络或 Windows 移动热点。手机关闭无线调试或网络变化后，地址/端口可能变化，需要重新配对或填写新地址。"
+                                   FontSize="12.5" LineHeight="19" Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                </TabItem>
+                <TabItem Header="Windows 热点">
+                    <StackPanel Margin="14">
+                        <TextBlock Text="1. 打开 Windows「设置 → 网络和 Internet → 移动热点」。&#x0a;2. 选择要共享的网络并开启移动热点。&#x0a;3. 手机加入该热点后，在手机开启无线调试。&#x0a;4. 回到 AnPod 配对并连接。"
+                                   FontSize="13.5" LineHeight="22" Foreground="{DynamicResource ForegroundBrush}" TextWrapping="Wrap" />
+                        <TextBlock Margin="0,14,0,0" Text="不同电脑的无线网卡和网络策略会影响热点可用性；AnPod 只打开系统设置页面，不会替你开启热点。"
+                                   FontSize="12.5" Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                </TabItem>
+                <TabItem Header="旧版 Android">
+                    <StackPanel Margin="14">
+                        <TextBlock Text="较旧的 Android 版本没有「无线调试」配对页。先用 USB 连接并授权，然后在终端运行 adb -s &lt;USB 序列号&gt; tcpip 5555；查看手机当前 Wi-Fi 地址，在 AnPod「添加手机 → 手动连接」输入 IP:5555。&#x0a;&#x0a;切回 USB 时可在终端运行 adb -s &lt;IP&gt;:5555 usb。此流程不会由 AnPod 自动执行；请仅在可信的私有网络使用，并在完成后关闭 TCP/IP 调试。"
+                                   FontSize="13.5" LineHeight="21" Foreground="{DynamicResource ForegroundBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                </TabItem>
+            </TabControl>
+        </StackPanel>
+    </DockPanel>
 </Window>

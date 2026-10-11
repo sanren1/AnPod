@@ -79,6 +79,8 @@ public sealed class ConnectionManager : IAsyncDisposable
     private string? _activeToken;
     private string? _suppressedAutoConnectSerial;
     private bool _userInitiatedDisconnect;
+    private bool _wantsPhoneOutput;
+    private CancellationTokenSource? _reconnectCts;
     private bool _disposed;
 
     /// <summary>
@@ -126,6 +128,8 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// </summary>
     public bool IsSessionUp => State is ConnectionState.Connected or ConnectionState.Streaming;
 
+    public bool WantsPhoneOutput => _wantsPhoneOutput;
+
     /// <summary>True when the last session ended in <see cref="ConnectionState.Error"/>.</summary>
     public bool HasError => State == ConnectionState.Error;
 
@@ -156,6 +160,9 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// </summary>
     public TransportKind PreferredTransport { get; set; } = TransportKind.Usb;
 
+    /// <summary>AudioTrack mode snapshotted at the start of each connection attempt.</summary>
+    public PlaybackMode PlaybackMode { get; set; } = PlaybackMode.Balanced;
+
     /// <summary>
     /// Last <c>ip:port</c> that accepted a connection. Plan §1.1a: the phone's
     /// address and port can change, so this is a hint for the next attempt, never
@@ -184,7 +191,7 @@ public sealed class ConnectionManager : IAsyncDisposable
     // ---------------------------------------------------------------- public API
 
     /// <summary>Opens a session to <paramref name="device"/>.</summary>
-    public async Task ConnectAsync(DeviceInfo device, CancellationToken cancellationToken = default)
+    public async Task ConnectAsync(DeviceInfo device, bool startPlayback = true, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(device);
 
@@ -198,11 +205,12 @@ public sealed class ConnectionManager : IAsyncDisposable
             }
 
             _suppressedAutoConnectSerial = null;
+            _wantsPhoneOutput = startPlayback;
             var token = BeginSession(cancellationToken);
 
             try
             {
-                await ConnectCoreAsync(device, token).ConfigureAwait(false);
+                await ConnectCoreAsync(device, token, startPlayback).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -241,6 +249,7 @@ public sealed class ConnectionManager : IAsyncDisposable
         }
 
         CancelCurrentSession();
+        CancelReconnect();
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -256,6 +265,12 @@ public sealed class ConnectionManager : IAsyncDisposable
         {
             _gate.Release();
         }
+    }
+
+    private void CancelReconnect()
+    {
+        try { _reconnectCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
     }
 
     /// <summary>
@@ -326,6 +341,7 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// </summary>
     private void SetAudioEnabledCore(bool enabled)
     {
+        _wantsPhoneOutput = enabled;
         if (enabled)
         {
             if (State != ConnectionState.Connected)
@@ -395,8 +411,10 @@ public sealed class ConnectionManager : IAsyncDisposable
     }
 
     /// <summary>Implements plan §5.3 steps 1-10. Gate is held by the caller.</summary>
-    private async Task ConnectCoreAsync(DeviceInfo device, CancellationToken token)
+    private async Task ConnectCoreAsync(DeviceInfo device, CancellationToken token, bool startPlayback)
     {
+        var playbackMode = PlaybackMode;
+        _log.Info($"Playback mode requested: {playbackMode}");
         _activeSerial = device.Serial;
         _activeDisplayName = device.DisplayName;
         _activeTransport = device.Transport;
@@ -505,6 +523,7 @@ public sealed class ConnectionManager : IAsyncDisposable
                 AndroidServerLayout.MainClass,
                 $"socketName={_reverseName}",
                 $"connectCode={sessionToken}",
+                $"playbackMode={(playbackMode == PlaybackMode.LowLatency ? "low-latency" : "balanced")}",
             },
             _log);
 
@@ -547,12 +566,17 @@ public sealed class ConnectionManager : IAsyncDisposable
         // started so a driver that ties endpoint mute to the loopback tap cannot
         // stop us from having a working stream in the first place. Best-effort:
         // MuteAll never throws and reports 0 when it changed nothing.
-        int mutedCount = _endpointMuter.MuteAll();
-
-        SetState(
-            ConnectionState.Streaming,
-            mutedCount > 0 ? "正在播放（已静音本机扬声器）" : "正在播放",
-            device.DisplayName);
+        if (startPlayback)
+        {
+            SetState(ConnectionState.Connected, "已连接，准备切换声音输出…", device.DisplayName);
+            SetAudioEnabledCore(true);
+        }
+        else
+        {
+            _capture.SetStreamingEnabled(false);
+            RestoreSpeakers();
+            SetState(ConnectionState.Connected, "已连接，声音从电脑播放", device.DisplayName);
+        }
         _log.Info($"Streaming session started on port {port}");
 
         // Only now is there something worth watching. Nothing polls while idle.
@@ -697,6 +721,7 @@ public sealed class ConnectionManager : IAsyncDisposable
         // app exit) funnels through here, so this is the one place that has to be
         // right — a leaked mute is indistinguishable from a Windows fault.
         RestoreSpeakers();
+        _wantsPhoneOutput = false;
 
         try
         {
@@ -994,7 +1019,7 @@ public sealed class ConnectionManager : IAsyncDisposable
         }
 
         _log.Info("Auto-connecting last device");
-        _ = ConnectAsync(device);
+        _ = ConnectAsync(device, startPlayback: false);
     }
 
     /// <summary>
@@ -1014,7 +1039,7 @@ public sealed class ConnectionManager : IAsyncDisposable
 
             // Remembered so a session that was deliberately paused comes back
             // paused. Reconnecting must not silently turn the audio back on.
-            bool wasPlaying = State == ConnectionState.Streaming;
+            bool wasPlaying = WantsPhoneOutput;
             bool wasWireless = _activeTransport == TransportKind.Wifi;
             var deviceName = _activeDisplayName;
             await TeardownSessionAsync().ConfigureAwait(false);
@@ -1026,72 +1051,85 @@ public sealed class ConnectionManager : IAsyncDisposable
             }
 
             var serial = LastDeviceId;
-            for (int attempt = 0; attempt < ReconnectBackoffMilliseconds.Length; attempt++)
+            var reconnectCts = new CancellationTokenSource();
+            _reconnectCts = reconnectCts;
+            var reconnectToken = reconnectCts.Token;
+            try
             {
-                SetState(
-                    ConnectionState.Reconnecting,
-                    $"{reason}，正在重连（{attempt + 1}/{ReconnectBackoffMilliseconds.Length}）…",
-                    deviceName);
-
-                try
+                for (int attempt = 0; attempt < ReconnectBackoffMilliseconds.Length; attempt++)
                 {
-                    await Task.Delay(ReconnectBackoffMilliseconds[attempt]).ConfigureAwait(false);
-                }
-                catch (Exception)
-                {
-                    return;
-                }
+                    if (reconnectToken.IsCancellationRequested || _userInitiatedDisconnect) return;
+                    SetState(
+                        ConnectionState.Reconnecting,
+                        $"{reason}，正在重连（{attempt + 1}/{ReconnectBackoffMilliseconds.Length}）…",
+                        deviceName);
 
-                // A wireless phone that slept leaves `adb devices` entirely, so
-                // refreshing alone would never find it again; `adb connect` is
-                // what puts it back (plan §1.1a). Bounded by the attempt counter.
-                if (wasWireless)
-                {
-                    await TryWirelessConnectAsync().ConfigureAwait(false);
-                }
-
-                // Refresh on demand: nothing polls while idle, so the cached
-                // list cannot be trusted to tell us whether the device is back.
-                try
-                {
-                    await _discovery.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _log.Debug($"Discovery refresh during reconnect failed: {ex.Message}");
-                }
-
-                var device = _discovery.Devices.FirstOrDefault(
-                    d => d.Serial == serial && d.IsConnectable);
-
-                if (device is null)
-                {
-                    continue;
-                }
-
-                var token = BeginSession(CancellationToken.None);
-                try
-                {
-                    await ConnectCoreAsync(device, token).ConfigureAwait(false);
-
-                    if (!wasPlaying)
+                    try
                     {
-                        SetAudioEnabledCore(false);
+                        await Task.Delay(ReconnectBackoffMilliseconds[attempt], reconnectToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
                     }
 
-                    _log.Info("Reconnect succeeded");
-                    return;
+                    if (_userInitiatedDisconnect) return;
+
+                    // A wireless phone that slept leaves `adb devices` entirely, so
+                    // refreshing alone would never find it again; `adb connect` is
+                    // what puts it back (plan §1.1a). Bounded by the attempt counter.
+                    if (wasWireless && !await TryWirelessConnectAsync(reconnectToken).ConfigureAwait(false))
+                    {
+                        reconnectToken.ThrowIfCancellationRequested();
+                    }
+
+                    // Refresh on demand: nothing polls while idle, so the cached
+                    // list cannot be trusted to tell us whether the device is back.
+                    try
+                    {
+                        await _discovery.RefreshAsync(reconnectToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (reconnectToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Debug($"Discovery refresh during reconnect failed: {ex.Message}");
+                    }
+
+                    var device = _discovery.Devices.FirstOrDefault(
+                        d => d.Serial == serial && d.IsConnectable);
+
+                    if (device is null)
+                    {
+                        continue;
+                    }
+
+                    var token = BeginSession(reconnectToken);
+                    try
+                    {
+                        await ConnectCoreAsync(device, token, wasPlaying).ConfigureAwait(false);
+
+                        _log.Info("Reconnect succeeded");
+                        return;
+                    }
+                    catch (ConnectionFailedException ex)
+                    {
+                        _log.Warn($"Reconnect attempt {attempt + 1} failed: {ex.Message}");
+                        await TeardownSessionAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        await TeardownSessionAsync().ConfigureAwait(false);
+                        return;
+                    }
                 }
-                catch (ConnectionFailedException ex)
-                {
-                    _log.Warn($"Reconnect attempt {attempt + 1} failed: {ex.Message}");
-                    await TeardownSessionAsync().ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    await TeardownSessionAsync().ConfigureAwait(false);
-                    return;
-                }
+            }
+            finally
+            {
+                if (ReferenceEquals(_reconnectCts, reconnectCts)) _reconnectCts = null;
+                reconnectCts.Dispose();
             }
 
             SetState(ConnectionState.Error, "重连失败，请手动重试。", deviceName);
@@ -1119,7 +1157,7 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// the reconnect loop has already counted.
     /// </para>
     /// </remarks>
-    private async Task<bool> TryWirelessConnectAsync()
+    private async Task<bool> TryWirelessConnectAsync(CancellationToken cancellationToken = default)
     {
         if (!AutoReconnectWifi)
         {
@@ -1134,7 +1172,7 @@ public sealed class ConnectionManager : IAsyncDisposable
 
         try
         {
-            var result = await _wireless.ConnectAsync(endpoint, CancellationToken.None).ConfigureAwait(false);
+            var result = await _wireless.ConnectAsync(endpoint, cancellationToken).ConfigureAwait(false);
             if (result.Success)
             {
                 _log.Info("Wireless ADB link restored");
@@ -1143,6 +1181,10 @@ public sealed class ConnectionManager : IAsyncDisposable
 
             _log.Debug($"Wireless ADB link could not be restored: {result.Message}");
             return false;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
