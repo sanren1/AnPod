@@ -5,9 +5,13 @@ import java.io.InputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.util.Arrays;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -20,9 +24,16 @@ public final class P5cLoopbackEndpoint {
         verifyHeartbeatDeadline();
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
-        FakePlayback playback = new FakePlayback(args.length > 1 && "--fail-resume".equals(args[1]));
-        try (P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openLoopback(binding, playback)) {
+        FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"));
+        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--discovery")
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"))
+                : P5cReceiverCoordinator.openLoopback(binding, playback);
+        try (P5cReceiverCoordinator endpoint = opened) {
             endpoint.start();
+            if (Arrays.asList(args).contains("--discovery")) {
+                endpoint.startDiscovery();
+                verifyInvalidDiscoveryDoesNotStartPlayback(playback);
+            }
             System.out.println("PORT=" + endpoint.port());
             System.out.flush();
             if (args.length > 0 && "--drop-on-stdin".equals(args[0])) {
@@ -35,6 +46,20 @@ public final class P5cLoopbackEndpoint {
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get());
             System.out.flush();
         }
+    }
+
+    private static void verifyInvalidDiscoveryDoesNotStartPlayback(FakePlayback playback) throws IOException {
+        try (DatagramSocket probe = new DatagramSocket(0, InetAddress.getByName("127.0.0.1"))) {
+            probe.setSoTimeout(100);
+            byte[] malformed = new byte[26];
+            probe.send(new DatagramPacket(malformed, malformed.length,
+                    new InetSocketAddress(InetAddress.getByName("127.0.0.1"), P5cDiscovery.PORT)));
+            try {
+                probe.receive(new DatagramPacket(new byte[64], 64));
+                throw new AssertionError("malformed discovery probe received a response");
+            } catch (SocketTimeoutException expected) { }
+        }
+        if (playback.starts.get() != 0) throw new AssertionError("discovery started playback before authentication");
     }
 
     private static void verifyFragmentedControlFrame() throws Exception {

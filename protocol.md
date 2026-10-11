@@ -244,10 +244,11 @@ remain NOT_TESTED. This section does not mark P5 complete.
 
 ## P5-D local single-session recovery owner
 
-`p5c::SessionOwner::start` is an explicit internal caller path that receives a
-trusted `BindingMaterial`, PCM parameters, a caller `CancellationToken`, and an
-explicit `127.0.0.1` endpoint. It starts one dedicated standard thread to own
-all synchronous session I/O; it does not block Tauri or PCM callback threads.
+`p5c::SessionOwner::start` is the explicit localhost check path. The
+`start_on_interface` path receives a caller-selected private IPv4 interface,
+literal receiver endpoint, trusted `BindingMaterial`, PCM parameters, and a
+caller `CancellationToken`. Both start one dedicated standard thread to own
+all synchronous session I/O; neither blocks Tauri or PCM callback threads.
 Tokio's cancellable connect is converted to a standard TCP socket and switched
 to blocking mode before synchronous I/O. A 50 ms socket timeout bounds each
 read/write poll while the absolute operation deadline and cancellation checks
@@ -261,8 +262,10 @@ While active, the owner sends authenticated heartbeats every second. A failed
 heartbeat closes the old sender, UDP/TCP sockets, queue, and session keys,
 publishes `Reconnecting`, and waits on the bounded 1/2/5/10 second schedule
 (10 seconds maximum) before trying the currently supplied endpoint again.
-`update_endpoint` is the only way to change that target; discovery and address
-guessing are not implemented. The latest requested pause state is tracked
+`update_endpoint` is the loopback test path; `update_network_endpoint` explicitly
+replaces both selected interface and literal receiver endpoint. Either change
+closes the old session and requires a fresh P5-A handshake. Address guessing is
+not implemented. The latest requested pause state is tracked
 separately from the last ACK-confirmed receiver state and is reapplied after
 the next authenticated START. A failed PAUSE/RESUME does not claim the requested
 state was applied. `SessionSnapshot` distinguishes
@@ -282,6 +285,67 @@ state or startup. Local recovery checks use a rebuilt fake localhost endpoint;
 they do not establish recovery after USB/bootstrap loss, start an unavailable
 Android media service, or verify real audio. Device, LAN, WASAPI and AudioTrack
 recovery remain NOT_TESTED.
+
+## P4-B / P5-E explicit private IPv4 path and discovery candidate
+
+Windows `network_interface::enumerate_private_ipv4` reads enabled, non-loopback
+IPv4 adapters through the existing Windows API dependency. It returns private
+unicast addresses with prefix, interface index/name, and IPv4 gateway values;
+the caller must select one entry explicitly. Runtime interface names and
+addresses are not persisted or logged. The direct session binds both its
+cancellable TCP connect and P5 authenticated UDP socket to that selected local
+address. Its literal IPv4 peer must be private; explicitly binding the local
+socket keeps route selection on the caller-selected interface.
+The authenticated BIND sends the exact host UDP port; the receiver binds its
+UDP socket to its selected local address and fixes the expected peer to the
+accepted TCP source address plus that port. The authenticated BIND ACK supplies
+the receiver UDP port, and the host sends the existing P3 encrypted PCM packets
+to the TCP peer address plus that port. Queue format, P5-A-derived audio key,
+session ID, and UDP sender all come from the same authenticated session.
+
+An explicit discovery call sends at most two UDP probes on that interface: the
+first actual gateway reported for that interface, then its directed broadcast
+(when the prefix supports one). There is no subnet scan, mDNS dependency, default
+probe, listener, or automatic hotspot/firewall change. The Receiver's internal
+`openOnInterface` and `startDiscovery` calls bind its P5-C listener and optional
+discovery responder to one explicitly supplied private IPv4 address. Closing or
+replacing the interface/session closes the responder and old authenticated
+session; the caller must supply the replacement endpoint for a fresh handshake.
+
+Discovery uses one fixed 26-byte UDP record on port 49772:
+
+| Offset | Bytes | Field |
+| --- | ---: | --- |
+| 0 | 4 | ASCII `ANPD` magic |
+| 4 | 1 | Version, `1` |
+| 5 | 1 | Type: probe `1`, candidate response `2` |
+| 6 | 2 | Reserved flags, zero |
+| 8 | 16 | Fresh random probe correlation token |
+| 24 | 2 | TCP control port, big-endian; zero in a probe, nonzero in a response |
+
+The receiver replies only to a correctly sized, versioned probe with zero flags
+and a zero port. It copies the correlation token and advertises its already
+bound temporary TCP port. The host accepts a response only when the token,
+record shape, response source port, and source IPv4 prefix match the current
+probe and selected interface. A response is only an unauthenticated endpoint
+candidate: it carries no key, serial, or persistent identity and cannot bind a
+UDP peer or start playback. The caller must continue with the existing P5-A
+mutual authentication and P5-C BIND/START. A caller can instead supply a
+literal private IPv4 endpoint directly without discovery; it still must pass
+the same authentication before playback.
+
+Discovery is cancellable, polls at 50 ms, sends to no more than those two
+targets, and has a maximum two-second window. An empty result reports that no
+Receiver answered and says it may be unreachable or stopped and require an
+authorized USB/bootstrap path; the result does not infer ForceStop or firewall
+state. Interface bind errors, unreachable endpoints, and P5-A identity/proof
+failure have separate diagnostics. None of these paths claim `phoneReady`.
+Discovery and the direct session remain explicit internal backend calls with
+no Tauri IPC/UI, persisted network choice, default listener, or automatic
+startup. Local checks exercise the wire exchange and full authenticated PCM
+handoff only on loopback with a fake sink; real LAN/hotspot, Android runtime,
+ADB, WASAPI, AudioTrack, and audible output remain NOT_TESTED. P4/P5 are not
+complete.
 
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3

@@ -195,6 +195,9 @@ pub struct UdpSender {
 
 impl UdpSender {
     pub fn spawn(remote: SocketAddr, queue: Arc<PcmQueue>, material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
+        if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            return Err("P3 unauthenticated UDP prototype only permits 127.0.0.1.".into());
+        }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
         Self::spawn_inner(remote, queue, socket, material, format)
     }
@@ -208,9 +211,9 @@ impl UdpSender {
 
     fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
         material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
-        if remote.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) { return Err("P3 UDP prototype only permits 127.0.0.1.".into()); }
         if !matches!(format.channels, 1 | 2) || format.sample_rate == 0
-            || socket.local_addr().map_err(|error| error.to_string())?.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            || !remote.is_ipv4()
+            || !socket.local_addr().map_err(|error| error.to_string())?.is_ipv4() {
             return Err("Unsupported PCM format or UDP source for the native sink.".into());
         }
         let stopping = Arc::new(AtomicBool::new(false));

@@ -1,5 +1,6 @@
 use crate::{
     network::{PcmQueue, UdpSender, UdpSessionMaterial},
+    network_interface::Ipv4Interface,
     protocol::{PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER},
     security::{AudioParameters, BindingMaterial, HostHandshake},
 };
@@ -40,6 +41,38 @@ const RECONNECT_DELAYS: [Duration; 4] = [
     Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(10),
 ];
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SessionEndpoint {
+    interface_index: u32,
+    local_address: Ipv4Addr,
+    prefix_length: u8,
+    peer: SocketAddr,
+}
+
+impl SessionEndpoint {
+    fn loopback(peer: SocketAddr) -> Self {
+        Self { interface_index: 0, local_address: Ipv4Addr::LOCALHOST, prefix_length: 32, peer }
+    }
+
+    fn on_interface(interface: &Ipv4Interface, peer: SocketAddr) -> Self {
+        Self { interface_index: interface.index, local_address: interface.address,
+            prefix_length: interface.prefix_length, peer }
+    }
+
+    fn validate(self) -> Result<(), String> {
+        let local_valid = self.local_address.is_loopback()
+            || (self.local_address.is_private() && !self.local_address.is_link_local());
+        let SocketAddr::V4(peer) = self.peer else { return Err("P5-C requires a literal IPv4 receiver endpoint.".into()); };
+        if !local_valid || self.prefix_length == 0 || self.prefix_length > 32 || peer.port() == 0
+            || peer.ip().is_unspecified() || peer.ip().is_multicast()
+            || (self.local_address.is_loopback() != peer.ip().is_loopback())
+            || (self.local_address.is_private() && !peer.ip().is_private()) {
+            return Err("P5-C endpoint must use the selected private IPv4 interface and a literal private IPv4 peer.".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReceiverState {
@@ -89,7 +122,7 @@ impl Drop for SessionKeys {
     }
 }
 
-/// Explicit host side of one authenticated loopback session. It has no listener or product caller.
+/// Explicit host side of one authenticated P5-C session. It has no listener or product caller.
 pub(crate) struct HostSession {
     tcp: Option<TcpStream>,
     udp_socket: Option<UdpSocket>,
@@ -116,16 +149,23 @@ impl HostSession {
 
     fn authenticate_loopback_cancellable(peer: SocketAddr, material: BindingMaterial,
         parameters: AudioParameters, parent_cancel: CancellationToken) -> Result<Self, String> {
+        Self::authenticate_on_network(SessionEndpoint::loopback(peer), material, parameters, parent_cancel)
+    }
+
+    fn authenticate_on_network(endpoint: SessionEndpoint, material: BindingMaterial,
+        parameters: AudioParameters, parent_cancel: CancellationToken) -> Result<Self, String> {
         parameters.validate().map_err(|_| "Unsupported P5-C PCM parameters.".to_string())?;
-        if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || peer.port() == 0 {
-            return Err("P5-C accepts only an explicit 127.0.0.1 peer.".into());
-        }
+        endpoint.validate()?;
         let cancellation = parent_cancel.child_token();
         check_cancelled(&cancellation).map_err(|_| "P5-C connection was cancelled.".to_string())?;
-        let udp_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .map_err(|_| "Unable to bind the P5-C loopback audio socket.".to_string())?;
-        let mut tcp = connect_cancellable(peer, &cancellation)
-            .map_err(|_| "Unable to connect to the explicit P5-C loopback peer.".to_string())?;
+        let udp_socket = UdpSocket::bind((endpoint.local_address, 0))
+            .map_err(|_| "Unable to bind the P5-C audio socket to the selected interface.".to_string())?;
+        let mut tcp = connect_cancellable(endpoint.local_address, endpoint.peer, &cancellation)
+            .map_err(|error| if error.kind() == std::io::ErrorKind::AddrNotAvailable {
+                "The selected network interface is no longer available.".to_string()
+            } else {
+                "Receiver endpoint is unavailable on the selected interface; it may be unreachable or require authorized USB/bootstrap if stopped.".to_string()
+            })?;
         tcp.set_read_timeout(Some(SESSION_IO_POLL)).map_err(|_| "Unable to configure P5-C control timeout.".to_string())?;
         tcp.set_write_timeout(Some(SESSION_IO_POLL)).map_err(|_| "Unable to configure P5-C control timeout.".to_string())?;
 
@@ -180,9 +220,20 @@ impl HostSession {
         Self::connect_loopback_cancellable(peer, material, parameters, CancellationToken::new())
     }
 
+    pub(crate) fn connect_on_interface(interface: &Ipv4Interface, peer: SocketAddr,
+        material: BindingMaterial, parameters: AudioParameters) -> Result<Self, String> {
+        Self::connect_endpoint(SessionEndpoint::on_interface(interface, peer), material, parameters,
+            CancellationToken::new())
+    }
+
     fn connect_loopback_cancellable(peer: SocketAddr, material: BindingMaterial,
         parameters: AudioParameters, cancellation: CancellationToken) -> Result<Self, String> {
-        let mut session = Self::authenticate_loopback_cancellable(peer, material, parameters, cancellation)?;
+        Self::connect_endpoint(SessionEndpoint::loopback(peer), material, parameters, cancellation)
+    }
+
+    fn connect_endpoint(endpoint: SessionEndpoint, material: BindingMaterial,
+        parameters: AudioParameters, cancellation: CancellationToken) -> Result<Self, String> {
+        let mut session = Self::authenticate_on_network(endpoint, material, parameters, cancellation)?;
         if let Err(error) = session.bind_audio().and_then(|_| session.select_mode()) {
             session.close_local();
             return Err(error);
@@ -425,7 +476,7 @@ const DEFAULT_SESSION_TIMING: SessionTiming = SessionTiming {
 
 enum OwnerCommand {
     SetPaused(bool),
-    UpdateEndpoint(SocketAddr),
+    UpdateEndpoint(SessionEndpoint),
     Stop,
 }
 
@@ -445,11 +496,20 @@ impl SessionOwner {
         Self::start_with_timing(peer, binding, parameters, caller_cancel, DEFAULT_SESSION_TIMING)
     }
 
+    pub(crate) fn start_on_interface(interface: &Ipv4Interface, peer: SocketAddr,
+        binding: BindingMaterial, parameters: AudioParameters, caller_cancel: CancellationToken) -> Result<Self, String> {
+        Self::start_with_endpoint(SessionEndpoint::on_interface(interface, peer), binding, parameters,
+            caller_cancel, DEFAULT_SESSION_TIMING)
+    }
+
     fn start_with_timing(peer: SocketAddr, binding: BindingMaterial, parameters: AudioParameters,
         caller_cancel: CancellationToken, timing: SessionTiming) -> Result<Self, String> {
-        if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || peer.port() == 0 {
-            return Err("P5-D accepts only an explicitly supplied 127.0.0.1 endpoint.".into());
-        }
+        Self::start_with_endpoint(SessionEndpoint::loopback(peer), binding, parameters, caller_cancel, timing)
+    }
+
+    fn start_with_endpoint(endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
+        caller_cancel: CancellationToken, timing: SessionTiming) -> Result<Self, String> {
+        endpoint.validate()?;
         let cancellation = caller_cancel.child_token();
         let enabled = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(SessionSnapshot {
@@ -467,7 +527,7 @@ impl SessionOwner {
         let owner_status = status.clone();
         let owner_queue = queue.clone();
         let worker = thread::Builder::new().name("AnPod P5-D session owner".into())
-            .spawn(move || run_session_owner(peer, binding, parameters, owner_cancel, owner_enabled,
+            .spawn(move || run_session_owner(endpoint, binding, parameters, owner_cancel, owner_enabled,
                 receiver, owner_status, owner_queue, timing))
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
         Ok(Self { cancellation, enabled, commands, status, queue, worker: Some(worker) })
@@ -488,10 +548,16 @@ impl SessionOwner {
 
     /// The caller must supply each changed endpoint; the owner never discovers or guesses one.
     pub(crate) fn update_endpoint(&self, peer: SocketAddr) -> Result<(), String> {
-        if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || peer.port() == 0 {
-            return Err("P5-D accepts only an explicitly supplied 127.0.0.1 endpoint.".into());
-        }
-        self.commands.send(OwnerCommand::UpdateEndpoint(peer))
+        self.enqueue_endpoint(SessionEndpoint::loopback(peer))
+    }
+
+    pub(crate) fn update_network_endpoint(&self, interface: &Ipv4Interface, peer: SocketAddr) -> Result<(), String> {
+        self.enqueue_endpoint(SessionEndpoint::on_interface(interface, peer))
+    }
+
+    fn enqueue_endpoint(&self, endpoint: SessionEndpoint) -> Result<(), String> {
+        endpoint.validate()?;
+        self.commands.send(OwnerCommand::UpdateEndpoint(endpoint))
             .map_err(|_| "P5-D session owner has stopped.".to_string())
     }
 
@@ -528,10 +594,10 @@ impl Drop for SessionOwner {
     fn drop(&mut self) { self.cancel(); }
 }
 
-fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: AudioParameters,
+fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
     cancellation: CancellationToken, enabled: Arc<AtomicBool>, commands: mpsc::Receiver<OwnerCommand>,
     status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>, timing: SessionTiming) {
-    let mut peer = peer;
+    let mut endpoint = endpoint;
     let mut paused = false;
     let mut desired_paused = false;
     let mut generation = 0u64;
@@ -544,8 +610,8 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
         attempts = attempts.saturating_add(1);
         publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
             None, paused, last_error.clone());
-        let result = HostSession::authenticate_loopback_cancellable(
-            peer, binding.duplicate_for_session(), parameters, cancellation.clone());
+        let result = HostSession::authenticate_on_network(
+            endpoint, binding.duplicate_for_session(), parameters, cancellation.clone());
         let mut session = match result {
             Ok(session) => session,
             Err(error) => {
@@ -554,7 +620,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
                 publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                     None, paused, last_error.clone());
                 match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                    &enabled, &mut peer, &mut desired_paused) {
+                    &enabled, &mut endpoint, &mut desired_paused) {
                     RetryWait::Stop => break,
                     RetryWait::ReconnectNow => retry_index = 0,
                     RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
@@ -571,14 +637,14 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut peer, &mut desired_paused) {
+                &enabled, &mut endpoint, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
             }
             continue 'owner;
         }
-        match apply_pending_commands(&commands, &mut peer, &mut desired_paused, &enabled) {
+        match apply_pending_commands(&commands, &mut endpoint, &mut desired_paused, &enabled) {
             PendingCommands::Stop => break,
             PendingCommands::EndpointChanged => {
                 drop(session);
@@ -596,7 +662,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut peer, &mut desired_paused) {
+                &enabled, &mut endpoint, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
@@ -638,9 +704,10 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
                         Err(error) => { last_error = Some(error); break; }
                     }
                 }
-                Ok(OwnerCommand::UpdateEndpoint(next_peer)) => {
-                    peer = next_peer;
-                    endpoint_changed = true;
+                Ok(OwnerCommand::UpdateEndpoint(next_endpoint)) => {
+                    endpoint_changed = endpoint != next_endpoint;
+                    endpoint = next_endpoint;
+                    if !endpoint_changed { continue; }
                     if let Err(error) = session.stop() { last_error = Some(error); }
                     break;
                 }
@@ -660,7 +727,7 @@ fn run_session_owner(peer: SocketAddr, binding: BindingMaterial, parameters: Aud
             None, paused, last_error.clone());
         if endpoint_changed { retry_index = 0; continue 'owner; }
         match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-            &enabled, &mut peer, &mut desired_paused) {
+            &enabled, &mut endpoint, &mut desired_paused) {
             RetryWait::Stop => break,
             RetryWait::ReconnectNow => retry_index = 0,
             RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
@@ -692,7 +759,7 @@ enum RetryWait { Stop, ReconnectNow, DelayElapsed }
 
 enum PendingCommands { Stop, EndpointChanged, Applied }
 
-fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, peer: &mut SocketAddr,
+fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mut SessionEndpoint,
     paused: &mut bool, enabled: &AtomicBool) -> PendingCommands {
     let mut endpoint_changed = false;
     loop {
@@ -702,9 +769,9 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, peer: &mut So
                 enabled.store(false, Ordering::Release);
                 return PendingCommands::Stop;
             }
-            Ok(OwnerCommand::UpdateEndpoint(next_peer)) => {
-                endpoint_changed |= *peer != next_peer;
-                *peer = next_peer;
+            Ok(OwnerCommand::UpdateEndpoint(next_endpoint)) => {
+                endpoint_changed |= *endpoint != next_endpoint;
+                *endpoint = next_endpoint;
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -717,7 +784,7 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, peer: &mut So
 }
 
 fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, cancellation: &CancellationToken,
-    enabled: &AtomicBool, peer: &mut SocketAddr, paused: &mut bool) -> RetryWait {
+    enabled: &AtomicBool, endpoint: &mut SessionEndpoint, paused: &mut bool) -> RetryWait {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { return RetryWait::Stop; }
@@ -728,7 +795,12 @@ fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, 
                 enabled.store(false, Ordering::Release);
                 return RetryWait::Stop;
             }
-            Ok(OwnerCommand::UpdateEndpoint(next_peer)) => { *peer = next_peer; return RetryWait::ReconnectNow; }
+            Ok(OwnerCommand::UpdateEndpoint(next_endpoint)) => {
+                if *endpoint != next_endpoint {
+                    *endpoint = next_endpoint;
+                    return RetryWait::ReconnectNow;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => { enabled.store(false, Ordering::Release); return RetryWait::Stop; }
         }
@@ -824,14 +896,17 @@ fn control_mac(key: &[u8; 32], bytes: &[u8]) -> Result<[u8; 32], String> {
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn connect_cancellable(peer: SocketAddr, cancellation: &CancellationToken) -> std::io::Result<TcpStream> {
+fn connect_cancellable(local_address: Ipv4Addr, peer: SocketAddr,
+    cancellation: &CancellationToken) -> std::io::Result<TcpStream> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
     let cancellation = cancellation.clone();
     runtime.block_on(async move {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind(SocketAddr::from((local_address, 0)))?;
         tokio::select! {
             _ = cancellation.cancelled() => Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted, "P5-C connection cancelled")),
-            result = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(peer)) => {
+            result = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(peer)) => {
                 match result {
                     Ok(result) => {
                         let tcp = result?.into_std()?;
@@ -917,7 +992,7 @@ mod tests {
     const JAVA_SOURCES: &[&str] = &[
         "PairingProtocol.java", "P5cControlProtocol.java", "UdpSessionContext.java",
         "UdpPacketDecoder.java", "UdpPcmQueue.java", "UdpReceiver.java",
-        "P5cReceiverCoordinator.java",
+        "P5cDiscovery.java", "P5cReceiverCoordinator.java",
     ];
 
     fn java_paths() -> (PathBuf, PathBuf) {
@@ -948,20 +1023,25 @@ mod tests {
     }
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false)
+        spawn_endpoint_mode(classes, false, false, false)
     }
 
     fn spawn_endpoint_until_disconnect(classes: &Path, fail_resume: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, fail_resume)
+        spawn_endpoint_mode(classes, true, fail_resume, false)
     }
 
-    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool)
+    fn spawn_discoverable_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        spawn_endpoint_mode(classes, false, false, true)
+    }
+
+    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool)
         -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         let (_, java) = java_paths();
         let mut command = Command::new(java);
         command.arg("-cp").arg(classes).arg("app.anpod.receiver.P5cLoopbackEndpoint");
         if wait_for_disconnect { command.arg("--drop-on-stdin"); }
         if fail_resume { command.arg("--fail-resume"); }
+        if discoverable { command.arg("--discovery"); }
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut stdout = stdout;
@@ -996,6 +1076,13 @@ mod tests {
         rejected_handshake(&classes, false);
         rejected_handshake(&classes, true);
 
+        let mut synthetic_interface = crate::network_interface::interface_for_test(Ipv4Addr::new(192, 168, 41, 12), 24);
+        synthetic_interface.gateways.push(Ipv4Addr::new(192, 168, 41, 1));
+        assert!(synthetic_interface.contains(Ipv4Addr::new(192, 168, 41, 200)));
+        assert_eq!(crate::discovery::probe_targets(&synthetic_interface),
+            [Ipv4Addr::new(192, 168, 41, 1), Ipv4Addr::new(192, 168, 41, 255)]);
+        assert!(!synthetic_interface.contains(Ipv4Addr::new(192, 168, 42, 1)));
+
         for send_bad_mac in [true, false] {
             let (child, stdout, peer) = spawn_endpoint(&classes);
             let mut host = HostSession::authenticate_loopback(peer, test_binding_material(), AudioParameters {
@@ -1008,8 +1095,42 @@ mod tests {
             assert!(result.starts_with("session_failed,0,0,0,1,"), "unexpected invalid-control result: {result}");
         }
 
-        let (child, stdout, peer) = spawn_endpoint(&classes);
-        let mut host = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+        let mut interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+        interface.gateways.push(Ipv4Addr::LOCALHOST);
+        let unrelated_probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, crate::discovery::DISCOVERY_PORT)).unwrap();
+        let unrelated = thread::spawn(move || {
+            let mut probe = [0; 128];
+            let (length, source) = unrelated_probe.recv_from(&mut probe).unwrap();
+            assert_eq!(length, 26);
+            unrelated_probe.send_to(&crate::discovery::candidate_for_test([0xA5; 16], 43210), source).unwrap();
+        });
+        let no_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST],
+            Duration::from_millis(120), &CancellationToken::new());
+        unrelated.join().unwrap();
+        assert!(no_candidates.is_err(), "a response with an unrelated probe token is not a candidate");
+
+        let discovery_cancel = CancellationToken::new();
+        let cancel_token = discovery_cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            cancel_token.cancel();
+        });
+        let start = Instant::now();
+        let cancelled_discovery = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST],
+            Duration::from_secs(1), &discovery_cancel);
+        canceller.join().unwrap();
+        assert!(cancelled_discovery.as_ref().is_err_and(|error| error == "Network discovery was cancelled."));
+        assert!(start.elapsed() < Duration::from_millis(250), "discovery cancellation must end at the bounded receive poll");
+
+        let (child, stdout, advertised_peer) = spawn_discoverable_endpoint(&classes);
+        let malformed_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        malformed_sender.send_to(&[0; 26], (Ipv4Addr::LOCALHOST, crate::discovery::DISCOVERY_PORT)).unwrap();
+        let candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST],
+            Duration::from_millis(250), &CancellationToken::new()).unwrap();
+        assert_eq!(candidates.len(), 1, "only a response correlated to the fresh probe is returned");
+        let peer = candidates[0].endpoint;
+        assert_eq!(peer, advertised_peer, "discovery provides only the endpoint candidate");
+        let mut host = HostSession::connect_on_interface(&interface, peer, test_binding_material(), AudioParameters {
             sample_rate: 48_000, channels: 2, mode: 0,
         }).unwrap();
         assert_eq!(host.state(), ReceiverState::TransportConnected);
@@ -1065,7 +1186,7 @@ mod tests {
             let (_socket, _) = listener.accept().unwrap();
             thread::sleep(Duration::from_millis(300));
         });
-        let mut tcp = connect_cancellable(peer, &CancellationToken::new()).unwrap();
+        let mut tcp = connect_cancellable(Ipv4Addr::LOCALHOST, peer, &CancellationToken::new()).unwrap();
         tcp.set_read_timeout(Some(SESSION_IO_POLL)).unwrap();
         let start = Instant::now();
         let read = tcp.read(&mut [0]);
@@ -1096,11 +1217,13 @@ mod tests {
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 3), Duration::from_secs(10));
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 8), Duration::from_secs(10));
 
+        let loopback_interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
         let (mut first, first_stdout, first_peer) = spawn_endpoint_until_disconnect(classes, true);
         let cancellation = CancellationToken::new();
-        let mut owner = SessionOwner::start_with_timing(first_peer, test_binding_material(), AudioParameters {
+        let mut owner = SessionOwner::start_on_interface(&loopback_interface, first_peer,
+            test_binding_material(), AudioParameters {
             sample_rate: 48_000, channels: 2, mode: 0,
-        }, cancellation.clone(), timing).unwrap();
+        }, cancellation.clone()).unwrap();
         let initial = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
         let old_session = initial.session_id.unwrap();
         let old_queue = owner.pcm_queue().unwrap();
@@ -1120,7 +1243,7 @@ mod tests {
             "disconnected generation PCM queue must already be stopped");
 
         let (second, second_stdout, second_peer) = spawn_endpoint(classes);
-        owner.update_endpoint(second_peer).unwrap();
+        owner.update_network_endpoint(&loopback_interface, second_peer).unwrap();
         let recovered = wait_for_owner(&owner, |status| status.session_id.is_some()
             && status.session_id != Some(old_session) && status.state == SessionLifecycleState::ReceiverRunning);
         assert!(recovered.generation > initial.generation);

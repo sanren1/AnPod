@@ -3,14 +3,18 @@
 mod state;
 mod audio;
 mod receiver;
-#[allow(dead_code)] // P3 prototype stays compiled but is not selected by product connection flows yet.
+#[allow(dead_code)] // P3/P4/P5 network backend has explicit internal callers only.
 mod network;
+#[allow(dead_code)] // P4/P5 direct LAN backend is an explicit internal caller path only.
+mod network_interface;
 #[allow(dead_code)] // P3 protocol is exercised by its focused test receiver for now.
 mod protocol;
 #[allow(dead_code)] // P5-A offline binding/handshake is not wired into product flows yet.
 mod security;
-#[allow(dead_code)] // P5-C is an explicit localhost prototype; product connection flows do not invoke it.
+#[allow(dead_code)] // P5-C/E sessions are explicit internal callers; product flows do not invoke them.
 mod p5c;
+#[allow(dead_code)] // P5-E discovery is opt-in and has no UI/default startup caller.
+mod discovery;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};

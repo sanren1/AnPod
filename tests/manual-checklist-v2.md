@@ -217,3 +217,10 @@
 - `SessionOwner` 在单独线程拥有唯一 HostSession，运行 1 秒认证心跳；对每次恢复复制并清零由调用方提供的现有 binding，使用新 nonce/session/key/queue。只向显式提供的 IPv4 loopback endpoint 重连；`update_endpoint` 是切换端口的唯一入口。用户 pause/resume 意图与最近已 ACK 确认状态分开保存，失败命令不会虚报状态，重连后按最新意图操作；停止或 token 取消后禁恢复，不会清除/覆盖 binding。
 - 本轮受影响的 Rust 合并 Cargo 检查：PASS，1/1，耗时 8.35 秒。静默 peer 及失败 RESUME ACK 场景在该入口一并执行。没有改 Android 生产源码，因此未重复 Gradle；Java 合并 helper 在该 Rust 检查中按 JDK 17 编译。退避测试注入短时间，不实耗 1/2/5/10 秒。
 - 此 owner 尚未接入产品状态、Tauri IPC、WASAPI、真实 PCM callback 或默认连接流程。Android 仍是 one-shot listener，测试通过显式重建并重新供给 endpoint 验证恢复；没有启动/重启真实 Receiver、没有 USB/bootstrap 或真实设备、局域网、音量、AudioTrack/WASAPI 测试。ACK/UDP/合成 PCM 不代表实际出声，以上均为 NOT_TESTED；P5 整体未完成。
+
+## P4-B / P5-E explicit IPv4 and discovery backend
+
+- Rust 合并入口 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1，8.23 秒。加入合成 adapter address/prefix/gateway 转换检查、无关 token 响应拒绝、畸形探测被忽略、发现取消在 250 ms 内结束、Java Receiver 对显式 localhost discovery 返回候选、候选经真实 P5-A/BIND/START 后到达 fake sink 的 synthetic PCM，以及 explicit-interface owner 重建/STOP 清理。所有 socket 测试目标均为 127.0.0.1；未执行真实接口枚举、广播到 LAN、网关探测或热点传输。
+- Windows 接口枚举使用现有 `windows` crate 的 IP Helper API；只在运行时返回当前启用的私有 IPv4 地址、前缀、gateway、接口索引/名称，未写入日志、协议或持久配置。发现最多对调用方选定接口的 directed broadcast 和第一项已报告 gateway 各发一个 26-byte 探测；响应仍是候选，后续 P5-A 互认证才允许 BIND/START。手动 literal IPv4 路径不调用 discovery。
+- 本地 Cargo 检查内的 JDK 17 `javac`：PASS，编译 P5 discovery/coordinator 与 UDP/认证源文件。因机器未设置 `ANDROID_HOME`/`ANDROID_SDK_ROOT`、项目也无 `local.properties`，`:app:compileDebugJavaWithJavac -x :app:processDebugResources` 无法评估 `app/build.gradle`（SDK location not found）；没有组装 APK。未改 Tauri UI/IPC、设置持久化、默认 listener 或启动流。
+- P4/P5 本地代码尚未在 Android runtime、真实 LAN/热点、ADB、真实网卡切换、WASAPI、AudioTrack 或可听输出上验证；未自动启动热点、改防火墙或连接真实网络。发现失败只报告未响应/端点不可达或可能需要 USB/bootstrap，不推断 ForceStop/防火墙原因。上述仍为 NOT_TESTED，P4/P5 整体未完成。
