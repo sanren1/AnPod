@@ -12,7 +12,7 @@ import android.net.Uri;
 public final class ReceiverStateProvider extends ContentProvider {
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
-            "foreground", "healthy", "startedAtElapsedMs", "error"
+            "foreground", "healthy", "audioActive", "actualMode", "startedAtElapsedMs", "error"
     };
 
     @Override
@@ -56,6 +56,8 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "serviceActive": values[i] = active; break;
                 case "foreground": values[i] = foreground; break;
                 case "healthy": values[i] = healthy; break;
+                case "audioActive": values[i] = ReceiverService.audioActive; break;
+                case "actualMode": values[i] = ReceiverService.actualMode; break;
                 case "startedAtElapsedMs": values[i] = ReceiverService.startedAtElapsedMs; break;
                 case "error": values[i] = ReceiverService.startFailure; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");

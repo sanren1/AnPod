@@ -21,7 +21,9 @@ if (-not $AndroidSdkRoot) { $AndroidSdkRoot = $env:ANDROID_HOME }
 if (-not $AndroidSdkRoot -or -not (Test-Path -LiteralPath (Join-Path $AndroidSdkRoot 'platforms\android-35\android.jar'))) {
     throw 'Android SDK Platform 35 is required. Pass -AndroidSdkRoot or set ANDROID_SDK_ROOT.'
 }
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'deps' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'artifacts\p2-receiver-candidate' }
+$OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+$appBuildDirectory = Join-Path $OutputDirectory 'gradle-app-build'
 
 if ($Variant -eq 'release') {
     $requiredSigningVariables = @(
@@ -54,6 +56,7 @@ $task = ":app:assemble$($Variant.Substring(0, 1).ToUpperInvariant())$($Variant.S
 $gradleArgs = @('--no-daemon', '--console', 'plain')
 if ($Offline) { $gradleArgs += '--offline' }
 $gradleArgs += $task
+$gradleArgs += "-PreceiverBuildDir=$appBuildDirectory"
 
 Push-Location $project
 try {
@@ -62,10 +65,10 @@ try {
 }
 finally { Pop-Location }
 
-$apk = Join-Path $project "app\build\outputs\apk\$Variant\app-$Variant.apk"
+$apk = Join-Path $appBuildDirectory "outputs\apk\$Variant\app-$Variant.apk"
 if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) { throw "Gradle did not create the expected APK: $apk" }
 
-$mergedManifest = Get-ChildItem -LiteralPath (Join-Path $project "app\build\intermediates\merged_manifest\$Variant") -Recurse -Filter 'AndroidManifest.xml' -ErrorAction SilentlyContinue |
+$mergedManifest = Get-ChildItem -LiteralPath (Join-Path $appBuildDirectory "intermediates\merged_manifest\$Variant") -Recurse -Filter 'AndroidManifest.xml' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if (-not $mergedManifest) { throw 'Gradle did not produce a merged manifest to audit.' }
@@ -82,15 +85,14 @@ $bootstrap = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.Ge
 $service = $components | Where-Object { $_.LocalName -eq 'service' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.ReceiverService' }
 $provider = $components | Where-Object { $_.LocalName -eq 'provider' -and $_.GetAttribute('authorities', $androidNs) -eq 'app.anpod.receiver.state' }
 if (-not $bootstrap -or $bootstrap.GetAttribute('exported', $androidNs) -ne 'true' -or $bootstrap.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'Bootstrap must be explicitly exported and protected by android.permission.DUMP.' }
-if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or $service.GetAttribute('foregroundServiceType', $androidNs) -ne 'shortService') { throw 'Receiver service must be private and use only the shortService foreground type in P1.' }
+if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or $service.GetAttribute('foregroundServiceType', $androidNs) -ne 'shortService|mediaPlayback') { throw 'P2 Receiver service must be private and declare shortService plus mediaPlayback foreground types.' }
 if (-not $provider -or $provider.GetAttribute('exported', $androidNs) -ne 'true' -or $provider.GetAttribute('readPermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('writePermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('grantUriPermissions', $androidNs) -ne 'false') { throw 'Health provider must be read-only to ordinary callers and protected by android.permission.DUMP.' }
 if (@($exports | Where-Object { $_ -ne $bootstrap -and $_ -ne $provider }).Count) { throw 'Merged manifest contains an unexpected exported component.' }
 if ($components | Where-Object { $_.SelectNodes('intent-filter/category[@android:name="android.intent.category.LAUNCHER"]', $ns).Count -gt 0 }) { throw 'Receiver APK must not contain a Launcher entry.' }
 $permissions = @($manifest.SelectNodes('/manifest/uses-permission', $ns) | ForEach-Object { $_.GetAttribute('name', $androidNs) })
-foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.POST_NOTIFICATIONS')) {
+foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.POST_NOTIFICATIONS')) {
     if ($required -notin $permissions) { throw "Merged manifest is missing $required." }
 }
-if ('android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK' -in $permissions) { throw 'P1 must not declare the mediaPlayback service permission before real audio playback exists.' }
 if ('android.permission.ACCESS_LOCAL_NETWORK' -in $permissions) { throw 'Do not request Android 17 local-network permission while targeting SDK 34.' }
 
 $badging = & (Join-Path $buildTools.FullName 'aapt.exe') dump badging $apk
@@ -99,7 +101,7 @@ $packageLine = $badging | Where-Object { $_ -match '^package:' } | Select-Object
 if ($packageLine -notmatch "name='app\.anpod\.receiver' versionCode='(?<code>\d+)' versionName='(?<name>[^']+)'") { throw 'APK package identity or version does not match the fixed Receiver application ID.' }
 $versionCode = [int]$Matches.code
 $versionName = $Matches.name
-if (($badging -join "`n") -notmatch "targetSdkVersion:'35'") { throw 'P1 Receiver APK must target API 35.' }
+if (($badging -join "`n") -notmatch "targetSdkVersion:'35'") { throw 'P2 Receiver APK must target API 35.' }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($apk)
@@ -116,8 +118,10 @@ if ($LASTEXITCODE -ne 0 -or -not $signerMatch.Success) {
 }
 $signerSha256 = $signerMatch.Groups['sha'].Value.ToLowerInvariant()
 $apkSha256 = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
+$expectedVersion = '0.2.0-p2-candidate'
+if ($versionName -ne $expectedVersion -or $versionCode -ne 2) { throw 'P2 candidate build must identify as version 0.2.0-p2-candidate / code 2.' }
 
-$outputPath = [IO.Path]::GetFullPath($OutputDirectory)
+$outputPath = $OutputDirectory
 New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 $apkDestination = Join-Path $outputPath 'receiver.apk'
 $metadataDestination = Join-Path $outputPath 'receiver.json'

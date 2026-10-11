@@ -97,7 +97,18 @@ pub async fn start(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, c
     start_with(&SystemAdb(adb), serial, apk, metadata_path, cancel).await
 }
 
+pub async fn start_audio(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    socket_name: &str, connect_code: &str, playback_mode: &str, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    start_with_action(&SystemAdb(adb), serial, apk, metadata_path, cancel,
+        Some((socket_name, connect_code, playback_mode))).await
+}
+
 async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    start_with_action(adb, serial, apk, metadata_path, cancel, None).await
+}
+
+async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken, audio: Option<(&str, &str, &str)>) -> Result<ReceiverStatus, String> {
     ensure_usb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
@@ -105,12 +116,20 @@ async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_pat
     verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let before = read_health(adb, serial, &user, cancel).await?;
     ensure_version(&before, &metadata)?;
-    if before.healthy { return Ok(status_from_health(before)); }
+    if before.healthy && audio.is_none() { return Ok(status_from_health(before)); }
 
-    let result = adb.run(Some(serial), &[
-        "shell", "am", "start", "--user", &user, "-W", "-n", "app.anpod.receiver/.BootstrapActivity",
-        "-a", "app.anpod.receiver.action.START",
-    ], Duration::from_secs(45), Some(cancel)).await?;
+    let mut args = vec![
+        "shell".to_string(), "am".into(), "start".into(), "--user".into(), user.clone(), "-W".into(),
+        "-n".into(), "app.anpod.receiver/.BootstrapActivity".into(), "-a".into(),
+        if audio.is_some() { "app.anpod.receiver.action.START_AUDIO" } else { "app.anpod.receiver.action.START" }.into(),
+    ];
+    if let Some((socket_name, connect_code, playback_mode)) = audio {
+        args.extend(["--es".into(), "socketName".into(), socket_name.into(),
+            "--es".into(), "connectCode".into(), connect_code.into(),
+            "--es".into(), "playbackMode".into(), playback_mode.into()]);
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = adb.run(Some(serial), &refs, Duration::from_secs(45), Some(cancel)).await?;
     ensure_adb_success(&result)?;
 
     let deadline = Instant::now() + Duration::from_secs(35);
@@ -429,6 +448,12 @@ mod tests {
                         state.healthy = true;
                         AdbResult { success: true, stdout: "Status: ok".into(), stderr: String::new() }
                     }
+                    values if values.windows(2).any(|pair| pair[0] == "-a" && pair[1] == "app.anpod.receiver.action.START_AUDIO") => {
+                        state.active = true;
+                        state.foreground = true;
+                        state.healthy = true;
+                        AdbResult { success: true, stdout: "Status: ok".into(), stderr: String::new() }
+                    }
                     values if values.windows(2).any(|pair| pair[0] == "-a" && pair[1] == "app.anpod.receiver.action.STOP") => {
                         state.active = false;
                         state.foreground = false;
@@ -539,6 +564,21 @@ mod tests {
             }
         }
         assert!(calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into(), "query".into(), "--user".into(), TEST_USER.into()])));
+    }
+
+    #[tokio::test]
+    async fn fake_adb_audio_start_sends_session_handshake_and_playback_mode() {
+        let files = ArtifactFiles::new();
+        let adb = FakeAdb::new(true, files.digest.clone());
+        let status = start_with_action(&adb, SERIAL, &files.apk, &files.metadata, &CancellationToken::new(),
+            Some(("anpod_test_session", "test_token", "lowlatency"))).await.unwrap();
+        assert!(status.healthy);
+        let audio_start = adb.calls().into_iter().find(|call|
+            call.iter().any(|arg| arg == "app.anpod.receiver.action.START_AUDIO")).unwrap();
+        for expected in ["socketName", "anpod_test_session", "connectCode", "test_token", "playbackMode", "lowlatency"] {
+            assert!(audio_start.iter().any(|arg| arg == expected), "missing {expected} in {audio_start:?}");
+        }
+        assert!(audio_start.windows(2).any(|pair| pair[0] == "--user" && pair[1] == TEST_USER));
     }
 
     #[tokio::test]

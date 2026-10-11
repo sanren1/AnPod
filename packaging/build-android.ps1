@@ -38,6 +38,8 @@ param(
 
     [string]$OutputDirectory,
 
+    [string]$BuildDirectory,
+
     [string]$AndroidSdkRoot,
 
     [string]$JavaHome,
@@ -50,7 +52,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $projectDir = Join-Path $root 'src\AnPod.AndroidServer'
 $javaSourceDir = Join-Path $projectDir 'src\main\java'
-$buildDir = Join-Path $root 'artifacts\android'
+$buildDir = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $root 'artifacts\android' }
 
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $root 'deps'
@@ -152,7 +154,7 @@ function Build-WithGradle {
 
     Push-Location $projectDir
     try {
-        & $gradleCommand $task "-PanpodPayloadPath=$payloadPath" --no-daemon
+        & $gradleCommand $task "-PanpodPayloadPath=$payloadPath" "-PanpodBuildDir=$buildDir" --no-daemon
         if ($LASTEXITCODE -ne 0) {
             throw "Gradle failed with exit code $LASTEXITCODE."
         }
@@ -184,8 +186,11 @@ function Build-WithSdkDirect {
     }
 
     $javac = Join-Path $JdkRoot 'bin\javac.exe'
-    $sources = Get-ChildItem -Path $javaSourceDir -Recurse -Filter '*.java' |
-        ForEach-Object { $_.FullName }
+    $protocolSourceDir = Join-Path $root 'src\AnPod.AndroidProtocol\src\main\java'
+    $sources = @(
+        Get-ChildItem -Path $javaSourceDir -Recurse -Filter '*.java' | ForEach-Object { $_.FullName }
+        Get-ChildItem -Path $protocolSourceDir -Recurse -Filter '*.java' | ForEach-Object { $_.FullName }
+    )
 
     if (-not $sources) {
         throw "No Java sources found under $javaSourceDir."

@@ -3,20 +3,28 @@ package com.anpod.server;
 import java.io.IOException;
 import java.io.InputStream;
 
-/** Preserves PCM16 stereo frame boundaries across arbitrary socket reads/writes. */
-final class Pcm16FrameStream {
-    static final int FRAME_BYTES = 4;
+/** Preserves PCM16 frame boundaries across arbitrary socket reads/writes. */
+public final class Pcm16FrameStream {
+    public static final int FRAME_BYTES = 4;
     private final byte[] tail = new byte[FRAME_BYTES - 1];
+    private final int frameBytes;
     private int tailLength;
 
-    interface Writer {
+    public interface Writer {
         int write(byte[] data, int offset, int length);
     }
 
+    public Pcm16FrameStream() { this(2); }
+
+    public Pcm16FrameStream(int channels) {
+        if (channels != 1 && channels != 2) throw new IllegalArgumentException("channels must be mono or stereo");
+        frameBytes = channels * 2;
+    }
+
     /** Returns complete frames, -1 at clean EOF; retains up to three bytes. */
-    int readFrames(InputStream input, byte[] buffer, int maxBytes) throws IOException {
-        int limit = maxBytes - maxBytes % FRAME_BYTES;
-        if (limit < FRAME_BYTES || buffer.length < limit) {
+    public int readFrames(InputStream input, byte[] buffer, int maxBytes) throws IOException {
+        int limit = maxBytes - maxBytes % frameBytes;
+        if (limit < frameBytes || buffer.length < limit) {
             throw new IllegalArgumentException("buffer must fit at least one complete frame");
         }
 
@@ -32,14 +40,15 @@ final class Pcm16FrameStream {
 
         if (count < 0) {
             if (prefix != 0) {
-                throw new IOException("PCM stream ended with an incomplete stereo frame (" + prefix + " bytes)");
+                throw new IOException("PCM stream ended with an incomplete "
+                        + (frameBytes == FRAME_BYTES ? "stereo " : "") + "frame (" + prefix + " bytes)");
             }
             tailLength = 0;
             return -1;
         }
 
         int total = prefix + count;
-        int complete = total - total % FRAME_BYTES;
+        int complete = total - total % frameBytes;
         tailLength = total - complete;
         if (tailLength > 0) {
             System.arraycopy(buffer, complete, tail, 0, tailLength);
@@ -47,8 +56,16 @@ final class Pcm16FrameStream {
         return complete;
     }
 
-    static void writeFrames(Writer writer, byte[] buffer, int length) throws IOException {
-        if (length % FRAME_BYTES != 0) {
+    public void writeFramesForChannels(Writer writer, byte[] buffer, int length) throws IOException {
+        writeAlignedFrames(writer, buffer, length, frameBytes);
+    }
+
+    public static void writeFrames(Writer writer, byte[] buffer, int length) throws IOException {
+        writeAlignedFrames(writer, buffer, length, FRAME_BYTES);
+    }
+
+    private static void writeAlignedFrames(Writer writer, byte[] buffer, int length, int frameBytes) throws IOException {
+        if (length % frameBytes != 0) {
             throw new IllegalArgumentException("write length is not frame aligned");
         }
 
@@ -62,7 +79,7 @@ final class Pcm16FrameStream {
                 pauseOnNoProgress();
                 continue;
             }
-            if (written % FRAME_BYTES != 0) {
+            if (written % frameBytes != 0) {
                 throw new IOException("AudioTrack.write returned a partial PCM frame: " + written);
             }
             offset += written;

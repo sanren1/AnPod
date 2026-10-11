@@ -118,3 +118,37 @@
 - 普通旧 Tauri 包只要求原有五个桌面运行文件和 Platform-Tools notice；Receiver APK/JSON 不再是 `tauri.conf` 或普通打包路径的强制依赖。
 - Receiver 候选包已刷新：`artifacts/AnPod-1.0.4-receiver-p1-candidate-tauri-win-x64-portable.zip`，SHA-256 `73EF0826D605D55ACD19CEC1C75D205F4347B0C4C8D35960B30FE42BB0F59650`。含当前 Receiver APK/JSON、icon.png、原有五个桌面运行依赖及 notices/licenses/upstream；归档内 APK SHA-256 与 JSON metadata 相符。归档文件列表与文本资料未检出 Probe、密钥、日志或设备标识；release EXE 仍含本机绝对构建路径，候选仅限本机验证，公开分发前必须做编译路径重映射并复验。稳定 ZIP 未覆盖，SHA-256 仍为 `95D707F54C4037E4A7E8126D496FB9B2F1E2E31B6349ACEF4159E03B54870B9F`。
 - 回退继续使用既有稳定 ZIP。候选包是 Android 16 / targetSdk 35 上的 P1 验收包，不代表 v2 完整发布；P2 与其他发布门槛仍由后续音频会话处理。
+
+## P2 Installed Receiver 音频候选
+
+### 本地实现与构建
+
+- 新增 opt-in 后端：只有在启动 AnPod 的进程环境中将 `ANPOD_AUDIO_BACKEND` 设为 `installed-receiver` 时，USB 音频连接才走 APK Receiver；未设置时仍走 `app_process`，Wi-Fi 也继续走原有路径。P2 不自动安装或升级 APK。
+- Receiver version `0.2.0-p2-candidate` / versionCode `2`。音频服务使用 `mediaPlayback` 前台服务类型，管理健康检查继续使用原来的 120 秒 `shortService`；两者不共用短服务时限。
+- 两条 Android 路径复用同一 PCM16 帧对齐实现、8-byte little-endian 音频头及已有随机 token 握手。Native C ABI、静音切换和播放模式接口不变。
+- P2 Native DLL、APK、Legacy Android payload 和 Rust target 都必须在隔离目录构建，例如分别使用 `build-native.ps1 -BuildDirectory artifacts/p2-native-build -OutputDirectory artifacts/p2-native`、`build-receiver.ps1 -OutputDirectory artifacts/p2-receiver`、`build-android.ps1 -ForceSdkDirect -BuildDirectory artifacts/p2-legacy-build -OutputDirectory artifacts/p2-legacy-payload`，再用 `publish-tauri.ps1 -IncludeReceiverCandidate -ReceiverCandidate p2 -NativeArtifactDirectory artifacts/p2-native -LegacyPayloadDirectory artifacts/p2-legacy-payload -ReceiverArtifactDirectory artifacts/p2-receiver -RustTargetDirectory artifacts/p2-tauri-target` 生成独立 portable candidate。不得指向 `deps/` 或原 Rust target，不得覆盖 P1 或稳定包。
+- P2 构建脚本审计 private Service、DUMP 保护、无 Launcher、mediaPlayback 权限及 Android 包身份。桌面 Release 启用 Rust 编译路径重映射，并扫描候选 EXE、Native DLL、APK 与文本资料中的本机源码路径。
+- P2 真机音频尚未在本轮编码会话中测试；本轮未安装/升级 APK、未操作 ADB reverse、未重启 AnPod 或手机、未发出真实音频。
+
+### 构建记录与升级兼容性
+
+| 检查 | 结果 | 说明 |
+|---|---|---|
+| Java PCM framing/mode 检查 | PASS | 编译共享 PCM helper、Legacy `Options` 与 `PcmCheck`；输出 `Android PCM framing and mode checks passed.` |
+| Legacy Android payload 隔离构建 | PASS | JDK 17 + SDK API 35 direct javac/d8；生成 15,004 B `classes.dex`，未覆盖 `deps/server`。 |
+| P2 Receiver APK 与 Manifest 审计 | PASS | Gradle 8.9 / AGP 8.7.3，API 35；`shortService|mediaPlayback`、前台服务权限、DUMP 入口、private Service 与无 Launcher 均通过脚本审计。APK SHA-256：`1d35c5a864c03c548647bdf0bdfe9d83716f922061d7d3491df1b21a62ccb6c1`。 |
+| Native DLL 隔离 Release 构建 | PASS | CMake/MSVC Release x64；既有 `AudioCapture_*` ABI 导出、架构与本机源码路径扫描通过。 |
+| Rust 自动检查与 Release | PASS | `cargo test --locked --offline`：23/23；Release 编译成功。修正 `CARGO_MANIFEST_DIR` 仅进入 Debug 编译分支后，EXE 本机路径扫描通过。 |
+| Frontend 与便携候选打包 | PASS | Frontend 生产构建成功；最终 P2 ZIP 的 EXE、Native DLL、Legacy payload、APK 及文本资料路径扫描通过。候选 ZIP：`artifacts/AnPod-1.0.4-receiver-p2-candidate-tauri-win-x64-portable.zip`；SHA-256：`A12540214C4AA9A8C04770B07F57277171F63CBB2254BC46988B3D61AA06DB9C`。 |
+| P1 → P2 APK 更新签名兼容性 | BLOCKED | P1 候选 ZIP 中 APK 与其 metadata 及记录签名一致；P2 临时 debug 签名与 P1 不同。未尝试升级、重签或卸载。正式 release keystore 仍未找到。 |
+
+升级方案：先由维护者提供/恢复与已安装 P1 相同的私有签名密钥，再重建 P2 并校验 Android Package Manager 所要求的 signer 连续性；随后才安排经用户确认的 `adb install -r` 更新。若无法恢复原密钥，暂停原包内升级，先另行评审迁移方式；不得卸载 P1、绕过签名校验或让本候选覆盖安装。
+
+### 真机前置与验收
+
+- 安装/升级候选 APK 前先由用户确认安装动作；检查候选 signer 与设备当前已安装 Receiver 的 signer 相同。未知或不符时停止，不能卸载或绕过 Package Manager 签名校验。当前正式 release keystore 状态仍需单独确认。
+- P2 硬件验收限定在用户授权的在线 USB ADB 设备；保持默认后端回退操作可用。使用同一唯一设备记录，并仅建立本会话的 `adb reverse localabstract:<本会话名> tcp:<本机端口>` 映射。
+- 安装并启动后检查 Receiver Provider 的 `audioActive` 与 `actualMode`，验证 token 握手成功、PCM 音频头/帧完整、balanced 与 low-latency 实际模式、电脑/手机输出切换、断开后 Receiver/AudioTrack/焦点停止以及电脑音量恢复。
+- 执行 20 次 USB 物理拔插、锁屏连续播放 30 分钟、输出切换及取消/异常退出恢复；记录每轮通过数、系统前台服务状态、实际模式、焦点及 underrun。此清单不是通过记录，完成前均为 NOT_TESTED。
+- 若 LocalSocket abstract endpoint 被应用 UID / SELinux 拒绝，先保存脱敏的拒绝证据；只有复现后才评估 TCP reverse adapter。不得仅因假设修改现有 P1 `app_process` 路径。
+- 本地快速回退：关闭启动进程的 `ANPOD_AUDIO_BACKEND` 环境变量并重启 AnPod，即回到默认 `LegacyAppProcess`；保持已安装 APK，不需要设备卸载或数据清理。

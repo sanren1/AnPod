@@ -9,6 +9,10 @@ plugins {
     id 'com.android.application' version '8.5.2'
 }
 
+if (project.hasProperty('anpodBuildDir')) {
+    layout.buildDirectory.set(file(project.property('anpodBuildDir')))
+}
+
 android {
     namespace 'com.anpod.server'
     compileSdk 34
@@ -34,6 +38,8 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    sourceSets.main.java.srcDir('../AnPod.AndroidProtocol/src/main/java')
 
     lint {
         // Lint noise is irrelevant for a non-installed payload.

@@ -31,6 +31,8 @@ param(
 
     [string]$OutputDirectory,
 
+    [string]$BuildDirectory,
+
     [string]$MinGWRoot,
 
     [switch]$ForceMinGW
@@ -42,7 +44,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $sourceDir = Join-Path $root 'src\AnPod.Native'
 $sourceFile = Join-Path $sourceDir 'audio_capture.cpp'
 $headerFile = Join-Path $sourceDir 'audio_capture.h'
-$buildDir = Join-Path $root 'artifacts\native'
+$buildDir = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $root 'artifacts\native' }
 
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $root 'deps'

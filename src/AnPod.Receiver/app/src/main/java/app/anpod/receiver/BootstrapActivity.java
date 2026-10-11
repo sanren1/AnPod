@@ -9,6 +9,7 @@ import android.widget.TextView;
 
 public final class BootstrapActivity extends Activity {
     public static final String ACTION_START = "app.anpod.receiver.action.START";
+    public static final String ACTION_START_AUDIO = "app.anpod.receiver.action.START_AUDIO";
     public static final String ACTION_STOP = "app.anpod.receiver.action.STOP";
     private TextView status;
 
@@ -25,7 +26,7 @@ public final class BootstrapActivity extends Activity {
             stopService(new Intent(this, ReceiverService.class));
             status.setText("AnPod Receiver 已停止。");
             status.postDelayed(this::finish, 250);
-        } else if (ACTION_START.equals(action)) {
+        } else if (ACTION_START.equals(action) || ACTION_START_AUDIO.equals(action)) {
             requestNotificationPermissionOrStart();
         } else {
             finish();
@@ -57,6 +58,11 @@ public final class BootstrapActivity extends Activity {
     private void startReceiverService() {
         try {
             Intent service = new Intent(this, ReceiverService.class);
+            String action = getIntent().getAction();
+            service.setAction(action);
+            if (ACTION_START_AUDIO.equals(action)) {
+                service.putExtras(getIntent().getExtras());
+            }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);
             else startService(service);
             status.setText("AnPod Receiver 管理服务已启动，正在等待电脑检查状态。");

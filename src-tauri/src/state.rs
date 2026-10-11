@@ -113,6 +113,7 @@ struct Session {
     transport: String,
     reverse: String,
     child: Option<Child>,
+    installed_receiver: bool,
     output: String,
     output_tail: Arc<Mutex<VecDeque<String>>>,
 }
@@ -170,11 +171,14 @@ impl AppState {
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir)
             .join("AnPod");
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let (adb_path, server_path, receiver_apk_path, receiver_metadata_path, audio_path) = if cfg!(debug_assertions) {
+        #[cfg(debug_assertions)]
+        let (adb_path, server_path, receiver_apk_path, receiver_metadata_path, audio_path) = {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let deps = root.join("../deps");
             (deps.join("adb.exe"), deps.join("server"), deps.join("receiver.apk"), deps.join("receiver.json"), deps.join("audio_capture.dll"))
-        } else {
+        };
+        #[cfg(not(debug_assertions))]
+        let (adb_path, server_path, receiver_apk_path, receiver_metadata_path, audio_path) = {
             let app_dir = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
             (app_dir.join("adb.exe"), app_dir.join("server"), app_dir.join("receiver.apk"), app_dir.join("receiver.json"), app_dir.join("audio_capture.dll"))
         };
@@ -689,13 +693,9 @@ impl AppState {
 
     async fn connect_inner(&self, app: &AppHandle, device: &Device, token: &CancellationToken, play_on_phone: bool) -> Result<String, String> {
         let serial = device.serial.as_str();
-        let old = adb_run(&self.adb_path, Some(serial), &["reverse", "--list"], Duration::from_secs(5), Some(&token)).await?;
-        if old.success {
-            for name in old.stdout.lines().filter_map(own_reverse_name) {
-                let _ = adb_run(&self.adb_path, Some(serial), &["reverse", "--remove", &name], Duration::from_secs(5), Some(&token)).await;
-            }
-        }
         token_check(&token)?;
+        let installed_receiver = device.transport == "usb"
+            && env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value.eq_ignore_ascii_case("installed-receiver"));
         self.audio.initialize()?;
         self.audio.set_streaming(false)?;
         let port = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
@@ -706,7 +706,7 @@ impl AppState {
         let remote = format!("localabstract:{reverse}");
         let port_arg = format!("tcp:{port}");
         checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(&token)).await?;
-        *self.session.lock().await = Some(Session { serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())) });
+        *self.session.lock().await = Some(Session { serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())) });
         {
             let mut view = self.view.lock().expect("view lock");
             view.session_active = true;
@@ -714,26 +714,33 @@ impl AppState {
             view.session_transport = Some(device.transport.clone());
             view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
         }
-        checked_adb(&self.adb_path, Some(serial), &["push", self.server_path.to_string_lossy().as_ref(), "/data/local/tmp/anpod_server"], Duration::from_secs(15), Some(&token)).await?;
         let mode = self.view.lock().expect("view lock").settings.playback_mode.to_ascii_lowercase();
-        let mut command = Command::new(&self.adb_path);
-        command.args(["-s", serial, "shell", "app_process", "-Djava.class.path=/data/local/tmp/anpod_server", "/data/local/tmp", "com.anpod.server.Main"])
-            .arg(format!("socketName={reverse}"))
-            .arg(format!("connectCode={token_text}"))
-            .arg(format!("playbackMode={}", if mode == "lowlatency" || mode == "low_latency" { "low-latency" } else { "balanced" }))
-            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000);
-        let mut child = command.spawn().map_err(|_| "无法启动手机端音频服务。".to_string())?;
-        let output_tail = self.session.lock().await.as_ref().expect("session created before server").output_tail.clone();
-        let log_path = self.data_dir.join("logs").join("anpod.log");
-        if let Some(stdout) = child.stdout.take() { tokio::spawn(capture_child_output(stdout, "stdout", output_tail.clone(), log_path.clone())); }
-        if let Some(stderr) = child.stderr.take() { tokio::spawn(capture_child_output(stderr, "stderr", output_tail.clone(), log_path)); }
+        if installed_receiver {
+            let playback_mode = if mode == "lowlatency" || mode == "low_latency" { "lowlatency" } else { "balanced" };
+            receiver::start_audio(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path,
+                &reverse, &token_text, playback_mode, token).await?;
+        } else {
+            checked_adb(&self.adb_path, Some(serial), &["push", self.server_path.to_string_lossy().as_ref(), "/data/local/tmp/anpod_server"], Duration::from_secs(15), Some(&token)).await?;
+            let mut command = Command::new(&self.adb_path);
+            command.args(["-s", serial, "shell", "app_process", "-Djava.class.path=/data/local/tmp/anpod_server", "/data/local/tmp", "com.anpod.server.Main"])
+                .arg(format!("socketName={reverse}"))
+                .arg(format!("connectCode={token_text}"))
+                .arg(format!("playbackMode={}", if mode == "lowlatency" || mode == "low_latency" { "low-latency" } else { "balanced" }))
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command.spawn().map_err(|_| "无法启动手机端音频服务。".to_string())?;
+            let output_tail = self.session.lock().await.as_ref().expect("session created before server").output_tail.clone();
+            let log_path = self.data_dir.join("logs").join("anpod.log");
+            if let Some(stdout) = child.stdout.take() { tokio::spawn(capture_child_output(stdout, "stdout", output_tail.clone(), log_path.clone())); }
+            if let Some(stderr) = child.stderr.take() { tokio::spawn(capture_child_output(stderr, "stderr", output_tail.clone(), log_path)); }
+            if let Some(session) = self.session.lock().await.as_mut() { session.child = Some(child); }
+        }
         token_check(&token)?;
         let handshake = self.audio.wait_handshake(&token_text, Duration::from_secs(10), &token).await?;
         token_check(&token)?;
-        if handshake != token_text { let _ = child.kill().await; return Err("握手校验失败，已拒绝连接。".into()); }
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() { return Err("手机端音频服务已停止。".into()); }
+        if handshake != token_text { return Err("握手校验失败，已拒绝连接。".into()); }
+        if !installed_receiver && self.session.lock().await.as_mut().and_then(|session| session.child.as_mut()).is_some_and(|child| child.try_wait().map_or(true, |status| status.is_some())) { return Err("手机端音频服务已停止。".into()); }
         if !self.audio.is_connected()? { return Err("手机端音频连接已中断。".into()); }
         token_check(&token)?;
         if play_on_phone { self.audio.mute_active()?; }
@@ -742,7 +749,7 @@ impl AppState {
         self.audio.start()?;
         token_check(&token)?;
         let output = if play_on_phone { "phone" } else { "computer" }.to_string();
-        if let Some(session) = self.session.lock().await.as_mut() { session.child = Some(child); session.output = output.clone(); }
+        if let Some(session) = self.session.lock().await.as_mut() { session.output = output.clone(); }
         {
             let mut view = self.view.lock().expect("view lock");
             view.output = output;
@@ -898,9 +905,15 @@ impl AppState {
     }
 
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
-        let mut first_error = self.audio.restore_muted().err();
+        let mut first_error = None;
         if let Some(mut session) = self.session.lock().await.take() {
             { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; }
+            if session.installed_receiver {
+                if let Err(error) = receiver::stop(&self.adb_path, &session.serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, &CancellationToken::new()).await {
+                    first_error.get_or_insert(error);
+                }
+            }
             if let Some(child) = session.child.as_mut() {
                 let tail = safe_android_tail(&session.output_tail.lock().expect("output log lock").iter().cloned().collect::<Vec<_>>());
                 if !tail.is_empty() { self.log(&format!("Android audio process output before teardown:\n{tail}")); }
@@ -912,6 +925,7 @@ impl AppState {
             }
         }
         if let Err(error) = self.audio.stop_and_cleanup() { first_error.get_or_insert(error); }
+        if let Err(error) = self.audio.restore_muted() { first_error.get_or_insert(error); }
         self.view.lock().expect("view lock").output = "computer".into();
         if let Some(app) = app { self.emit(app); }
         first_error.map_or(Ok(()), Err)
@@ -1332,12 +1346,6 @@ fn parse_getprop(text: &str) -> HashMap<String, String> {
         let close = line.find("]:")?;
         Some((line.get(1..close)?.into(), line.get(close + 2..)?.trim().trim_start_matches('[').trim_end_matches(']').into()))
     }).collect()
-}
-
-fn own_reverse_name(line: &str) -> Option<String> {
-    let fields: Vec<_> = line.split_whitespace().collect();
-    let name = fields.iter().find(|value| value.starts_with("localabstract:anpod_"))?;
-    Some((*name).to_string())
 }
 
 fn normalize_endpoint(value: &str) -> Result<String, String> {
