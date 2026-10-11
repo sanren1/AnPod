@@ -25,6 +25,10 @@ public final class P5cLoopbackEndpoint {
             endpoint.start();
             System.out.println("PORT=" + endpoint.port());
             System.out.flush();
+            if (args.length > 0 && "--drop-on-stdin".equals(args[0])) {
+                if (System.in.read() < 0) throw new IOException("P5-D test disconnect signal was not supplied");
+                endpoint.close();
+            }
             if (!endpoint.await(15, TimeUnit.SECONDS)) throw new IOException("P5-C test endpoint timed out");
             System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
                     + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","

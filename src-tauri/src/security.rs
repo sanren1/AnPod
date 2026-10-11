@@ -62,6 +62,10 @@ pub(crate) struct BindingMaterial {
 }
 
 impl BindingMaterial {
+    pub(crate) fn duplicate_for_session(&self) -> Self {
+        Self { host_id: self.host_id, receiver_id: self.receiver_id, secret: self.secret }
+    }
+
     pub(crate) fn generate() -> Result<Self, SecurityError> {
         let mut bytes = [0u8; 64];
         getrandom::fill(&mut bytes).map_err(|_| SecurityError::Random)?;

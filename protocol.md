@@ -213,7 +213,7 @@ Audio remains the existing ANPD v1 UDP datagram: 34-byte authenticated header,
 PCM16LE payload, AES-GCM tag, and the negotiated P5-A session ID. The sender
 uses the P5-A host-to-receiver audio key. The receiver uses that same derived
 direction key and accepts FORMAT only when sample rate and channel count equal
-the authenticated parameters; later PCM payloads must be aligned to that
+the authenticated parameters; later PCM payloads must be aligned to that format.
 Both balanced and low-latency modes use the existing 5 ms target for UDP
 packetization, bounded further by the 1200-byte datagram limit. Mode selection
 does not claim a transport packetization or performance difference; it passes
@@ -241,6 +241,41 @@ firewall/hotspot changes, WASAPI/AudioTrack startup, or product bootstrap. The
 local cross-language test uses synthetic PCM and a fake playback endpoint;
 real USB/network transport, real WASAPI/AudioTrack output, and device behavior
 remain NOT_TESTED. This section does not mark P5 complete.
+
+## P5-D local single-session recovery owner
+
+`p5c::SessionOwner::start` is an explicit internal caller path that receives a
+trusted `BindingMaterial`, PCM parameters, a caller `CancellationToken`, and an
+explicit `127.0.0.1` endpoint. It starts one dedicated standard thread to own
+all synchronous session I/O; it does not block Tauri or PCM callback threads.
+The owner reuses the supplied binding by making and wiping one private copy per
+fresh P5-A handshake. Every recovery derives a new session ID and directional
+keys and creates a new PCM queue; it never provisions, overwrites, or clears
+the caller's binding.
+
+While active, the owner sends authenticated heartbeats every second. A failed
+heartbeat closes the old sender, UDP/TCP sockets, queue, and session keys,
+publishes `Reconnecting`, and waits on the bounded 1/2/5/10 second schedule
+(10 seconds maximum) before trying the currently supplied endpoint again.
+`update_endpoint` is the only way to change that target; discovery and address
+guessing are not implemented. The requested pause state is retained and
+reapplied after the next authenticated START. `SessionSnapshot` distinguishes
+authenticated, transport-connected, receiver-running, streaming, paused,
+reconnecting, and stopped; streaming still comes only from the authenticated
+receiver's PCM output callback reflected by a heartbeat ACK.
+
+Explicit owner stop disables recovery and asks the owner thread to send the
+authenticated STOP when it is between I/O operations. If that does not finish
+within its short 100 ms stop window, it cancels the pending operation and
+closes locally. Caller cancellation directly interrupts a pending
+connect/read/write/backoff poll. Both paths clear the queue and close the
+control socket. The current one-shot Android endpoint cleans its playback on
+STOP or control-channel EOF; retry requires an explicitly supplied endpoint
+whose receiver listener is running again. `SessionOwner` is not wired to product
+state or startup. Local recovery checks use a rebuilt fake localhost endpoint;
+they do not establish recovery after USB/bootstrap loss, start an unavailable
+Android media service, or verify real audio. Device, LAN, WASAPI and AudioTrack
+recovery remain NOT_TESTED.
 
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3
