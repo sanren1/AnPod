@@ -217,10 +217,10 @@ function App() {
         <div className="section-title"><h1>声音输出</h1><button className="text-button" onClick={() => void refresh()} disabled={working || snapshot.busy} aria-label="刷新设备"><LoaderCircle className={working || snapshot.busy ? "spin" : ""} size={15} />刷新</button></div>
         <div className="output-grid" role="group" aria-label="选择声音输出">
           <button className={`output-card ${snapshot.output === "computer" ? "selected" : ""}`} aria-pressed={snapshot.output === "computer"} onClick={() => void setOutput("computer")} disabled={working || snapshot.busy || cleanupPending || (!active && snapshot.output === "computer")}>
-            <span className="output-heading"><Computer size={18} aria-hidden="true" /><span className="output-name">电脑</span></span><span className="output-caption">本机扬声器</span>
+            <span className="output-heading"><Computer size={18} aria-hidden="true" /><span className="output-name">电脑</span></span>
           </button>
           <button className={`output-card ${snapshot.output === "phone" ? "selected" : ""}`} aria-pressed={snapshot.output === "phone"} onClick={() => void setOutput("phone")} disabled={working || snapshot.busy || cleanupPending}>
-            <span className="output-heading"><Smartphone size={18} aria-hidden="true" /><span className="output-name">手机</span></span><span className="output-caption">{active ? snapshot.deviceName ?? "当前连接手机" : selected?.displayName ?? "选择手机连接播放"}</span>
+            <span className="output-heading"><Smartphone size={18} aria-hidden="true" /><span className="output-name">手机</span></span>
           </button>
         </div>
         <p className="status-description">{snapshot.statusDetail}</p>

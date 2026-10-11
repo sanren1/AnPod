@@ -213,7 +213,6 @@ public sealed class MainViewModel : ObservableObject
                 OnPropertyChanged(nameof(IsIdle));
                 OnPropertyChanged(nameof(IsTransportSwitchEnabled));
                 OnPropertyChanged(nameof(IsPlaybackModeSwitchEnabled));
-                OnPropertyChanged(nameof(IsConnectionChangeHintVisible));
                 OnPropertyChanged(nameof(IsWifiPanelEnabled));
                 OnPropertyChanged(nameof(IsWifiInputEnabled));
                 OnPropertyChanged(nameof(PrimaryActionText));
@@ -244,7 +243,6 @@ public sealed class MainViewModel : ObservableObject
 
     public bool IsDisconnectEnabled => IsSessionUp || IsBusy;
 
-    public bool IsConnectionChangeHintVisible => IsSessionUp || IsBusy;
 
     /// <summary>
     /// The "从手机播放声音" switch. True while audio is routed to the phone —
