@@ -1,19 +1,23 @@
 use crate::{
     network::{PcmQueue, UdpSender, UdpSessionMaterial},
     network_interface::Ipv4Interface,
-    protocol::{PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER},
+    protocol::PcmFormat,
     security::{AudioParameters, BindingMaterial, HostHandshake},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex},
+    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
+use crate::protocol::{PacketEncoder, PacketType, HOST_TO_RECEIVER};
+#[cfg(test)]
+use std::net::IpAddr;
 
 const CONTROL_MAGIC: &[u8; 4] = b"ANPC";
 const CONTROL_HEADER_BYTES: usize = 30;
@@ -244,6 +248,9 @@ impl HostSession {
     pub(crate) fn state(&self) -> ReceiverState { self.state }
     pub(crate) fn session_id(&self) -> u64 { self.session_id }
     pub(crate) fn pcm_queue(&self) -> Arc<PcmQueue> { self.queue.clone() }
+    pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
+        self.sender.as_ref().map_or(0, UdpSender::pcm_payload_bytes_sent)
+    }
 
     pub(crate) fn bind_audio(&mut self) -> Result<(), String> {
         if self.state != ReceiverState::Authenticated { return Err("P5-C BIND is out of order.".into()); }
@@ -487,6 +494,7 @@ pub(crate) struct SessionOwner {
     commands: mpsc::Sender<OwnerCommand>,
     status: Arc<Mutex<SessionSnapshot>>,
     queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -521,16 +529,18 @@ impl SessionOwner {
             last_error: None,
         }));
         let queue = Arc::new(Mutex::new(None));
+        let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
         let (commands, receiver) = mpsc::channel();
         let owner_cancel = cancellation.clone();
         let owner_enabled = enabled.clone();
         let owner_status = status.clone();
         let owner_queue = queue.clone();
+        let owner_bytes = pcm_payload_bytes_sent.clone();
         let worker = thread::Builder::new().name("AnPod P5-D session owner".into())
             .spawn(move || run_session_owner(endpoint, binding, parameters, owner_cancel, owner_enabled,
-                receiver, owner_status, owner_queue, timing))
+                receiver, owner_status, owner_queue, owner_bytes, timing))
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
-        Ok(Self { cancellation, enabled, commands, status, queue, worker: Some(worker) })
+        Ok(Self { cancellation, enabled, commands, status, queue, pcm_payload_bytes_sent, worker: Some(worker) })
     }
 
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
@@ -540,6 +550,8 @@ impl SessionOwner {
     pub(crate) fn pcm_queue(&self) -> Option<Arc<PcmQueue>> {
         self.queue.lock().expect("P5-D PCM queue lock poisoned").clone()
     }
+
+    pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 { self.pcm_payload_bytes_sent.load(Ordering::Relaxed) }
 
     pub(crate) fn set_paused(&self, paused: bool) -> Result<(), String> {
         self.commands.send(OwnerCommand::SetPaused(paused))
@@ -596,7 +608,8 @@ impl Drop for SessionOwner {
 
 fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
     cancellation: CancellationToken, enabled: Arc<AtomicBool>, commands: mpsc::Receiver<OwnerCommand>,
-    status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>, timing: SessionTiming) {
+    status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>, timing: SessionTiming) {
     let mut endpoint = endpoint;
     let mut paused = false;
     let mut desired_paused = false;
@@ -671,6 +684,7 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
         }
         paused = desired_paused;
         let session_id = session.session_id();
+        let mut last_session_bytes = 0;
         let session_queue = session.pcm_queue();
         *queue.lock().expect("P5-D PCM queue lock poisoned") = Some(session_queue);
         publish_session(&status, if paused { SessionLifecycleState::Paused } else { SessionLifecycleState::ReceiverRunning },
@@ -682,8 +696,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break 'owner; }
             if Instant::now() >= next_heartbeat {
                 match session.heartbeat() {
-                    Ok(state) => publish_session(&status, lifecycle_from_receiver(state), generation,
-                        attempts, Some(session_id), paused, None),
+                    Ok(state) => {
+                        let sent = session.pcm_payload_bytes_sent();
+                        pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
+                        last_session_bytes = sent;
+                        publish_session(&status, lifecycle_from_receiver(state), generation,
+                            attempts, Some(session_id), paused, None);
+                    }
                     Err(error) => { last_error = Some(error); break; }
                 }
                 next_heartbeat = Instant::now() + timing.heartbeat_interval;
@@ -1055,7 +1074,9 @@ mod tests {
         let mut result = String::new();
         stdout.read_line(&mut result).unwrap();
         let status = child.wait().unwrap();
-        assert!(status.success(), "Java P5-C test endpoint did not finish successfully");
+        let mut stderr = String::new();
+        if let Some(mut stderr_pipe) = child.stderr.take() { let _ = stderr_pipe.read_to_string(&mut stderr); }
+        assert!(status.success(), "Java P5-C test endpoint did not finish successfully: {stderr}");
         result.trim().strip_prefix("RESULT=").expect("Java endpoint result").to_string()
     }
 

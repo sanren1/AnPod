@@ -1,6 +1,8 @@
 use std::net::Ipv4Addr;
+use serde::Serialize;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Ipv4Interface {
     pub(crate) index: u32,
     pub(crate) name: String,

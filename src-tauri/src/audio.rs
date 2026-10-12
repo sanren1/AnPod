@@ -23,8 +23,8 @@ enum Request {
     Initialize(mpsc::SyncSender<Result<(), String>>),
     Listen(u16, String, mpsc::SyncSender<Result<(), String>>),
     Start(mpsc::SyncSender<Result<(), String>>),
-    #[allow(dead_code)] // P3 prototype API; deliberately not used by product connection flows yet.
     StartPcmSink(Arc<PcmQueue>, mpsc::SyncSender<Result<(), String>>),
+    StopPcmSink(mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
     StopAndCleanup(mpsc::SyncSender<Result<(), String>>),
     Mute(mpsc::SyncSender<Result<(), String>>),
@@ -127,22 +127,46 @@ impl AudioActor {
                     }
                     Request::StartPcmSink(queue, reply) => {
                         let result = if let Some(native) = native.as_ref() {
-                            let user_data = Arc::as_ptr(&queue) as *mut c_void;
                             let Some(set_pcm_callback) = native.set_pcm_callback else {
                                 let _ = reply.send(Err("音频采集组件不支持 PCM sink。".into()));
                                 continue;
                             };
-                            if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
-                                Err(native.describe_error("无法设置 PCM sink"))
-                            } else if unsafe { (native.start)() } == 0 {
-                                unsafe { set_pcm_callback(None, std::ptr::null_mut()); }
-                                Err(native.describe_error("无法开始 PCM sink 采集"))
-                            } else {
-                                pcm_sink = Some(queue);
+                            if pcm_sink.as_ref().is_some_and(|old| Arc::ptr_eq(old, &queue)) {
                                 Ok(())
+                            } else {
+                                unsafe {
+                                    (native.stop)();
+                                    (native.set_stream)(0);
+                                    set_pcm_callback(None, std::ptr::null_mut());
+                                }
+                                drop(pcm_sink.take());
+                                let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                                if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
+                                    Err(native.describe_error("无法设置 PCM sink"))
+                                } else if unsafe { (native.start)() } == 0 {
+                                    unsafe {
+                                        (native.stop)();
+                                        set_pcm_callback(None, std::ptr::null_mut());
+                                    }
+                                    Err(native.describe_error("无法开始 PCM sink 采集"))
+                                } else {
+                                    pcm_sink = Some(queue);
+                                    Ok(())
+                                }
                             }
                         } else { Err("音频采集组件尚未初始化。".into()) };
                         let _ = reply.send(result);
+                    }
+                    Request::StopPcmSink(reply) => {
+                        if let Some(native) = native.as_ref() {
+                            unsafe {
+                                (native.stop)();
+                                (native.set_stream)(0);
+                                if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
+                            }
+                        }
+                        drop(pcm_sink.take());
+                        let _ = reply.send(Ok(()));
                     }
                     Request::Stream(enabled, reply) => {
                         let result = native.as_ref().map(|native| unsafe { (native.set_stream)(i32::from(enabled)); Ok(()) }).unwrap_or_else(|| Err("音频会话尚未初始化。".into()));
@@ -214,8 +238,8 @@ impl AudioActor {
     pub fn initialize(&self) -> Result<(), String> { self.call(Request::Initialize) }
     pub fn listen(&self, port: u16, token: &str) -> Result<(), String> { self.call(|reply| Request::Listen(port, token.into(), reply)) }
     pub fn start(&self) -> Result<(), String> { self.call(Request::Start) }
-    #[allow(dead_code)] // Kept opt-in until the UDP Receiver is implemented.
     pub fn start_pcm_sink(&self, queue: Arc<PcmQueue>) -> Result<(), String> { self.call(|reply| Request::StartPcmSink(queue, reply)) }
+    pub fn stop_pcm_sink(&self) -> Result<(), String> { self.call(Request::StopPcmSink) }
     pub fn set_streaming(&self, enabled: bool) -> Result<(), String> { self.call(|reply| Request::Stream(enabled, reply)) }
     pub fn stop_and_cleanup(&self) -> Result<(), String> { self.call(Request::StopAndCleanup) }
     pub fn mute_active(&self) -> Result<(), String> { self.call(Request::Mute) }

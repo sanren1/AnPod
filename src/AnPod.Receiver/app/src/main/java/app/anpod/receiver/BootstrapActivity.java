@@ -6,12 +6,19 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.widget.TextView;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 
 public final class BootstrapActivity extends Activity {
     public static final String ACTION_START = "app.anpod.receiver.action.START";
     public static final String ACTION_START_AUDIO = "app.anpod.receiver.action.START_AUDIO";
+    public static final String ACTION_START_NETWORK_AUDIO = "app.anpod.receiver.action.START_NETWORK_AUDIO";
     public static final String ACTION_STOP = "app.anpod.receiver.action.STOP";
+    private static final long NETWORK_START_WINDOW_MS = 25_000L;
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView status;
+    private long networkDeadline;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -26,7 +33,8 @@ public final class BootstrapActivity extends Activity {
             stopService(new Intent(this, ReceiverService.class));
             status.setText("AnPod Receiver 已停止。");
             status.postDelayed(this::finish, 250);
-        } else if (ACTION_START.equals(action) || ACTION_START_AUDIO.equals(action)) {
+        } else if (ACTION_START.equals(action) || ACTION_START_AUDIO.equals(action)
+                || ACTION_START_NETWORK_AUDIO.equals(action)) {
             requestNotificationPermissionOrStart();
         } else {
             finish();
@@ -62,15 +70,46 @@ public final class BootstrapActivity extends Activity {
             service.setAction(action);
             if (ACTION_START_AUDIO.equals(action)) {
                 service.putExtras(getIntent().getExtras());
+            } else if (ACTION_START_NETWORK_AUDIO.equals(action)) {
+                service.putExtra("networkAddress", getIntent().getStringExtra("networkAddress"));
+                service.putExtra("networkPrefixLength", getIntent().getIntExtra("networkPrefixLength", 0));
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);
             else startService(service);
-            status.setText("AnPod Receiver 管理服务已启动，正在等待电脑检查状态。");
-            status.postDelayed(this::finish, 1_000);
+            if (ACTION_START_NETWORK_AUDIO.equals(action)) {
+                status.setText("已通过 USB 启动网络接收。保持此页面打开，等待电脑完成认证和开始播放。");
+                networkDeadline = SystemClock.elapsedRealtime() + NETWORK_START_WINDOW_MS;
+                status.postDelayed(this::checkNetworkStart, 100);
+            } else {
+                status.setText("AnPod Receiver 管理服务已启动，正在等待电脑检查状态。");
+                status.postDelayed(this::finish, 1_000);
+            }
         } catch (RuntimeException error) {
             ReceiverService.recordStartFailure(error.getClass().getSimpleName());
             status.setText("AnPod Receiver 启动失败，请查看系统限制后重试。");
             status.postDelayed(this::finish, 1_500);
         }
+    }
+
+    private void checkNetworkStart() {
+        String state = ReceiverService.networkAudioState;
+        if ("receiverRunning".equals(state) || "streaming".equals(state) || "paused".equals(state)) {
+            status.setText("电脑已通过认证；Receiver 音频会话已启动。");
+            status.postDelayed(this::finish, 500);
+        } else if ("failed".equals(state) || !ReceiverService.startFailure.isEmpty()) {
+            status.setText("网络接收启动失败：" + ReceiverService.startFailure + "。请检查 USB 引导和 Receiver 状态。");
+            status.postDelayed(this::finish, 1_500);
+        } else if (SystemClock.elapsedRealtime() >= networkDeadline) {
+            status.setText("认证等待已超时；临时接收已关闭。请通过 USB/bootstrap 重试。");
+            status.postDelayed(this::finish, 1_500);
+        } else {
+            status.postDelayed(this::checkNetworkStart, 150);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 }

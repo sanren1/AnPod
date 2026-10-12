@@ -191,6 +191,7 @@ pub struct UdpSender {
     stopping: Arc<AtomicBool>,
     queue: Arc<PcmQueue>,
     worker: Option<JoinHandle<Result<NetworkStats, String>>>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
 }
 
 impl UdpSender {
@@ -219,11 +220,15 @@ impl UdpSender {
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let worker_queue = queue.clone();
+        let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
+        let worker_bytes = pcm_payload_bytes_sent.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
-            send_loop(socket, remote, worker_queue, worker_stopping, material, format)
+            send_loop(socket, remote, worker_queue, worker_stopping, material, format, worker_bytes)
         }).map_err(|error| error.to_string())?;
-        Ok(Self { stopping, queue, worker: Some(worker) })
+        Ok(Self { stopping, queue, worker: Some(worker), pcm_payload_bytes_sent })
     }
+
+    pub fn pcm_payload_bytes_sent(&self) -> u64 { self.pcm_payload_bytes_sent.load(Ordering::Relaxed) }
 
     pub fn stop(mut self) -> Result<NetworkStats, String> {
         self.stop_worker()
@@ -242,7 +247,7 @@ impl Drop for UdpSender {
 }
 
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
-    material: UdpSessionMaterial, format: PcmFormat) -> Result<NetworkStats, String> {
+    material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<NetworkStats, String> {
     let mut encoder = PacketEncoder::new(&material.key, material.session_id, HOST_TO_RECEIVER);
     let format_payload = format.encode().map_err(|error| error.to_string())?;
     send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
@@ -277,6 +282,7 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
             if sent != packet.len() { return Err("UDP datagram was not sent atomically.".into()); }
             stats.packets_sent = stats.packets_sent.saturating_add(1);
             stats.pcm_payload_bytes_sent = stats.pcm_payload_bytes_sent.saturating_add(payload.len() as u64);
+            pcm_payload_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
             offset_frames += packet_frames;
         }
     }

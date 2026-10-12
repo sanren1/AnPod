@@ -7,6 +7,26 @@ use tokio_util::sync::CancellationToken;
 const PACKAGE: &str = "app.anpod.receiver";
 const HEALTH_URI: &str = "content://app.anpod.receiver.state/health";
 const BINDING_URI: &str = "content://app.anpod.receiver.state/binding";
+const INTERFACES_URI: &str = "content://app.anpod.receiver.state/interfaces";
+const NETWORK_URI: &str = "content://app.anpod.receiver.state/network";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverInterface {
+    pub address: String,
+    pub prefix_length: u8,
+    pub interface_index: u32,
+    pub interface_name: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverNetworkStatus {
+    pub network_audio_version: u32,
+    pub network_audio_state: String,
+    pub network_audio_failure: String,
+    pub pcm_bytes_written: u64,
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +219,87 @@ async fn read_binding_state(adb: &impl AdbRunner, serial: &str, user: &str,
 
 pub async fn status(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     status_with(&SystemAdb(adb), serial, apk, metadata_path, cancel).await
+}
+
+pub async fn network_interfaces(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken) -> Result<Vec<ReceiverInterface>, String> {
+    let runner = SystemAdb(adb);
+    ensure_usb_device(&runner, serial, cancel).await?;
+    let user = current_android_user(&runner, serial, cancel).await?;
+    let metadata = read_artifact(apk, metadata_path)?;
+    if !is_installed(&runner, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
+    verify_installed_identity(&runner, serial, &user, &metadata, cancel).await?;
+    let result = runner.run(Some(serial), &["shell", "content", "query", "--user", &user,
+        "--uri", INTERFACES_URI, "--projection", "address:prefixLength:interfaceIndex:interfaceName"],
+        Duration::from_secs(8), Some(cancel)).await?;
+    ensure_adb_success(&result)?;
+    let mut interfaces = Vec::new();
+    for line in result.stdout.lines().filter_map(parse_content_row) {
+        let Some(address) = line.get("address") else { continue; };
+        let Some(prefix_length) = line.get("prefixLength").and_then(|value| value.parse::<u8>().ok()) else { continue; };
+        let Some(interface_index) = line.get("interfaceIndex").and_then(|value| value.parse::<u32>().ok()) else { continue; };
+        let Some(interface_name) = line.get("interfaceName") else { continue; };
+        if address.parse::<std::net::Ipv4Addr>().is_err() || !(1..=32).contains(&prefix_length) { continue; }
+        interfaces.push(ReceiverInterface { address: address.clone(), prefix_length, interface_index, interface_name: interface_name.clone() });
+    }
+    Ok(interfaces)
+}
+
+pub async fn start_network(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    address: &str, prefix_length: u8, cancel: &CancellationToken) -> Result<ReceiverNetworkStatus, String> {
+    let interfaces = network_interfaces(adb, serial, apk, metadata_path, cancel).await?;
+    let selected = interfaces.iter().find(|interface| interface.address == address && interface.prefix_length == prefix_length)
+        .ok_or_else(|| "所选手机接口已不可用；请重新读取手机接口列表。".to_string())?;
+    let _ = selected;
+    let user = current_android_user(&SystemAdb(adb), serial, cancel).await?;
+    let address = address.to_owned();
+    let prefix = prefix_length.to_string();
+    let result = adb_run(adb, Some(serial), &["shell", "am", "start", "--user", &user, "-W", "-n",
+        "app.anpod.receiver/.BootstrapActivity", "-a", "app.anpod.receiver.action.START_NETWORK_AUDIO",
+        "--es", "networkAddress", &address, "--ei", "networkPrefixLength", &prefix],
+        Duration::from_secs(40), Some(cancel)).await?;
+    ensure_adb_success(&result)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if cancel.is_cancelled() { return Err("操作已取消。".into()); }
+        let status = network_status(adb, serial, apk, metadata_path, cancel).await?;
+        if status.network_audio_state == "authenticated" || status.network_audio_state == "receiverRunning"
+            || status.network_audio_state == "streaming" || status.network_audio_state == "paused" { return Ok(status); }
+        if status.network_audio_state == "failed" { return Err(format!("Receiver 网络启动失败：{}。", status.network_audio_failure)); }
+        if Instant::now() >= deadline { return Err("Receiver 未能在临时授权窗口内启动网络监听。".into()); }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("操作已取消。".into()),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+}
+
+pub async fn network_status(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken) -> Result<ReceiverNetworkStatus, String> {
+    let runner = SystemAdb(adb);
+    ensure_usb_device(&runner, serial, cancel).await?;
+    let user = current_android_user(&runner, serial, cancel).await?;
+    let metadata = read_artifact(apk, metadata_path)?;
+    verify_installed_identity(&runner, serial, &user, &metadata, cancel).await?;
+    let result = runner.run(Some(serial), &["shell", "content", "query", "--user", &user,
+        "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten"],
+        Duration::from_secs(8), Some(cancel)).await?;
+    ensure_adb_success(&result)?;
+    let row = result.stdout.lines().find_map(parse_content_row).ok_or_else(|| "手机网络状态格式无效。".to_string())?;
+    Ok(ReceiverNetworkStatus {
+        network_audio_version: row.get("networkAudioVersion").and_then(|value| value.parse().ok()).ok_or("手机不支持网络接收。")?,
+        network_audio_state: row.get("networkAudioState").cloned().ok_or("手机网络状态缺少会话状态。")?,
+        network_audio_failure: row.get("networkAudioFailure").cloned().unwrap_or_default(),
+        pcm_bytes_written: row.get("pcmBytesWritten").and_then(|value| value.parse().ok()).unwrap_or(0),
+    })
+}
+
+fn parse_content_row(line: &str) -> Option<std::collections::HashMap<String, String>> {
+    let row = line.trim().strip_prefix("Row: 0 ")?;
+    Some(row.split(", ").filter_map(|field| {
+        let (key, value) = field.split_once('=')?;
+        Some((key.to_owned(), value.to_owned()))
+    }).collect())
 }
 
 async fn status_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {

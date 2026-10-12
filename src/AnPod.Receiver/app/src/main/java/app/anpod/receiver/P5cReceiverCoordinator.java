@@ -9,6 +9,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -33,6 +35,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         void resume() throws IOException;
         void stop();
         boolean streaming();
+        void shutdown();
     }
 
     private final ServerSocket listener;
@@ -45,6 +48,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private volatile Thread worker;
     private volatile P5cDiscovery discovery;
     private volatile String failure = "";
+    private volatile boolean shutdownRequested;
 
     static P5cReceiverCoordinator openLoopback(PairingProtocol.BindingMaterial existingBinding,
             PlaybackEndpoint playback) throws IOException {
@@ -56,7 +60,19 @@ final class P5cReceiverCoordinator implements AutoCloseable {
             PlaybackEndpoint playback, InetAddress localAddress, int prefixLength) throws IOException {
         if (!validInterfaceAddress(localAddress, prefixLength))
             throw new IOException("P5-C requires an explicit private IPv4 interface address and prefix");
+        if (!isAssignedInterfaceAddress(localAddress, prefixLength))
+            throw new IOException("P5-C interface address is not assigned to an active Android interface");
         return open(existingBinding, playback, localAddress, false, prefixLength);
+    }
+
+    private static boolean isAssignedInterfaceAddress(InetAddress address, int prefixLength) throws SocketException {
+        NetworkInterface network = NetworkInterface.getByInetAddress(address);
+        if (network == null || !network.isUp()) return false;
+        if (address.isLoopbackAddress()) return network.isLoopback() && prefixLength == 32;
+        if (network.isLoopback()) return false;
+        for (java.net.InterfaceAddress item : network.getInterfaceAddresses())
+            if (address.equals(item.getAddress()) && item.getNetworkPrefixLength() == prefixLength) return true;
+        return false;
     }
 
     static boolean validInterfaceAddress(InetAddress localAddress, int prefixLength) {
@@ -113,14 +129,25 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     String failure() { return failure; }
 
     private void serve() {
-        try (Socket socket = listener.accept()) {
-            stopDiscovery();
-            activeSocket = socket;
-            socket.setSoTimeout(250);
-            if (loopbackOnly && !socket.getInetAddress().isLoopbackAddress()) throw new IOException("loopback peer required");
-            serveSession(socket);
-        } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
-            failure = "session_failed";
+        try {
+            while (!listener.isClosed()) {
+                try (Socket socket = listener.accept()) {
+                    stopDiscovery();
+                    activeSocket = socket;
+                    socket.setSoTimeout(250);
+                    if (loopbackOnly && !socket.getInetAddress().isLoopbackAddress()) throw new IOException("loopback peer required");
+                    serveSession(socket);
+                    if (shutdownRequested) playback.shutdown();
+                    if (shutdownRequested || loopbackOnly) break;
+                } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
+                    if (listener.isClosed()) break;
+                    failure = "session_failed";
+                } finally { activeSocket = null; }
+                if (loopbackOnly) break;
+                if (!listener.isClosed()) startDiscovery();
+            }
+        } catch (IOException | RuntimeException error) {
+            if (!listener.isClosed()) failure = "listener_failed";
         } finally {
             stopDiscovery();
             activeSocket = null;
@@ -244,6 +271,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                 else if (context != null) context.destroy();
                                 playbackStarted = false;
                                 state = STATE_STOPPED;
+                                shutdownRequested = true;
                             }
                             break;
                         case P5cControlProtocol.HEARTBEAT:

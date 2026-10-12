@@ -1,5 +1,6 @@
 use crate::network_interface::Ipv4Interface;
 use getrandom::fill;
+use serde::Serialize;
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -18,6 +19,8 @@ const MAX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CANDIDATES: usize = 16;
 
 /// Unauthenticated network hint. Callers must authenticate it with P5-A before START.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Candidate {
     pub(crate) endpoint: SocketAddr,
 }

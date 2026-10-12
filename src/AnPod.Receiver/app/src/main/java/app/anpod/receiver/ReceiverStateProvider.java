@@ -19,11 +19,19 @@ import java.io.FileNotFoundException;
 import java.io.FileDescriptor;
 import java.io.InterruptedIOException;
 import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.util.Enumeration;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ReceiverStateProvider extends ContentProvider {
     private static final String BINDING_URI = "content://app.anpod.receiver.state/binding";
+    private static final String INTERFACES_URI = "content://app.anpod.receiver.state/interfaces";
+    private static final String NETWORK_URI = "content://app.anpod.receiver.state/network";
+    private static final String[] INTERFACE_COLUMNS = {"address", "prefixLength", "interfaceIndex", "interfaceName"};
+    private static final String[] NETWORK_COLUMNS = {"networkAudioVersion", "networkAudioState", "networkAudioFailure", "pcmBytesWritten"};
     private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment", "bindingFailure"};
     private static final long BINDING_READ_TIMEOUT_MS = 15_000;
     private static final int POLL_SLICE_MS = 100;
@@ -48,10 +56,12 @@ public final class ReceiverStateProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
             String[] selectionArgs, String sortOrder) {
-        if (!BINDING_URI.equals(uri.toString())
+        boolean healthUri = isPath(uri, "health");
+        boolean interfacesUri = isPath(uri, "interfaces");
+        boolean networkUri = isPath(uri, "network");
+        if (!BINDING_URI.equals(uri.toString()) && !healthUri && !interfacesUri && !networkUri
                 && (!"app.anpod.receiver.state".equals(uri.getAuthority())
-                || uri.getPathSegments().size() != 1
-                || !"health".equals(uri.getPathSegments().get(0)))) {
+                || uri.getPathSegments().size() != 1)) {
             throw new IllegalArgumentException("Unsupported receiver status URI");
         }
 
@@ -61,6 +71,10 @@ public final class ReceiverStateProvider extends ContentProvider {
                 throw new IllegalArgumentException("Unsupported receiver binding query");
             return queryBinding();
         }
+
+        if (interfacesUri) return queryInterfaces(projection, selection, selectionArgs, sortOrder);
+        if (networkUri) return queryNetwork(projection, selection, selectionArgs, sortOrder);
+        if (!healthUri) throw new IllegalArgumentException("Unsupported receiver status URI");
 
         String[] columns = projection == null ? COLUMNS : projection;
         for (String column : columns) {
@@ -104,6 +118,55 @@ public final class ReceiverStateProvider extends ContentProvider {
         }
         result.addRow(values);
         return result;
+    }
+
+    private Cursor queryInterfaces(String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+        if (selection != null || selectionArgs != null || sortOrder != null) throw new IllegalArgumentException("Unsupported interface query");
+        String[] columns = projection == null ? INTERFACE_COLUMNS : projection;
+        for (String column : columns) if (!contains(INTERFACE_COLUMNS, column)) throw new IllegalArgumentException("Unsupported interface column");
+        MatrixCursor result = new MatrixCursor(columns);
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface network = interfaces.nextElement();
+                if (!network.isUp() || network.isLoopback()) continue;
+                for (java.net.InterfaceAddress item : network.getInterfaceAddresses()) {
+                    if (!(item.getAddress() instanceof Inet4Address) || !item.getAddress().isSiteLocalAddress()) continue;
+                    Object[] row = new Object[columns.length];
+                    for (int i = 0; i < columns.length; i++) switch (columns[i]) {
+                        case "address": row[i] = item.getAddress().getHostAddress(); break;
+                        case "prefixLength": row[i] = item.getNetworkPrefixLength(); break;
+                        case "interfaceIndex": row[i] = network.getIndex(); break;
+                        case "interfaceName": row[i] = network.getName(); break;
+                        default: throw new IllegalArgumentException("Unsupported interface column");
+                    }
+                    result.addRow(row);
+                }
+            }
+        } catch (SocketException error) { throw new IllegalStateException("Receiver interface status is unavailable"); }
+        return result;
+    }
+
+    private Cursor queryNetwork(String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+        if (selection != null || selectionArgs != null || sortOrder != null) throw new IllegalArgumentException("Unsupported network status query");
+        String[] columns = projection == null ? NETWORK_COLUMNS : projection;
+        for (String column : columns) if (!contains(NETWORK_COLUMNS, column)) throw new IllegalArgumentException("Unsupported network status column");
+        Object[] row = new Object[columns.length];
+        for (int i = 0; i < columns.length; i++) switch (columns[i]) {
+            case "networkAudioVersion": row[i] = 1; break;
+            case "networkAudioState": row[i] = ReceiverService.networkAudioState; break;
+            case "networkAudioFailure": row[i] = ReceiverService.networkAudioFailure; break;
+            case "pcmBytesWritten": row[i] = ReceiverService.PCM_BYTES_WRITTEN.get(); break;
+            default: throw new IllegalArgumentException("Unsupported network status column");
+        }
+        MatrixCursor result = new MatrixCursor(columns, 1);
+        result.addRow(row);
+        return result;
+    }
+
+    private static boolean isPath(Uri uri, String path) {
+        return "app.anpod.receiver.state".equals(uri.getAuthority()) && uri.getPathSegments().size() == 1
+                && path.equals(uri.getPathSegments().get(0));
     }
 
     @Override

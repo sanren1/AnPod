@@ -5,15 +5,15 @@ mod audio;
 mod receiver;
 #[allow(dead_code)] // P3/P4/P5 network backend has explicit internal callers only.
 mod network;
-#[allow(dead_code)] // P4/P5 direct LAN backend is an explicit internal caller path only.
+#[allow(dead_code)] // Explicit LAN commands expose only enumerated interfaces and authenticated endpoints.
 mod network_interface;
 #[allow(dead_code)] // P3 protocol is exercised by its focused test receiver for now.
 mod protocol;
-#[allow(dead_code)] // P5-A offline binding/handshake is not wired into product flows yet.
+#[allow(dead_code)] // P5-A is invoked only by explicit LAN session commands.
 mod security;
-#[allow(dead_code)] // P5-C/E sessions are explicit internal callers; product flows do not invoke them.
+#[allow(dead_code)] // P5-C/E sessions are invoked only by explicit LAN commands.
 mod p5c;
-#[allow(dead_code)] // P5-E discovery is opt-in and has no UI/default startup caller.
+#[allow(dead_code)] // P5-E discovery is opt-in and has no default startup caller.
 mod discovery;
 
 use state::{AppSnapshot, AppState, OperationResult};
@@ -123,6 +123,29 @@ async fn receiver_stop(state: State<'_, AppState>, serial: String) -> Result<rec
 }
 
 #[tauri::command]
+fn network_interfaces(state: State<'_, AppState>) -> Result<Vec<network_interface::Ipv4Interface>, String> {
+    state.network_interfaces()
+}
+
+#[tauri::command]
+async fn receiver_network_interfaces(state: State<'_, AppState>, serial: String) -> Result<Vec<receiver::ReceiverInterface>, String> {
+    state.receiver_network_interfaces(&serial).await
+}
+
+#[tauri::command]
+async fn discover_network_receivers(state: State<'_, AppState>, local_address: String) -> Result<Vec<discovery::Candidate>, String> {
+    state.discover_network_receivers(&local_address).await
+}
+
+#[tauri::command]
+async fn start_network_audio(app: tauri::AppHandle, state: State<'_, AppState>, local_address: String,
+    peer: String, bootstrap_serial: Option<String>, receiver_address: Option<String>,
+    receiver_prefix_length: Option<u8>) -> Result<AppSnapshot, String> {
+    state.start_network_audio(&app, &local_address, &peer, bootstrap_serial.as_deref(),
+        receiver_address.as_deref(), receiver_prefix_length).await
+}
+
+#[tauri::command]
 fn cancel_qr_pairing(state: State<'_, AppState>) {
     state.cancel_qr_pairing();
 }
@@ -216,6 +239,10 @@ fn main() {
             receiver_start,
             receiver_health,
             receiver_stop,
+            network_interfaces,
+            receiver_network_interfaces,
+            discover_network_receivers,
+            start_network_audio,
             cancel_qr_pairing,
             reconfigure_session,
             show_main_window,

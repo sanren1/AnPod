@@ -24,6 +24,13 @@ import com.anpod.server.Pcm16FrameStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.util.Enumeration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -37,6 +44,7 @@ public final class ReceiverService extends Service {
     private static final long MAX_RUN_MS = 120_000L;
     private static final Object STATUS_LOCK = new Object();
     private static final AtomicLong NEXT_AUDIO_ID = new AtomicLong();
+    static final AtomicLong PCM_BYTES_WRITTEN = new AtomicLong();
 
     static volatile boolean foregroundReady;
     static volatile long startedAtElapsedMs;
@@ -48,6 +56,8 @@ public final class ReceiverService extends Service {
     static volatile int effectiveBufferFrames = -1;
     static volatile int startThresholdFrames = -1;
     static volatile int underrunCount = -1;
+    static volatile String networkAudioState = "stopped";
+    static volatile String networkAudioFailure = "";
     private static long statusAudioId;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -56,6 +66,8 @@ public final class ReceiverService extends Service {
     private AudioRequest pendingAudio;
     private int latestStartId;
     private volatile boolean destroyed;
+    private volatile boolean networkSessionEverStarted;
+    private volatile P5cReceiverCoordinator networkCoordinator;
 
     @Override
     public void onCreate() {
@@ -71,16 +83,20 @@ public final class ReceiverService extends Service {
         startedAtElapsedMs = 0;
         startFailure = "";
         synchronized (STATUS_LOCK) { statusAudioId = 0; }
+        networkAudioState = "stopped";
+        networkAudioFailure = "";
         createNotificationChannel();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         latestStartId = startId;
+        boolean networkAudio = intent != null && BootstrapActivity.ACTION_START_NETWORK_AUDIO.equals(intent.getAction());
         boolean audio = intent != null && BootstrapActivity.ACTION_START_AUDIO.equals(intent.getAction());
         // A management retry must not downgrade an active mediaPlayback FGS to
         // shortService or attach a short-service timeout to the audio session.
         if (!audio && currentAudio != null) return START_NOT_STICKY;
+        if (networkAudio && networkCoordinator != null) return START_NOT_STICKY;
 
         try {
             Notification.Builder builder = Build.VERSION.SDK_INT >= 26
@@ -115,6 +131,14 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
 
+        if (networkAudio) {
+            if (timeout != null) handler.removeCallbacks(timeout);
+            timeout = () -> stopNetworkBootstrap("BootstrapTimeout");
+            handler.postDelayed(timeout, 25_000L);
+            startNetworkBootstrap(intent.getStringExtra("networkAddress"), intent.getIntExtra("networkPrefixLength", 0));
+            return START_NOT_STICKY;
+        }
+
         if (timeout != null) handler.removeCallbacks(timeout);
         timeout = () -> stopSelf(latestStartId);
         handler.postDelayed(timeout, MAX_RUN_MS);
@@ -136,6 +160,9 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         currentAudio = null;
         if (session != null) cancelAudio(session, "AudioServiceDestroyed");
+        P5cReceiverCoordinator coordinator = networkCoordinator;
+        networkCoordinator = null;
+        if (coordinator != null) coordinator.close();
         if (timeout != null) handler.removeCallbacks(timeout);
         synchronized (STATUS_LOCK) {
             if (session != null && statusAudioId == session.id) {
@@ -188,6 +215,7 @@ public final class ReceiverService extends Service {
             underrunCount = -1;
             startFailure = "";
         }
+        if (request.udpContext != null) PCM_BYTES_WRITTEN.set(0);
         session.thread = new Thread(() -> receiveAudio(session), "AnPod audio receiver");
         session.thread.start();
     }
@@ -200,6 +228,136 @@ public final class ReceiverService extends Service {
         };
         if (Looper.myLooper() == Looper.getMainLooper()) start.run();
         else if (!handler.post(start)) context.destroy();
+    }
+
+    private void startNetworkBootstrap(String address, int prefixLength) {
+        try {
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            startFailure = "";
+            networkSessionEverStarted = false;
+            InetAddress local = parseIpv4(address);
+            if (!isAssignedPrivateAddress(local, prefixLength)) throw new IOException("InvalidReceiverInterface");
+            PairingProtocol.BindingMaterial binding = new BindingStore(getFilesDir()).load();
+            P5cReceiverCoordinator.PlaybackEndpoint playback = new P5cReceiverCoordinator.PlaybackEndpoint() {
+                @Override public boolean start(UdpSessionContext context) throws IOException {
+                    CountDownLatch started = new CountDownLatch(1);
+                    boolean posted = handler.post(() -> {
+                        try {
+                            if (destroyed || currentAudio != null) { context.destroy(); return; }
+                            Notification notification = new Notification.Builder(ReceiverService.this, CHANNEL_ID)
+                                    .setSmallIcon(android.R.drawable.stat_sys_headset).setContentTitle("AnPod Receiver")
+                                    .setContentText("正在播放电脑音频。").setOngoing(true).build();
+                            if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification,
+                                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                            else startForeground(NOTIFICATION_ID, notification);
+                            if (timeout != null) handler.removeCallbacks(timeout);
+                            timeout = null;
+                            foregroundReady = true;
+                            networkSessionEverStarted = true;
+                            networkAudioState = "receiverRunning";
+                            startAudio(AudioRequest.udp(context));
+                        } catch (RuntimeException error) {
+                            recordNetworkFailure(error.getClass().getSimpleName());
+                            context.destroy();
+                        } finally { started.countDown(); }
+                    });
+                    if (!posted) return false;
+                    try {
+                        if (!started.await(3, TimeUnit.SECONDS)) return false;
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                    return currentAudio != null;
+                }
+                @Override public void pause() { setUdpAudioPaused(true); networkAudioState = "paused"; }
+                @Override public void resume() { setUdpAudioPaused(false); networkAudioState = "receiverRunning"; }
+                @Override public void stop() {
+                    AudioSession session = currentAudio;
+                    if (session != null && session.request.udpContext != null) cancelAudio(session, "NetworkSessionStopped");
+                    networkAudioState = "authenticated";
+                }
+                @Override public boolean streaming() {
+                    boolean streaming = currentAudio != null && PCM_BYTES_WRITTEN.get() > 0;
+                    if (streaming) networkAudioState = "streaming";
+                    else if (currentAudio != null && "streaming".equals(networkAudioState)) networkAudioState = "receiverRunning";
+                    return streaming;
+                }
+                @Override public void shutdown() {
+                    networkAudioState = "stopped";
+                    networkCoordinator = null;
+                    handler.post(() -> { if (currentAudio == null) stopSelf(latestStartId); });
+                }
+            };
+            P5cReceiverCoordinator coordinator = P5cReceiverCoordinator.openOnInterface(binding, playback, local, prefixLength);
+            networkCoordinator = coordinator;
+            coordinator.start();
+            coordinator.startDiscovery();
+            networkAudioState = "authenticated";
+            Thread waiter = new Thread(() -> {
+                try {
+                    while (true) {
+                        boolean completed = coordinator.await(25, TimeUnit.SECONDS);
+                        if (completed) {
+                            if (networkCoordinator == coordinator) networkCoordinator = null;
+                            if (currentAudio == null) handler.post(() -> stopSelf(latestStartId));
+                            break;
+                        }
+                        if (!networkSessionEverStarted) { stopNetworkBootstrap("AuthenticationTimeout"); break; }
+                    }
+                } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                finally { if (networkCoordinator == coordinator) networkCoordinator = null; }
+            }, "AnPod P5-C bootstrap timeout");
+            waiter.setDaemon(true);
+            waiter.start();
+        } catch (Exception error) {
+            recordNetworkFailure(error instanceof IOException ? error.getMessage() : error.getClass().getSimpleName());
+            stopSelf(latestStartId);
+        }
+    }
+
+    private static boolean isAssignedPrivateAddress(InetAddress address, int prefixLength) throws SocketException {
+        if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress() || prefixLength < 1 || prefixLength > 32) return false;
+        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+        while (interfaces != null && interfaces.hasMoreElements()) {
+            NetworkInterface network = interfaces.nextElement();
+            if (!network.isUp() || network.isLoopback()) continue;
+            for (java.net.InterfaceAddress item : network.getInterfaceAddresses())
+                if (address.equals(item.getAddress()) && item.getNetworkPrefixLength() == prefixLength) return true;
+        }
+        return false;
+    }
+
+    private static InetAddress parseIpv4(String text) throws IOException {
+        String[] parts = text == null ? new String[0] : text.split("\\.", -1);
+        if (parts.length != 4) throw new IOException("InvalidReceiverInterface");
+        byte[] address = new byte[4];
+        for (int i = 0; i < parts.length; i++) {
+            try {
+                int value = Integer.parseInt(parts[i]);
+                if (value < 0 || value > 255 || !Integer.toString(value).equals(parts[i]))
+                    throw new IOException("InvalidReceiverInterface");
+                address[i] = (byte) value;
+            } catch (NumberFormatException error) { throw new IOException("InvalidReceiverInterface"); }
+        }
+        return InetAddress.getByAddress(address);
+    }
+
+    private void stopNetworkBootstrap(String reason) {
+        P5cReceiverCoordinator coordinator = networkCoordinator;
+        networkCoordinator = null;
+        if (coordinator != null) coordinator.close();
+        if (currentAudio == null) {
+            if (networkAudioState.equals("authenticated")) recordNetworkFailure(reason);
+            stopSelf(latestStartId);
+        }
+    }
+
+    private static void recordNetworkFailure(String reason) {
+        networkAudioFailure = reason == null ? "NetworkStartFailed" : reason;
+        networkAudioState = "failed";
+        startFailure = networkAudioFailure;
     }
 
     /** Internal pause hook: drop pending and incoming history without adding a control datagram. */
@@ -408,6 +566,7 @@ public final class ReceiverService extends Service {
                 ensureRunning(session);
                 int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
                 if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
+                if (session.request.udpContext != null) PCM_BYTES_WRITTEN.addAndGet(written);
                 return written;
             }
         }, buffer, count);
@@ -423,7 +582,11 @@ public final class ReceiverService extends Service {
             startAudio(next);
         } else {
             if (!destroyed && statusAudioId == session.id) startFailure = failure;
-            stopSelf(latestStartId);
+            if (session.request.udpContext != null) {
+                if (failure.isEmpty() || "NetworkSessionStopped".equals(failure)) networkAudioState = networkCoordinator != null ? "authenticated" : "stopped";
+                else if (!networkAudioState.equals("failed")) recordNetworkFailure(failure);
+            }
+            if (session.request.udpContext == null || "stopped".equals(networkAudioState)) stopSelf(latestStartId);
         }
     }
 

@@ -179,6 +179,7 @@ public final class P5cLoopbackEndpoint {
             if (queue != null) queue.setPaused(false);
         }
         @Override public boolean streaming() { return streaming.get(); }
+        @Override public void shutdown() { }
 
         @Override public void stop() {
             stops.incrementAndGet();
