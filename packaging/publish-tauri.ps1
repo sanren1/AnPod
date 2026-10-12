@@ -45,10 +45,12 @@ if ($ReceiverCandidate -in @('p2', 'v2') -and $IncludeReceiverCandidate) {
     $targetDir = [System.IO.Path]::GetFullPath($RustTargetDirectory)
 }
 
-$packageRunner = Get-Command npm -ErrorAction SilentlyContinue
-if (-not $packageRunner) { $packageRunner = Get-Command pnpm -ErrorAction SilentlyContinue }
+$npm = Get-Command npm -ErrorAction SilentlyContinue
+$frontendTools = Join-Path $root 'frontend\node_modules\.bin'
+$tsc = Join-Path $frontendTools 'tsc.cmd'
+$vite = Join-Path $frontendTools 'vite.cmd'
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-if (-not $packageRunner) { throw 'Neither npm nor pnpm was found on PATH.' }
+if (-not $npm -and (-not (Test-Path -LiteralPath $tsc -PathType Leaf) -or -not (Test-Path -LiteralPath $vite -PathType Leaf))) { throw 'npm or the already-installed local TypeScript/Vite commands are required.' }
 if (-not $cargo) { throw 'cargo was not found on PATH. Install Rust stable 1.90 or newer.' }
 
 $required = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'audio_capture.dll', 'server', 'PLATFORM_TOOLS_NOTICE.txt')
@@ -125,9 +127,17 @@ if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ',
 
 Push-Location (Join-Path $root 'frontend')
 try {
-    Write-Host "Building frontend with $($packageRunner.Name)..." -ForegroundColor Cyan
-    & $packageRunner.Source run build
-    if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
+    if ($npm) {
+        Write-Host "Building frontend with $($npm.Name)..." -ForegroundColor Cyan
+        & $npm.Source run build
+        if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
+    } else {
+        Write-Host 'Building frontend with the already-installed local TypeScript and Vite commands...' -ForegroundColor Cyan
+        & $tsc -b
+        if ($LASTEXITCODE -ne 0) { throw "TypeScript build failed with exit code $LASTEXITCODE." }
+        & $vite build
+        if ($LASTEXITCODE -ne 0) { throw "Vite build failed with exit code $LASTEXITCODE." }
+    }
 }
 finally { Pop-Location }
 
