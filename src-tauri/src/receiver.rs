@@ -26,6 +26,8 @@ pub struct ReceiverNetworkStatus {
     pub network_audio_state: String,
     pub network_audio_failure: String,
     pub pcm_bytes_written: u64,
+    pub network_audio_address: String,
+    pub network_audio_port: u16,
 }
 
 #[derive(Clone, Serialize)]
@@ -96,8 +98,30 @@ impl AdbRunner for SystemAdb<'_> {
 #[allow(dead_code)]
 pub async fn provision(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
     binding_path: &Path, cancel: &CancellationToken) -> Result<String, String> {
+    if let Some(parent) = binding_path.parent() {
+        fs::create_dir_all(parent).map_err(|_| "无法创建本机绑定存储目录。".to_string())?;
+    }
     provision_with(&SystemAdb(adb), serial, apk, metadata_path, binding_path, cancel,
         Duration::from_secs(8)).await
+}
+
+#[cfg(windows)]
+pub async fn binding_reference(adb: &Path, serial: &str, cancel: &CancellationToken) -> Result<String, String> {
+    let runner = SystemAdb(adb);
+    ensure_usb_device(&runner, serial, cancel).await?;
+    let user = current_android_user(&runner, serial, cancel).await?;
+    Ok(binding_reference_for(serial, &user))
+}
+
+#[cfg(windows)]
+fn binding_reference_for(serial: &str, android_user: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"AnPod receiver binding reference v1\0");
+    digest.update(serial.as_bytes());
+    digest.update([0]);
+    digest.update(android_user.as_bytes());
+    let result: [u8; 32] = digest.finalize().into();
+    hex_digest(&result)
 }
 
 #[cfg(windows)]
@@ -107,6 +131,10 @@ async fn provision_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata
 
     ensure_usb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
+    let expected_reference = binding_reference_for(serial, &user);
+    if binding_path.file_stem().and_then(|value| value.to_str()) != Some(expected_reference.as_str()) {
+        return Err("USB 设备或 Android 用户已变化；没有复用其他设备的绑定。".into());
+    }
     let metadata = read_artifact(apk, metadata_path)?;
     if !is_installed(adb, serial, &user, cancel).await? {
         return Err("Receiver 尚未安装；没有发送绑定材料。".into());
@@ -182,11 +210,9 @@ async fn read_binding_state(adb: &impl AdbRunner, serial: &str, user: &str,
         "--projection", "bindingState:bindingCommitment:bindingFailure",
     ], Duration::from_secs(6), Some(cancel)).await?;
     if !result.success { return Err("无法读取手机绑定确认状态；本机 DPAPI 副本已保留。".into()); }
-    let row = result.stdout.lines().find(|line| line.trim_start().starts_with("Row: 0 "))
-        .and_then(|line| line.trim().strip_prefix("Row: 0 "))
+        let row = result.stdout.lines().find_map(parse_content_row)
         .ok_or_else(|| "手机绑定状态格式无效；本机 DPAPI 副本已保留。".to_string())?;
-    let fields: std::collections::HashMap<_, _> = row.split(", ")
-        .filter_map(|field| field.split_once('=')).collect();
+    let fields: std::collections::HashMap<_, _> = row.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
     let failure = match fields.get("bindingFailure").copied() {
         Some("") => None,
         Some("cancelled") => Some("操作已取消；本机 DPAPI 绑定材料已保留，可用相同路径重试。"),
@@ -233,8 +259,12 @@ pub async fn network_interfaces(adb: &Path, serial: &str, apk: &Path, metadata_p
         "--uri", INTERFACES_URI, "--projection", "address:prefixLength:interfaceIndex:interfaceName"],
         Duration::from_secs(8), Some(cancel)).await?;
     ensure_adb_success(&result)?;
+    Ok(parse_receiver_interfaces(&result.stdout))
+}
+
+fn parse_receiver_interfaces(output: &str) -> Vec<ReceiverInterface> {
     let mut interfaces = Vec::new();
-    for line in result.stdout.lines().filter_map(parse_content_row) {
+    for line in output.lines().filter_map(parse_content_row) {
         let Some(address) = line.get("address") else { continue; };
         let Some(prefix_length) = line.get("prefixLength").and_then(|value| value.parse::<u8>().ok()) else { continue; };
         let Some(interface_index) = line.get("interfaceIndex").and_then(|value| value.parse::<u32>().ok()) else { continue; };
@@ -242,7 +272,7 @@ pub async fn network_interfaces(adb: &Path, serial: &str, apk: &Path, metadata_p
         if address.parse::<std::net::Ipv4Addr>().is_err() || !(1..=32).contains(&prefix_length) { continue; }
         interfaces.push(ReceiverInterface { address: address.clone(), prefix_length, interface_index, interface_name: interface_name.clone() });
     }
-    Ok(interfaces)
+    interfaces
 }
 
 pub async fn start_network(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
@@ -263,8 +293,15 @@ pub async fn start_network(adb: &Path, serial: &str, apk: &Path, metadata_path: 
     loop {
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
         let status = network_status(adb, serial, apk, metadata_path, cancel).await?;
-        if status.network_audio_state == "authenticated" || status.network_audio_state == "receiverRunning"
-            || status.network_audio_state == "streaming" || status.network_audio_state == "paused" { return Ok(status); }
+        if status.network_audio_version != 1 {
+            return Err("Receiver 网络协议版本不兼容；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+        }
+        if matches!(status.network_audio_state.as_str(), "authenticated" | "receiverRunning" | "streaming" | "paused") {
+            if status.network_audio_address != address || status.network_audio_port == 0 {
+                return Err("Receiver 未报告本次 bootstrap 的监听地址和端口。".into());
+            }
+            return Ok(status);
+        }
         if status.network_audio_state == "failed" { return Err(format!("Receiver 网络启动失败：{}。", status.network_audio_failure)); }
         if Instant::now() >= deadline { return Err("Receiver 未能在临时授权窗口内启动网络监听。".into()); }
         tokio::select! {
@@ -282,20 +319,29 @@ pub async fn network_status(adb: &Path, serial: &str, apk: &Path, metadata_path:
     let metadata = read_artifact(apk, metadata_path)?;
     verify_installed_identity(&runner, serial, &user, &metadata, cancel).await?;
     let result = runner.run(Some(serial), &["shell", "content", "query", "--user", &user,
-        "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten"],
+        "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten:networkAudioAddress:networkAudioPort"],
         Duration::from_secs(8), Some(cancel)).await?;
-    ensure_adb_success(&result)?;
-    let row = result.stdout.lines().find_map(parse_content_row).ok_or_else(|| "手机网络状态格式无效。".to_string())?;
+    if !result.success {
+        return Err("Receiver 网络状态不可用；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+    }
+    parse_network_status(&result.stdout)
+}
+
+fn parse_network_status(output: &str) -> Result<ReceiverNetworkStatus, String> {
+    let row = output.lines().find_map(parse_content_row).ok_or_else(|| "手机网络状态格式无效。".to_string())?;
     Ok(ReceiverNetworkStatus {
         network_audio_version: row.get("networkAudioVersion").and_then(|value| value.parse().ok()).ok_or("手机不支持网络接收。")?,
         network_audio_state: row.get("networkAudioState").cloned().ok_or("手机网络状态缺少会话状态。")?,
         network_audio_failure: row.get("networkAudioFailure").cloned().unwrap_or_default(),
         pcm_bytes_written: row.get("pcmBytesWritten").and_then(|value| value.parse().ok()).unwrap_or(0),
+        network_audio_address: row.get("networkAudioAddress").cloned().unwrap_or_default(),
+        network_audio_port: row.get("networkAudioPort").and_then(|value| value.parse().ok()).unwrap_or(0),
     })
 }
 
 fn parse_content_row(line: &str) -> Option<std::collections::HashMap<String, String>> {
-    let row = line.trim().strip_prefix("Row: 0 ")?;
+    let (index, row) = line.trim().strip_prefix("Row: ")?.split_once(' ')?;
+    index.parse::<u32>().ok()?;
     Some(row.split(", ").filter_map(|field| {
         let (key, value) = field.split_once('=')?;
         Some((key.to_owned(), value.to_owned()))
@@ -613,6 +659,29 @@ mod tests {
     const SERIAL: &str = "FAKE123";
     const TEST_USER: &str = "10";
     const INSTALLED_PATH: &str = "/data/app/~~AbCdEf0123==/app.anpod.receiver-xYz987==/base.apk";
+
+    #[test]
+    fn content_rows_preserve_multiple_interfaces_and_bootstrap_listener_endpoint() {
+        let output = "Row: 0 address=192.168.1.20, prefixLength=24, interfaceIndex=3, interfaceName=wlan0\nRow: 1 address=192.168.43.1, prefixLength=24, interfaceIndex=7, interfaceName=ap0\n";
+        let interfaces = parse_receiver_interfaces(output);
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[1].address, "192.168.43.1");
+        assert_eq!(interfaces[1].prefix_length, 24);
+
+        let status = "Row: 1 networkAudioVersion=1, networkAudioState=authenticated, networkAudioFailure=, pcmBytesWritten=0, networkAudioAddress=192.168.43.1, networkAudioPort=41237";
+        let endpoint = parse_network_status(status).unwrap();
+        assert_eq!(endpoint.network_audio_version, 1);
+        assert_eq!(endpoint.network_audio_address, "192.168.43.1");
+        assert_eq!(endpoint.network_audio_port, 41237);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_binding_reference_isolated_by_usb_identity_and_android_user() {
+        let first = binding_reference_for("USB-A", "0");
+        assert_ne!(first, binding_reference_for("USB-B", "0"));
+        assert_ne!(first, binding_reference_for("USB-A", "10"));
+    }
 
     #[derive(Default)]
     struct FakeState {

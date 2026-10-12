@@ -474,16 +474,19 @@ pub(crate) struct SessionSnapshot {
 struct SessionTiming {
     heartbeat_interval: Duration,
     reconnect_delays: [Duration; 4],
+    recovery_window: Duration,
 }
 
 const DEFAULT_SESSION_TIMING: SessionTiming = SessionTiming {
     heartbeat_interval: HEARTBEAT_INTERVAL,
     reconnect_delays: RECONNECT_DELAYS,
+    recovery_window: Duration::from_secs(30),
 };
 
 enum OwnerCommand {
     SetPaused(bool),
     UpdateEndpoint(SessionEndpoint),
+    SetMode(u8),
     Stop,
 }
 
@@ -558,6 +561,12 @@ impl SessionOwner {
             .map_err(|_| "P5-D session owner has stopped.".to_string())
     }
 
+    pub(crate) fn set_mode(&self, mode: u8) -> Result<(), String> {
+        if mode > 1 { return Err("P5-C playback mode is invalid.".into()); }
+        self.commands.send(OwnerCommand::SetMode(mode))
+            .map_err(|_| "P5-D session owner has stopped.".to_string())
+    }
+
     /// The caller must supply each changed endpoint; the owner never discovers or guesses one.
     pub(crate) fn update_endpoint(&self, peer: SocketAddr) -> Result<(), String> {
         self.enqueue_endpoint(SessionEndpoint::loopback(peer))
@@ -611,12 +620,14 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
     status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,
     pcm_payload_bytes_sent: Arc<AtomicU64>, timing: SessionTiming) {
     let mut endpoint = endpoint;
+    let mut parameters = parameters;
     let mut paused = false;
     let mut desired_paused = false;
     let mut generation = 0u64;
     let mut attempts = 0u64;
     let mut retry_index = 0;
     let mut last_error = None;
+    let mut last_active_at = None;
     'owner: loop {
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break; }
         generation = generation.saturating_add(1);
@@ -633,10 +644,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                 publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                     None, paused, last_error.clone());
                 match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                    &enabled, &mut endpoint, &mut desired_paused) {
+                    &enabled, &mut endpoint, &mut parameters, &mut desired_paused) {
                     RetryWait::Stop => break,
                     RetryWait::ReconnectNow => retry_index = 0,
-                    RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
+                    RetryWait::DelayElapsed => {
+                        retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
+                        if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                    }
                 }
                 continue 'owner;
             }
@@ -650,16 +664,24 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut endpoint, &mut desired_paused) {
+                &enabled, &mut endpoint, &mut parameters, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
-                RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
+                RetryWait::DelayElapsed => {
+                    retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
+                    if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                }
             }
             continue 'owner;
         }
-        match apply_pending_commands(&commands, &mut endpoint, &mut desired_paused, &enabled) {
+        match apply_pending_commands(&commands, &mut endpoint, &mut parameters, &mut desired_paused, &enabled) {
             PendingCommands::Stop => break,
             PendingCommands::EndpointChanged => {
+                drop(session);
+                retry_index = 0;
+                continue 'owner;
+            }
+            PendingCommands::ModeChanged => {
                 drop(session);
                 retry_index = 0;
                 continue 'owner;
@@ -675,14 +697,18 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
                 None, paused, last_error.clone());
             match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-                &enabled, &mut endpoint, &mut desired_paused) {
+                &enabled, &mut endpoint, &mut parameters, &mut desired_paused) {
                 RetryWait::Stop => break,
                 RetryWait::ReconnectNow => retry_index = 0,
-                RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
+                RetryWait::DelayElapsed => {
+                    retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
+                    if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                }
             }
             continue 'owner;
         }
         paused = desired_paused;
+        last_active_at = Some(Instant::now());
         let session_id = session.session_id();
         let mut last_session_bytes = 0;
         let session_queue = session.pcm_queue();
@@ -694,16 +720,21 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
         let mut next_heartbeat = Instant::now() + timing.heartbeat_interval;
         loop {
             if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break 'owner; }
+            let sent = session.pcm_payload_bytes_sent();
+            pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
+            last_session_bytes = sent;
             if Instant::now() >= next_heartbeat {
                 match session.heartbeat() {
                     Ok(state) => {
-                        let sent = session.pcm_payload_bytes_sent();
-                        pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
-                        last_session_bytes = sent;
                         publish_session(&status, lifecycle_from_receiver(state), generation,
                             attempts, Some(session_id), paused, None);
                     }
-                    Err(error) => { last_error = Some(error); break; }
+                    Err(error) => {
+                        let sent = session.pcm_payload_bytes_sent();
+                        pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
+                        last_error = Some(error);
+                        break;
+                    }
                 }
                 next_heartbeat = Instant::now() + timing.heartbeat_interval;
                 continue;
@@ -727,11 +758,24 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                     endpoint_changed = endpoint != next_endpoint;
                     endpoint = next_endpoint;
                     if !endpoint_changed { continue; }
+                    let sent = session.pcm_payload_bytes_sent();
+                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     if let Err(error) = session.stop() { last_error = Some(error); }
+                    break;
+                }
+                Ok(OwnerCommand::SetMode(mode)) => {
+                    if mode == parameters.mode { continue; }
+                    parameters.mode = mode;
+                    let sent = session.pcm_payload_bytes_sent();
+                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
+                    session.close_local();
+                    endpoint_changed = true;
                     break;
                 }
                 Ok(OwnerCommand::Stop) => {
                     enabled.store(false, Ordering::Release);
+                    let sent = session.pcm_payload_bytes_sent();
+                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     if let Err(error) = session.stop() { last_error = Some(error); }
                     break 'owner;
                 }
@@ -746,10 +790,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             None, paused, last_error.clone());
         if endpoint_changed { retry_index = 0; continue 'owner; }
         match wait_for_reconnect(lifecycle_retry_delay(&timing.reconnect_delays, retry_index), &commands, &cancellation,
-            &enabled, &mut endpoint, &mut desired_paused) {
+            &enabled, &mut endpoint, &mut parameters, &mut desired_paused) {
             RetryWait::Stop => break,
             RetryWait::ReconnectNow => retry_index = 0,
-            RetryWait::DelayElapsed => retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1),
+            RetryWait::DelayElapsed => {
+                retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
+                if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+            }
         }
     }
     *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
@@ -776,11 +823,12 @@ fn publish_session(status: &Mutex<SessionSnapshot>, state: SessionLifecycleState
 
 enum RetryWait { Stop, ReconnectNow, DelayElapsed }
 
-enum PendingCommands { Stop, EndpointChanged, Applied }
+enum PendingCommands { Stop, EndpointChanged, ModeChanged, Applied }
 
 fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mut SessionEndpoint,
-    paused: &mut bool, enabled: &AtomicBool) -> PendingCommands {
+    parameters: &mut AudioParameters, paused: &mut bool, enabled: &AtomicBool) -> PendingCommands {
     let mut endpoint_changed = false;
+    let mut mode_changed = false;
     loop {
         match commands.try_recv() {
             Ok(OwnerCommand::SetPaused(value)) => *paused = value,
@@ -792,6 +840,10 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mu
                 endpoint_changed |= *endpoint != next_endpoint;
                 *endpoint = next_endpoint;
             }
+            Ok(OwnerCommand::SetMode(mode)) => {
+                mode_changed |= parameters.mode != mode;
+                parameters.mode = mode;
+            }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 enabled.store(false, Ordering::Release);
@@ -799,11 +851,13 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mu
             }
         }
     }
-    if endpoint_changed { PendingCommands::EndpointChanged } else { PendingCommands::Applied }
+    if endpoint_changed { PendingCommands::EndpointChanged }
+    else if mode_changed { PendingCommands::ModeChanged }
+    else { PendingCommands::Applied }
 }
 
 fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, cancellation: &CancellationToken,
-    enabled: &AtomicBool, endpoint: &mut SessionEndpoint, paused: &mut bool) -> RetryWait {
+    enabled: &AtomicBool, endpoint: &mut SessionEndpoint, parameters: &mut AudioParameters, paused: &mut bool) -> RetryWait {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { return RetryWait::Stop; }
@@ -820,6 +874,9 @@ fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, 
                     return RetryWait::ReconnectNow;
                 }
             }
+            Ok(OwnerCommand::SetMode(mode)) => {
+                if parameters.mode != mode { parameters.mode = mode; return RetryWait::ReconnectNow; }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => { enabled.store(false, Ordering::Release); return RetryWait::Stop; }
         }
@@ -829,6 +886,10 @@ fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, 
 
 fn lifecycle_retry_delay(delays: &[Duration; 4], attempt: usize) -> Duration {
     delays[attempt.min(delays.len() - 1)]
+}
+
+fn recovery_window_expired(active_since: Option<Instant>, window: Duration, now: Instant) -> bool {
+    active_since.is_some_and(|active_since| now.saturating_duration_since(active_since) >= window)
 }
 
 struct Ack { result: u8, state: ReceiverState, udp_port: u16 }
@@ -1042,18 +1103,26 @@ mod tests {
     }
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, false)
+        spawn_endpoint_mode(classes, false, false, false, false)
     }
 
     fn spawn_endpoint_until_disconnect(classes: &Path, fail_resume: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, fail_resume, false)
+        spawn_endpoint_mode(classes, true, fail_resume, false, false)
     }
 
     fn spawn_discoverable_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, true)
+        spawn_endpoint_mode(classes, false, false, true, false)
     }
 
-    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool)
+    fn spawn_persistent_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        spawn_endpoint_mode(classes, true, false, true, false)
+    }
+
+    fn spawn_stop_ack_drop_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        spawn_endpoint_mode(classes, false, false, false, true)
+    }
+
+    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool, stop_ack_drop: bool)
         -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         let (_, java) = java_paths();
         let mut command = Command::new(java);
@@ -1061,6 +1130,7 @@ mod tests {
         if wait_for_disconnect { command.arg("--drop-on-stdin"); }
         if fail_resume { command.arg("--fail-resume"); }
         if discoverable { command.arg("--discovery"); }
+        if stop_ack_drop { command.arg("--stop-ack-drop"); }
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut stdout = stdout;
@@ -1193,16 +1263,73 @@ mod tests {
         drop(host);
         let result = finish_endpoint(child, stdout);
         let fields: Vec<_> = result.split(',').collect();
-        assert_eq!(fields.len(), 7, "unexpected merged P5-C result: {result}");
+        assert_eq!(fields.len(), 8, "unexpected merged P5-C result: {result}");
         assert_eq!(fields[0], "");
         assert_eq!(fields[1..5], ["1", "1", "1", "1"]);
         assert!(fields[5].parse::<usize>().unwrap() >= 3_840, "synthetic PCM was not drained: {result}");
         assert_eq!(fields[6], "true", "STOP must release the receiver UDP socket");
+        assert_eq!(fields[7], "1", "authenticated STOP must shut down the receiver listener");
 
+        same_coordinator_accepts_a_fresh_authenticated_session(&classes);
+        stop_ack_failure_still_shuts_down_listener(&classes);
+        mode_change_uses_a_fresh_session_and_preserves_pause(&classes);
         stop_disconnect_clears_active_local_session(&classes);
         start_handoff_failure_closes_session(&classes);
         lifecycle_owner_recovers_fresh_session_and_stops(&classes);
         let _ = fs::remove_dir_all(classes);
+    }
+
+    fn same_coordinator_accepts_a_fresh_authenticated_session(classes: &Path) {
+        let (mut child, stdout, peer) = spawn_persistent_endpoint(classes);
+        let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+        for _ in 0..2 {
+            let session = HostSession::connect_on_interface(&interface, peer, test_binding_material(), AudioParameters {
+                sample_rate: 48_000, channels: 2, mode: 0,
+            }).unwrap();
+            assert_eq!(session.state(), ReceiverState::TransportConnected);
+            drop(session);
+        }
+        child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+        drop(child.stdin.take());
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields[1], "0", "pre-START reauthentication must not start playback");
+    }
+
+    fn stop_ack_failure_still_shuts_down_listener(classes: &Path) {
+        let (child, stdout, peer) = spawn_stop_ack_drop_endpoint(classes);
+        let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+        let mut session = HostSession::connect_on_interface(&interface, peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        session.start().unwrap();
+        assert!(session.stop().is_err(), "test endpoint must drop the authenticated STOP ACK");
+        drop(session);
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields.len(), 8, "unexpected STOP ACK failure result: {result}");
+        assert_eq!(fields[4], "1", "STOP playback must be cleaned before ACK failure");
+        assert_eq!(fields[7], "1", "STOP ACK failure must still close the listener");
+    }
+
+    fn mode_change_uses_a_fresh_session_and_preserves_pause(classes: &Path) {
+        let (child, stdout, peer) = spawn_discoverable_endpoint(classes);
+        let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+        let mut owner = SessionOwner::start_on_interface(&interface, peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }, CancellationToken::new()).unwrap();
+        let before = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+        owner.set_paused(true).unwrap();
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Paused);
+        owner.set_mode(1).unwrap();
+        let after = wait_for_owner(&owner, |status| status.generation > before.generation
+            && status.session_id.is_some() && status.state == SessionLifecycleState::Paused);
+        assert_ne!(after.session_id, before.session_id, "playback mode must use a fresh authenticated session");
+        assert!(after.paused, "the user's pause intent must survive fresh mode authentication");
+        owner.stop();
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields[1], "2", "mode change must start exactly one new playback session: {result}");
     }
 
     fn wait_for_owner(owner: &SessionOwner, predicate: impl Fn(&SessionSnapshot) -> bool) -> SessionSnapshot {
@@ -1246,6 +1373,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(20),
             reconnect_delays: [Duration::from_millis(20), Duration::from_millis(30),
                 Duration::from_millis(40), Duration::from_millis(50)],
+            recovery_window: Duration::from_secs(5),
         };
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 0), Duration::from_secs(1));
         assert_eq!(lifecycle_retry_delay(&RECONNECT_DELAYS, 1), Duration::from_secs(2));

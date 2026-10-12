@@ -189,19 +189,19 @@
 - Android 源码接线：Gradle 8.9 / 指定 JDK 17 / API 35 `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS。编译时 AAPT2 资源处理被跳过；此前资源链接曾报 `Unexpected error during link`，本次未改资源。没有组装 APK。
 - 测试只在本机 JDK loopback socket 上运行；没有 Android AudioTrack 真机播放、Android 网络收包、USB/热点/LAN 联通或时延/性能检查。P4-A adapter 只接受包内提供的已解析 peer/session/key 与指定本地 bind 地址；不处理发现、配对、START/STOP/SET_MODE，不接收任意 IP 作为信任依据，也未由产品流程调用。P4 真机联通和音频表现仍为 NOT_TESTED。
 
-## P5-A 离线绑定与会话密钥（未接入产品流程）
+## P5-A 离线绑定与会话密钥
 
 - Rust 定向单测：PASS，4 项覆盖双方握手得到相同方向密钥、每次建立会话均使用新材料、固定 transcript/HKDF 跨语言向量，以及错误 identity/role/proof/跨会话响应拒绝。Windows DPAPI 隔离临时目录存取单测：PASS，1 项覆盖当前用户加密后读取、create-only 不覆盖和损坏密文拒绝；只使用合成测试材料，不读写应用配置。
 - Java 17 `tests/AnPodUdpVectorCheck.java`：PASS。和 Rust 比对固定 transcript、双方 HMAC proof、Ready proof 及四把 HKDF 密钥；覆盖双向握手、参数篡改/身份/角色/错误证明/旧响应拒绝及新会话密钥差异。另覆盖前述 UDP parser/queue/loopback 行为。
 - Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；AAPT2 资源处理被跳过，没有组装 APK。`BindingStore` 的真实 Android app-private `AtomicFile` 行为、Android 真机存储、APK 打包均为 NOT_TESTED。
-- Windows DPAPI 绑定存储及 Android app-private 绑定存储实现均是 create-only；Android 记录由系统 app-private 目录隔离，未加密 at rest。Rust/Android 握手 API 目前仅可由内存调用，不做 USB 传输、设备 provisioning、网络 discovery/listen、控制消息或播放器接线。真实 USB 配对、P4-A 手机网络收包、AudioTrack 播放及远程主机交接均为 NOT_TESTED。
+- Windows DPAPI 绑定存储及 Android app-private 绑定存储实现均是 create-only；Android 记录由系统 app-private 目录隔离，未加密 at rest。P5-F 已接入 USB provisioning、已保存绑定选择与显式网络会话；本段的历史验证未运行真实 USB。真实 USB 配对、P4-A 手机网络收包、AudioTrack 播放及远程主机交接均为 NOT_TESTED。
 
 ## P5-B USB binding provision（仅源码与 fake 检查）
 
 - `receiver::tests::fake_adb_secure_provision_confirms_persists_and_rejects_failures_without_leaks`：PASS。fake runner 覆盖固定 USB `content write` 参数与 stdin 承诺匹配、`content write` 错误文本但退出码为 0 时仍须远端摘要确认、远端已有不同材料、取消后使用同一 DPAPI 记录重试、非 USB/current-user 改变/APK 字节不匹配拒绝；错误诊断不回显合成 secret。所有文件仅位于隔离测试临时目录，没有运行真实 ADB。
 - `state::tests::adb_stdin_cancellation_reaps_child_and_output_drains`：检查 fake 子进程取消，以及 stdout JoinHandle 已消费、stderr drain 阻塞时取消会返回错误并 abort/join 剩余 drain；不调用 ADB、不访问设备。
 - `tests/AnPodUdpVectorCheck.java`：既有纯 Java 记录解析检查 PASS，覆盖 69-byte 记录解析、短包/长包/未知版本拒绝。本次 Android 源码使用 Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources` 编译 PASS；未执行 AAPT2、未组装 APK。Android fd poll、CancellationSignal、15 秒 EOF 截止时间及设备 pipe 错误行为仅编译检查，运行行为 NOT_TESTED。
-- Provider 使用已有 `android.permission.DUMP` 读写保护，只扩展固定绑定 URI；health 查询保持只读。Rust `provision` 未注册 IPC，没有 UI、网络入口或播放器接线。真实 USB、系统 DUMP 鉴权、Android `filesDir`/AtomicFile 落盘及设备端状态确认均为 NOT_TESTED。
+- Provider 使用已有 `android.permission.DUMP` 读写保护，只扩展固定绑定 URI；health 查询保持只读。P5-F 通过显式 Tauri backend command 调用 provisioning；本段 fake 检查不覆盖真实 USB、系统 DUMP 鉴权、Android `filesDir`/AtomicFile 落盘及设备端状态确认，均为 NOT_TESTED。
 
 ## P5-C authenticated localhost session prototype
 
@@ -209,18 +209,25 @@
 - 后续定向复核在同一合并检查中增加了断开控制通道后的 STOP 本地 sender/queue/socket/key 清理、远端 START ACK 后本地 UDP sender handoff 失败清理、25 ms idle timeout 间隔中的分段控制帧读取，以及使用虚拟单调时钟的 5 秒 heartbeat 截止检查。Android 实际 `ReceiverService` UDP 队列也按已认证参数校验 FORMAT；P4 上下文的 `parameters == null` 保持原行为。
 - 双模式沿用同一 5 ms UDP packetization target（48 kHz stereo 的数据报仍受 1200-byte 限制），模式差异由 Android AudioTrack buffer 设置承载；本地 fake 检查不代表音质或时延收益。
 - Rust 定向 Cargo 测试：PASS。Android `:app:compileDebugJavaWithJavac -x :app:processDebugResources`：PASS；未执行资源处理或组装 APK。JDK 合并检查只编译 P5-C 所需 Java protocol/UDP 文件及 `tests/P5cLoopbackEndpoint.java`。
-- 所有检查仅在 127.0.0.1 使用合成 binding 与 PCM；没有启动 AnPod 产品入口、真实音频设备、ADB、手机或局域网。P5-C 不接入 UI/IPC、默认 listener 或产品自动启动；真实 WASAPI/AudioTrack 输出和设备行为仍为 NOT_TESTED，P5 尚未完成。
+- 所有检查仅在 127.0.0.1 使用合成 binding 与 PCM；没有启动 AnPod 产品入口、真实音频设备、ADB、手机或局域网。P5-F 后端接线见下节；真实 WASAPI/AudioTrack 输出和设备行为仍为 NOT_TESTED。
 
 ## P5-D local single-session recovery owner
 
 - 同一个 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。新增场景使用静默 localhost peer 检查同步 socket 会等待 50 ms poll timeout，并检查取消可在 250 ms 内结束；Java fake endpoint 对 RESUME 返回确定失败 ACK，确认重连期间 snapshot 仍保持上次已确认的 paused 状态。显式供给重建 endpoint 后，fresh P5-A session 依最新 RESUME 意图恢复为 ReceiverRunning，再将 synthetic PCM 送到 fake sink。另检查生产退避表为 1/2/5/10 秒且上限 10 秒，测试实例注入短间隔；显式 owner stop 收到认证 STOP ACK，attempt 数不再增长；失败连接 owner 在退避中收到 caller cancellation 并 join 到 Stopped。
 - `SessionOwner` 在单独线程拥有唯一 HostSession，运行 1 秒认证心跳；对每次恢复复制并清零由调用方提供的现有 binding，使用新 nonce/session/key/queue。只向显式提供的 IPv4 loopback endpoint 重连；`update_endpoint` 是切换端口的唯一入口。用户 pause/resume 意图与最近已 ACK 确认状态分开保存，失败命令不会虚报状态，重连后按最新意图操作；停止或 token 取消后禁恢复，不会清除/覆盖 binding。
 - 本轮受影响的 Rust 合并 Cargo 检查：PASS，1/1，耗时 8.35 秒。静默 peer 及失败 RESUME ACK 场景在该入口一并执行。没有改 Android 生产源码，因此未重复 Gradle；Java 合并 helper 在该 Rust 检查中按 JDK 17 编译。退避测试注入短时间，不实耗 1/2/5/10 秒。
-- 此 owner 尚未接入产品状态、Tauri IPC、WASAPI、真实 PCM callback 或默认连接流程。Android 仍是 one-shot listener，测试通过显式重建并重新供给 endpoint 验证恢复；没有启动/重启真实 Receiver、没有 USB/bootstrap 或真实设备、局域网、音量、AudioTrack/WASAPI 测试。ACK/UDP/合成 PCM 不代表实际出声，以上均为 NOT_TESTED；P5 整体未完成。
+- P5-F 已接入产品状态、Tauri backend、Native PCM callback 与显式连接流程。Receiver 在断开后最多保留 30 秒 listener 以等待恢复；本段 loopback 检查未验证真实 Receiver 重启、USB/bootstrap、LAN、音量、AudioTrack/WASAPI 或实际出声，均为 NOT_TESTED。
 
 ## P4-B / P5-E explicit IPv4 and discovery backend
 
 - Rust 合并入口 `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1，8.24 秒。覆盖合成 private IPv4 地址/前缀契约、selected-prefix 内外来源校验、发现伪造候选上限（16 项后停止接收）、无关 token 拒绝、畸形探测忽略、取消，以及候选经 P5-A/BIND/START 后 synthetic PCM 到 fake sink。错误 HELLO、错误绑定身份/密钥和认证后但未 START 的错误控制帧均不调用 playback.stop；成功 START 后合法 STOP 只调用一次。其余 explicit-interface owner 重建/STOP 清理仍受覆盖。所有 socket 目标均为 127.0.0.1；未执行真实接口枚举、LAN 广播、网关探测或热点传输。
 - Windows 接口枚举使用现有 `windows` crate 的 IP Helper API；只在运行时返回当前启用的私有 IPv4 地址、前缀、gateway、接口索引/名称，未写入日志、协议或持久配置。发现最多对调用方选定接口的 directed broadcast 和第一项已报告 gateway 各发一个 26-byte 探测；响应仍是候选，后续 P5-A 互认证才允许 BIND/START。手动 literal IPv4 路径不调用 discovery。
-- Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources --offline --no-daemon`：PASS，JDK 17、Android SDK 35 显式环境变量，9 秒，3 个任务（compileDebugJavaWithJavac 实际执行）；未执行资源处理或组装 APK。先前未配置 SDK 环境时的失败不是外部阻塞。本轮未改 Tauri UI/IPC、设置持久化、默认 listener 或启动流。
+- Android Gradle `:app:compileDebugJavaWithJavac -x :app:processDebugResources --offline --no-daemon`：PASS，JDK 17、Android SDK 35 显式环境变量，9 秒，3 个任务（compileDebugJavaWithJavac 实际执行）；未执行资源处理或组装 APK。先前未配置 SDK 环境时的失败不是外部阻塞。P5-F 新增显式 Tauri backend commands；没有增加 UI caller、设置持久化、默认 listener 或自动启动。
 - P4/P5 本地代码尚未在 Android runtime、真实 LAN/热点广播、ADB、真实网卡切换、WASAPI、AudioTrack 或可听输出上验证；未自动启动热点、改防火墙或连接真实网络。发现失败只报告未响应/端点不可达或可能需要 USB/bootstrap，不推断 ForceStop/防火墙原因。上述仍为 NOT_TESTED，P4/P5 整体未完成。
+
+## P5-F product backend wiring
+
+- Rust targeted tests: PASS, 5/5: `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`, `network::tests::session_queue_reports_real_capture_format_before_discarding_mismatch`, `state::tests::fresh_network_queue_is_handed_off_even_without_observing_none`, `receiver::tests::content_rows_preserve_multiple_interfaces_and_bootstrap_listener_endpoint`, and `receiver::tests::saved_binding_reference_isolated_by_usb_identity_and_android_user`.
+- `cargo check --locked --offline --target x86_64-pc-windows-msvc`: PASS. Android `:app:compileDebugJavaWithJavac -x :app:processDebugResources --offline --no-daemon`: PASS. Resource processing was skipped and no APK was assembled. Rust emitted existing unused/dead-code warnings.
+- The connection path uses explicit Tauri backend commands and no new UI/default listener. Bindings are selected through opaque per-USB-serial/per-Android-user references. USB bootstrap verifies protocol version 1 and obtains the actual Receiver listener address/port. Mode changes reauthenticate; pause intent is retained. Capture format must match negotiated PCM before desktop mute; capture errors clean up and restore computer output. Session bitrate uses live successful PCM deltas; network queue handoff tracks queue identity.
+- Real USB provisioning, Android runtime, LAN/hotspot, WASAPI capture, AudioTrack output, audible output, and on-device recovery remain NOT_TESTED. No ADB/device commands, APK install, or stable/preview package replacement were performed in this code review turn.

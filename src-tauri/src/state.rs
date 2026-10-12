@@ -1,4 +1,4 @@
-use crate::{audio::AudioActor, discovery::{self, Candidate}, network_interface::{self, Ipv4Interface}, p5c::{SessionLifecycleState, SessionOwner}};
+use crate::{audio::AudioActor, discovery::{self, Candidate}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{SessionLifecycleState, SessionOwner}};
 use crate::receiver::{self, ReceiverStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +14,8 @@ use std::{
 use tauri::{AppHandle, Emitter};
 use tokio::{process::{Child, Command}, sync::Mutex as AsyncMutex, time::timeout};
 use tokio_util::sync::CancellationToken;
+
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +90,7 @@ pub struct AppSnapshot {
     pub devices: Vec<Device>,
     pub selected_serial: Option<String>,
     pub session_serial: Option<String>,
+    pub session_receiver_binding: Option<String>,
     pub session_transport: Option<String>,
     pub session_android_version: Option<String>,
     pub transport: String,
@@ -110,6 +113,7 @@ pub struct OperationResult {
 }
 
 struct Session {
+    generation: u64,
     serial: String,
     transport: String,
     reverse: String,
@@ -118,7 +122,8 @@ struct Session {
     output: String,
     output_tail: Arc<Mutex<VecDeque<String>>>,
     network_owner: Option<SessionOwner>,
-    network_sink_active: bool,
+    network_sink_queue: Option<Arc<PcmQueue>>,
+    network_binding_ref: Option<String>,
 }
 
 struct ActiveOperation {
@@ -138,6 +143,7 @@ struct ViewState {
     devices: Vec<Device>,
     selected_serial: Option<String>,
     session_serial: Option<String>,
+    session_receiver_binding: Option<String>,
     session_transport: Option<String>,
     session_android_version: Option<String>,
     output: String,
@@ -161,7 +167,7 @@ pub struct AppState {
     last_pairing_endpoint: Mutex<Option<String>>,
     gate: AsyncMutex<()>,
     session: AsyncMutex<Option<Session>>,
-    pcm_rate_sample: Mutex<Option<(String, u64, Instant)>>,
+    pcm_rate_sample: Mutex<Option<(u64, u64, Instant)>>,
     audio: AudioActor,
     data_dir: PathBuf,
     adb_path: PathBuf,
@@ -195,6 +201,7 @@ impl AppState {
                 devices: Vec::new(),
                 selected_serial: None,
                 session_serial: None,
+                session_receiver_binding: None,
                 session_transport: None,
                 session_android_version: None,
                 output: "computer".into(),
@@ -288,6 +295,26 @@ impl AppState {
         result
     }
 
+    pub fn receiver_binding_references(&self) -> Result<Vec<String>, String> {
+        let directory = self.data_dir.join("receiver-bindings");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err("无法读取已保存的 Receiver 绑定列表。".into()),
+        };
+        let mut references = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| "无法读取已保存的 Receiver 绑定列表。".to_string())?;
+            if entry.path().extension().is_some_and(|extension| extension == "dat") {
+                if let Some(reference) = entry.path().file_stem().and_then(|stem| stem.to_str()) {
+                    if valid_binding_reference(reference) { references.push(reference.to_owned()); }
+                }
+            }
+        }
+        references.sort();
+        Ok(references)
+    }
+
     pub async fn discover_network_receivers(&self, local_address: &str) -> Result<Vec<Candidate>, String> {
         let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
             .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
@@ -299,30 +326,61 @@ impl AppState {
 
     #[cfg(windows)]
     pub async fn start_network_audio(&self, app: &AppHandle, local_address: &str, peer: &str,
-        bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>) -> Result<AppSnapshot, String> {
+        bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
+        selected_binding_ref: Option<&str>) -> Result<AppSnapshot, String> {
         use crate::security::{AudioParameters, BindingStore};
         let (generation, token) = self.start_operation();
+        let mut audio_initialized = false;
         let result = async {
             let _gate = self.gate.lock().await;
             token_check(&token)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
             let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
                 .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
-            let peer: std::net::SocketAddr = peer.parse().map_err(|_| "接收端点必须是明确的 IPv4 地址和端口。".to_string())?;
-            let std::net::SocketAddr::V4(peer_v4) = peer else { return Err("网络接收仅支持 IPv4 端点。".into()); };
-            if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) { return Err("接收端点不在所选 IPv4 接口的本地网段内。".into()); }
-
-            let binding_path = self.data_dir.join("receiver-binding.dat");
-            if let Some(serial) = bootstrap_serial {
+            let (binding_ref, binding_path, peer) = if let Some(serial) = bootstrap_serial {
                 let address = receiver_address.ok_or_else(|| "USB/bootstrap 需要明确选择手机 IPv4 接口。".to_string())?;
                 let prefix = receiver_prefix.ok_or_else(|| "USB/bootstrap 需要手机接口前缀长度。".to_string())?;
-                let _commitment = receiver::provision(&self.adb_path, serial, &self.receiver_apk_path,
-                    &self.receiver_metadata_path, &binding_path, &token).await?;
-                receiver::start_network(&self.adb_path, serial, &self.receiver_apk_path,
+                let reference = receiver::binding_reference(&self.adb_path, serial, &token).await?;
+                if selected_binding_ref.is_some_and(|selected| selected != reference) {
+                    return Err("所选绑定与当前 USB 设备或 Android 用户不匹配。".into());
+                }
+                let version = receiver::network_status(&self.adb_path, serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, &token).await
+                    .map_err(|error| format!("无法验证 Receiver 网络版本；请升级 Receiver 后重试（保留应用数据）：{error}"))?;
+                if version.network_audio_version != 1 {
+                    return Err("Receiver 网络协议版本不兼容；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+                }
+                let path = binding_store_path(&self.data_dir, &reference)?;
+                receiver::provision(&self.adb_path, serial, &self.receiver_apk_path,
+                    &self.receiver_metadata_path, &path, &token).await?;
+                let status = receiver::start_network(&self.adb_path, serial, &self.receiver_apk_path,
                     &self.receiver_metadata_path, address, prefix, &token).await?;
-            } else if receiver_address.is_some() || receiver_prefix.is_some() {
-                return Err("手机接口地址只允许与明确的 USB/bootstrap 设备一起提供。".into());
-            }
+                if status.network_audio_version != 1 || status.network_audio_address != address || status.network_audio_port == 0 {
+                    return Err("Receiver 未报告本次 bootstrap 的有效监听地址和端口。".into());
+                }
+                if !peer.is_empty() {
+                    let supplied = peer.parse::<std::net::SocketAddr>()
+                        .map_err(|_| "USB/bootstrap 不接受手动猜测的 Receiver 端口。".to_string())?;
+                    let actual = std::net::SocketAddr::new(status.network_audio_address.parse().map_err(|_| "Receiver 监听地址无效。".to_string())?, status.network_audio_port);
+                    if supplied != actual { return Err("USB/bootstrap 端点必须来自本次 Receiver 状态查询。".into()); }
+                }
+                let address = status.network_audio_address.parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| "Receiver 监听地址不是 IPv4。".to_string())?;
+                (reference, path, std::net::SocketAddr::V4(std::net::SocketAddrV4::new(address, status.network_audio_port)))
+            } else {
+                if receiver_address.is_some() || receiver_prefix.is_some() {
+                    return Err("手机接口地址只允许与明确的 USB/bootstrap 设备一起提供。".into());
+                }
+                let reference = selected_binding_ref.filter(|reference| valid_binding_reference(reference))
+                    .ok_or_else(|| "无 USB bootstrap 时必须明确选择已保存的 Receiver 绑定。".to_string())?.to_owned();
+                let path = binding_store_path(&self.data_dir, &reference)?;
+                if !path.is_file() { return Err("所选 Receiver 绑定不存在；请通过授权 USB/bootstrap 建立该绑定。".into()); }
+                let peer = peer.parse::<std::net::SocketAddr>()
+                    .map_err(|_| "接收端点必须是发现候选或明确的 IPv4 地址和端口。".to_string())?;
+                (reference, path, peer)
+            };
+            let std::net::SocketAddr::V4(peer_v4) = peer else { return Err("网络接收仅支持 IPv4 端点。".into()); };
+            if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) { return Err("接收端点不在所选 IPv4 接口的本地网段内。".into()); }
             token_check(&token)?;
             let binding = BindingStore::load(&binding_path).map_err(|_| "本机 DPAPI 绑定材料不可用；请通过授权 USB/bootstrap 建立绑定。".to_string())?;
             let parameters = AudioParameters { sample_rate: 48_000, channels: 2,
@@ -338,9 +396,9 @@ impl AppState {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
+            audio_initialized = true;
             self.audio.initialize()?;
-            self.audio.set_streaming(false)?;
-            if let Err(error) = self.audio.start_pcm_sink(queue) {
+            if let Err(error) = self.audio.start_pcm_sink(queue.clone()) {
                 let _ = self.audio.stop_and_cleanup();
                 let _ = self.audio.restore_muted();
                 owner.stop();
@@ -359,14 +417,16 @@ impl AppState {
                 return Err(error);
             }
             *self.session.lock().await = Some(Session {
+                generation: NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
                 installed_receiver: false, output: "phone".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
-                network_owner: Some(owner), network_sink_active: true,
+                network_owner: Some(owner), network_sink_queue: Some(queue), network_binding_ref: Some(binding_ref.clone()),
             });
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = true;
                 view.session_serial = None;
+                view.session_receiver_binding = Some(binding_ref);
                 view.session_transport = Some("lan".into());
                 view.session_android_version = None;
                 view.output = "phone".into();
@@ -379,6 +439,16 @@ impl AppState {
             self.emit(app);
             Ok(self.snapshot())
         }.await;
+        if result.is_err() && audio_initialized {
+            let _ = self.audio.stop_pcm_sink();
+            let _ = self.audio.stop_and_cleanup();
+            if self.audio.restore_muted().is_err() {
+                let mut view = self.view.lock().expect("app view lock");
+                view.state = "error".into();
+                view.message = "网络启动失败，电脑声音恢复失败".into();
+                view.status_detail = "电脑声音恢复待处理；请通过托盘重试或断开连接。".into();
+            }
+        }
         self.finish_operation(generation);
         if result.is_err() { self.emit(app); }
         result
@@ -386,7 +456,8 @@ impl AppState {
 
     #[cfg(not(windows))]
     pub async fn start_network_audio(&self, _app: &AppHandle, _local_address: &str, _peer: &str,
-        _bootstrap_serial: Option<&str>, _receiver_address: Option<&str>, _receiver_prefix: Option<u8>) -> Result<AppSnapshot, String> {
+        _bootstrap_serial: Option<&str>, _receiver_address: Option<&str>, _receiver_prefix: Option<u8>,
+        _selected_binding_ref: Option<&str>) -> Result<AppSnapshot, String> {
         Err("Windows 网络音频接收仅在 Windows 上可用。".into())
     }
 
@@ -445,6 +516,7 @@ impl AppState {
             devices: view.devices.clone(),
             selected_serial: view.selected_serial.clone(),
             session_serial: view.session_serial.clone(),
+            session_receiver_binding: view.session_receiver_binding.clone(),
             session_transport: view.session_transport.clone(),
             session_android_version: view.session_android_version.clone(),
             transport,
@@ -460,32 +532,21 @@ impl AppState {
     }
 
     pub async fn sample_audio_bitrate(&self, app: &AppHandle) {
-        let sample = self.session.lock().await.as_ref().map(|session| {
-            if let Some(owner) = session.network_owner.as_ref() {
-                ("direct-network".to_string(), owner.pcm_payload_bytes_sent())
-            } else { (session.reverse.clone(), 0) }
-        });
-        let Some((session_id, network_bytes)) = sample else {
+        let session = self.session.lock().await;
+        let Some(active) = session.as_ref() else {
+            drop(session);
             self.clear_audio_bitrate_if_session(None, app).await;
             return;
         };
-        let bytes = if session_id == "direct-network" { network_bytes } else {
-            let Ok(bytes) = self.audio.sent_pcm_bytes() else {
-                self.clear_audio_bitrate_if_session(Some(&session_id), app).await;
-                return;
-            };
-            bytes
-        };
+        let generation = active.generation;
+        let bytes = if let Some(owner) = active.network_owner.as_ref() {
+            owner.pcm_payload_bytes_sent()
+        } else if let Ok(bytes) = self.audio.sent_pcm_bytes() { bytes } else { return; };
         let now = Instant::now();
-        let session = self.session.lock().await;
-        if !session.as_ref().is_some_and(|session| {
-            if session_id == "direct-network" { session.network_owner.is_some() }
-            else { session.network_owner.is_none() && session.reverse == session_id }
-        }) { return; }
         let changed = {
             let mut previous = self.pcm_rate_sample.lock().expect("PCM rate sample lock");
             let mut view = self.view.lock().expect("app view lock");
-            commit_pcm_bitrate_sample(Some(&session_id), &session_id, &mut previous,
+            commit_pcm_bitrate_sample(Some(generation), generation, &mut previous,
                 &mut view.audio_bitrate_bps, bytes, now)
         };
         drop(session);
@@ -494,7 +555,7 @@ impl AppState {
 
     async fn clear_audio_bitrate_if_session(&self, expected_session: Option<&str>, app: &AppHandle) {
         let session = self.session.lock().await;
-        if session.as_ref().map(|session| session.reverse.as_str()) != expected_session { return; }
+        if expected_session.is_some() || session.is_some() { return; }
         *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
         let changed = {
             let mut view = self.view.lock().expect("app view lock");
@@ -729,36 +790,73 @@ impl AppState {
         let Some(active) = session.as_mut().filter(|session| session.network_owner.is_some()) else { return false; };
         let owner = active.network_owner.as_ref().expect("network session owner");
         let snapshot = owner.snapshot();
+        let needs_bootstrap = snapshot.state == SessionLifecycleState::Stopped;
         let queue = owner.pcm_queue();
-        let mut failure = None;
-        match queue.as_ref() {
-            Some(queue) if !active.network_sink_active && active.output == "phone" => {
-                if let Err(error) = self.audio.start_pcm_sink(queue.clone()) { failure = Some(error); }
-                else if let Err(error) = self.audio.mute_active() {
-                    let _ = self.audio.stop_pcm_sink();
-                    let _ = self.audio.restore_muted();
-                    failure = Some(error);
-                } else { active.network_sink_active = true; }
-            }
-            None if active.network_sink_active => {
+        let mut failure = self.audio.take_last_error().ok().flatten();
+        if failure.is_none() && needs_bootstrap {
+            failure = Some(snapshot.last_error.clone().unwrap_or_else(|| "Receiver session stopped".into()));
+        }
+        if failure.is_none() {
+            if active.output == "phone" {
+                if let Some(queue) = queue.as_ref() {
+                    if pcm_queue_identity_changed(active.network_sink_queue.as_ref(), Some(queue)) {
+                        if let Err(error) = self.audio.start_pcm_sink(queue.clone()) { failure = Some(error); }
+                        else if let Err(error) = self.audio.mute_active() {
+                            let _ = self.audio.stop_pcm_sink();
+                            let _ = self.audio.restore_muted();
+                            failure = Some(error);
+                        } else { active.network_sink_queue = Some(queue.clone()); }
+                    }
+                } else if active.network_sink_queue.take().is_some() {
+                    if let Err(error) = self.audio.stop_pcm_sink() { failure = Some(error); }
+                    if let Err(error) = self.audio.restore_muted() { failure = Some(error); }
+                }
+            } else if active.network_sink_queue.take().is_some() {
                 if let Err(error) = self.audio.stop_pcm_sink() { failure = Some(error); }
                 if let Err(error) = self.audio.restore_muted() { failure = Some(error); }
-                active.network_sink_active = false;
             }
-            _ => {}
         }
-        let state = if failure.is_some() { "error" }
+        if let Some(error) = failure {
+            let mut cleanup_errors = Vec::new();
+            if let Err(stop_error) = self.audio.stop_pcm_sink() { cleanup_errors.push(stop_error); }
+            if let Err(restore_error) = self.audio.restore_muted() { cleanup_errors.push(restore_error); }
+            if let Some(mut owner) = active.network_owner.take() { owner.stop(); }
+            active.network_sink_queue = None;
+            active.output = "computer".into();
+            let mut detail = if cleanup_errors.is_empty() { error } else { format!("{error}；{}", cleanup_errors.join("；")) };
+            if needs_bootstrap { detail.push_str("；请重新通过授权 USB/bootstrap 启动 Receiver"); }
+            *session = None;
+            {
+                let mut view = self.view.lock().expect("app view lock");
+                view.session_active = false;
+                view.session_serial = None;
+                view.session_receiver_binding = None;
+                view.session_transport = None;
+                view.session_android_version = None;
+                view.output = "computer".into();
+                view.state = "error".into();
+                view.message = "LAN 音频会话已停止".into();
+                view.status_detail = format!("本机音频已清理；Receiver 会话停止：{detail}");
+                view.audio_bitrate_bps = None;
+            }
+            *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+            drop(session);
+            self.emit(app);
+            return true;
+        }
+        let state = if active.output == "computer" { "connected" }
             else if queue.is_none() || snapshot.state == SessionLifecycleState::Reconnecting { "reconnecting" }
             else { match snapshot.state {
                 SessionLifecycleState::Streaming => "streaming",
                 SessionLifecycleState::Paused => "paused",
-                SessionLifecycleState::Stopped => "reconnecting",
                 _ => "phoneReady",
             }};
         let (message, detail) = if let Some(error) = failure {
             ("网络音频切换失败".to_string(), format!("本机 PCM sink 操作失败：{error}"))
         } else if state == "reconnecting" {
             ("正在重新连接手机".into(), "网络接收暂时中断；电脑声音已恢复，正在尝试重新认证。".into())
+        } else if active.output == "computer" {
+            ("已连接 · 电脑播放".into(), "网络会话保持暂停；电脑声音已恢复到本机扬声器。".into())
         } else if state == "streaming" {
             ("正在手机播放".into(), "Receiver 已确认 AudioTrack 收到 PCM 音频。".into())
         } else if state == "paused" {
@@ -773,6 +871,7 @@ impl AppState {
             view.message = message;
             view.status_detail = detail;
             view.output = active.output.clone();
+            view.session_receiver_binding = active.network_binding_ref.clone();
             changed
         };
         drop(session);
@@ -976,11 +1075,12 @@ impl AppState {
         let remote = format!("localabstract:{reverse}");
         let port_arg = format!("tcp:{port}");
         checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(&token)).await?;
-        *self.session.lock().await = Some(Session { serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())), network_owner: None, network_sink_active: false });
+        *self.session.lock().await = Some(Session { generation: NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed), serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())), network_owner: None, network_sink_queue: None, network_binding_ref: None });
         {
             let mut view = self.view.lock().expect("view lock");
             view.session_active = true;
             view.session_serial = Some(device.serial.clone());
+            view.session_receiver_binding = None;
             view.session_transport = Some(device.transport.clone());
             view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
             view.audio_bitrate_bps = Some(0);
@@ -1106,8 +1206,30 @@ impl AppState {
     async fn reconfigure_locked(&self, app: &AppHandle, kind: &str, value: &str, generation: u64, token: &CancellationToken) -> Result<AppSnapshot, String> {
         let _guard = self.gate.lock().await;
         token_check(token)?;
-        if self.session.lock().await.as_ref().is_some_and(|session| session.network_owner.is_some()) {
-            return Err("当前是 LAN 直连会话；请先断开后再更改连接方式或播放模式。".into());
+        {
+            let session = self.session.lock().await;
+            if let Some(active) = session.as_ref().filter(|session| session.network_owner.is_some()) {
+                if kind != "playback" { return Err("LAN 会话不能直接切换到 USB/Wi-Fi 传输；请先断开。".into()); }
+                let mode = match value { "balanced" => 0, "lowLatency" => 1,
+                    _ => return Err("未知的播放模式。".into()) };
+                let previous = self.snapshot().settings.playback_mode;
+                self.update_mode_setting(kind, value)?;
+                let owner = active.network_owner.as_ref().expect("network session owner");
+                if let Err(error) = owner.set_mode(mode).and_then(|_| owner.set_paused(active.output == "computer")) {
+                    let rollback = self.update_mode_setting("playback", &previous.to_ascii_lowercase());
+                    return Err(rollback.err().map_or(error.clone(), |rollback| format!("{error}；设置回滚失败：{rollback}")));
+                }
+                {
+                    let mut view = self.view.lock().expect("app view lock");
+                    view.state = "reconnecting".into();
+                    view.message = "正在应用播放模式".into();
+                    view.status_detail = if active.output == "computer" {
+                        "电脑输出保持暂停；Receiver 将使用新的认证会话应用播放模式。".into()
+                    } else { "正在建立新的认证会话应用播放模式；电脑输出在确认 PCM 格式前保持静音状态。".into() };
+                }
+                self.emit(app);
+                return Ok(self.snapshot());
+            }
         }
         let (had_session, serial, old_output, old_transport, old_device) = {
             let session = self.session.lock().await;
@@ -1196,7 +1318,7 @@ impl AppState {
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
             let network_session = session.network_owner.is_some();
-            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_transport = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -1269,21 +1391,40 @@ impl AppState {
             if let Some(active) = session.as_mut().filter(|session| session.network_owner.is_some()) {
                 token_check(token)?;
                 let owner = active.network_owner.as_ref().expect("network session owner");
-                owner.set_paused(output == "computer")?;
-                if output == "phone" {
-                    if let Some(queue) = owner.pcm_queue() {
-                        self.audio.start_pcm_sink(queue)?;
-                        if let Err(error) = self.audio.mute_active() {
-                            let _ = self.audio.stop_pcm_sink();
-                            let _ = self.audio.restore_muted();
-                            return Err(error);
+                let change = (|| -> Result<(), String> {
+                    owner.set_paused(output == "computer")?;
+                    if output == "phone" {
+                        if let Some(queue) = owner.pcm_queue() {
+                            self.audio.start_pcm_sink(queue.clone())?;
+                            self.audio.mute_active()?;
+                            active.network_sink_queue = Some(queue);
                         }
-                        active.network_sink_active = true;
+                    } else {
+                        self.audio.stop_pcm_sink()?;
+                        self.audio.restore_muted()?;
+                        active.network_sink_queue = None;
                     }
-                } else {
-                    self.audio.stop_pcm_sink()?;
-                    self.audio.restore_muted()?;
-                    active.network_sink_active = false;
+                    Ok(())
+                })();
+                if let Err(error) = change {
+                    let mut cleanup = Vec::new();
+                    if let Err(stop_error) = self.audio.stop_pcm_sink() { cleanup.push(stop_error); }
+                    if let Err(restore_error) = self.audio.restore_muted() { cleanup.push(restore_error); }
+                    if let Some(mut owner) = active.network_owner.take() { owner.stop(); }
+                    *session = None;
+                    let detail = if cleanup.is_empty() { error.clone() } else { format!("{error}；{}", cleanup.join("；")) };
+                    let mut view = self.view.lock().expect("app view lock");
+                    view.session_active = false;
+                    view.session_serial = None;
+                    view.session_receiver_binding = None;
+                    view.session_transport = None;
+                    view.session_android_version = None;
+                    view.output = "computer".into();
+                    view.state = "error".into();
+                    view.message = "LAN 输出切换失败".into();
+                    view.status_detail = format!("本机音频已清理；Receiver 会话停止：{detail}");
+                    view.audio_bitrate_bps = None;
+                    return Err(detail);
                 }
                 active.output = output.into();
                 let mut view = self.view.lock().expect("view lock");
@@ -1600,17 +1741,17 @@ fn receiver_health_needed(installed_receiver: bool, device_present: Option<bool>
     installed_receiver && !session_is_lost(device_present, process_exited, audio_connected)
 }
 
-fn commit_pcm_bitrate_sample(current_session: Option<&str>, expected_session: &str,
-    previous: &mut Option<(String, u64, Instant)>, current_rate: &mut Option<u64>, bytes: u64, now: Instant) -> bool {
+fn commit_pcm_bitrate_sample(current_session: Option<u64>, expected_session: u64,
+    previous: &mut Option<(u64, u64, Instant)>, current_rate: &mut Option<u64>, bytes: u64, now: Instant) -> bool {
     if current_session != Some(expected_session) { return false; }
-    let bitrate = calculate_pcm_bitrate(previous.as_ref().map(|(id, count, at)| (id.as_str(), *count, *at)),
+    let bitrate = calculate_pcm_bitrate(previous.as_ref().map(|(id, count, at)| (*id, *count, *at)),
         expected_session, bytes, now);
-    *previous = Some((expected_session.to_owned(), bytes, now));
+    *previous = Some((expected_session, bytes, now));
     if *current_rate == Some(bitrate) { false }
     else { *current_rate = Some(bitrate); true }
 }
 
-fn calculate_pcm_bitrate(previous: Option<(&str, u64, Instant)>, session_id: &str, bytes: u64, now: Instant) -> u64 {
+fn calculate_pcm_bitrate(previous: Option<(u64, u64, Instant)>, session_id: u64, bytes: u64, now: Instant) -> u64 {
     let Some((previous_session, previous_bytes, previous_at)) = previous else { return 0; };
     if previous_session != session_id { return 0; }
     let elapsed_nanos = now.saturating_duration_since(previous_at).as_nanos();
@@ -1621,6 +1762,23 @@ fn calculate_pcm_bitrate(previous: Option<(&str, u64, Instant)>, session_id: &st
 
 fn same_physical_device(left: &Device, right: &Device) -> bool {
     left.physical_id.as_ref().is_some_and(|id| right.physical_id.as_ref() == Some(id))
+}
+
+fn valid_binding_reference(reference: &str) -> bool {
+    reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn pcm_queue_identity_changed(current: Option<&Arc<PcmQueue>>, next: Option<&Arc<PcmQueue>>) -> bool {
+    match (current, next) {
+        (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn binding_store_path(data_dir: &Path, reference: &str) -> Result<PathBuf, String> {
+    if !valid_binding_reference(reference) { return Err("Receiver 绑定引用格式无效。".into()); }
+    Ok(data_dir.join("receiver-bindings").join(format!("{}.dat", reference.to_ascii_lowercase())))
 }
 
 fn choose_selected_serial(session_serial: Option<String>, previous: Option<String>, devices: &[Device], preferred: &str) -> Option<String> {
@@ -1960,20 +2118,28 @@ mod tests {
     #[test]
     fn pcm_bitrate_uses_successful_byte_deltas_and_resets_between_sessions() {
         let started = Instant::now();
-        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 0, started)), "session-a", 192_000, started + Duration::from_secs(1)), 1_536_000);
-        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 900_000, started)), "session-b", 192_000, started + Duration::from_secs(1)), 0);
-        assert_eq!(calculate_pcm_bitrate(Some(("session-a", 192_000, started)), "session-a", 192_000, started + Duration::from_secs(1)), 0);
+        assert_eq!(calculate_pcm_bitrate(Some((1, 0, started)), 1, 192_000, started + Duration::from_secs(1)), 1_536_000);
+        assert_eq!(calculate_pcm_bitrate(Some((1, 900_000, started)), 2, 192_000, started + Duration::from_secs(1)), 0);
+        assert_eq!(calculate_pcm_bitrate(Some((1, 192_000, started)), 1, 192_000, started + Duration::from_secs(1)), 0);
     }
 
     #[test]
     fn stale_pcm_sample_is_rejected_after_session_changes() {
         let started = Instant::now();
-        let mut previous = Some(("session-b".into(), 10, started));
+        let mut previous = Some((2, 10, started));
         let mut current_rate = None;
-        assert!(!commit_pcm_bitrate_sample(Some("session-b"), "session-a", &mut previous,
+        assert!(!commit_pcm_bitrate_sample(Some(2), 1, &mut previous,
             &mut current_rate, 192_010, started + Duration::from_secs(1)));
-        assert_eq!(previous.as_ref().map(|(id, count, _)| (id.as_str(), *count)), Some(("session-b", 10)));
+        assert_eq!(previous.as_ref().map(|(id, count, _)| (*id, *count)), Some((2, 10)));
         assert_eq!(current_rate, None);
+    }
+
+    #[test]
+    fn fresh_network_queue_is_handed_off_even_without_observing_none() {
+        let old = Arc::new(PcmQueue::new());
+        let new = Arc::new(PcmQueue::new());
+        assert!(!pcm_queue_identity_changed(Some(&old), Some(&old)));
+        assert!(pcm_queue_identity_changed(Some(&old), Some(&new)));
     }
 
     #[test]

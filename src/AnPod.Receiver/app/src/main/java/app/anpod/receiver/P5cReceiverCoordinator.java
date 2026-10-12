@@ -34,7 +34,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         void pause() throws IOException;
         void resume() throws IOException;
         void stop();
-        boolean streaming();
+        boolean streaming() throws IOException;
         void shutdown();
     }
 
@@ -42,6 +42,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private final PairingProtocol.BindingMaterial binding;
     private final PlaybackEndpoint playback;
     private final boolean loopbackOnly;
+    private final boolean dropStopAckForTest;
     private final int discoveryPrefixLength;
     private final CountDownLatch finished = new CountDownLatch(1);
     private volatile Socket activeSocket;
@@ -52,7 +53,12 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopback(PairingProtocol.BindingMaterial existingBinding,
             PlaybackEndpoint playback) throws IOException {
-        return open(existingBinding, playback, InetAddress.getByName("127.0.0.1"), true, 32);
+        return open(existingBinding, playback, InetAddress.getByName("127.0.0.1"), true, 32, false);
+    }
+
+    static P5cReceiverCoordinator openLoopbackDropStopAckForTest(PairingProtocol.BindingMaterial binding,
+            PlaybackEndpoint playback) throws IOException {
+        return open(binding, playback, InetAddress.getByName("127.0.0.1"), false, 32, true);
     }
 
     /** Explicit internal LAN entry; it never starts discovery or playback by itself. */
@@ -62,7 +68,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
             throw new IOException("P5-C requires an explicit private IPv4 interface address and prefix");
         if (!isAssignedInterfaceAddress(localAddress, prefixLength))
             throw new IOException("P5-C interface address is not assigned to an active Android interface");
-        return open(existingBinding, playback, localAddress, false, prefixLength);
+        return open(existingBinding, playback, localAddress, false, prefixLength, false);
     }
 
     private static boolean isAssignedInterfaceAddress(InetAddress address, int prefixLength) throws SocketException {
@@ -83,12 +89,13 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     private static P5cReceiverCoordinator open(PairingProtocol.BindingMaterial existingBinding,
-            PlaybackEndpoint playback, InetAddress localAddress, boolean loopbackOnly, int prefixLength) throws IOException {
+            PlaybackEndpoint playback, InetAddress localAddress, boolean loopbackOnly, int prefixLength,
+            boolean dropStopAckForTest) throws IOException {
         ServerSocket listener = new ServerSocket();
         try {
             listener.setReuseAddress(false);
             listener.bind(new InetSocketAddress(localAddress, 0));
-            return new P5cReceiverCoordinator(listener, existingBinding, playback, loopbackOnly, prefixLength);
+            return new P5cReceiverCoordinator(listener, existingBinding, playback, loopbackOnly, prefixLength, dropStopAckForTest);
         } catch (IOException | RuntimeException error) {
             listener.close();
             throw error;
@@ -96,16 +103,18 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     private P5cReceiverCoordinator(ServerSocket listener, PairingProtocol.BindingMaterial binding,
-            PlaybackEndpoint playback, boolean loopbackOnly, int discoveryPrefixLength) {
+            PlaybackEndpoint playback, boolean loopbackOnly, int discoveryPrefixLength, boolean dropStopAckForTest) {
         if (binding == null || playback == null) throw new IllegalArgumentException("P5-C inputs are required");
         this.listener = listener;
         this.binding = binding;
         this.playback = playback;
         this.loopbackOnly = loopbackOnly;
+        this.dropStopAckForTest = dropStopAckForTest;
         this.discoveryPrefixLength = discoveryPrefixLength;
     }
 
     int port() { return listener.getLocalPort(); }
+    InetAddress localAddress() { return listener.getInetAddress(); }
 
     synchronized void start() {
         if (worker != null) throw new IllegalStateException("P5-C listener already started");
@@ -137,9 +146,9 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     socket.setSoTimeout(250);
                     if (loopbackOnly && !socket.getInetAddress().isLoopbackAddress()) throw new IOException("loopback peer required");
                     serveSession(socket);
-                    if (shutdownRequested) playback.shutdown();
                     if (shutdownRequested || loopbackOnly) break;
                 } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
+                    if (shutdownRequested) break;
                     if (listener.isClosed()) break;
                     failure = "session_failed";
                 } finally { activeSocket = null; }
@@ -151,6 +160,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         } finally {
             stopDiscovery();
             activeSocket = null;
+            if (shutdownRequested) playback.shutdown();
             binding.close();
             try { listener.close(); } catch (IOException ignored) {}
             finished.countDown();
@@ -162,7 +172,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         DataOutputStream output = new DataOutputStream(socket.getOutputStream());
         byte[] hello = new byte[85];
         input.readFully(hello);
-        PairingProtocol.ReceiverHandshake handshake = PairingProtocol.ReceiverHandshake.acceptHello(binding, hello);
+        PairingProtocol.ReceiverHandshake handshake = PairingProtocol.ReceiverHandshake.acceptHello(binding.duplicate(), hello);
         try (handshake) {
             output.write(handshake.challenge());
             output.flush();
@@ -289,6 +299,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     }
                 } catch (IOException | RuntimeException error) {
                     result = RESULT_FAILED;
+                    if (command.type == P5cControlProtocol.HEARTBEAT) shutdownRequested = true;
                 }
 
                 byte[] ackPayload = P5cControlProtocol.ackPayload(command.type, command.sequence,
@@ -296,10 +307,13 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 byte[] ack = P5cControlProtocol.encode(keys.receiverToHostControl,
                         P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                         P5cControlProtocol.ACK, ackPayload);
+                if (dropStopAckForTest && command.type == P5cControlProtocol.STOP && result == RESULT_OK)
+                    throw new IOException("test dropped the authenticated STOP ACK");
                 P5cControlProtocol.write(output, ack);
                 lastCommand = command.raw;
                 lastAck = ack;
                 expectedCommandSequence++;
+                if (shutdownRequested) return;
                 if (command.type == P5cControlProtocol.STOP && result == RESULT_OK) return;
             }
                     } finally {

@@ -25,7 +25,9 @@ public final class P5cLoopbackEndpoint {
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
         FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"));
-        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--discovery")
+        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--stop-ack-drop")
+                ? P5cReceiverCoordinator.openLoopbackDropStopAckForTest(binding, playback)
+                : Arrays.asList(args).contains("--discovery")
                 ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : P5cReceiverCoordinator.openLoopback(binding, playback);
         try (P5cReceiverCoordinator endpoint = opened) {
@@ -44,7 +46,7 @@ public final class P5cLoopbackEndpoint {
             endpoint.close();
             System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
                     + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","
-                    + playback.pcmBytes.get() + "," + playback.udpClosed.get());
+                    + playback.pcmBytes.get() + "," + playback.udpClosed.get() + "," + playback.shutdowns.get());
             System.out.flush();
         }
     }
@@ -133,6 +135,7 @@ public final class P5cLoopbackEndpoint {
         final AtomicInteger pauses = new AtomicInteger();
         final AtomicInteger resumes = new AtomicInteger();
         final AtomicInteger stops = new AtomicInteger();
+        final AtomicInteger shutdowns = new AtomicInteger();
         final AtomicInteger pcmBytes = new AtomicInteger();
         final AtomicBoolean streaming = new AtomicBoolean();
         final AtomicBoolean udpClosed = new AtomicBoolean();
@@ -148,6 +151,8 @@ public final class P5cLoopbackEndpoint {
 
         @Override public boolean start(UdpSessionContext context) throws IOException {
             starts.incrementAndGet();
+            stopped.set(false);
+            streaming.set(false);
             this.context = context;
             queue = new UdpPcmQueue(context.parameters);
             receiver = new UdpReceiver(context, queue);
@@ -179,7 +184,7 @@ public final class P5cLoopbackEndpoint {
             if (queue != null) queue.setPaused(false);
         }
         @Override public boolean streaming() { return streaming.get(); }
-        @Override public void shutdown() { }
+        @Override public void shutdown() { shutdowns.incrementAndGet(); }
 
         @Override public void stop() {
             stops.incrementAndGet();

@@ -133,6 +133,11 @@ async fn receiver_network_interfaces(state: State<'_, AppState>, serial: String)
 }
 
 #[tauri::command]
+fn receiver_binding_references(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.receiver_binding_references()
+}
+
+#[tauri::command]
 async fn discover_network_receivers(state: State<'_, AppState>, local_address: String) -> Result<Vec<discovery::Candidate>, String> {
     state.discover_network_receivers(&local_address).await
 }
@@ -140,9 +145,9 @@ async fn discover_network_receivers(state: State<'_, AppState>, local_address: S
 #[tauri::command]
 async fn start_network_audio(app: tauri::AppHandle, state: State<'_, AppState>, local_address: String,
     peer: String, bootstrap_serial: Option<String>, receiver_address: Option<String>,
-    receiver_prefix_length: Option<u8>) -> Result<AppSnapshot, String> {
+    receiver_prefix_length: Option<u8>, binding_reference: Option<String>) -> Result<AppSnapshot, String> {
     state.start_network_audio(&app, &local_address, &peer, bootstrap_serial.as_deref(),
-        receiver_address.as_deref(), receiver_prefix_length).await
+        receiver_address.as_deref(), receiver_prefix_length, binding_reference.as_deref()).await
 }
 
 #[tauri::command]
@@ -241,6 +246,7 @@ fn main() {
             receiver_stop,
             network_interfaces,
             receiver_network_interfaces,
+            receiver_binding_references,
             discover_network_receivers,
             start_network_audio,
             cancel_qr_pairing,

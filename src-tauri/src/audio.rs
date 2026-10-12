@@ -3,7 +3,7 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use crate::network::PcmQueue;
 use tokio::sync::{mpsc as async_mpsc, Mutex as AsyncMutex};
@@ -134,54 +134,93 @@ impl AudioActor {
                             if pcm_sink.as_ref().is_some_and(|old| Arc::ptr_eq(old, &queue)) {
                                 Ok(())
                             } else {
-                                unsafe {
-                                    (native.stop)();
-                                    (native.set_stream)(0);
-                                    set_pcm_callback(None, std::ptr::null_mut());
-                                }
-                                drop(pcm_sink.take());
-                                let user_data = Arc::as_ptr(&queue) as *mut c_void;
-                                if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
-                                    Err(native.describe_error("无法设置 PCM sink"))
-                                } else if unsafe { (native.start)() } == 0 {
-                                    unsafe {
-                                        (native.stop)();
-                                        set_pcm_callback(None, std::ptr::null_mut());
-                                    }
-                                    Err(native.describe_error("无法开始 PCM sink 采集"))
+                                let expected_format = queue.expected_format();
+                                unsafe { (native.cleanup)(); }
+                                if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } == 0 {
+                                    Err(native.describe_error("无法安全注销旧 PCM sink"))
                                 } else {
-                                    pcm_sink = Some(queue);
-                                    Ok(())
+                                    drop(pcm_sink.take());
+                                    let initialized = unsafe { (native.initialize)() } != 0;
+                                    if !initialized {
+                                        Err(native.describe_error("无法初始化 PCM sink 采集"))
+                                    } else {
+                                        let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                                        pcm_sink = Some(queue);
+                                        if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
+                                            drop(pcm_sink.take());
+                                            Err(native.describe_error("无法设置 PCM sink"))
+                                        } else {
+                                            unsafe { (native.set_stream)(1); }
+                                            if unsafe { (native.start)() } == 0 {
+                                                let error = native.describe_error("无法开始 PCM sink 采集");
+                                                unsafe { (native.cleanup)(); }
+                                                if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
+                                                    drop(pcm_sink.take());
+                                                }
+                                                Err(error)
+                                            } else {
+                                                let deadline = Instant::now() + Duration::from_millis(500);
+                                                loop {
+                                                    match pcm_sink.as_ref().and_then(|queue| queue.observed_format()) {
+                                                        Some(format) if expected_format == Some(format) => break Ok(()),
+                                                        Some(_) => {
+                                                            let error = "WASAPI PCM 格式与认证会话不匹配；电脑声音保持未静音。".to_string();
+                                                            unsafe { (native.cleanup)(); }
+                                                            if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
+                                                                drop(pcm_sink.take());
+                                                            }
+                                                            break Err(error);
+                                                        }
+                                                        None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                                                        None => {
+                                                            let error = "未能确认 WASAPI PCM 格式；电脑声音保持未静音。".to_string();
+                                                            unsafe { (native.cleanup)(); }
+                                                            if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
+                                                                drop(pcm_sink.take());
+                                                            }
+                                                            break Err(error);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else { Err("音频采集组件尚未初始化。".into()) };
                         let _ = reply.send(result);
                     }
                     Request::StopPcmSink(reply) => {
-                        if let Some(native) = native.as_ref() {
-                            unsafe {
-                                (native.stop)();
-                                (native.set_stream)(0);
-                                if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
-                            }
-                        }
-                        drop(pcm_sink.take());
-                        let _ = reply.send(Ok(()));
+                        let result = if let Some(native) = native.as_ref() {
+                            unsafe { (native.cleanup)(); }
+                            if pcm_sink.is_none() { Ok(()) } else { match native.set_pcm_callback {
+                                Some(set_callback) if unsafe { set_callback(None, std::ptr::null_mut()) } != 0 => {
+                                    drop(pcm_sink.take());
+                                    Ok(())
+                                }
+                                Some(_) => Err(native.describe_error("无法安全注销 PCM sink")),
+                                None => Err("音频采集组件不支持 PCM sink。".into()),
+                            }}
+                        } else { Ok(()) };
+                        let _ = reply.send(result);
                     }
                     Request::Stream(enabled, reply) => {
                         let result = native.as_ref().map(|native| unsafe { (native.set_stream)(i32::from(enabled)); Ok(()) }).unwrap_or_else(|| Err("音频会话尚未初始化。".into()));
                         let _ = reply.send(result);
                     }
                     Request::StopAndCleanup(reply) => {
-                        if let Some(native) = native.as_ref() {
-                            unsafe {
-                                (native.stop)();
-                                if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
-                                (native.cleanup)();
-                            }
-                        }
-                        drop(pcm_sink.take());
-                        let _ = reply.send(Ok(()));
+                        let result = if let Some(native) = native.as_ref() {
+                            unsafe { (native.cleanup)(); }
+                            if pcm_sink.is_none() { Ok(()) } else { match native.set_pcm_callback {
+                                Some(set_callback) if unsafe { set_callback(None, std::ptr::null_mut()) } != 0 => {
+                                    drop(pcm_sink.take());
+                                    Ok(())
+                                }
+                                Some(_) => Err(native.describe_error("无法安全注销 PCM sink")),
+                                None => Err("音频采集组件不支持 PCM sink。".into()),
+                            }}
+                        } else { Ok(()) };
+                        let _ = reply.send(result);
                     }
                     Request::Mute(reply) => {
                         let result = mute_active_endpoints(&marker_path, &mut muted_ids);

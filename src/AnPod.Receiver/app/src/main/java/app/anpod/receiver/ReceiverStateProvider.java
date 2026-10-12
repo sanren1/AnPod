@@ -31,7 +31,7 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static final String INTERFACES_URI = "content://app.anpod.receiver.state/interfaces";
     private static final String NETWORK_URI = "content://app.anpod.receiver.state/network";
     private static final String[] INTERFACE_COLUMNS = {"address", "prefixLength", "interfaceIndex", "interfaceName"};
-    private static final String[] NETWORK_COLUMNS = {"networkAudioVersion", "networkAudioState", "networkAudioFailure", "pcmBytesWritten"};
+    private static final String[] NETWORK_COLUMNS = {"networkAudioVersion", "networkAudioState", "networkAudioFailure", "pcmBytesWritten", "networkAudioAddress", "networkAudioPort"};
     private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment", "bindingFailure"};
     private static final long BINDING_READ_TIMEOUT_MS = 15_000;
     private static final int POLL_SLICE_MS = 100;
@@ -157,6 +157,8 @@ public final class ReceiverStateProvider extends ContentProvider {
             case "networkAudioState": row[i] = ReceiverService.networkAudioState; break;
             case "networkAudioFailure": row[i] = ReceiverService.networkAudioFailure; break;
             case "pcmBytesWritten": row[i] = ReceiverService.PCM_BYTES_WRITTEN.get(); break;
+            case "networkAudioAddress": row[i] = ReceiverService.networkAudioAddress; break;
+            case "networkAudioPort": row[i] = ReceiverService.networkAudioPort; break;
             default: throw new IllegalArgumentException("Unsupported network status column");
         }
         MatrixCursor result = new MatrixCursor(columns, 1);

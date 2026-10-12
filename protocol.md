@@ -3,7 +3,9 @@
 This document fixes the P3 wire format used by the localhost prototype and the
 P4-A Android parser/adapter. The P3 mock sender remains loopback-only. The
 separate P5 authenticated session can use a caller-selected private IPv4
-interface and literal peer; no product connection flow selects either path.
+interface and authenticated literal peer. An explicit Tauri backend command
+now wires bootstrap/discovery, binding selection, playback, and recovery; no UI
+caller or default connection flow starts this path.
 
 ## Datagram
 
@@ -50,8 +52,9 @@ is not used as a session key.
 
 P5-A defines the offline binding record, mutually authenticated handshake, and
 session key derivation used by the Rust and Android implementations. The
-handshake is currently in-memory only: no USB transport, discovery, listener,
-control path, or product connection flow invokes it.
+handshake API remains in-memory; the explicit P5-F backend obtains binding
+material through USB provisioning or a selected saved binding, then uses the
+existing handshake over the selected private IPv4 connection.
 
 The 69-byte binding record is `ANPB` (4 bytes), version `1` (1 byte), host ID
 (16 random bytes), receiver ID (16 random bytes), and shared secret (32 random
@@ -59,8 +62,8 @@ bytes). Windows stores only the current-user DPAPI-protected record, with UI
 forbidden and no machine-wide protection. Android stores the record under the
 explicit app-private files directory via `AtomicFile`; the Android file is
 app-private storage, not an encrypted-at-rest record. Both stores are
-create-only, and neither creates its parent directory or overwrites an
-existing binding.
+create-only and never overwrite an existing binding. Product provisioning
+creates the selected per-device/user parent directory before the first write.
 
 Handshake messages use `ANP5`, version `1`, and a one-byte type. All integers
 are big-endian. The caller exchanges complete messages but transport framing
@@ -105,9 +108,10 @@ four derived keys.
 
 ## P5-B USB binding provision path
 
-The explicit Rust `receiver::provision` entry point is not registered with
-Tauri IPC and has no product UI caller. It accepts an explicit host binding
-file path, verifies the selected target as authorized USB, reads the active
+The Rust `receiver::provision` entry point is not registered as a standalone
+Tauri command; it is called only by the explicit `start_network_audio` backend
+flow. It accepts a per-device/user host binding file path, verifies the
+selected target as authorized USB, reads the active
 Android user, and rechecks the installed APK identity against the local
 trusted artifact before sending anything. If the DPAPI file is absent, Rust
 creates and durably publishes the current-user protected record first. If it
@@ -154,10 +158,11 @@ terminates only its own child and aborts and joins both drain tasks. ADB output
 is reduced to presence markers and is not copied to logs or returned as a
 diagnostic.
 
-This remains a USB provisioning path only. It does not add LAN discovery,
-listeners, automatic reconnect, audio/control startup, product IPC/UI,
-unbinding, or reconfiguration. Real USB, system DUMP permission enforcement,
-and Android private storage remain NOT_TESTED.
+Provisioning itself remains USB-only. The P5-F backend checks the Receiver
+network protocol version before calling it and never copies a global binding
+between devices or Android users. There is no unbind, clear, or silent re-pair
+operation. Real USB, DUMP permission enforcement, and Android private storage
+remain NOT_TESTED.
 
 ## P5-C authenticated session prototype
 
@@ -237,13 +242,10 @@ operation and never claim that the Receiver is running. Invalid UDP datagrams
 are dropped by the existing parser; they cannot commit replay state or enter
 the PCM queue.
 
-P5-C exposes an internal localhost exchange and a separate explicit
-private-IPv4 exchange with controlled playback callback. It adds no
-UI/IPC/default listener, firewall/hotspot changes, WASAPI/AudioTrack startup,
-or product bootstrap. The local cross-language test uses synthetic PCM and a
-fake playback endpoint; real USB/LAN/hotspot transport, Android runtime,
-WASAPI/AudioTrack output, and device behavior remain NOT_TESTED. This section
-does not mark P5 complete.
+P5-C provides the authenticated session used by the explicit P5-F backend. The
+local cross-language test uses synthetic PCM and a fake playback endpoint;
+real USB/LAN/hotspot transport, Android runtime, WASAPI/AudioTrack output, and
+device behavior remain NOT_TESTED.
 
 ## P5-D local single-session recovery owner
 
@@ -281,10 +283,10 @@ authenticated STOP when it is between I/O operations. If that does not finish
 within its short 100 ms stop window, it cancels the pending operation and
 closes locally. Caller cancellation directly interrupts a pending
 connect/read/write/backoff poll. Both paths clear the queue and close the
-control socket. The current one-shot Android endpoint cleans its playback on
-STOP or control-channel EOF; retry requires an explicitly supplied endpoint
-whose receiver listener is running again. `SessionOwner` is not wired to product
-state or startup. Local recovery checks use a rebuilt fake localhost endpoint;
+control socket. The Android service keeps its listener available for a bounded
+30-second recovery window after disconnect, then stops when recovery expires.
+The product owner reauthenticates with a fresh session and the selected binding
+during that window. Local recovery checks use a rebuilt fake localhost endpoint;
 they do not establish recovery after USB/bootstrap loss, start an unavailable
 Android media service, or verify real audio. Device, LAN, WASAPI and AudioTrack
 recovery remain NOT_TESTED.
@@ -350,12 +352,45 @@ Receiver answered and says it may be unreachable or stopped and require an
 authorized USB/bootstrap path; the result does not infer ForceStop or firewall
 state. Interface bind errors, unreachable endpoints, and P5-A identity/proof
 failure have separate diagnostics. None of these paths claim `phoneReady`.
-Discovery and the direct session remain explicit internal backend calls with
-no Tauri IPC/UI, persisted network choice, default listener, or automatic
-startup. Local checks exercise the wire exchange and full authenticated PCM
-handoff only on loopback with a fake sink; real LAN/hotspot broadcast, Android
-runtime, ADB, WASAPI, AudioTrack, and audible output remain NOT_TESTED. P4/P5 are not
-complete.
+Discovery and the direct session are available through explicit Tauri backend
+commands and the existing product session state. No UI caller, persisted
+network choice, default listener, or automatic startup was added. Local checks exercise
+the wire exchange and full authenticated PCM handoff only on loopback with a
+fake sink; real LAN/hotspot broadcast, Android runtime, ADB, WASAPI, AudioTrack,
+and audible output remain NOT_TESTED.
+
+## P5-F explicit product backend
+
+The desktop backend exposes explicit Tauri commands and routes their work
+through the existing session state; there is no UI caller or default network
+listener. The selected output and
+balanced/low-latency mode flow through the existing session state. Computer
+output uses the existing Legacy path; phone output requires an explicitly
+selected private IPv4 interface and receiver binding reference. USB bootstrap
+is allowed only after checking Receiver network protocol version 1. The host
+then queries the Receiver's actual bound address and nonzero control port; it
+does not guess an address or port. Discovery candidates remain unauthenticated
+until P5-A mutual authentication succeeds.
+
+Saved bindings are isolated by USB serial and Android user. The UI-facing list
+contains opaque SHA-256 references only; binding bytes remain in the existing
+DPAPI store and Android app-private store. A selected reference is rechecked
+against the current USB identity/user before provisioning or connecting.
+Changing playback mode closes the old authenticated session and establishes a
+fresh one while preserving pause intent. Live bitrate uses successful PCM
+payload byte deltas from the active session. Native capture replacement joins
+the previous capture before releasing callback state, and a new phone-output
+sink starts only after its actual callback rate/channel format matches the
+negotiated format. Capture or format failure follows local cleanup and restores
+computer output.
+
+The Receiver keeps its listener for at most 30 seconds after disconnect so the
+host can recover with a fresh authenticated session. This does not cover loss
+of USB provisioning or an unavailable service. The only current verification
+for this backend is local compilation and synthetic localhost coverage; real
+USB bootstrap, Android runtime, LAN/hotspot, WASAPI capture, AudioTrack output,
+audible output, and recovery on devices remain NOT_TESTED. No APK was assembled
+or installed during this work.
 
 The receiver checks bounds, version, type, flags, and session identity. The
 Android parser authenticates before checking replay eligibility; the Rust P3

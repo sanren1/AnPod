@@ -101,6 +101,11 @@ final class PairingProtocol {
             return moved;
         }
 
+        BindingMaterial duplicate() {
+            requireOpen();
+            return new BindingMaterial(hostId, receiverId, secret);
+        }
+
         static BindingMaterial decode(byte[] bytes) throws Failure {
             if (bytes.length != BINDING_BYTES || !matches(bytes, 0, BINDING_MAGIC) || bytes[4] != 1)
                 throw new Failure("malformed binding record");
