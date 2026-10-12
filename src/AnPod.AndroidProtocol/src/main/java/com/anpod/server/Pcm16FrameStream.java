@@ -69,8 +69,10 @@ public final class Pcm16FrameStream {
                 return framesPlayed;
             }
             long advance = (current - lastPosition) & HEAD_MASK;
-            if (advance > 0 && advance < MAX_FORWARD_DELTA) framesPlayed += advance;
-            lastPosition = current;
+            if (advance > 0 && advance < MAX_FORWARD_DELTA) {
+                framesPlayed += advance;
+                lastPosition = current;
+            }
             return framesPlayed;
         }
     }

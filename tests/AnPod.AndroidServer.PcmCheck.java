@@ -84,6 +84,12 @@ final class PcmCheck {
                 || Pcm16FrameStream.pendingFrames(100, 150) != 0) {
             throw new AssertionError("AudioTrack pending frames lost pre-roll or unsigned head wrap");
         }
+        Pcm16FrameStream.PlaybackHeadTracker reorderedPlaybackHead = new Pcm16FrameStream.PlaybackHeadTracker();
+        reorderedPlaybackHead.reset(100);
+        if (reorderedPlaybackHead.update(110) != 10 || reorderedPlaybackHead.update(105) != 10
+                || reorderedPlaybackHead.update(120) != 20) {
+            throw new AssertionError("out-of-order AudioTrack head sample was counted more than once");
+        }
         Pcm16FrameStream monoStream = new Pcm16FrameStream(1);
         byte[] monoBuffer = new byte[6];
         if (monoStream.readFrames(new ByteArrayInputStream(new byte[] {1, 2, 3, 4, 5, 6}), monoBuffer,
