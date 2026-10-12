@@ -5,6 +5,7 @@ param(
     [string]$JavaHome,
     [string]$AndroidSdkRoot,
     [string]$OutputDirectory,
+    [string]$DebugKeyStorePath,
     [switch]$Offline
 )
 
@@ -21,9 +22,29 @@ if (-not $AndroidSdkRoot) { $AndroidSdkRoot = $env:ANDROID_HOME }
 if (-not $AndroidSdkRoot -or -not (Test-Path -LiteralPath (Join-Path $AndroidSdkRoot 'platforms\android-35\android.jar'))) {
     throw 'Android SDK Platform 35 is required. Pass -AndroidSdkRoot or set ANDROID_SDK_ROOT.'
 }
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'artifacts\p2-receiver-candidate' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'artifacts\p8-v2-receiver' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $appBuildDirectory = Join-Path $OutputDirectory 'gradle-app-build'
+if ($DebugKeyStorePath) {
+    $DebugKeyStorePath = [IO.Path]::GetFullPath($DebugKeyStorePath)
+    if ($Variant -ne 'debug') { throw '-DebugKeyStorePath is only valid for the debug candidate variant.' }
+    if (-not (Test-Path -LiteralPath $DebugKeyStorePath -PathType Leaf)) { throw 'The selected local candidate keystore was not found.' }
+}
+if ((Test-Path -LiteralPath (Join-Path $OutputDirectory 'receiver.apk')) -or
+        (Test-Path -LiteralPath (Join-Path $OutputDirectory 'receiver.json'))) {
+    throw "Refusing to overwrite an existing Receiver artifact in $OutputDirectory. Choose a fresh isolated output directory."
+}
+
+$appGradle = Get-Content -LiteralPath (Join-Path $project 'app\build.gradle') -Raw
+$applicationId = [regex]::Match($appGradle, "(?m)^\s*applicationId\s+'([^']+)'\s*$").Groups[1].Value
+$configuredVersionCode = [int][regex]::Match($appGradle, '(?m)^\s*versionCode\s+(\d+)\s*$').Groups[1].Value
+$configuredVersionName = [regex]::Match($appGradle, "(?m)^\s*versionName\s+'([^']+)'\s*$").Groups[1].Value
+$configuredTargetSdk = [int][regex]::Match($appGradle, '(?m)^\s*targetSdk\s+(\d+)\s*$').Groups[1].Value
+if ($applicationId -ne 'app.anpod.receiver' -or $configuredVersionCode -ne 3 -or $configuredVersionName -ne '0.3.0-v2-candidate' -or $configuredTargetSdk -ne 35) {
+    throw 'Receiver Gradle configuration must identify the v2 candidate as app.anpod.receiver / 0.3.0-v2-candidate / code 3 / targetSdk 35.'
+}
+$sourceCommit = (& git -C $root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the Receiver source commit.' }
 
 if ($Variant -eq 'release') {
     $requiredSigningVariables = @(
@@ -47,10 +68,16 @@ $buildTools = Get-ChildItem -LiteralPath (Join-Path $AndroidSdkRoot 'build-tools
     Select-Object -First 1
 if (-not $buildTools) { throw 'Android SDK Build-Tools with aapt.exe and apksigner.bat are required.' }
 
+$oldJavaHome = $env:JAVA_HOME
+$oldAndroidHome = $env:ANDROID_HOME
+$oldAndroidSdkRoot = $env:ANDROID_SDK_ROOT
+$oldCandidateDebugKeyStore = $env:ANPOD_RECEIVER_DEBUG_KEYSTORE
+$oldPath = $env:PATH
 $env:JAVA_HOME = [IO.Path]::GetFullPath($JavaHome)
 $env:ANDROID_HOME = [IO.Path]::GetFullPath($AndroidSdkRoot)
 $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
 $env:PATH = (Join-Path $env:JAVA_HOME 'bin') + [IO.Path]::PathSeparator + $env:PATH
+if ($DebugKeyStorePath) { $env:ANPOD_RECEIVER_DEBUG_KEYSTORE = $DebugKeyStorePath }
 
 $task = ":app:assemble$($Variant.Substring(0, 1).ToUpperInvariant())$($Variant.Substring(1))"
 $gradleArgs = @('--no-daemon', '--console', 'plain')
@@ -63,7 +90,14 @@ try {
     & (Join-Path $project 'gradlew.bat') @gradleArgs
     if ($LASTEXITCODE -ne 0) { throw "Receiver Gradle build failed with exit code $LASTEXITCODE." }
 }
-finally { Pop-Location }
+finally {
+    Pop-Location
+    $env:JAVA_HOME = $oldJavaHome
+    $env:ANDROID_HOME = $oldAndroidHome
+    $env:ANDROID_SDK_ROOT = $oldAndroidSdkRoot
+    $env:ANPOD_RECEIVER_DEBUG_KEYSTORE = $oldCandidateDebugKeyStore
+    $env:PATH = $oldPath
+}
 
 $apk = Join-Path $appBuildDirectory "outputs\apk\$Variant\app-$Variant.apk"
 if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) { throw "Gradle did not create the expected APK: $apk" }
@@ -98,10 +132,10 @@ if ('android.permission.ACCESS_LOCAL_NETWORK' -in $permissions) { throw 'Do not 
 $badging = & (Join-Path $buildTools.FullName 'aapt.exe') dump badging $apk
 if ($LASTEXITCODE -ne 0) { throw 'aapt could not inspect the Receiver APK.' }
 $packageLine = $badging | Where-Object { $_ -match '^package:' } | Select-Object -First 1
-if ($packageLine -notmatch "name='app\.anpod\.receiver' versionCode='(?<code>\d+)' versionName='(?<name>[^']+)'") { throw 'APK package identity or version does not match the fixed Receiver application ID.' }
+if ($packageLine -notmatch "name='$([regex]::Escape($applicationId))' versionCode='(?<code>\d+)' versionName='(?<name>[^']+)'") { throw 'APK package identity or version does not match the current Receiver Gradle configuration.' }
 $versionCode = [int]$Matches.code
 $versionName = $Matches.name
-if (($badging -join "`n") -notmatch "targetSdkVersion:'35'") { throw 'P2 Receiver APK must target API 35.' }
+if (($badging -join "`n") -notmatch "targetSdkVersion:'$configuredTargetSdk'") { throw 'Receiver APK target SDK does not match the current Gradle configuration.' }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($apk)
@@ -118,8 +152,9 @@ if ($LASTEXITCODE -ne 0 -or -not $signerMatch.Success) {
 }
 $signerSha256 = $signerMatch.Groups['sha'].Value.ToLowerInvariant()
 $apkSha256 = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
-$expectedVersion = '0.2.0-p2-candidate'
-if ($versionName -ne $expectedVersion -or $versionCode -ne 2) { throw 'P2 candidate build must identify as version 0.2.0-p2-candidate / code 2.' }
+if ($versionName -ne $configuredVersionName -or $versionCode -ne $configuredVersionCode) {
+    throw 'Receiver APK version does not match the v2 candidate Gradle configuration.'
+}
 
 $outputPath = $OutputDirectory
 New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
@@ -129,13 +164,14 @@ $temporaryApk = "$apkDestination.new"
 $temporaryMetadata = "$metadataDestination.new"
 Copy-Item -LiteralPath $apk -Destination $temporaryApk -Force
 $metadata = [ordered]@{
-    applicationId = 'app.anpod.receiver'
+    applicationId = $applicationId
     versionCode = $versionCode
     versionName = $versionName
     variant = $Variant
-    targetSdk = 35
+    targetSdk = $configuredTargetSdk
     sha256 = $apkSha256
     signerSha256 = $signerSha256
+    sourceCommit = $sourceCommit
 }
 $metadataJson = $metadata | ConvertTo-Json
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)

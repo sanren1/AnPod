@@ -311,6 +311,13 @@ different records conflict without replacement. The Rust entry is not
 registered with Tauri IPC. No real-device ADB or Android storage test is
 claimed.
 
+### B13. Shared TCP/USB PCM backlog trim *(P6-B)*
+
+The existing AnPod PCM stream path trims stale queued frames when the consumer
+falls behind and applies a short fade at the trim boundary. This is new AnPod
+code in the shared Android protocol helper; it adds no dependency and does not
+change the Native DLL protocol or the legacy Android service wire format.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.

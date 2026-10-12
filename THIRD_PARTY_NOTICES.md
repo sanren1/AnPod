@@ -89,6 +89,10 @@ are in `src-tauri/Cargo.lock`; no cryptographic implementation source is
 copied into AnPod. Android uses platform JCA, `AtomicFile`, and
 `ParcelFileDescriptor` APIs and adds no Android dependency.
 
+The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
+queue and applies a short fade when trimming backlog. This is AnPod-owned code
+and adds no dependency or change to the Native DLL protocol.
+
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
 .NET 8 application and is not part of the Tauri portable package.

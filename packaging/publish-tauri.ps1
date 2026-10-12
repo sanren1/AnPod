@@ -2,12 +2,14 @@
 param(
     [string]$Version = '1.0.4',
     [switch]$IncludeReceiverCandidate,
-    [ValidateSet('p1', 'p2')]
+    [ValidateSet('p1', 'p2', 'v2')]
     [string]$ReceiverCandidate = 'p1',
     [string]$ReceiverArtifactDirectory,
     [string]$NativeArtifactDirectory,
     [string]$LegacyPayloadDirectory,
-    [string]$RustTargetDirectory
+    [string]$RustTargetDirectory,
+    [string]$AndroidSdkRoot,
+    [switch]$Offline
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,8 +32,12 @@ foreach ($target in @($packageDir, $zipPath)) {
         throw "Refusing to write outside artifacts/: $target"
     }
 }
+if ($IncludeReceiverCandidate -and $ReceiverCandidate -eq 'v2' -and ((Test-Path -LiteralPath $packageDir) -or (Test-Path -LiteralPath $zipPath))) {
+    throw "Refusing to overwrite an existing v2 candidate path: $packageName"
+}
 
-if ($ReceiverCandidate -eq 'p2' -and $IncludeReceiverCandidate) {
+if ($ReceiverCandidate -in @('p2', 'v2') -and $IncludeReceiverCandidate) {
+    if ($ReceiverCandidate -eq 'v2' -and -not $RustTargetDirectory) { throw 'V2 packaging requires an explicit isolated RustTargetDirectory.' }
     if (-not $RustTargetDirectory) { $RustTargetDirectory = 'artifacts\p2-tauri-target' }
     $targetDir = if ([IO.Path]::IsPathRooted($RustTargetDirectory)) { [IO.Path]::GetFullPath($RustTargetDirectory) } else { [IO.Path]::GetFullPath((Join-Path $root $RustTargetDirectory)) }
 } else {
@@ -39,9 +45,10 @@ if ($ReceiverCandidate -eq 'p2' -and $IncludeReceiverCandidate) {
     $targetDir = [System.IO.Path]::GetFullPath($RustTargetDirectory)
 }
 
-$npm = Get-Command npm -ErrorAction SilentlyContinue
+$packageRunner = Get-Command npm -ErrorAction SilentlyContinue
+if (-not $packageRunner) { $packageRunner = Get-Command pnpm -ErrorAction SilentlyContinue }
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-if (-not $npm) { throw 'npm was not found on PATH. Install Node.js.' }
+if (-not $packageRunner) { throw 'Neither npm nor pnpm was found on PATH.' }
 if (-not $cargo) { throw 'cargo was not found on PATH. Install Rust stable 1.90 or newer.' }
 
 $required = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'audio_capture.dll', 'server', 'PLATFORM_TOOLS_NOTICE.txt')
@@ -63,10 +70,54 @@ if ($IncludeReceiverCandidate) {
     if ($ReceiverCandidate -eq 'p2' -and -not $LegacyPayloadDirectory) { throw 'P2 packaging requires an isolated legacy audio payload build.' }
     if ($ReceiverCandidate -eq 'p2' -and $legacyPayloadSource.Equals([IO.Path]::GetFullPath($deps), [StringComparison]::OrdinalIgnoreCase)) { throw 'P2 packaging must not use deps/server.' }
     $missingReceiver = @($receiverFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $receiverSource $_) -PathType Leaf) })
-    if ($missingReceiver.Count) { throw "Receiver candidate needs both files in deps/: $($missingReceiver -join ', ')" }
+    if ($missingReceiver.Count) { throw "Receiver candidate needs both files in the selected artifact directory: $($missingReceiver -join ', ')" }
     if ($ReceiverCandidate -eq 'p2') {
         $receiverMetadata = Get-Content -Raw (Join-Path $receiverSource 'receiver.json') | ConvertFrom-Json
         if ($receiverMetadata.versionName -ne '0.2.0-p2-candidate' -or $receiverMetadata.versionCode -ne 2) { throw 'P2 package requires a version 0.2.0-p2-candidate / code 2 Receiver artifact.' }
+    }
+    if ($ReceiverCandidate -eq 'v2') {
+        foreach ($requiredPath in @($ReceiverArtifactDirectory, $NativeArtifactDirectory, $LegacyPayloadDirectory, $RustTargetDirectory)) {
+            if (-not $requiredPath) { throw 'V2 packaging requires explicit isolated Receiver, Native, Legacy, and Rust target directories.' }
+        }
+        $artifactsPrefix = $artifactsRoot + [IO.Path]::DirectorySeparatorChar
+        foreach ($sourcePath in @($receiverSource, $nativeSource, $legacyPayloadSource, $targetDir)) {
+            if (-not $sourcePath.StartsWith($artifactsPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "V2 artifacts and Rust target must use isolated paths under artifacts/: $([IO.Path]::GetFileName($sourcePath))"
+            }
+        }
+        if (Test-Path -LiteralPath $targetDir) { throw "Refusing to reuse a V2 Rust target directory: $targetDir" }
+
+        $receiverMetadata = Get-Content -Raw (Join-Path $receiverSource 'receiver.json') | ConvertFrom-Json
+        if ($receiverMetadata.applicationId -ne 'app.anpod.receiver' -or $receiverMetadata.versionName -ne '0.3.0-v2-candidate' -or $receiverMetadata.versionCode -ne 3 -or $receiverMetadata.targetSdk -ne 35 -or $receiverMetadata.variant -ne 'debug' -or $receiverMetadata.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $receiverMetadata.signerSha256 -notmatch '^[0-9a-fA-F]{64}$' -or $receiverMetadata.sourceCommit -notmatch '^[0-9a-f]{40}$') {
+            throw 'V2 package requires the isolated v2 Receiver APK metadata: app.anpod.receiver, code 3, targetSdk 35, debug candidate signature, and source commit.'
+        }
+        $actualReceiverHash = (Get-FileHash -LiteralPath (Join-Path $receiverSource 'receiver.apk') -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($receiverMetadata.sha256.ToLowerInvariant() -ne $actualReceiverHash) { throw 'V2 Receiver APK SHA-256 does not match receiver.json.' }
+        $currentSourceCommit = (& git -C $root rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $receiverMetadata.sourceCommit -ne $currentSourceCommit) {
+            throw 'V2 Receiver source commit does not match the current committed source.'
+        }
+
+        if (-not $AndroidSdkRoot) { $AndroidSdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME } }
+        $androidBuildTools = if ($AndroidSdkRoot) {
+            Get-ChildItem -LiteralPath (Join-Path $AndroidSdkRoot 'build-tools') -Directory |
+                Where-Object { (Test-Path -LiteralPath (Join-Path $_.FullName 'aapt.exe')) -and (Test-Path -LiteralPath (Join-Path $_.FullName 'apksigner.bat')) } |
+                Sort-Object { [version]((Get-Content -LiteralPath (Join-Path $_.FullName 'source.properties') | Where-Object { $_ -like 'Pkg.Revision=*' } | Select-Object -First 1) -replace '^Pkg.Revision=', '') } -Descending |
+                Select-Object -First 1
+        }
+        if (-not $androidBuildTools) { throw 'V2 packaging requires Android SDK Build-Tools with aapt.exe and apksigner.bat.' }
+        $apkPath = Join-Path $receiverSource 'receiver.apk'
+        $badging = & (Join-Path $androidBuildTools.FullName 'aapt.exe') dump badging $apkPath
+        if ($LASTEXITCODE -ne 0) { throw 'aapt could not inspect the V2 Receiver APK.' }
+        $packageLine = $badging | Where-Object { $_ -match '^package:' } | Select-Object -First 1
+        if ($packageLine -notmatch "name='app\.anpod\.receiver' versionCode='3' versionName='0\.3\.0-v2-candidate'" -or ($badging -join "`n") -notmatch "targetSdkVersion:'35'") {
+            throw 'V2 Receiver APK identity, version, or target SDK does not match receiver.json.'
+        }
+        $signatureOutput = & (Join-Path $androidBuildTools.FullName 'apksigner.bat') verify --print-certs $apkPath 2>&1
+        $signerMatch = [regex]::Match(($signatureOutput -join "`n"), 'Signer #1 certificate SHA-256 digest: (?<sha>[0-9a-fA-F]{64})')
+        if ($LASTEXITCODE -ne 0 -or -not $signerMatch.Success -or $signerMatch.Groups['sha'].Value.ToLowerInvariant() -ne $receiverMetadata.signerSha256.ToLowerInvariant()) {
+            throw 'V2 Receiver APK signer does not match receiver.json.'
+        }
     }
 }
 $missing = @($required | Where-Object { $source = if ($_ -eq 'audio_capture.dll') { $nativeSource } elseif ($_ -eq 'server') { $legacyPayloadSource } else { $deps }; -not (Test-Path -LiteralPath (Join-Path $source $_) -PathType Leaf) })
@@ -74,7 +125,8 @@ if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ',
 
 Push-Location (Join-Path $root 'frontend')
 try {
-    & $npm.Source run build
+    Write-Host "Building frontend with $($packageRunner.Name)..." -ForegroundColor Cyan
+    & $packageRunner.Source run build
     if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
 }
 finally { Pop-Location }
@@ -96,7 +148,9 @@ try {
     }
     $env:RUSTFLAGS = $oldRustFlags
     $env:CARGO_TARGET_DIR = $targetDir
-    & $cargo.Source build --release --manifest-path (Join-Path $root 'src-tauri\Cargo.toml')
+    $cargoArguments = @('build', '--release', '--locked', '--manifest-path', (Join-Path $root 'src-tauri\Cargo.toml'))
+    if ($Offline) { $cargoArguments += '--offline' }
+    & $cargo.Source @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE." }
 }
 finally {
@@ -131,18 +185,19 @@ if ($IncludeReceiverCandidate) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }
 
-$privatePaths = @($root.ToLowerInvariant(), $root.Replace('\', '/').ToLowerInvariant())
-$scanFiles = @($exe, (Join-Path $nativeSource 'audio_capture.dll'), (Join-Path $legacyPayloadSource 'server'))
-if ($IncludeReceiverCandidate) { $scanFiles += @((Join-Path $receiverSource 'receiver.apk'), (Join-Path $packageDir 'receiver.json')) }
-foreach ($file in $scanFiles) {
-    $bytes = [IO.File]::ReadAllBytes($file)
+$privatePaths = @($root, $root.Replace('\', '/'), $env:USERPROFILE, $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME, $env:JAVA_HOME, $env:CARGO_HOME, $env:RUSTUP_HOME, $env:GRADLE_USER_HOME) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    ForEach-Object { $_.ToLowerInvariant(); $_.Replace('\', '/').ToLowerInvariant() } |
+    Select-Object -Unique
+$prohibitedNames = @('AnPod_plan_v2.md', 'probe', 'keystore', '.jks', '.p12', '.pem', '.key', '.pdb', '.log', 'audio-sample', 'adbkey')
+$packageFiles = @(Get-ChildItem -LiteralPath $packageDir -Recurse -File)
+foreach ($file in $packageFiles) {
+    $relativePath = $file.FullName.Substring($packageDir.Length + 1)
+    if ($prohibitedNames | Where-Object { $relativePath -like "*$_*" }) { throw "Prohibited file in candidate package: $relativePath" }
+    $bytes = [IO.File]::ReadAllBytes($file.FullName)
     $ascii = [Text.Encoding]::ASCII.GetString($bytes).ToLowerInvariant()
     $unicode = [Text.Encoding]::Unicode.GetString($bytes).ToLowerInvariant()
-    if ($privatePaths | Where-Object { $ascii.Contains($_) -or $unicode.Contains($_) }) { throw "Private build path remains embedded in candidate binary: $([IO.Path]::GetFileName($file))" }
-}
-Get-ChildItem -LiteralPath $packageDir -Recurse -File | Where-Object { $_.Extension -in @('.txt', '.md', '.json', '.xml', '.html', '.js', '.css') } | ForEach-Object {
-    $text = [IO.File]::ReadAllText($_.FullName).ToLowerInvariant()
-    if ($privatePaths | Where-Object { $text.Contains($_) }) { throw "Private build path remains in candidate text: $($_.Name)" }
+    if ($privatePaths | Where-Object { $ascii.Contains($_) -or $unicode.Contains($_) }) { throw "Private build path remains in candidate file: $relativePath" }
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -152,6 +207,27 @@ try {
     Get-ChildItem -LiteralPath $sourceRoot -Recurse -File | ForEach-Object {
         $relative = $_.FullName.Substring($sourceRoot.Length + 1) -replace '\\', '/'
         [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $relative, [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+}
+finally { $archive.Dispose() }
+
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+    foreach ($entry in $archive.Entries) {
+        $entryPath = $entry.FullName
+        if ([IO.Path]::IsPathRooted($entryPath) -or $entryPath -match '(^|/)\.\.(/|$)') { throw "Unsafe ZIP entry path: $entryPath" }
+        if ($prohibitedNames | Where-Object { $entryPath -like "*$_*" }) { throw "Prohibited ZIP entry: $entryPath" }
+        if (-not $entryPath) { continue }
+        $entryStream = $entry.Open()
+        $memory = [IO.MemoryStream]::new()
+        try {
+            $entryStream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally { $entryStream.Dispose(); $memory.Dispose() }
+        $ascii = [Text.Encoding]::ASCII.GetString($bytes).ToLowerInvariant()
+        $unicode = [Text.Encoding]::Unicode.GetString($bytes).ToLowerInvariant()
+        if ($privatePaths | Where-Object { $ascii.Contains($_) -or $unicode.Contains($_) }) { throw "Private build path remains in ZIP entry: $entryPath" }
     }
 }
 finally { $archive.Dispose() }
