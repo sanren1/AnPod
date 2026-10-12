@@ -243,3 +243,11 @@
 - 打包器以明确的 `-ReviewPackage -ReuseExistingBuild` 复用已审计 Tauri 产物：Git 检查确认自 `20e42fa` 以来 `src-tauri/`、`frontend/` 未变化，并确认 APK 输入路径也未变化。复用组件的 source commit 未伪造为后续文档/Native 提交。
 - Review ZIP：`artifacts/AnPod-1.0.4-receiver-v2-candidate-review-tauri-win-x64-portable.zip`；SHA-256：`eb3e719b074b4ae5890c9d1cb7374008588200e615cc60dd7483bbb15254bfb2`。Native DLL SHA-256：`eeda608983ef520f281d72c4f0021634b4e87c251ab83dea7f8dcb413068761e`。ZIP 有 30 个条目；递归检查外层 ZIP、Receiver APK 与 Legacy `server` 共展开 50 个 ZIP entry（5 层/个嵌套 ZIP 文件），无私密构建路径、绝对路径或禁止文件名。新增 `aes-gcm`、`getrandom`、`hkdf`、`hmac`、`sha2` 的原始 MIT 文本及 `subtle` 的完整原始 BSD-3-Clause 许可逐字节匹配本地锁定 crates；Apache-2.0 全文随包保留。稳定、P1、P2 包保持原样。
 - 真机安装、P1 升级、USB 授权/绑定、直接网络认证、Receiver 前台服务通知、Android AudioTrack 出声、WASAPI 实际采集、手机强行停止/重启恢复及长时间稳定性均为 **NOT_TESTED**。没有对手机运行 ADB、安装 APK 或播放测试音；本节仅记录本地构建与静态包审计结果。
+
+## P8-C Receiver v2 音频与连接流程候选复核
+
+- 代码 `b914880` 修复低延迟起播预滚动后队列目标为 0 帧的情形：队列在预滚动后至少保留 5 ms 初始余量，仍受现有 20 ms 上限约束。此处只处理已证实的启动缓冲问题，不据此宣称之前的严重卡顿已全部解决。
+- `p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup`：PASS，1/1。本机合成场景以 48 kHz、10 ms 采集块模拟一次 WASAPI 块被切为两个 5 ms UDP 包并批量发送；验证低延迟初始会话、同模式重选不重建、切换均衡时 fresh authenticated session 与旧 PCM queue 清理、新会话从 frame 0 起播，以及后续重新认证。Java helper 在该合并检查中由 JDK 17 编译。该合成不代表真实 WASAPI、无线传输或 AudioTrack 的播放性能。
+- 源码流向核查：首次 `playbackMode` 设置会映射进认证 `AudioParameters`；Receiver 将已认证模式带入 `UdpSessionContext`、播放队列预算和 `AudioTrack` 设置。相同模式调用不触发新 session；不同模式会关闭当前 session、清理旧队列并重新认证。源代码未显示 PCM partial payload 跨会话复用。
+- UI 说明：只有一个选项时自动填入 USB 手机、已配对绑定、网络接口或地址；多项时在“高级选项与诊断”明确选择。发现地址仍仅是提示，连接前必须双向认证；Receiver 服务未启动时可用“USB 启动所选手机”恢复所选手机的服务。
+- 用户报告重选均衡后音质改善属于主观反馈，未做新声学测量。首次断联后无法重连没有复现，重连状态机未修改。真机音频、断线恢复、UI 视觉均为 **NOT_TESTED**；取消的长时间测试继续保持 `CANCELLED_BY_USER`。本轮只做源码与本机合成检查，不使用 ADB 或真实设备。
