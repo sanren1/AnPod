@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, TryLockError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -14,6 +14,8 @@ const PCM_QUEUE_CAPACITY: usize = 8;
 const MAX_CAPTURE_FRAMES: usize = 4096;
 const PCM_CHANNELS: u16 = 2;
 const MAX_JITTER_PACKETS: usize = 4;
+const BALANCED_CAPTURE_QUEUE_MS: u64 = 40;
+const LOW_LATENCY_CAPTURE_QUEUE_MS: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]
 struct PcmBlockInfo {
@@ -21,6 +23,7 @@ struct PcmBlockInfo {
     sample_rate: u32,
     channels: u16,
     frame_index: u64,
+    enqueued_at: Instant,
 }
 
 struct PcmSlot {
@@ -32,6 +35,7 @@ struct QueueState {
     slots: Vec<PcmSlot>,
     head: usize,
     len: usize,
+    queued_frames: u64,
 }
 
 pub struct PcmQueue {
@@ -39,6 +43,7 @@ pub struct PcmQueue {
     wake: Condvar,
     dropped_frames: AtomicU64,
     target_format: Option<PcmFormat>,
+    max_queue_ms: u64,
     stopped: AtomicBool,
 }
 
@@ -47,17 +52,20 @@ impl PcmQueue {
         let samples_per_slot = MAX_CAPTURE_FRAMES * PCM_CHANNELS as usize;
         let slots = (0..PCM_QUEUE_CAPACITY).map(|_| PcmSlot {
             samples: vec![0; samples_per_slot].into_boxed_slice(),
-            info: PcmBlockInfo { frame_count: 0, sample_rate: 0, channels: PCM_CHANNELS, frame_index: 0 },
+            info: PcmBlockInfo { frame_count: 0, sample_rate: 0, channels: PCM_CHANNELS,
+                frame_index: 0, enqueued_at: Instant::now() },
         }).collect();
-        Self { state: Mutex::new(QueueState { slots, head: 0, len: 0 }), wake: Condvar::new(),
-            dropped_frames: AtomicU64::new(0), target_format: None, stopped: AtomicBool::new(false) }
+        Self { state: Mutex::new(QueueState { slots, head: 0, len: 0, queued_frames: 0 }), wake: Condvar::new(),
+            dropped_frames: AtomicU64::new(0), target_format: None,
+            max_queue_ms: BALANCED_CAPTURE_QUEUE_MS, stopped: AtomicBool::new(false) }
     }
 
     pub fn dropped_frames(&self) -> u64 { self.dropped_frames.load(Ordering::Relaxed) }
 
-    pub(crate) fn for_session(format: PcmFormat) -> Self {
+    pub(crate) fn for_session(format: PcmFormat, low_latency: bool) -> Self {
         let mut queue = Self::new();
         queue.target_format = Some(format);
+        queue.max_queue_ms = if low_latency { LOW_LATENCY_CAPTURE_QUEUE_MS } else { BALANCED_CAPTURE_QUEUE_MS };
         queue
     }
 
@@ -68,6 +76,7 @@ impl PcmQueue {
         if let Ok(mut state) = self.state.lock() {
             state.head = 0;
             state.len = 0;
+            state.queued_frames = 0;
             for slot in &mut state.slots { slot.samples.fill(0); }
         }
         self.wake.notify_all();
@@ -75,6 +84,11 @@ impl PcmQueue {
 
     pub(crate) fn push_raw(&self, samples: *const i16, frame_count: u32, sample_rate: u32,
         channels: u16, frame_index: u64) -> bool {
+        self.push_raw_at(samples, frame_count, sample_rate, channels, frame_index, Instant::now())
+    }
+
+    fn push_raw_at(&self, samples: *const i16, frame_count: u32, sample_rate: u32,
+        channels: u16, frame_index: u64, enqueued_at: Instant) -> bool {
         let frames = frame_count as usize;
         let sample_count = frames.checked_mul(channels as usize);
         if self.stopped.load(Ordering::Acquire) || samples.is_null() || sample_rate == 0
@@ -103,10 +117,23 @@ impl PcmQueue {
             Some(format) => format.channels,
             None => channels,
         };
-        let target_count = frames * target_channels as usize;
-        if state.len == PCM_QUEUE_CAPACITY {
-            let stale = &state.slots[state.head].info;
-            self.add_dropped(stale.frame_count as u64);
+        let max_queued_frames = (sample_rate as u64 * self.max_queue_ms / 1000).max(1);
+        let kept_frames = (frames as u64).min(max_queued_frames) as usize;
+        let skipped_frames = frames - kept_frames;
+        let Some(kept_frame_index) = frame_index.checked_add(skipped_frames as u64) else {
+            self.add_dropped(frame_count as u64);
+            return false;
+        };
+        self.add_dropped(skipped_frames as u64);
+        while state.len > 0 {
+            let oldest = state.slots[state.head].info;
+            if oldest.enqueued_at.elapsed() <= Duration::from_millis(self.max_queue_ms)
+                && state.len < PCM_QUEUE_CAPACITY
+                && state.queued_frames + kept_frames as u64 <= max_queued_frames {
+                break;
+            }
+            state.queued_frames -= oldest.frame_count as u64;
+            self.add_dropped(oldest.frame_count as u64);
             state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
             state.len -= 1;
         }
@@ -115,18 +142,22 @@ impl PcmQueue {
         // The native pointer is borrowed only for this callback. Copy directly
         // into the slot allocated when the session queue was created.
         let source = unsafe { std::slice::from_raw_parts(samples, sample_count) };
+        let source = &source[skipped_frames * channels as usize..];
+        let kept_sample_count = kept_frames * target_channels as usize;
         match (channels, target_channels) {
-            (1, 2) => for (frame, mono) in source.iter().enumerate() {
+            (1, 2) => for (frame, mono) in source.iter().take(kept_frames).enumerate() {
                 slot.samples[frame * 2] = *mono;
                 slot.samples[frame * 2 + 1] = *mono;
             },
-            (2, 1) => for frame in 0..frames {
+            (2, 1) => for frame in 0..kept_frames {
                 slot.samples[frame] = ((source[frame * 2] as i32 + source[frame * 2 + 1] as i32) / 2) as i16;
             },
-            _ => slot.samples[..target_count].copy_from_slice(source),
+            _ => slot.samples[..kept_sample_count].copy_from_slice(&source[..kept_sample_count]),
         }
-        slot.info = PcmBlockInfo { frame_count, sample_rate, channels: target_channels, frame_index };
+        slot.info = PcmBlockInfo { frame_count: kept_frames as u32, sample_rate, channels: target_channels,
+            frame_index: kept_frame_index, enqueued_at };
         state.len += 1;
+        state.queued_frames += kept_frames as u64;
         drop(state);
         self.wake.notify_one();
         true
@@ -138,19 +169,25 @@ impl PcmQueue {
 
     fn pop_wait(&self, stopping: &AtomicBool, scratch: &mut Vec<i16>) -> Option<PcmBlockInfo> {
         let mut state = self.state.lock().ok()?;
-        while state.len == 0 && !stopping.load(Ordering::Acquire) {
-            state = self.wake.wait_timeout(state, Duration::from_millis(20)).ok()?.0;
+        loop {
+            while state.len == 0 && !stopping.load(Ordering::Acquire) {
+                state = self.wake.wait_timeout(state, Duration::from_millis(20)).ok()?.0;
+            }
+            if stopping.load(Ordering::Acquire) || state.len == 0 { return None; }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
         }
-        if stopping.load(Ordering::Acquire) || state.len == 0 { return None; }
-        let index = state.head;
-        let slot = &state.slots[index];
-        let sample_count = slot.info.frame_count as usize * slot.info.channels as usize;
-        scratch.clear();
-        scratch.extend_from_slice(&slot.samples[..sample_count]);
-        let info = slot.info;
-        state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
-        state.len -= 1;
-        Some(info)
     }
 
     fn wake_worker(&self) { self.wake.notify_all(); }
@@ -284,6 +321,10 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
         if samples.len() != frames * info.channels as usize { continue; }
         let mut offset_frames = 0;
         while offset_frames < frames {
+            if info.enqueued_at.elapsed() > Duration::from_millis(queue.max_queue_ms) {
+                queue.add_dropped((frames - offset_frames) as u64);
+                break;
+            }
             let packet_frames = frames_per_packet.min(frames - offset_frames);
             let sample_offset = offset_frames * info.channels as usize;
             let sample_end = sample_offset + packet_frames * info.channels as usize;
@@ -418,7 +459,7 @@ mod tests {
 
     #[test]
     fn session_queue_discards_audio_that_does_not_match_negotiated_format() {
-        let queue = PcmQueue::for_session(PcmFormat { sample_rate: 48_000, channels: 2 });
+        let queue = PcmQueue::for_session(PcmFormat { sample_rate: 48_000, channels: 2 }, false);
         let samples = vec![0i16; 480 * 2];
         assert!(!queue.push_raw(samples.as_ptr(), 480, 44_100, 2, 0));
         assert_eq!(queue.len(), 0);
@@ -486,4 +527,70 @@ mod tests {
             .encode_at(12, PacketType::Audio, 3360, &pcm_payload).unwrap();
         assert_eq!(receiver.ingest(&wrong_session), Err(ProtocolError::WrongSession));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn verify_capture_queue_bounds() {
+    let format = PcmFormat { sample_rate: 48_000, channels: 2 };
+    let samples: Vec<i16> = (0..MAX_CAPTURE_FRAMES)
+        .flat_map(|frame| [(frame + 10) as i16; 2])
+        .collect();
+    let queue = Arc::new(PcmQueue::for_session(format, false));
+    assert!(queue.push_raw(samples.as_ptr(), MAX_CAPTURE_FRAMES as u32, 48_000, 2, 10));
+    {
+        let state = queue.state.lock().unwrap();
+        let info = state.slots[state.head].info;
+        let kept_frames = 48_000 * BALANCED_CAPTURE_QUEUE_MS as usize / 1000;
+        assert_eq!(state.queued_frames, kept_frames as u64);
+        assert_eq!(info.frame_count as usize, kept_frames);
+        assert_eq!(info.frame_index, 10 + MAX_CAPTURE_FRAMES as u64 - kept_frames as u64);
+    }
+    let material = UdpSessionMaterial::generate().unwrap();
+    let key = material.key;
+    let session_id = material.session_id;
+    let receiver_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver_socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let sender = UdpSender::spawn(receiver_socket.local_addr().unwrap(), queue.clone(), material, format).unwrap();
+    let mut decoder = PacketDecoder::new(&key, session_id, HOST_TO_RECEIVER);
+    let mut datagram = [0; MAX_DATAGRAM_LEN + 1];
+    let (length, _) = receiver_socket.recv_from(&mut datagram).unwrap();
+    let decoded = decoder.open(&datagram[..length]).unwrap();
+    assert_eq!(decoded.header.packet_type, PacketType::Format);
+    decoder.commit(decoded.header.sequence);
+    let kept_frames = 48_000 * BALANCED_CAPTURE_QUEUE_MS as usize / 1000;
+    let first_frame = 10 + MAX_CAPTURE_FRAMES as u64 - kept_frames as u64;
+    for index in 0..kept_frames / 240 {
+        let (length, _) = receiver_socket.recv_from(&mut datagram).unwrap();
+        let packet = decoder.open(&datagram[..length]).unwrap();
+        assert_eq!(packet.header.packet_type, PacketType::Audio);
+        assert_eq!(packet.header.sample_frame_index, first_frame + index as u64 * 240);
+        assert_eq!(packet.payload.len(), 960);
+        assert_eq!(i16::from_le_bytes([packet.payload[0], packet.payload[1]]),
+            (first_frame + index as u64 * 240) as i16);
+        decoder.commit(packet.header.sequence);
+    }
+    let stats = sender.stop().unwrap();
+    assert_eq!(stats.packets_sent, 1 + (kept_frames / 240) as u64);
+    assert_eq!(stats.pcm_payload_bytes_sent, (kept_frames * 4) as u64);
+    assert_eq!(queue.dropped_frames(), (MAX_CAPTURE_FRAMES - kept_frames) as u64);
+
+    let stale_queue = Arc::new(PcmQueue::for_session(format, false));
+    assert!(stale_queue.push_raw_at(samples.as_ptr(), 240, 48_000, 2, 900,
+        Instant::now() - Duration::from_millis(BALANCED_CAPTURE_QUEUE_MS + 10)));
+    let stale_material = UdpSessionMaterial::generate().unwrap();
+    let stale_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    stale_socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stale_sender = UdpSender::spawn(stale_socket.local_addr().unwrap(), stale_queue.clone(), stale_material, format).unwrap();
+    let mut received_format = [0u8; MAX_DATAGRAM_LEN + 1];
+    let (length, _) = stale_socket.recv_from(&mut received_format).unwrap();
+    assert_eq!(length, 57);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while stale_queue.dropped_frames() != 240 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(stale_queue.dropped_frames(), 240, "expired capture audio was not dropped before UDP send");
+    let stale_stats = stale_sender.stop().unwrap();
+    assert_eq!(stale_stats.packets_sent, 1);
+    assert_eq!(stale_stats.pcm_payload_bytes_sent, 0);
+    assert_eq!(stale_queue.dropped_frames(), 240);
 }

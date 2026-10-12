@@ -440,6 +440,16 @@ it had already taken when the pause boundary changes. No UDP control packet or
 default listener is implemented. This does not claim one-way latency or
 real-time performance.
 
+The native capture handoff is bounded by frames and local monotonic age: at
+most 20 ms in low-latency mode or 40 ms in balanced mode. If one capture block
+is larger than that frame budget, it keeps the newest tail and advances its
+sample frame index by the discarded prefix. Older queued blocks are evicted
+first, and the sender checks age again before each datagram; discarded frames
+are included in the queue counter. Android's network jitter reserve starts at
+5 ms / 15 ms and may grow on AudioTrack underruns up to 20 ms / 40 ms. That
+reserve is independent of AudioTrack's own buffer and startup pre-roll; these
+values are tuning bounds, not an end-to-end latency budget.
+
 ## Cross-language vector
 
 The Rust test `protocol::tests::java_jca_aes_gcm_vector` and

@@ -34,7 +34,6 @@ final class UdpPcmQueue {
     private QueueInputStream activePayloadStream;
     private long trackUnderruns = -1;
     private long stableSinceNanos;
-    private int trackPreRollFrames;
     private int initialTargetFrames;
     private int targetFrames;
     private int maxTargetFrames;
@@ -60,13 +59,14 @@ final class UdpPcmQueue {
         lowLatency = "lowlatency".equalsIgnoreCase(playbackMode);
         if (expectedParameters != null) {
             format = new UdpPacketDecoder.Format(expectedParameters.sampleRate, expectedParameters.channels);
-            updateBudget(expectedParameters.sampleRate, 0);
+            updateBudget(expectedParameters.sampleRate);
         }
     }
 
     synchronized void configureAudioTrack(int preRollFrames) {
         if (format == null) return;
-        updateBudget(format.sampleRate, Math.max(0, preRollFrames));
+        // AudioTrack pre-roll is a separate device buffer, not part of this network jitter budget.
+        updateBudget(format.sampleRate);
         targetFrames = initialTargetFrames;
         updateWaitBudget();
         stableSinceNanos = System.nanoTime();
@@ -115,7 +115,7 @@ final class UdpPcmQueue {
             decoder.commit(packet.sequence);
             if (format != null) return;
             format = acceptedFormat;
-            updateBudget(format.sampleRate, trackPreRollFrames);
+            updateBudget(format.sampleRate);
             stableSinceNanos = System.nanoTime();
             notifyAll();
             return;
@@ -276,21 +276,14 @@ final class UdpPcmQueue {
         notifyAll();
     }
 
-    private void updateBudget(int sampleRate, int preRollFrames) {
+    private void updateBudget(int sampleRate) {
         if (sampleRate <= 0) return;
         int initialMs = lowLatency ? LOW_LATENCY_INITIAL_MS : BALANCED_INITIAL_MS;
         int maxMs = lowLatency ? LOW_LATENCY_MAX_MS : BALANCED_MAX_MS;
-        int initialTotalFrames = Math.max(1, sampleRate * initialMs / 1000);
-        int maxTotalFrames = Math.max(initialTotalFrames, sampleRate * maxMs / 1000);
-        trackPreRollFrames = Math.max(0, preRollFrames);
-        initialTargetFrames = Math.max(0, initialTotalFrames - trackPreRollFrames);
-        maxTargetFrames = Math.max(initialTargetFrames, maxTotalFrames - trackPreRollFrames);
-        if (lowLatency && trackPreRollFrames > 0) {
-            initialTargetFrames = Math.min(maxTargetFrames,
-                    Math.max(initialTargetFrames, sampleRate * 5 / 1000));
-        }
+        initialTargetFrames = Math.max(1, sampleRate * initialMs / 1000);
+        maxTargetFrames = Math.max(initialTargetFrames, sampleRate * maxMs / 1000);
         targetFrames = Math.min(Math.max(targetFrames, initialTargetFrames), maxTargetFrames);
-        maxQueuedFrames = maxTotalFrames;
+        maxQueuedFrames = maxTargetFrames;
         maxPacketAgeNanos = maxMs * 1_000_000L;
         updateWaitBudget();
     }

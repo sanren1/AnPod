@@ -28,6 +28,7 @@ public final class P5cLoopbackEndpoint {
         verifyFragmentedControlFrame();
         verifyHeartbeatDeadline();
         verifyAuthenticatedParametersQueueWithoutFormat();
+        verifyQueueAgeBurstAndLayeredBudget();
         verifyPlaybackActivityWindow();
         if (Arrays.asList(args).contains("--self-check-only")) {
             System.out.println("P5-C queue and playback activity checks passed.");
@@ -257,6 +258,62 @@ public final class P5cLoopbackEndpoint {
             throw new AssertionError("playback activity leaked across audio sessions");
     }
 
+    private static void verifyQueueAgeBurstAndLayeredBudget() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
+        UdpPcmQueue budget = new UdpPcmQueue(parameters);
+        budget.configureAudioTrack(3_840);
+        if (budget.targetFrames() != 720)
+            throw new AssertionError("80 ms AudioTrack pre-roll consumed the 15 ms network jitter target");
+        budget.reportTrackUnderruns(0);
+        budget.reportTrackUnderruns(100);
+        if (budget.targetFrames() != 1_920)
+            throw new AssertionError("balanced network jitter target did not retain its independent 40 ms ceiling");
+        budget.stop();
+
+        byte[] key = repeated((byte) 0x6a, 32);
+        long sessionId = 0x1020304050607080L;
+        UdpPcmQueue queue = new UdpPcmQueue(parameters);
+        UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
+        try {
+            long receivedAt = System.nanoTime();
+            byte[] small = encodeUdp(key, sessionId, 1, 0, UdpPacketDecoder.AUDIO,
+                    pcmPayloadValue(120, (short) 0x1111));
+            queue.acceptAt(decoder.open(small, small.length), decoder, receivedAt);
+            byte[] medium = encodeUdp(key, sessionId, 2, 120, UdpPacketDecoder.AUDIO,
+                    pcmPayloadValue(240, (short) 0x2222));
+            queue.acceptAt(decoder.open(medium, medium.length), decoder, receivedAt + 1);
+            byte[] large = encodeUdp(key, sessionId, 3, 360, UdpPacketDecoder.AUDIO,
+                    pcmPayloadValue(240, (short) 0x3333));
+            queue.acceptAt(decoder.open(large, large.length), decoder, receivedAt + 2);
+            queue.expireStalePackets(receivedAt + 41_000_003L);
+            if (queue.size() != 0 || queue.droppedFrames() != 600 || queue.expiredFrames() != 600)
+                throw new AssertionError("stalled playback did not expire variable-size old audio by exact frame count");
+
+            byte[] fresh = encodeUdp(key, sessionId, 4, 600, UdpPacketDecoder.AUDIO,
+                    pcmPayloadValue(240, (short) 0x1234));
+            queue.accept(decoder.open(fresh, fresh.length), decoder);
+            InputStream pcm = queue.asPcmInputStream();
+            DataInputStream pcmInput = new DataInputStream(pcm);
+            byte[] header = new byte[8];
+            pcmInput.readFully(header);
+            byte[] first = new byte[960];
+            pcmInput.readFully(first);
+
+            byte[] afterGap = encodeUdp(key, sessionId, 5, 1_080, UdpPacketDecoder.AUDIO,
+                    pcmPayloadValue(240, (short) 0x1234));
+            queue.accept(decoder.open(afterGap, afterGap.length), decoder);
+            byte[] recovered = new byte[960];
+            pcmInput.readFully(recovered);
+            if (littleShort(recovered, 0) == 0x1234 || littleShort(recovered, 600) != 0x1234)
+                throw new AssertionError("burst gap was not faded into the newest packet");
+            pcm.close();
+        } finally {
+            queue.stop();
+            decoder.destroy();
+            Arrays.fill(key, (byte) 0);
+        }
+    }
+
     private static byte[] encodeUdp(byte[] key, long sessionId, long sequence, long frameIndex,
             int type, byte[] payload) throws Exception {
         byte[] header = ByteBuffer.allocate(UdpPacketDecoder.HEADER_BYTES).order(ByteOrder.BIG_ENDIAN)
@@ -280,6 +337,15 @@ public final class P5cLoopbackEndpoint {
         for (int i = 0; i < payload.length; i += 2) {
             payload[i] = 0x34;
             payload[i + 1] = 0x12;
+        }
+        return payload;
+    }
+
+    private static byte[] pcmPayloadValue(int frames, short sample) {
+        byte[] payload = new byte[frames * 4];
+        for (int i = 0; i < payload.length; i += 2) {
+            payload[i] = (byte) sample;
+            payload[i + 1] = (byte) (sample >>> 8);
         }
         return payload;
     }

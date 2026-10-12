@@ -207,7 +207,7 @@ impl HostSession {
             udp_socket: Some(udp_socket),
             sender: None,
             pcm_payload_bytes_sent,
-            queue: Arc::new(PcmQueue::for_session(format)),
+            queue: Arc::new(PcmQueue::for_session(format, authenticated_parameters.mode == 1)),
             keys: session_keys,
             parameters: authenticated_parameters,
             session_id,
@@ -1239,6 +1239,7 @@ mod tests {
 
     #[test]
     fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
+        crate::network::verify_capture_queue_bounds();
         let classes = compile_java_endpoint();
         rejected_handshake(&classes, false);
         rejected_handshake(&classes, true);
