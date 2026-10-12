@@ -280,6 +280,15 @@ impl HostSession {
     }
 
     pub(crate) fn start(&mut self) -> Result<(), String> {
+        self.start_with_format(true)
+    }
+
+    #[cfg(test)]
+    fn start_without_format_for_test(&mut self) -> Result<(), String> {
+        self.start_with_format(false)
+    }
+
+    fn start_with_format(&mut self, send_format: bool) -> Result<(), String> {
         if self.state != ReceiverState::TransportConnected || self.sender.is_some() {
             return Err("P5-C START is out of order.".into());
         }
@@ -293,8 +302,13 @@ impl HostSession {
                 .try_clone().map_err(|_| "Unable to transfer the authenticated UDP socket.".to_string())?;
             let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
             let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
-            self.sender = Some(UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
-                material, self.parameters, self.pcm_payload_bytes_sent.clone())?);
+            self.sender = Some(if send_format {
+                UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
+                    material, self.parameters, self.pcm_payload_bytes_sent.clone())?
+            } else {
+                UdpSender::spawn_authenticated_without_format_for_test(remote, self.queue.clone(), socket,
+                    material, self.parameters, self.pcm_payload_bytes_sent.clone())?
+            });
             Ok(())
         })();
         if let Err(error) = result {
@@ -434,6 +448,21 @@ impl HostSession {
         let sent = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
             .send_to(&frame, remote).map_err(|_| "unable to send old-session packet")?;
         if sent != frame.len() { return Err("old-session datagram send was incomplete".into()); }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn send_format_packet_for_test(&self, sample_rate: u32) -> Result<(), String> {
+        let payload = PcmFormat { sample_rate, channels: self.parameters.channels as u16 }
+            .encode().map_err(|_| "invalid synthetic test format")?;
+        let mut encoder = PacketEncoder::with_sequence(&self.keys.audio, self.session_id,
+            HOST_TO_RECEIVER, 0);
+        let packet = encoder.encode_next(PacketType::Format, 0, &payload)
+            .map_err(|_| "unable to encode synthetic FORMAT")?;
+        let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
+        let sent = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
+            .send_to(&packet, remote).map_err(|_| "unable to send synthetic FORMAT")?;
+        if sent != packet.len() { return Err("synthetic FORMAT datagram send was incomplete".into()); }
         Ok(())
     }
 
@@ -1130,31 +1159,31 @@ mod tests {
     }
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, false, false, false)
+        spawn_endpoint_mode(classes, false, false, false, false, false, false)
     }
 
     fn spawn_endpoint_until_disconnect(classes: &Path, fail_resume: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, fail_resume, false, false, false)
+        spawn_endpoint_mode(classes, true, fail_resume, false, false, false, false)
     }
 
     fn spawn_discoverable_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, true, false, false)
+        spawn_endpoint_mode(classes, false, false, true, false, false, true)
     }
 
     fn spawn_mode_switch_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, true, false, true)
+        spawn_endpoint_mode(classes, false, false, true, false, true, false)
     }
 
     fn spawn_persistent_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, false, true, false, false)
+        spawn_endpoint_mode(classes, true, false, true, false, false, false)
     }
 
     fn spawn_stop_ack_drop_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, false, true, false)
+        spawn_endpoint_mode(classes, false, false, false, true, false, false)
     }
 
     fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool,
-        stop_ack_drop: bool, verify_mode_switch: bool)
+        stop_ack_drop: bool, verify_mode_switch: bool, verify_audio_window: bool)
         -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         let (_, java) = java_paths();
         let mut command = Command::new(java);
@@ -1164,6 +1193,7 @@ mod tests {
         if discoverable { command.arg("--discovery"); }
         if stop_ack_drop { command.arg("--stop-ack-drop"); }
         if verify_mode_switch { command.arg("--verify-mode-switch"); }
+        if verify_audio_window { command.arg("--verify-audio-window"); }
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut stdout = stdout;
@@ -1273,7 +1303,7 @@ mod tests {
             sample_rate: 48_000, channels: 2, mode: 0,
         }).unwrap();
         assert_eq!(host.state(), ReceiverState::TransportConnected);
-        host.start().unwrap();
+        host.start_without_format_for_test().unwrap();
         assert_eq!(host.state(), ReceiverState::ReceiverRunning);
         host.resend_last_for_test().unwrap();
         host.send_old_audio_for_test().unwrap();
@@ -1287,6 +1317,11 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(state, ReceiverState::Streaming, "streaming follows synthetic PCM sink output");
+        host.send_format_packet_for_test(44_100).unwrap();
+        host.send_format_packet_for_test(48_000).unwrap();
+        host.send_format_packet_for_test(48_000).unwrap();
+        assert_eq!(host.heartbeat().unwrap(), ReceiverState::ReceiverRunning,
+            "stale playback activity must return to waiting while authenticated control remains alive");
         host.pause().unwrap();
         assert_eq!(host.state(), ReceiverState::Paused);
         host.resume().unwrap();

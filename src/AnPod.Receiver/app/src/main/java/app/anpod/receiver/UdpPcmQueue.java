@@ -20,6 +20,8 @@ final class UdpPcmQueue {
     private final PairingProtocol.AudioParameters expectedParameters;
     private final boolean lowLatency;
     private UdpPacketDecoder.Format format;
+    private volatile boolean hasAuthenticatedAudio;
+    private volatile long lastAuthenticatedAudioAtNanos;
     private boolean paused;
     private boolean stopped;
     private IOException failure;
@@ -56,7 +58,10 @@ final class UdpPcmQueue {
     UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters, String playbackMode) {
         this.expectedParameters = expectedParameters;
         lowLatency = "lowlatency".equalsIgnoreCase(playbackMode);
-        if (expectedParameters != null) updateBudget(expectedParameters.sampleRate, 0);
+        if (expectedParameters != null) {
+            format = new UdpPacketDecoder.Format(expectedParameters.sampleRate, expectedParameters.channels);
+            updateBudget(expectedParameters.sampleRate, 0);
+        }
     }
 
     synchronized void configureAudioTrack(int preRollFrames) {
@@ -98,13 +103,17 @@ final class UdpPcmQueue {
             throws UdpPacketDecoder.ProtocolException {
         if (stopped) throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.AUDIO);
         if (packet.type == UdpPacketDecoder.FORMAT) {
-            if (format != null || packet.sequence != 0)
+            if (packet.sequence != 0)
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
             UdpPacketDecoder.Format acceptedFormat = UdpPacketDecoder.decodeFormat(packet);
             if (expectedParameters != null && (acceptedFormat.sampleRate != expectedParameters.sampleRate
                     || acceptedFormat.channels != expectedParameters.channels))
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
+            if (format != null && (acceptedFormat.sampleRate != format.sampleRate
+                    || acceptedFormat.channels != format.channels))
+                throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
             decoder.commit(packet.sequence);
+            if (format != null) return;
             format = acceptedFormat;
             updateBudget(format.sampleRate, trackPreRollFrames);
             stableSinceNanos = System.nanoTime();
@@ -112,7 +121,7 @@ final class UdpPcmQueue {
             return;
         }
 
-        if (packet.type != UdpPacketDecoder.AUDIO || format == null || packet.payload.length == 0)
+        if (packet.type != UdpPacketDecoder.AUDIO || packet.sequence == 0 || format == null || packet.payload.length == 0)
             throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
         int frameBytes = format.channels * 2;
         if (packet.payload.length % frameBytes != 0)
@@ -123,6 +132,8 @@ final class UdpPcmQueue {
             throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
 
         decoder.commit(packet.sequence);
+        lastAuthenticatedAudioAtNanos = now;
+        hasAuthenticatedAudio = true;
         if (paused) {
             droppedFrames += frameCount;
             advancePlayoutFrame(frameEnd);
@@ -517,6 +528,8 @@ final class UdpPcmQueue {
     synchronized long expiredFrames() { return expiredFrames; }
     synchronized int targetFrames() { return targetFrames; }
     synchronized UdpPacketDecoder.Format format() { return format; }
+    boolean hasAuthenticatedAudio() { return hasAuthenticatedAudio; }
+    long lastAuthenticatedAudioAtNanos() { return lastAuthenticatedAudioAtNanos; }
 
     InputStream asPcmInputStream() { return new QueueInputStream(this); }
 
@@ -621,5 +634,55 @@ final class UdpPcmQueue {
             target[offset] = (byte) value;
             target[offset + 1] = (byte) (value >>> 8);
         }
+    }
+}
+
+/** Per-session evidence that AudioTrack is consuming recently received and written PCM. */
+final class UdpPlaybackActivity {
+    private static final long ACTIVE_WINDOW_NANOS = 2_000_000_000L;
+    private static final long HEAD_MASK = 0xffff_ffffL;
+    private static final long MAX_FORWARD_DELTA = 0x8000_0000L;
+
+    private boolean hasPlaybackHead;
+    private long lastPlaybackHead;
+    private boolean hasHeadAdvance;
+    private long lastHeadAdvanceAtNanos;
+    private volatile boolean hasSuccessfulWrite;
+    private volatile long lastSuccessfulWriteAtNanos;
+
+    void resetPlaybackHead(int position) {
+        hasPlaybackHead = true;
+        lastPlaybackHead = Integer.toUnsignedLong(position);
+        hasHeadAdvance = false;
+    }
+
+    void noteSuccessfulWrite(long nowNanos) {
+        lastSuccessfulWriteAtNanos = nowNanos;
+        hasSuccessfulWrite = true;
+    }
+
+    synchronized boolean isActive(long nowNanos, int playbackHeadPosition,
+            boolean hasReceivedAudio, long lastReceivedAudioAtNanos, boolean paused) {
+        long position = Integer.toUnsignedLong(playbackHeadPosition);
+        if (!hasPlaybackHead) {
+            hasPlaybackHead = true;
+            lastPlaybackHead = position;
+        } else {
+            long advance = (position - lastPlaybackHead) & HEAD_MASK;
+            if (advance > 0 && advance < MAX_FORWARD_DELTA) {
+                lastHeadAdvanceAtNanos = nowNanos;
+                hasHeadAdvance = true;
+            }
+            lastPlaybackHead = position;
+        }
+        return !paused && hasReceivedAudio && hasSuccessfulWrite && hasHeadAdvance
+                && isRecent(nowNanos, lastReceivedAudioAtNanos)
+                && isRecent(nowNanos, lastSuccessfulWriteAtNanos)
+                && isRecent(nowNanos, lastHeadAdvanceAtNanos);
+    }
+
+    private static boolean isRecent(long nowNanos, long activityAtNanos) {
+        long age = nowNanos - activityAtNanos;
+        return age >= 0 && age <= ACTIVE_WINDOW_NANOS;
     }
 }

@@ -219,8 +219,13 @@ stopped (5). ACK has its own receiver-to-host sequence and HMAC.
 Audio remains the existing ANPD v1 UDP datagram: 34-byte authenticated header,
 PCM16LE payload, AES-GCM tag, and the negotiated P5-A session ID. The sender
 uses the P5-A host-to-receiver audio key. The receiver uses that same derived
-direction key and accepts FORMAT only when sample rate and channel count equal
-the authenticated parameters; later PCM payloads must be aligned to that format.
+direction key. Authenticated P5-A sample rate and channel count initialize the
+production receiver's PCM format and stream header, so playback does not depend
+on receiving the sender's one-time FORMAT packet. If FORMAT arrives, it must
+use sequence zero and match those authenticated parameters; a mismatch is
+dropped without changing replay state or playback, and a matching late FORMAT
+does not restart the queue or stream header. AUDIO sequence zero is invalid;
+later PCM payloads must be aligned to the authenticated format.
 Both balanced and low-latency modes use the existing 5 ms target for UDP
 packetization, bounded further by the 1200-byte datagram limit. Mode selection
 does not claim a transport packetization or performance difference; it passes
@@ -232,10 +237,13 @@ session keys/context, and does not reconnect.
 
 TransportConnected means authentication and BIND completed. ReceiverRunning
 means the controlled playback endpoint reports successful start. Streaming
-means that endpoint reports a PCM write/output callback; neither READY, a
-received UDP packet, nor queued PCM alone means Streaming or audible output.
-Only an authenticated HEARTBEAT can refresh receiver liveness or return a newer
-playback state. A heartbeat deadline is checked from local monotonic time.
+means the endpoint recently received valid session audio, successfully wrote
+PCM, and observed AudioTrack's playback head advance within its activity window.
+This receiver activity state is not proof of audible output. Waiting for PCM or
+a paused session stays on the live control path as ReceiverRunning or paused;
+it is not an audio-session failure. Only an authenticated HEARTBEAT can refresh
+receiver liveness or return a newer playback state. A heartbeat deadline is
+checked from local monotonic time.
 Unknown commands, invalid control state transitions, bad control identity or
 authentication, replay, and sequence failures terminate or reject the control
 operation and never claim that the Receiver is running. Invalid UDP datagrams
@@ -276,7 +284,8 @@ the next authenticated START. A failed PAUSE/RESUME does not claim the requested
 state was applied. `SessionSnapshot` distinguishes
 authenticated, transport-connected, receiver-running, streaming, paused,
 reconnecting, and stopped; streaming still comes only from the authenticated
-receiver's PCM output callback reflected by a heartbeat ACK.
+receiver's recent receive/write/playback-head activity reflected by a heartbeat
+ACK.
 
 Explicit owner stop disables recovery and asks the owner thread to send the
 authenticated STOP when it is between I/O operations. If that does not finish

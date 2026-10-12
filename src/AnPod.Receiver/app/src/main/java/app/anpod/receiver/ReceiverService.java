@@ -334,7 +334,7 @@ public final class ReceiverService extends Service {
                             ? "NetworkAudioWorkerFailed" : networkAudioFailure);
                     AudioSession session = ownedSession;
                     if (session == null || currentAudio != session) throw new IOException("NetworkAudioSessionNoLongerOwned");
-                    boolean streaming = PCM_BYTES_WRITTEN.get() > 0;
+                    boolean streaming = session.isStreamingAt(System.nanoTime());
                     if (streaming) networkAudioState = "streaming";
                     else if (session != null && currentAudio == session && "streaming".equals(networkAudioState)) networkAudioState = "receiverRunning";
                     return streaming;
@@ -507,6 +507,7 @@ public final class ReceiverService extends Service {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
                     track = builder.build();
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("AudioTrack initialization failed");
+                    session.audioTrack = track;
                     capacityFrames = Build.VERSION.SDK_INT >= 24
                             ? track.getBufferCapacityInFrames() : track.getBufferSizeInFrames();
                     if ("lowlatency".equalsIgnoreCase(session.request.playbackMode)) {
@@ -587,6 +588,8 @@ public final class ReceiverService extends Service {
                     ensureRunning(session);
                     track.play();
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) throw new IOException("AudioTrack did not start");
+                    session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+                    session.trackPlaying = true;
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) audioActive = true;
                     }
@@ -613,6 +616,8 @@ public final class ReceiverService extends Service {
         } catch (IOException | RuntimeException error) {
             failure = session.cancelled ? session.stopReason : describeFailure(error);
         } finally {
+            session.trackPlaying = false;
+            if (session.audioTrack == track) session.audioTrack = null;
             String trackReleaseFailure = releaseTrack(track);
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
@@ -661,7 +666,10 @@ public final class ReceiverService extends Service {
                 ensureRunning(session);
                 int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
                 if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
-                if (session.request.udpContext != null) PCM_BYTES_WRITTEN.addAndGet(written);
+                if (session.request.udpContext != null) {
+                    PCM_BYTES_WRITTEN.addAndGet(written);
+                    session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+                }
                 return written;
             }
         }, buffer, count);
@@ -843,13 +851,32 @@ public final class ReceiverService extends Service {
         volatile LocalSocket socket;
         volatile UdpReceiver udpReceiver;
         volatile UdpPcmQueue udpQueue;
-        boolean udpPaused;
+        final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
+        volatile AudioTrack audioTrack;
+        volatile boolean trackPlaying;
+        volatile boolean udpPaused;
         volatile boolean cancelled;
         volatile String stopReason = "";
 
         AudioSession(long id, AudioRequest request) {
             this.id = id;
             this.request = request;
+        }
+
+        boolean isStreamingAt(long nowNanos) throws IOException {
+            if (cancelled || udpPaused || !trackPlaying) return false;
+            UdpPcmQueue queue = udpQueue;
+            AudioTrack track = audioTrack;
+            if (queue == null || track == null) return false;
+            int playbackHead;
+            try {
+                playbackHead = track.getPlaybackHeadPosition();
+            } catch (IllegalStateException error) {
+                if (audioTrack != track || cancelled) return false;
+                throw new IOException("AudioTrack playback position unavailable", error);
+            }
+            return playbackActivity.isActive(nowNanos, playbackHead, queue.hasAuthenticatedAudio(),
+                    queue.lastAuthenticatedAudioAtNanos(), udpPaused);
         }
     }
 }

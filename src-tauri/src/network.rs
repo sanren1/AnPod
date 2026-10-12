@@ -202,19 +202,35 @@ impl UdpSender {
             return Err("P3 unauthenticated UDP prototype only permits 127.0.0.1.".into());
         }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
-        Self::spawn_inner(remote, queue, socket, material, format, Arc::new(AtomicU64::new(0)))
+        Self::spawn_inner(remote, queue, socket, material, format, Arc::new(AtomicU64::new(0)), true)
     }
 
     pub(crate) fn spawn_authenticated(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
         material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
         pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
+        Self::spawn_authenticated_with_format(remote, queue, socket, material, parameters,
+            pcm_payload_bytes_sent, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_authenticated_without_format_for_test(remote: SocketAddr, queue: Arc<PcmQueue>,
+        socket: UdpSocket, material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
+        pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
+        Self::spawn_authenticated_with_format(remote, queue, socket, material, parameters,
+            pcm_payload_bytes_sent, false)
+    }
+
+    fn spawn_authenticated_with_format(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
+        material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
+        pcm_payload_bytes_sent: Arc<AtomicU64>, send_format: bool) -> Result<Self, String> {
         parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
         let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
-        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent)
+        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent, send_format)
     }
 
     fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
-        material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
+        material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>,
+        send_format: bool) -> Result<Self, String> {
         if !matches!(format.channels, 1 | 2) || format.sample_rate == 0
             || !remote.is_ipv4()
             || !socket.local_addr().map_err(|error| error.to_string())?.is_ipv4() {
@@ -225,7 +241,7 @@ impl UdpSender {
         let worker_queue = queue.clone();
         let worker_bytes = pcm_payload_bytes_sent.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
-            send_loop(socket, remote, worker_queue, worker_stopping, material, format, worker_bytes)
+            send_loop(socket, remote, worker_queue, worker_stopping, material, format, worker_bytes, send_format)
         }).map_err(|error| error.to_string())?;
         Ok(Self { stopping, queue, worker: Some(worker), pcm_payload_bytes_sent })
     }
@@ -249,12 +265,16 @@ impl Drop for UdpSender {
 }
 
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
-    material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<NetworkStats, String> {
-    let mut encoder = PacketEncoder::new(&material.key, material.session_id, HOST_TO_RECEIVER);
+    material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>,
+    send_format: bool) -> Result<NetworkStats, String> {
+    let mut encoder = PacketEncoder::with_sequence(&material.key, material.session_id, HOST_TO_RECEIVER,
+        if send_format { 0 } else { 1 });
     let format_payload = format.encode().map_err(|error| error.to_string())?;
-    send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
+    if send_format {
+        send_packet(&socket, remote, &mut encoder, PacketType::Format, 0, &format_payload)?;
+    }
 
-    let mut stats = NetworkStats { packets_sent: 1, pcm_payload_bytes_sent: 0 };
+    let mut stats = NetworkStats { packets_sent: if send_format { 1 } else { 0 }, pcm_payload_bytes_sent: 0 };
     let mut samples = Vec::with_capacity(MAX_CAPTURE_FRAMES * PCM_CHANNELS as usize);
     let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
     let sample_bytes_per_frame = format.channels as usize * 2;
