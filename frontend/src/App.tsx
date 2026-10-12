@@ -23,13 +23,21 @@ type Settings = {
 type Snapshot = {
   state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "reconnecting" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
-  sessionTransport: Device["transport"] | null; sessionAndroidVersion: string | null;
+  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null; sessionAndroidVersion: string | null;
   transport: "usb" | "wifi"; output: "computer" | "phone"; settings: Settings;
   busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
   audioBitrateBps: number | null; version: string;
 };
 type Credentials = { instanceName: string; password: string; payload: string };
 type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };
+type PrivateIpv4Interface = { index: number; name: string; address: string; prefixLength: number; gateways: string[] };
+type ReceiverIpv4Interface = { address: string; prefixLength: number; interfaceIndex: number; interfaceName: string };
+type NetworkCandidate = { endpoint: string };
+type NetworkStartRequest = {
+  localAddress: string; peer: string; bootstrapSerial?: string; receiverAddress?: string;
+  receiverPrefixLength?: number; bindingReference?: string;
+};
+type OperationResult = { success: boolean; message: string; snapshot: Snapshot };
 
 const isDesktop = "__TAURI_INTERNALS__" in window;
 const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
@@ -38,12 +46,21 @@ const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
 };
 const byTransport = (snapshot: Snapshot) => snapshot.devices.filter(device => device.transport === snapshot.transport || device.transport === "unknown");
 const formatBitrate = (bps: number | null) => bps === null ? "—" : bps >= 1_000_000 ? `${(bps / 1_000_000).toFixed(2)} Mbps` : bps >= 1_000 ? `${(bps / 1_000).toFixed(1)} kbps` : `${bps} bps`;
-const bitrateHelp = "实际成功发送的 PCM 数据率，包含暂停或电脑输出时发送的静音帧，不含 TCP/ADB 等网络开销；不是压缩编码档位、链路带宽、接收端吞吐或延迟。";
+const bitrateHelp = "只统计实际成功发送的 PCM payload，不含 UDP/TCP/ADB 等网络开销。暂停或电脑输出时显示后端实际值（可能为 0）；不是延迟、链路带宽或接收端吞吐。";
+const transportLabel = (transport?: Snapshot["sessionTransport"]) => transport === "lan" ? "直接 UDP · 加密认证"
+  : transport === "usb" ? "USB · ADB" : transport === "wifi" ? "Wi-Fi · ADB TCP" : "连接方式未知";
+const bindingLabel = (reference: string | null | undefined) => reference ? `已配对接收端 · ${reference.slice(0, 8)}` : "已配对接收端";
+const isIpv4Endpoint = (value: string) => {
+  const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
+  return !!match && match[1].split(".").every(part => Number(part) <= 255) && Number(match[2]) > 0 && Number(match[2]) <= 65535;
+};
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "help" | "diagnostics" | null>(null);
-  const [confirm, setConfirm] = useState<{ kind: "transport" | "playback" | "device"; value: string } | null>(null);
+  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "help" | "diagnostics" | null>(null);
+  const [confirm, setConfirm] = useState<{ kind: "transport" | "playback" | "device" | "network"; value: string } | null>(null);
+  const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
+  const [networkDialogError, setNetworkDialogError] = useState("");
   const [localSelected, setLocalSelected] = useState<string | null>(null);
   const [largeText, setLargeText] = useState(false);
   const [notice, setNotice] = useState("");
@@ -84,21 +101,21 @@ function App() {
 
   const devices = useMemo(() => snapshot ? byTransport(snapshot) : [], [snapshot]);
   const selected = devices.find(device => device.serial === localSelected) ?? devices.find(device => device.connectable);
-  const active = !!snapshot?.sessionSerial;
+  const active = !!snapshot?.sessionSerial || !!snapshot?.sessionReceiverBinding || snapshot?.sessionTransport === "lan";
+  const lanSession = active && snapshot?.sessionTransport === "lan";
   const canDisconnect = !!snapshot?.canDisconnect;
-  const cleanupPending = canDisconnect && !active;
+  const cleanupPending = canDisconnect && !active && snapshot?.state === "error";
   const activeDevice = snapshot?.devices.find(device => device.serial === snapshot.sessionSerial);
   const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
   const deviceChoices = useMemo(() => {
     if (!snapshot?.sessionSerial || devices.some(device => device.serial === snapshot.sessionSerial)) return devices;
     const current = snapshot.devices.find(device => device.serial === snapshot.sessionSerial) ?? {
-      serial: snapshot.sessionSerial, transport: snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
+      serial: snapshot.sessionSerial, transport: snapshot.sessionTransport === "lan" ? "unknown" : snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
       androidVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? "已连接手机",
       statusText: "当前连接；设备扫描暂不可用", connectable: false,
     };
     return [current, ...devices];
   }, [snapshot, devices]);
-  const transportLabel = (transport?: Device["transport"] | null) => transport === "usb" ? "USB · ADB" : transport === "wifi" ? "Wi-Fi · ADB TCP" : "连接方式未知";
   const notify = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 4200); };
 
   const refresh = async () => {
@@ -111,6 +128,8 @@ function App() {
   const setOption = async (kind: "transport" | "playback", value: string) => {
     if (!snapshot) return;
     if (snapshot.busy || cleanupPending) return;
+    if ((kind === "transport" && value === snapshot.transport)
+      || (kind === "playback" && value === (snapshot.settings.playbackMode === "LowLatency" ? "lowLatency" : "balanced"))) return;
     if (active) { setConfirm({ kind, value }); return; }
     setWorking(true);
     try {
@@ -126,8 +145,29 @@ function App() {
     if (!confirm) return;
     setWorking(true);
     try {
-      if (confirm.kind === "device") {
-        const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("switch_device", { serial: confirm.value });
+      if (confirm.kind === "network") {
+        if (!pendingNetworkStart) throw new Error("网络连接参数已失效；请重新选择接收端。");
+        const stopped = await invokeApp<OperationResult>("disconnect");
+        apply(stopped.snapshot);
+        if (!stopped.success) throw new Error(stopped.message);
+        apply(await invokeApp<Snapshot>("start_network_audio", { ...pendingNetworkStart }));
+        setPanel(null);
+      } else if (confirm.kind === "device" && lanSession) {
+        const stopped = await invokeApp<OperationResult>("disconnect");
+        apply(stopped.snapshot);
+        if (!stopped.success) throw new Error(stopped.message);
+        const result = await invokeApp<OperationResult>("connect_device", { serial: confirm.value });
+        apply(result.snapshot);
+        if (!result.success) notify(result.message);
+      } else if (confirm.kind === "transport" && lanSession) {
+        const stopped = await invokeApp<OperationResult>("disconnect");
+        apply(stopped.snapshot);
+        if (!stopped.success) throw new Error(stopped.message);
+        await invokeApp("update_setting", { key: "preferredTransport", value: confirm.value === "wifi" ? "Wifi" : "Usb" });
+        apply(await invokeApp<Snapshot>("refresh_devices"));
+        setNotice("直接网络会话已断开；连接方式已更新。需要时请重新选择手机。");
+      } else if (confirm.kind === "device") {
+        const result = await invokeApp<OperationResult>("switch_device", { serial: confirm.value });
         apply(result.snapshot);
         if (!result.success) notify(result.message);
       } else {
@@ -135,15 +175,39 @@ function App() {
         apply(next);
       }
       setConfirm(null);
-    } catch (error) { notify(String(error)); }
+      setPendingNetworkStart(null);
+    } catch (error) {
+      if (confirm.kind === "network") setNetworkDialogError(String(error)); else notify(String(error));
+      setConfirm(null);
+      setPendingNetworkStart(null);
+    }
+    finally { setWorking(false); }
+  };
+
+  const startNetwork = async (request: NetworkStartRequest) => {
+    setNetworkDialogError("");
+    if (cleanupPending) { setNetworkDialogError("上一条连接仍有清理工作待完成；请先重试断开，再启动网络连接。"); return; }
+    if (active) {
+      setPendingNetworkStart(request);
+      setConfirm({ kind: "network", value: "" });
+      return;
+    }
+    setWorking(true);
+    try {
+      apply(await invokeApp<Snapshot>("start_network_audio", { ...request }));
+      setPanel(null);
+    } catch (error) { setNetworkDialogError(String(error)); }
     finally { setWorking(false); }
   };
 
   const setOutput = async (output: "computer" | "phone") => {
     if (!snapshot) return;
     if (snapshot.busy || cleanupPending) return;
+    if (output === "phone" && !active && snapshot.transport === "wifi") {
+      setNetworkDialogError(""); setPanel("network"); return;
+    }
     if (output === "phone" && !active && !selected) {
-      if (snapshot.transport === "wifi") setPanel("pair"); else setPanel("help");
+      setPanel("help");
       return;
     }
     if (output === "phone" && !active && selected) {
@@ -199,8 +263,16 @@ function App() {
   const stateLabels: Record<Snapshot["state"], string> = {
     noDevice: empty ? "尚未连接手机" : "等待手机授权", unauthorized: "等待手机授权",
     ready: "准备就绪", connecting: "正在连接", connected: "已连接 · 电脑播放",
-    streaming: "正在手机播放", phoneReady: "手机接收已就绪", reconnecting: "正在重新连接", error: "连接失败",
+    streaming: "正在手机播放", phoneReady: lanSession ? "已认证 · 等待手机播放确认" : "手机接收已就绪", reconnecting: "正在重新连接", error: "连接失败",
   };
+  const currentDeviceLabel = lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName;
+  const statusDetail = lanSession
+    ? snapshot.state === "phoneReady" ? snapshot.output === "computer" ? "Receiver 已认证；声音由电脑输出。" : "Receiver 已认证；等待接收端确认手机正在播放。"
+      : snapshot.state === "streaming" ? "Receiver 已确认音频正在手机端播放。"
+        : snapshot.state === "reconnecting" ? "直接网络连接正在恢复；请保持两端位于可互访网络。"
+          : snapshot.state === "error" ? "直接网络连接出现错误；请查看诊断或重新连接。"
+            : snapshot.output === "computer" ? "网络会话保持；声音由电脑输出。" : "电脑声音通过已认证的直接网络会话发送。"
+    : snapshot.statusDetail;
 
   return <div className={`app-shell ${largeText ? "large-text" : ""}`}>
     <header className="topbar">
@@ -212,11 +284,11 @@ function App() {
       <div className={`status-line state-${snapshot.state}`}>
         <span className="status-dot" aria-hidden="true" />
         <span role="status" aria-live="polite">{stateLabels[snapshot.state]}</span>
-        {snapshot.deviceName && <span className="status-device">{snapshot.deviceName}</span>}
+        {currentDeviceLabel && <span className="status-device">{currentDeviceLabel}</span>}
         <span className="audio-bitrate" title={bitrateHelp}>
           <span>音频码率</span><span className="audio-bitrate-value">{formatBitrate(snapshot.audioBitrateBps)}</span>
         </span>
-        <span className="transport-tag">{snapshot.transport.toUpperCase()}</span>
+        <span className="transport-tag">{snapshot.sessionTransport === "lan" ? "UDP" : (snapshot.sessionTransport ?? snapshot.transport).toUpperCase()}</span>
       </div>
 
       <section className="playback-section" aria-label="声音输出">
@@ -229,7 +301,7 @@ function App() {
             <span className="output-heading"><Smartphone size={18} aria-hidden="true" /><span className="output-name">手机</span></span>
           </button>
         </div>
-        <p className="status-description">{snapshot.statusDetail}</p>
+        <p className="status-description">{statusDetail}</p>
         <div className="session-row">
         <span>{snapshot.busy ? "正在处理手机连接" : cleanupPending ? "连接清理待完成" : active ? "手机连接保持中" : empty ? "声音继续从电脑播放" : "连接手机后可从手机输出声音"}</span>
           {(snapshot.state === "connecting" || snapshot.state === "reconnecting") && <button className="text-button cancel-button" onClick={() => void invokeApp<Snapshot>("cancel_operation").then(apply).catch(error => notify(String(error)))}>取消连接</button>}
@@ -241,19 +313,19 @@ function App() {
           <button aria-pressed={snapshot.transport === "usb"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("transport", "usb")}><Usb size={16} />USB</button>
           <button aria-pressed={snapshot.transport === "wifi"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("transport", "wifi")}><Wifi size={16} />Wi-Fi</button>
         </div>
-        <div className="section-title device-heading"><h2>连接手机</h2><button className="text-button" disabled={working || snapshot.busy} onClick={() => setPanel(snapshot.transport === "wifi" ? "pair" : "help")}>{snapshot.transport === "wifi" ? "添加手机" : "连接帮助"}</button></div>
+        <div className="section-title device-heading"><h2>连接手机</h2><button className="text-button" disabled={working || snapshot.busy} onClick={() => { setNetworkDialogError(""); setPanel(snapshot.transport === "wifi" ? "network" : "help"); }}>{snapshot.transport === "wifi" ? "添加手机" : "连接帮助"}</button></div>
         <div className="device-card">
-          <button className="device-select" onClick={() => setPanel("device")} disabled={working || snapshot.busy} aria-haspopup="dialog" aria-expanded={panel === "device"} aria-label={`选择手机，${active ? `当前连接${activeDevice?.displayName ?? snapshot.deviceName ?? "手机"}` : cardDevice ? `当前选择${cardDevice.displayName}` : "打开设备列表"}`}>
+          <button className="device-select" onClick={() => setPanel("device")} disabled={working || snapshot.busy} aria-haspopup="dialog" aria-expanded={panel === "device"} aria-label={`选择手机，${active ? `当前连接${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "手机"}` : cardDevice ? `当前选择${cardDevice.displayName}` : "打开设备列表"}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
-              <strong>{active ? activeDevice?.displayName ?? snapshot.deviceName ?? "已连接手机" : cleanupPending ? snapshot.deviceName ?? "连接清理待完成" : selected?.displayName ?? (empty ? "未检测到手机" : "选择手机")}</strong>
-              <span>{active ? `${transportLabel(snapshot.sessionTransport)}${snapshot.sessionAndroidVersion ? ` · Android ${snapshot.sessionAndroidVersion}` : ""}` : cleanupPending ? "当前连接信息不可用" : cardDevice ? `${transportLabel(cardDevice.transport)}${cardDevice.androidVersion ? ` · Android ${cardDevice.androidVersion}` : ""}` : snapshot.transport === "wifi" ? "通过扫码、配对码或手动地址添加" : "连接 USB 手机后刷新设备列表"}</span>
+              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "已连接手机" : cleanupPending ? snapshot.deviceName ?? "连接清理待完成" : selected?.displayName ?? (empty ? "未检测到手机" : "选择手机")}</strong>
+              <span>{active ? `${transportLabel(snapshot.sessionTransport)}${snapshot.sessionAndroidVersion ? ` · Android ${snapshot.sessionAndroidVersion}` : ""}` : cleanupPending ? "当前连接信息不可用" : cardDevice ? `${transportLabel(cardDevice.transport)}${cardDevice.androidVersion ? ` · Android ${cardDevice.androidVersion}` : ""}` : snapshot.transport === "wifi" ? "直接网络接收；ADB 无线调试为过渡/诊断方式" : "连接 USB 手机后刷新设备列表"}</span>
               {(active || cleanupPending) && <span className="device-live-state" role="status">{cleanupPending ? "连接清理待重试" : stateLabels[snapshot.state]}</span>}
             </span>
             <ChevronDown size={18} aria-hidden="true" />
           </button>
           <button className="primary-button device-action" disabled={working || snapshot.busy || (!canDisconnect && !selected?.connectable)} onClick={() => canDisconnect ? void disconnect() : void connectOnly()}>
-            {working || snapshot.busy ? <><LoaderCircle className="spin" size={15} />处理中</> : canDisconnect ? "断开连接" : "连接"}
+            {working || snapshot.busy ? <><LoaderCircle className="spin" size={15} />处理中</> : canDisconnect ? "断开连接" : snapshot.transport === "wifi" ? "ADB 诊断连接" : "连接"}
           </button>
         </div>
       </section>
@@ -270,18 +342,23 @@ function App() {
     <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />连接帮助</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />诊断</button></footer>
     {notice && <div className="toast" role="status">{notice}</div>}
 
-    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onClose={() => setPanel(null)} />}
+    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onClose={() => setPanel(null)} />}
     {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} onSave={async (key, value) => {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {panel === "pair" && <PairDialog transport={snapshot.transport} initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
+    {panel === "network" && <NetworkReceiverDialog usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} disabled={working || snapshot.busy} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onLegacy={() => setPanel("pair")} onClose={() => setPanel(null)} />}
+    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={snapshot.busy} onClose={() => setPanel("network")} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.transport} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {confirm && <ConfirmDialog
-      title={confirm.kind === "device" ? "切换连接手机？" : confirm.kind === "transport" ? "切换连接方式？" : "切换播放模式？"}
-      body={confirm.kind === "device" ? `切换到 ${snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? "所选手机"} 会短暂中断当前连接；${snapshot.output === "phone" ? "完成后会继续从手机输出。" : "完成后声音仍从电脑输出。"}` : "切换时会短暂中断声音，AnPod 会清理当前连接后重新连接同一部手机。"}
-      confirmLabel={confirm.kind === "device" ? "中断并切换" : "断开并重新连接"} busy={working} onCancel={() => setConfirm(null)} onConfirm={() => void applyConfirmed()} />}
+      title={confirm.kind === "network" ? "断开当前会话并连接？" : confirm.kind === "device" ? "切换连接手机？" : confirm.kind === "transport" ? "切换连接方式？" : "切换播放模式？"}
+      body={confirm.kind === "network" ? "将先断开当前会话，再启动所选网络接收。声音会中断；只有 Receiver 完成双向认证后才会显示连接就绪。"
+        : confirm.kind === "device" && lanSession ? `先断开当前直接网络会话，再连接 ${snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? "所选手机"}。声音会中断，原网络会话不会自动恢复。`
+          : confirm.kind === "transport" && lanSession ? "先断开当前直接网络会话，再切换连接方式。不会自动重连同一部手机。"
+            : confirm.kind === "device" ? `切换到 ${snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? "所选手机"} 会短暂中断当前连接；${snapshot.output === "phone" ? "完成后会继续从手机输出。" : "完成后声音仍从电脑输出。"}`
+              : "切换播放模式时会短暂中断声音，AnPod 会重新配置当前连接。"}
+      confirmLabel={confirm.kind === "network" ? "断开并启动" : confirm.kind === "device" ? "中断并切换" : confirm.kind === "transport" && lanSession ? "断开并切换" : confirm.kind === "transport" ? "断开并重新连接" : "重新配置"} busy={working} onCancel={() => { setConfirm(null); setPendingNetworkStart(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 
@@ -302,13 +379,151 @@ function Modal({ title, children, onClose, className = "" }: { title: string; ch
   </dialog>;
 }
 
-function DeviceDialog({ devices, selected, activeSerial, busy, onSelect, onRefresh, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onClose: () => void }) {
+function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, onLegacy, onClose }: {
+  usbDevices: Device[]; disabled: boolean; error: string; onError: (error: string) => void;
+  onStart: (request: NetworkStartRequest) => void; onLegacy: () => void; onClose: () => void;
+}) {
+  const [method, setMethod] = useState<"bootstrap" | "paired">("bootstrap");
+  const [interfaces, setInterfaces] = useState<PrivateIpv4Interface[]>([]);
+  const [receiverInterfaces, setReceiverInterfaces] = useState<ReceiverIpv4Interface[]>([]);
+  const [bindings, setBindings] = useState<string[]>([]);
+  const [candidates, setCandidates] = useState<NetworkCandidate[]>([]);
+  const [localAddress, setLocalAddress] = useState("");
+  const [serial, setSerial] = useState("");
+  const [receiverAddress, setReceiverAddress] = useState("");
+  const [bindingReference, setBindingReference] = useState("");
+  const [peer, setPeer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [localError, setLocalError] = useState("");
+  const alertRef = useRef<HTMLParagraphElement>(null);
+  const busy = disabled || loading;
+
+  useEffect(() => {
+    if (error || localError) alertRef.current?.focus();
+  }, [error, localError]);
+
+  const loadInterfaces = async () => {
+    setLoading(true); setLocalError("");
+    try {
+      const values = await invokeApp<PrivateIpv4Interface[]>("network_interfaces");
+      setInterfaces(values);
+      if (!values.some(value => value.address === localAddress)) setLocalAddress("");
+      if (values.length === 0) setLocalError("没有可用的电脑 IPv4 网络接口。请启用 Wi-Fi 或有线网络后刷新。");
+    } catch (reason) { setLocalError(String(reason)); }
+    finally { setLoading(false); }
+  };
+  const loadBindings = async () => {
+    setLoading(true); setLocalError("");
+    try {
+      const values = await invokeApp<string[]>("receiver_binding_references");
+      setBindings(values);
+      if (!values.includes(bindingReference)) setBindingReference("");
+    } catch (reason) { setLocalError(String(reason)); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { void loadInterfaces(); void loadBindings(); }, []);
+  useEffect(() => {
+    setReceiverInterfaces([]); setReceiverAddress("");
+    if (!serial) return;
+    let current = true;
+    setLoading(true); setLocalError("");
+    void invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial })
+      .then(values => { if (current) { setReceiverInterfaces(values); if (values.length === 0) setLocalError("手机没有报告可用的 IPv4 地址；请检查手机网络并刷新设备列表。"); } })
+      .catch(reason => { if (current) setLocalError(String(reason)); })
+      .finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
+  }, [serial]);
+
+  const discover = async () => {
+    if (!localAddress) return;
+    setLoading(true); setLocalError(""); setCandidates([]);
+    try {
+      const values = await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress });
+      setCandidates(values);
+      if (values.length === 0) setLocalError("没有发现接收端。确认两端位于可互访网络后，可手动输入接收端地址。");
+    } catch (reason) { setLocalError(String(reason)); }
+    finally { setLoading(false); }
+  };
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault(); setLocalError(""); onError("");
+    if (!localAddress) { setLocalError("请明确选择电脑使用的网络接口。"); return; }
+    if (method === "bootstrap") {
+      const receiver = receiverInterfaces.find(value => value.address === receiverAddress);
+      if (!serial || !receiver) { setLocalError("请选择已授权的 USB 手机及其当前 IPv4 地址。"); return; }
+      onStart({ localAddress, peer: "", bootstrapSerial: serial, receiverAddress: receiver.address, receiverPrefixLength: receiver.prefixLength });
+      return;
+    }
+    if (!bindingReference) { setLocalError("请选择已配对的接收端绑定。"); return; }
+    if (!isIpv4Endpoint(peer)) { setLocalError("请输入有效的 IPv4 地址和端口，例如 192.0.2.20:45678。"); return; }
+    onStart({ localAddress, peer: peer.trim(), bindingReference });
+  };
+  const shownError = error || localError;
+
+  return <Modal title="直接连接 Receiver" onClose={onClose} className="network-dialog">
+    <form className="network-pane" onSubmit={submit}>
+      <p className="network-intro">选择电脑网络接口，再通过 USB 首次授权，或使用已配对接收端。发现结果只是地址提示；连接仍会进行双向认证。</p>
+      <label className="network-field">电脑网络接口
+        <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+          <option value="">请选择 IPv4 接口</option>
+          {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
+        </select>
+      </label>
+      <button className="text-button network-refresh" type="button" onClick={() => { void loadInterfaces(); void loadBindings(); }} disabled={busy}><Search size={15} />刷新接口和配对信息</button>
+      <div className="network-methods" role="group" aria-label="Receiver 连接方式">
+        <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次授权</button>
+        <button type="button" aria-pressed={method === "paired"} disabled={busy} onClick={() => { setMethod("paired"); onError(""); setLocalError(""); }}>已配对接收端</button>
+      </div>
+      {method === "bootstrap" ? <>
+        <label className="network-field">已授权的 USB 手机
+          <select required value={serial} disabled={busy} onChange={event => { setSerial(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">请选择 USB 设备</option>
+            {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
+          </select>
+        </label>
+        {usbDevices.length === 0 && <p className="network-note">未检测到已授权 USB 手机。首次连接需要手机允许 USB 调试，并完成 Receiver 安装及通知授权。</p>}
+        <label className="network-field">手机当前 IPv4 地址
+          <select required value={receiverAddress} disabled={busy || !serial} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">请选择手机网络接口</option>
+            {receiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
+          </select>
+        </label>
+        {serial && <button className="text-button network-refresh" type="button" disabled={busy} onClick={async () => {
+          setLoading(true); setLocalError("");
+          try { const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial }); setReceiverInterfaces(values); setReceiverAddress(""); if (values.length === 0) setLocalError("手机没有报告可用的 IPv4 地址；请检查手机网络。"); }
+          catch (reason) { setLocalError(String(reason)); }
+          finally { setLoading(false); }
+        }}><Search size={15} />刷新手机接口</button>}
+        <p className="network-note">首次授权会使用所选 USB 手机查询实际网络地址，并启动 Receiver。不会猜测热点地址。</p>
+      </> : <>
+        <label className="network-field">已配对接收端
+          <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">请选择配对绑定</option>
+            {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
+          </select>
+        </label>
+        {bindings.length === 0 && <p className="network-note">没有已保存的配对绑定。请先通过 USB 首次授权。</p>}
+        <label className="network-field">接收端 IPv4 地址和控制端口
+          <input required value={peer} disabled={busy} onChange={event => { setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || undefined} aria-describedby={`network-peer-hint${shownError ? " network-flow-error" : ""}`} />
+        </label>
+        <small id="network-peer-hint" className="network-hint">也可以先发现候选地址。候选未经验证，不会自动绑定或配对。</small>
+        <button className="text-button network-refresh" type="button" onClick={() => void discover()} disabled={busy || !localAddress}><Search size={15} />发现接收端候选</button>
+        {candidates.length > 0 && <div className="candidate-list" aria-label="未验证的发现候选">{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>未经验证 · 仅填入地址</small></button>)}</div>}
+      </>}
+      {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
+      {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在读取网络信息…</p>}
+      <div className="network-actions"><button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button><button className="primary-button" disabled={busy}>{disabled ? "正在处理…" : "连接 Receiver"}</button></div>
+    </form>
+  </Modal>;
+}
+
+function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onClose: () => void }) {
   return <Modal title="选择手机" onClose={onClose} className="device-dialog">
     <div className="dialog-tools"><span>只显示当前连接方式的设备</span><button className="text-button" onClick={onRefresh} disabled={busy}><Search size={15} />刷新</button></div>
+    {activeBinding && <div className="network-active-card"><strong>{bindingLabel(activeBinding)}</strong><span>当前连接 · 直接 UDP · 加密认证</span></div>}
     <div className="device-list">{devices.map(device => { const connected = activeSerial === device.serial; const chosen = (activeSerial ?? selected) === device.serial; return <button className="device-option" key={device.serial} onClick={() => onSelect(device)} disabled={busy || (!connected && !device.connectable)} aria-pressed={chosen}>
       <Smartphone size={18} aria-hidden="true" /><span><strong>{device.displayName}</strong><small>{connected ? "当前连接 · " : ""}{device.statusText}{device.transport !== "unknown" ? ` · ${device.transport === "wifi" ? "Wi-Fi · ADB TCP" : "USB · ADB"}` : " · 连接方式未知"}{device.androidVersion ? ` · Android ${device.androidVersion}` : ""}</small></span>{chosen && <Check size={17} aria-hidden="true" />}
     </button>; })}</div>
-    {devices.length === 0 && <div className="empty-note"><Info size={17} /><span>尚未发现设备。{" "} {" “添加手机”可通过扫码、配对码或 IP:端口地址添加。"}</span></div>}
+    {devices.length === 0 && <div className="empty-note"><Info size={17} /><span>{activeBinding ? "当前是直接网络 Receiver 会话。可添加另一台接收端；USB/ADB 设备扫描为空时不影响当前连接。" : "尚未发现设备。Wi-Fi 下可添加直接网络 Receiver；无线调试扫码、配对码或地址连接位于过渡/诊断入口。"}</span></div>}
     <button className="dialog-secondary" onClick={onClose}>完成</button>
   </Modal>;
 }
@@ -379,7 +594,7 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
     } catch (reason) { if (generation === taskGeneration.current) setError(String(reason)); }
     finally { if (generation === taskGeneration.current) setBusy(false); }
   };
-  return <Modal title={transport === "wifi" ? "添加无线手机" : "连接 USB 手机"} onClose={onClose} className="pair-dialog">
+  return <Modal title={transport === "wifi" ? "无线调试（过渡/诊断）" : "连接 USB 手机"} onClose={onClose} className="pair-dialog">
     {transport === "wifi" ? <>
       <div className="tabs" role="tablist" aria-label="添加方式"><button role="tab" aria-selected={tab === "qr"} disabled={disabled || busy} onClick={() => setTab("qr")}>扫码配对</button><button role="tab" aria-selected={tab === "code"} disabled={disabled || busy} onClick={() => setTab("code")}>配对码</button><button role="tab" aria-selected={tab === "address"} disabled={disabled || busy} onClick={() => setTab("address")}>手动地址</button></div>
       {tab === "qr" && <div className="qr-pane">
@@ -416,13 +631,13 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
 
 function HelpDialog({ transport, onClose }: { transport: "usb" | "wifi"; onClose: () => void }) {
   return <Modal title="连接帮助" onClose={onClose} className="help-dialog">
-    {transport === "usb" ? <><h3>USB 调试</h3><ol><li>在手机开发者选项中开启 USB 调试。</li><li>用支持数据的线连接手机和电脑。</li><li>解锁手机，在授权提示中允许此电脑。</li></ol></> : <><h3>无线调试</h3><ol><li>让电脑和手机连接同一可互访网络。</li><li>在手机无线调试中扫描二维码，或输入配对端口和 6 位码。</li><li>连接地址使用无线调试主页面的连接端口。</li></ol></>}
-    <p>手机端无需安装可见 App。配对仅授予 ADB 权限，不会自动开始播放。</p><button className="dialog-secondary" onClick={onClose}>完成</button>
+    {transport === "usb" ? <><h3>USB 与 Receiver</h3><ol><li>在手机开发者选项中开启 USB 调试，用支持数据的线连接，并允许此电脑进行 USB 调试。</li><li>首次直接网络连接会通过 USB 安装并启动 Receiver；请在手机上允许安装和通知权限。</li><li>连接时明确选择电脑与手机正在使用的网络接口，两端需要位于可互访网络。</li></ol></> : <><h3>直接网络连接</h3><ol><li>主入口使用已安装并完成授权的 Receiver，通过同一可互访网络进行加密认证。</li><li>首次授权或重新启动 Receiver 时需要已授权 USB 连接；可在手机上允许安装与通知权限。</li><li>无线调试扫码、配对码和地址连接保留为过渡/诊断方式。</li></ol></>}
+    <p>如果 Receiver 被强行停止或手机重启，需要重新通过 USB 启动。连接就绪不代表手机已开始播放；播放状态会在 Receiver 确认后显示。</p><button className="dialog-secondary" onClick={onClose}>完成</button>
   </Modal>;
 }
 
 function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose: () => void }) {
-  const text = [`状态：${snapshot.message}`, `连接方式：${snapshot.transport.toUpperCase()}`, `设备：${snapshot.deviceName ?? "无"}`, `输出：${snapshot.output === "phone" ? "手机" : "电脑"}`, `可见设备：${snapshot.devices.length}`, `版本：${snapshot.version}`].join("\n");
+  const text = [`状态：${snapshot.message}`, `连接方式：${transportLabel(snapshot.sessionTransport ?? snapshot.transport)}`, `设备：${snapshot.sessionReceiverBinding ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName ?? "无"}`, `输出：${snapshot.output === "phone" ? "手机" : "电脑"}`, `可见设备：${snapshot.devices.length}`, `详细状态：${snapshot.statusDetail}`, `版本：${snapshot.version}`].join("\n");
   return <Modal title="诊断" onClose={onClose} className="diagnostics-dialog">
     <p>本次运行状态</p><pre>{text}</pre><div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(text)}><Copy size={15} />复制诊断</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>查看日志文件夹<ExternalLink size={14} /></button></div>
   </Modal>;
