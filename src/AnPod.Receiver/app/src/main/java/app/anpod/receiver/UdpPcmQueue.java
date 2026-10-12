@@ -91,6 +91,11 @@ final class UdpPcmQueue {
 
     synchronized void accept(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder)
             throws UdpPacketDecoder.ProtocolException {
+        acceptAt(packet, decoder, System.nanoTime());
+    }
+
+    synchronized void acceptAt(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder, long now)
+            throws UdpPacketDecoder.ProtocolException {
         if (stopped) throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.AUDIO);
         if (packet.type == UdpPacketDecoder.FORMAT) {
             if (format != null || packet.sequence != 0)
@@ -132,30 +137,67 @@ final class UdpPcmQueue {
             return;
         }
 
-        long now = System.nanoTime();
         expireStalePackets(now);
         discardBehindWatermark();
         AudioPacket audio = new AudioPacket(packet.sequence, packet.sampleFrameIndex, frameCount,
                 packet.payload, now);
         int insertAt = 0;
         while (insertAt < packets.size()
-                && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) <= 0) insertAt++;
+                && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) < 0) insertAt++;
         if (insertAt < packets.size()
                 && packets.get(insertAt).frameIndex == audio.frameIndex) {
             droppedFrames += frameCount;
             return;
         }
-        while (!packets.isEmpty() && (packets.size() == CAPACITY_PACKETS
-                || queuedFrames + frameCount > maxQueuedFrames)) {
+        int evictions = 0;
+        long remainingFrames = queuedFrames;
+        int remainingPackets = packets.size();
+        boolean predictedWatermarkSet = hasPlayoutFrame;
+        long predictedWatermark = playoutFrame;
+        boolean needsEviction = packets.size() >= CAPACITY_PACKETS
+                || queuedFrames + frameCount > maxQueuedFrames;
+        if (needsEviction && insertAt == 0 && !packets.isEmpty()) {
+            droppedFrames += frameCount;
+            expiredFrames += frameCount;
+            return;
+        }
+        while (remainingPackets > 0 && (remainingPackets >= CAPACITY_PACKETS
+                || remainingFrames + frameCount > maxQueuedFrames)) {
+            AudioPacket stale = packets.get(evictions++);
+            remainingFrames -= stale.frameCount;
+            remainingPackets--;
+            long end = stale.frameIndex + stale.frameCount;
+            if (!predictedWatermarkSet || Long.compareUnsigned(end, predictedWatermark) > 0) {
+                predictedWatermark = end;
+                predictedWatermarkSet = true;
+            }
+        }
+        if (frameCount > maxQueuedFrames || remainingFrames + frameCount > maxQueuedFrames
+                || (evictions > 0 && predictedWatermarkSet
+                        && Long.compareUnsigned(audio.frameIndex, predictedWatermark) < 0)) {
+            droppedFrames += frameCount;
+            expiredFrames += frameCount;
+            return;
+        }
+        int insertionAfterEvictions = Math.max(0, insertAt - evictions);
+        int previousIndex = evictions + insertionAfterEvictions - 1;
+        int nextIndex = evictions + insertionAfterEvictions;
+        if ((previousIndex >= evictions && Long.compareUnsigned(audio.frameIndex,
+                        packets.get(previousIndex).frameIndex + packets.get(previousIndex).frameCount) < 0)
+                || (nextIndex < packets.size() && Long.compareUnsigned(audio.frameIndex + frameCount,
+                        packets.get(nextIndex).frameIndex) > 0)) {
+            droppedFrames += frameCount;
+            return;
+        }
+        for (int i = 0; i < evictions; i++) {
             AudioPacket stale = packets.remove(0);
             queuedFrames -= stale.frameCount;
             dropQueuedPacket(stale, true);
-            insertAt = Math.max(0, insertAt - 1);
         }
         discardBehindWatermark();
         insertAt = 0;
         while (insertAt < packets.size()
-                && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) <= 0) insertAt++;
+                && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) < 0) insertAt++;
         if ((hasPlayoutFrame && Long.compareUnsigned(audio.frameIndex, playoutFrame) < 0)
                 || queuedFrames + frameCount > maxQueuedFrames) {
             droppedFrames += frameCount;
@@ -180,13 +222,18 @@ final class UdpPcmQueue {
     }
 
     synchronized AudioPacket take() throws IOException {
-        while ((packets.isEmpty() || paused) && !stopped) waitForChange();
+        discardBehindWatermark();
+        while ((packets.isEmpty() || paused) && !stopped) {
+            waitForChange();
+            discardBehindWatermark();
+        }
         if (packets.isEmpty() && failure != null) throw failure;
         if (stopped) return null;
         AudioPacket packet = packets.remove(0);
         queuedFrames -= packet.frameCount;
         playoutFrame = packet.frameIndex + packet.frameCount;
         hasPlayoutFrame = true;
+        discardBehindWatermark();
         return packet;
     }
 
@@ -277,6 +324,11 @@ final class UdpPcmQueue {
             queuedFrames -= stale.frameCount;
             droppedFrames += stale.frameCount;
             expiredFrames += stale.frameCount;
+            long end = stale.frameIndex + stale.frameCount;
+            if (Long.compareUnsigned(end, playoutFrame) > 0) {
+                advancePlayoutFrame(end);
+                markDiscontinuity();
+            }
         }
     }
 
@@ -393,6 +445,7 @@ final class UdpPcmQueue {
             }
             playoutFrame = next.frameIndex + next.frameCount;
             hasPlayoutFrame = true;
+            discardBehindWatermark();
             gapWaitActive = false;
             stream.currentPayload = next.payload;
             stream.payloadOffset = 0;

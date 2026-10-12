@@ -285,6 +285,10 @@ public final class AnPodUdpVectorCheck {
                 check(accept(receiver, third, sender) == UdpReceiver.ProcessResult.AUDIO, "later audio rejected");
                 check(accept(receiver, second, sender) == UdpReceiver.ProcessResult.AUDIO, "in-window reordered audio rejected");
                 check(accept(receiver, second, sender) == UdpReceiver.ProcessResult.REPLAY, "duplicate audio reached the queue");
+                byte[] sameFrameNewSequence = encode(key, sessionId, 5, 0, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x55));
+                check(accept(receiver, sameFrameNewSequence, sender) == UdpReceiver.ProcessResult.AUDIO
+                        && queue.size() == 3, "same-frame PCM with a fresh sequence was queued twice");
                 InputStream pcmInput = queue.asPcmInputStream();
                 byte[] legacyHeader = new byte[8];
                 new DataInputStream(pcmInput).readFully(legacyHeader);
@@ -298,6 +302,10 @@ public final class AnPodUdpVectorCheck {
                         && (audioBuffer[0] & 0xff) == 0x22, "reordered PCM packet was not sorted");
                 check(framedPcm.readFrames(pcmInput, audioBuffer, audioBuffer.length) == 960
                         && (audioBuffer[0] & 0xff) == 0x33, "last sorted PCM packet mismatch");
+                byte[] playedFrameDuplicate = encode(key, sessionId, 7, 0, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x77));
+                check(accept(receiver, playedFrameDuplicate, sender) == UdpReceiver.ProcessResult.AUDIO
+                        && queue.size() == 0, "already-played PCM frame was queued again");
 
                 byte[] authenticatedRetry = encode(key, sessionId, 4, 720, UdpPacketDecoder.AUDIO, pcm(240));
                 byte[] badTag = authenticatedRetry.clone();
@@ -308,7 +316,7 @@ public final class AnPodUdpVectorCheck {
                 check(accept(receiver, authenticatedRetry, sender) == UdpReceiver.ProcessResult.AUDIO,
                         "bad tag committed the replay sequence");
 
-                byte[] invalidFormat = encode(key, sessionId, 5, 960, UdpPacketDecoder.AUDIO, new byte[] {1, 2, 3});
+                byte[] invalidFormat = encode(key, sessionId, 6, 960, UdpPacketDecoder.AUDIO, new byte[] {1, 2, 3});
                 check(accept(receiver, invalidFormat, sender) == UdpReceiver.ProcessResult.FORMAT_REJECTED,
                         "unaligned PCM was accepted");
                 check(queue.size() == 1 && queue.format().sampleRate == 48_000,
@@ -341,31 +349,31 @@ public final class AnPodUdpVectorCheck {
                         "unexpected peer reached the parser");
 
                 queue.setPaused(true);
-                byte[] pausedOne = encode(key, sessionId, 7, 960, UdpPacketDecoder.AUDIO, pcm(240));
-                byte[] pausedTwo = encode(key, sessionId, 8, 1200, UdpPacketDecoder.AUDIO, pcm(240));
+                byte[] pausedOne = encode(key, sessionId, 8, 960, UdpPacketDecoder.AUDIO, pcm(240));
+                byte[] pausedTwo = encode(key, sessionId, 9, 1200, UdpPacketDecoder.AUDIO, pcm(240));
                 check(accept(receiver, pausedOne, sender) == UdpReceiver.ProcessResult.AUDIO
                         && accept(receiver, pausedTwo, sender) == UdpReceiver.ProcessResult.AUDIO,
                         "valid packets were rejected while paused");
                 check(queue.size() == 0, "paused session accumulated audio");
                 queue.setPaused(false);
-                byte[] delayedPauseAudio = encode(key, sessionId, 6, 960, UdpPacketDecoder.AUDIO, pcm(240, 0x66));
+                byte[] delayedPauseAudio = encode(key, sessionId, 10, 960, UdpPacketDecoder.AUDIO, pcm(240, 0x66));
                 check(accept(receiver, delayedPauseAudio, sender) == UdpReceiver.ProcessResult.AUDIO
                         && queue.size() == 0, "delayed audio from the pause interval survived resume");
-                byte[] stale = encode(key, sessionId, 9, 720, UdpPacketDecoder.AUDIO, pcm(240));
+                byte[] stale = encode(key, sessionId, 11, 720, UdpPacketDecoder.AUDIO, pcm(240));
                 check(accept(receiver, stale, sender) == UdpReceiver.ProcessResult.AUDIO && queue.size() == 0,
                         "pre-pause audio was replayed after resume");
 
-                byte[] newest = encode(key, sessionId, 10, 1440, UdpPacketDecoder.AUDIO, pcm(240, 0x44));
+                byte[] newest = encode(key, sessionId, 12, 1440, UdpPacketDecoder.AUDIO, pcm(240, 0x44));
                 check(accept(receiver, newest, sender) == UdpReceiver.ProcessResult.AUDIO, "fresh audio rejected");
                 byte[] resumedPayload = new byte[800];
                 check(pauseInput.read(resumedPayload) == resumedPayload.length && (resumedPayload[720] & 0xff) == 0x44,
                         "the partially consumed pre-pause payload continued after resume");
 
                 byte[] oldWindowPacket = null;
-                for (int sequence = 11; sequence <= 20; sequence++) {
-                    byte[] packet = encode(key, sessionId, sequence, (sequence - 4L) * 240,
+                for (int sequence = 13; sequence <= 22; sequence++) {
+                    byte[] packet = encode(key, sessionId, sequence, (sequence - 6L) * 240,
                             UdpPacketDecoder.AUDIO, pcm(240));
-                    if (sequence == 20) oldWindowPacket = packet;
+                    if (sequence == 22) oldWindowPacket = packet;
                     check(accept(receiver, packet, sender) == UdpReceiver.ProcessResult.AUDIO,
                             "in-window bounded-queue packet rejected");
                 }
@@ -506,11 +514,46 @@ public final class AnPodUdpVectorCheck {
                 blockedReader.join(1_000);
                 check(!blockedReader.isAlive() && Integer.valueOf(-1).equals(stoppedRead.get()),
                         "stopping the paused queue did not wake its reader");
+
+                checkLatePacketDoesNotEvictQueuedAudio(key, parameters);
             } finally {
                 context.destroy();
                 Arrays.fill(key, (byte) 0);
             }
         }
+    }
+
+    private static void checkLatePacketDoesNotEvictQueuedAudio(byte[] key,
+            PairingProtocol.AudioParameters parameters) throws Exception {
+        long sessionId = 0x2233445566778899L;
+        UdpPcmQueue queue = new UdpPcmQueue(parameters, "lowlatency");
+        UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
+        long syntheticNow = System.nanoTime();
+        try {
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), syntheticNow);
+            queue.configureAudioTrack(0);
+            for (int packet = 1; packet <= 4; packet++) {
+                acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
+                        UdpPacketDecoder.AUDIO, pcm(240, packet), syntheticNow);
+            }
+            long droppedBefore = queue.droppedFrames();
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 5, 0,
+                    UdpPacketDecoder.AUDIO, pcm(240, 0x55), syntheticNow);
+            check(queue.size() == 4 && queue.droppedFrames() == droppedBefore + 240
+                    && queue.take().frameIndex == 240,
+                    "a late packet at the frame budget evicted newer queued audio");
+        } finally {
+            queue.stop();
+            decoder.destroy();
+        }
+    }
+
+    private static void acceptAuthenticatedAt(UdpPcmQueue queue, UdpPacketDecoder decoder,
+            byte[] key, long sessionId, long sequence, long frameIndex, int type, byte[] payload,
+            long receivedAtNanos) throws Exception {
+        byte[] datagram = encode(key, sessionId, sequence, frameIndex, type, payload);
+        queue.acceptAt(decoder.open(datagram, datagram.length), decoder, receivedAtNanos);
     }
 
     private static void checkLoopbackReceiveThread() throws Exception {
