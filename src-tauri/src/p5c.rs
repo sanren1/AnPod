@@ -731,9 +731,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             generation, attempts, Some(session_id), paused, None);
         retry_index = 0;
         let mut endpoint_changed = false;
+        let mut stop_owner = false;
         let mut next_heartbeat = Instant::now() + timing.heartbeat_interval;
         loop {
-            if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break 'owner; }
+            if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
+                stop_owner = true;
+                break;
+            }
             let sent = session.pcm_payload_bytes_sent();
             pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
             last_session_bytes = sent;
@@ -744,8 +748,6 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                             attempts, Some(session_id), paused, None);
                     }
                     Err(error) => {
-                        let sent = session.pcm_payload_bytes_sent();
-                        pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                         last_error = Some(error);
                         break;
                     }
@@ -772,43 +774,41 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                     endpoint_changed = endpoint != next_endpoint;
                     endpoint = next_endpoint;
                     if !endpoint_changed { continue; }
-                    let sent = session.pcm_payload_bytes_sent();
-                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     if let Err(error) = session.stop() { last_error = Some(error); }
                     break;
                 }
                 Ok(OwnerCommand::SetMode(mode)) => {
                     if mode == parameters.mode { continue; }
                     parameters.mode = mode;
-                    let sent = session.pcm_payload_bytes_sent();
-                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     session.close_local();
                     endpoint_changed = true;
                     break;
                 }
                 Ok(OwnerCommand::Reconnect) => {
-                    let sent = session.pcm_payload_bytes_sent();
-                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     session.close_local();
                     endpoint_changed = true;
                     break;
                 }
                 Ok(OwnerCommand::Stop) => {
                     enabled.store(false, Ordering::Release);
-                    let sent = session.pcm_payload_bytes_sent();
-                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
                     if let Err(error) = session.stop() { last_error = Some(error); }
-                    break 'owner;
+                    stop_owner = true;
+                    break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => { enabled.store(false, Ordering::Release); break 'owner; }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    enabled.store(false, Ordering::Release);
+                    stop_owner = true;
+                    break;
+                }
             }
         }
+        session.close_local();
         let sent = session.pcm_payload_bytes_sent();
         pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
         *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
         drop(session);
-        if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break; }
+        if stop_owner || !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break 'owner; }
         publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
             None, paused, last_error.clone());
         if endpoint_changed { retry_index = 0; continue 'owner; }
@@ -1376,14 +1376,14 @@ mod tests {
         assert!(resumed_queue.push_raw(samples.as_ptr(), 960, 48_000, 2, 0),
             "new session audio frame zero must be accepted by its fresh queue");
         wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
-        assert!(owner.pcm_payload_bytes_sent() >= 7_680,
-            "both output sessions' frame-zero PCM must reach the fake sink");
         owner.stop();
+        assert_eq!(owner.pcm_payload_bytes_sent(), 7_680,
+            "both output sessions' frame-zero PCM payloads must be counted exactly once");
         let result = finish_endpoint(child, stdout);
         let fields: Vec<_> = result.split(',').collect();
         assert_eq!(fields[1], "3", "mode change and output recovery must start fresh playback sessions: {result}");
-        assert!(fields[5].parse::<usize>().unwrap() >= 7_680,
-            "frame-zero PCM after fresh output recovery must reach the fake sink: {result}");
+        assert_eq!(fields[5].parse::<usize>().unwrap(), 7_680,
+            "both frame-zero PCM payloads must reach the fake sink exactly once: {result}");
     }
 
     fn wait_for_owner(owner: &SessionOwner, predicate: impl Fn(&SessionSnapshot) -> bool) -> SessionSnapshot {
