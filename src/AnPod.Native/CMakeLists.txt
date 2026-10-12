@@ -26,6 +26,12 @@ set_target_properties(audio_capture PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"
 )
 
+if(MSVC)
+    set_property(TARGET audio_capture PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+endif()
+
 # ws2_32 / winmm / ole32 are also pulled in via #pragma comment for MSVC, but
 # listing them keeps MinGW and any other toolchain working.
 target_link_libraries(audio_capture PRIVATE ws2_32 winmm ole32 uuid)

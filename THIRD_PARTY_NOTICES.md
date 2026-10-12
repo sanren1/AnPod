@@ -75,11 +75,11 @@ MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
 `LICENSES/` where available. Each Rust crate retains the licence terms recorded
 in its published package; see the lockfile for exact versions.
 
-The P3 localhost UDP prototype adds Rust crate `aes-gcm` 0.11.1 for
-AES-256-GCM authenticated encryption. The crate is dual-licensed MIT or
-Apache-2.0; its transitive dependencies and exact locked versions are listed
-in `src-tauri/Cargo.lock`. No AES-GCM implementation source is copied into
-AnPod.
+The P3 localhost UDP prototype adds Rust crates `aes-gcm` 0.11.1 for
+AES-256-GCM authenticated encryption, `sha2` 0.10.9 for SHA-256, and
+`getrandom` 0.3.4 for session material. Each is dual-licensed MIT or
+Apache-2.0; exact locked versions are listed in `src-tauri/Cargo.lock`. No
+cryptographic implementation source is copied into AnPod.
 
 The P5-A/B pairing and USB binding code adds Rust crates `hmac` 0.12.1 and
 `hkdf` 0.12.4 (MIT OR Apache-2.0) for HMAC-SHA256 proofs and RFC 5869
@@ -87,7 +87,12 @@ HKDF-SHA256 session key derivation. `subtle` 2.6.1 (BSD-3-Clause) is a
 transitive dependency used by HMAC tag verification. Exact locked versions
 are in `src-tauri/Cargo.lock`; no cryptographic implementation source is
 copied into AnPod. Android uses platform JCA, `AtomicFile`, and
-`ParcelFileDescriptor` APIs and adds no Android dependency.
+`ParcelFileDescriptor` APIs and adds no Android dependency. Original crate
+copyright notices and MIT license texts are included in `LICENSES/` as
+`aes-gcm-MIT.txt`, `getrandom-MIT.txt`, `hkdf-MIT.txt`, `hmac-MIT.txt`, and
+`sha2-MIT.txt`; the complete original BSD-3-Clause text for transitive crate
+`subtle` 2.6.1 is included as `subtle-BSD-3-Clause.txt`. Shared Apache-2.0
+terms are in `LICENSES/Apache-2.0.txt`.
 
 The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
 queue and applies a short fade when trimming backlog. This is AnPod-owned code

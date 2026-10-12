@@ -9,7 +9,9 @@ param(
     [string]$LegacyPayloadDirectory,
     [string]$RustTargetDirectory,
     [string]$AndroidSdkRoot,
-    [switch]$Offline
+    [switch]$Offline,
+    [switch]$ReviewPackage,
+    [switch]$ReuseExistingBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,7 +19,10 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid p
 $root = Split-Path -Parent $PSScriptRoot
 $deps = Join-Path $root 'deps'
 $artifacts = Join-Path $root 'artifacts'
-$packageName = if ($IncludeReceiverCandidate) { "AnPod-$Version-receiver-$ReceiverCandidate-candidate-tauri-win-x64-portable" } else { "AnPod-$Version-tauri-win-x64-portable" }
+if ($ReviewPackage -and (-not $IncludeReceiverCandidate -or $ReceiverCandidate -ne 'v2')) { throw '-ReviewPackage is only valid for the v2 Receiver candidate.' }
+if ($ReuseExistingBuild -and (-not $IncludeReceiverCandidate -or $ReceiverCandidate -ne 'v2')) { throw '-ReuseExistingBuild is only valid for the v2 Receiver candidate.' }
+$reviewSuffix = if ($ReviewPackage) { '-review' } else { '' }
+$packageName = if ($IncludeReceiverCandidate) { "AnPod-$Version-receiver-$ReceiverCandidate-candidate$reviewSuffix-tauri-win-x64-portable" } else { "AnPod-$Version-tauri-win-x64-portable" }
 $manifest = Get-Content -Raw (Join-Path $root 'src-tauri\Cargo.toml')
 $config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 $manifestVersion = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -50,8 +55,12 @@ $frontendTools = Join-Path $root 'frontend\node_modules\.bin'
 $tsc = Join-Path $frontendTools 'tsc.cmd'
 $vite = Join-Path $frontendTools 'vite.cmd'
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-if (-not $npm -and (-not (Test-Path -LiteralPath $tsc -PathType Leaf) -or -not (Test-Path -LiteralPath $vite -PathType Leaf))) { throw 'npm or the already-installed local TypeScript/Vite commands are required.' }
-if (-not $cargo) { throw 'cargo was not found on PATH. Install Rust stable 1.90 or newer.' }
+if (-not $ReuseExistingBuild) {
+    if (-not $npm -and (-not (Test-Path -LiteralPath $tsc -PathType Leaf) -or -not (Test-Path -LiteralPath $vite -PathType Leaf))) { throw 'npm or the already-installed local TypeScript/Vite commands are required.' }
+    if (-not $cargo) { throw 'cargo was not found on PATH. Install Rust stable 1.90 or newer.' }
+} elseif (-not (Test-Path -LiteralPath (Join-Path $targetDir 'release\anpod-tauri.exe') -PathType Leaf)) {
+    throw 'The selected isolated target does not contain the previously audited Tauri release executable.'
+}
 
 $required = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'audio_capture.dll', 'server', 'PLATFORM_TOOLS_NOTICE.txt')
 $receiverFiles = @('receiver.apk', 'receiver.json')
@@ -87,7 +96,8 @@ if ($IncludeReceiverCandidate) {
                 throw "V2 artifacts and Rust target must use isolated paths under artifacts/: $([IO.Path]::GetFileName($sourcePath))"
             }
         }
-        if (Test-Path -LiteralPath $targetDir) { throw "Refusing to reuse a V2 Rust target directory: $targetDir" }
+        if ((Test-Path -LiteralPath $targetDir) -and -not $ReuseExistingBuild) { throw "V2 Rust target already exists; pass -ReuseExistingBuild only when the audited build inputs are unchanged: $targetDir" }
+        if (-not (Test-Path -LiteralPath $targetDir) -and $ReuseExistingBuild) { throw "Cannot reuse a missing V2 Rust target directory: $targetDir" }
 
         $receiverMetadata = Get-Content -Raw (Join-Path $receiverSource 'receiver.json') | ConvertFrom-Json
         if ($receiverMetadata.applicationId -ne 'app.anpod.receiver' -or $receiverMetadata.versionName -ne '0.3.0-v2-candidate' -or $receiverMetadata.versionCode -ne 3 -or $receiverMetadata.targetSdk -ne 35 -or $receiverMetadata.variant -ne 'debug' -or $receiverMetadata.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $receiverMetadata.signerSha256 -notmatch '^[0-9a-fA-F]{64}$' -or $receiverMetadata.sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -96,8 +106,24 @@ if ($IncludeReceiverCandidate) {
         $actualReceiverHash = (Get-FileHash -LiteralPath (Join-Path $receiverSource 'receiver.apk') -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($receiverMetadata.sha256.ToLowerInvariant() -ne $actualReceiverHash) { throw 'V2 Receiver APK SHA-256 does not match receiver.json.' }
         $currentSourceCommit = (& git -C $root rev-parse HEAD).Trim()
-        if ($LASTEXITCODE -ne 0 -or $receiverMetadata.sourceCommit -ne $currentSourceCommit) {
-            throw 'V2 Receiver source commit does not match the current committed source.'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the current source commit.' }
+        & git -C $root merge-base --is-ancestor $receiverMetadata.sourceCommit $currentSourceCommit
+        if ($LASTEXITCODE -ne 0) { throw 'V2 Receiver source commit is not an ancestor of the current source.' }
+        $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1')
+        $receiverInputChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
+        $receiverInputChanges += @(& git -C $root diff --name-only HEAD -- @receiverInputPaths)
+        $receiverInputChanges += @(& git -C $root diff --cached --name-only HEAD -- @receiverInputPaths)
+        if ($LASTEXITCODE -ne 0 -or $receiverInputChanges.Count) {
+            throw "V2 Receiver build inputs changed after source commit $($receiverMetadata.sourceCommit); rebuild the Receiver artifact before packaging."
+        }
+        if ($ReuseExistingBuild) {
+            $tauriInputPaths = @('src-tauri', 'frontend')
+            $tauriInputChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @tauriInputPaths)
+            $tauriInputChanges += @(& git -C $root diff --name-only HEAD -- @tauriInputPaths)
+            $tauriInputChanges += @(& git -C $root diff --cached --name-only HEAD -- @tauriInputPaths)
+            if ($LASTEXITCODE -ne 0 -or $tauriInputChanges.Count) {
+                throw "Tauri/frontend build inputs changed after source commit $($receiverMetadata.sourceCommit); cannot reuse the existing Tauri build."
+            }
         }
 
         if (-not $AndroidSdkRoot) { $AndroidSdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME } }
@@ -125,48 +151,52 @@ if ($IncludeReceiverCandidate) {
 $missing = @($required | Where-Object { $source = if ($_ -eq 'audio_capture.dll') { $nativeSource } elseif ($_ -eq 'server') { $legacyPayloadSource } else { $deps }; -not (Test-Path -LiteralPath (Join-Path $source $_) -PathType Leaf) })
 if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ', ')" }
 
-Push-Location (Join-Path $root 'frontend')
-try {
-    if ($npm) {
-        Write-Host "Building frontend with $($npm.Name)..." -ForegroundColor Cyan
-        & $npm.Source run build
-        if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
-    } else {
-        Write-Host 'Building frontend with the already-installed local TypeScript and Vite commands...' -ForegroundColor Cyan
-        & $tsc -b
-        if ($LASTEXITCODE -ne 0) { throw "TypeScript build failed with exit code $LASTEXITCODE." }
-        & $vite build
-        if ($LASTEXITCODE -ne 0) { throw "Vite build failed with exit code $LASTEXITCODE." }
-    }
-}
-finally { Pop-Location }
-
-$oldCargoTargetDir = $env:CARGO_TARGET_DIR
-$oldRustFlags = $env:RUSTFLAGS
-$oldEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
-try {
-    $remap = "--remap-path-prefix=$root=."
-    if (-not [string]::IsNullOrWhiteSpace($oldEncodedRustFlags)) {
-        $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags + [char]31 + $remap
-    } else {
-        $rustFlagArgs = @()
-        if (-not [string]::IsNullOrWhiteSpace($oldRustFlags)) {
-            $rustFlagArgs = @($oldRustFlags -split '\s+' | Where-Object { $_.Length -gt 0 })
+if (-not $ReuseExistingBuild) {
+    Push-Location (Join-Path $root 'frontend')
+    try {
+        if ($npm) {
+            Write-Host "Building frontend with $($npm.Name)..." -ForegroundColor Cyan
+            & $npm.Source run build
+            if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
+        } else {
+            Write-Host 'Building frontend with the already-installed local TypeScript and Vite commands...' -ForegroundColor Cyan
+            & $tsc -b
+            if ($LASTEXITCODE -ne 0) { throw "TypeScript build failed with exit code $LASTEXITCODE." }
+            & $vite build
+            if ($LASTEXITCODE -ne 0) { throw "Vite build failed with exit code $LASTEXITCODE." }
         }
-        $rustFlagArgs += $remap
-        $env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([string][char]31, [string[]]$rustFlagArgs)
     }
-    $env:RUSTFLAGS = $oldRustFlags
-    $env:CARGO_TARGET_DIR = $targetDir
-    $cargoArguments = @('build', '--release', '--locked', '--manifest-path', (Join-Path $root 'src-tauri\Cargo.toml'))
-    if ($Offline) { $cargoArguments += '--offline' }
-    & $cargo.Source @cargoArguments
-    if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE." }
+    finally { Pop-Location }
 }
-finally {
-    $env:RUSTFLAGS = $oldRustFlags
-    $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags
-    $env:CARGO_TARGET_DIR = $oldCargoTargetDir
+
+if (-not $ReuseExistingBuild) {
+    $oldCargoTargetDir = $env:CARGO_TARGET_DIR
+    $oldRustFlags = $env:RUSTFLAGS
+    $oldEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
+    try {
+        $remap = "--remap-path-prefix=$root=."
+        if (-not [string]::IsNullOrWhiteSpace($oldEncodedRustFlags)) {
+            $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags + [char]31 + $remap
+        } else {
+            $rustFlagArgs = @()
+            if (-not [string]::IsNullOrWhiteSpace($oldRustFlags)) {
+                $rustFlagArgs = @($oldRustFlags -split '\s+' | Where-Object { $_.Length -gt 0 })
+            }
+            $rustFlagArgs += $remap
+            $env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([string][char]31, [string[]]$rustFlagArgs)
+        }
+        $env:RUSTFLAGS = $oldRustFlags
+        $env:CARGO_TARGET_DIR = $targetDir
+        $cargoArguments = @('build', '--release', '--locked', '--manifest-path', (Join-Path $root 'src-tauri\Cargo.toml'))
+        if ($Offline) { $cargoArguments += '--offline' }
+        & $cargo.Source @cargoArguments
+        if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE." }
+    }
+    finally {
+        $env:RUSTFLAGS = $oldRustFlags
+        $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedRustFlags
+        $env:CARGO_TARGET_DIR = $oldCargoTargetDir
+    }
 }
 
 $exe = Join-Path $targetDir 'release\anpod-tauri.exe'

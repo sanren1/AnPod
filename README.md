@@ -20,12 +20,12 @@
   <a href="https://github.com/sanren1/AnPod/issues">反馈问题</a>
 </p>
 
-AnPod 将 Windows 当前默认播放设备的声音实时传到 Android 手机。音频通过 WASAPI Loopback 采集；Windows 桌面端通过经认证的直接网络会话，将 PCM 音频发送给 Receiver。Receiver 是需单独安装的 Android 前台服务应用。
+AnPod 将 Windows 当前默认播放设备的声音实时传到 Android 手机。USB Legacy 路径通过 ADB 启动随包携带的 Android `server`，无需安装 Receiver；直接 Wi-Fi 路径会把 PCM 音频发送给需单独安装的 Receiver 前台服务。
 
 ## 功能
 
-- Wi-Fi 主入口直接连接 Receiver；可选电脑与手机网络接口，使用已配对绑定进行认证。无线调试扫码、配对码和地址连接保留为过渡/诊断方式。
-- 首次通过已授权 USB 连接安装或更新 Receiver、检查手机网络地址并完成绑定；已配对设备发现只提供地址提示，连接仍须通过双向认证。
+- USB Legacy 通过手机卡片连接，可播放而无需安装 Receiver。
+- Wi-Fi 主流程直接连接 Receiver；首次绑定/启动时使用已授权 USB，已绑定后使用保存的密钥和 IPv4 端点完成认证。无线调试扫码、配对码和地址连接保留为过渡/诊断方式。
 - 手机播放、电脑播放切换；断开或暂停后恢复此前未静音的电脑音频端点。
 - 均衡和低延迟播放模式，支持确认后重连切换。
 - 设备重新出现后自动连接；Wi-Fi 音频会话掉线后进行有限次数恢复。
@@ -38,8 +38,8 @@ AnPod 将 Windows 当前默认播放设备的声音实时传到 Android 手机�
 | 电脑 | Windows 10/11 x64 |
 | WebView | Microsoft Edge WebView2 Runtime；便携包不包含该运行时 |
 | 手机 | Android 6.0+，需允许 Receiver 通知和前台服务运行 |
-| USB 首次绑定 | 支持数据传输的 USB 线，已开启并授权 USB 调试 |
-| Wi-Fi | 手机与电脑处于可互访的网络；分别明确选择电脑和手机当前网络接口 |
+| USB | Legacy 连接和首次 Receiver 绑定都需要支持数据传输的 USB 线及已授权 USB 调试；Legacy 无需安装 Receiver |
+| Wi-Fi | 手机与电脑处于可互访的网络；直接 Receiver 流程总要选择电脑接口，首次 USB 绑定时再选择手机接口 |
 | 过渡/诊断 | 无线调试配对需要 Android 11+ |
 
 AnPod 需要可用的 Windows 默认音频输出设备。手机不会显示为 Windows 音频设备。ADB 授权会授予电脑 ADB 调试能力；请只连接信任的电脑和手机。
@@ -48,23 +48,21 @@ AnPod 需要可用的 Windows 默认音频输出设备。手机不会显示为 W
 
 从 `artifacts/` 解压完整 ZIP 到可写目录并运行 `AnPod.exe`。`adb.exe`、Platform-Tools DLL、`audio_capture.dll` 和 Android `server` 载荷必须与 EXE 同目录；请勿单独移动 EXE。包内含第三方许可与通知。首次运行需要系统已安装 WebView2 Runtime。
 
-### 首次设置与 USB
+### USB：Legacy 播放
 
 1. 在手机开发者选项中开启 **USB 调试**，用数据线连接电脑，并在手机上确认调试授权。
-2. 在 AnPod 中打开 **直接连接 Receiver**，选择已授权 USB 手机，并明确点击 **安装/更新 Receiver**。按 Android 提示确认安装及通知权限。
-3. 选择电脑正在使用的网络接口，以及手机当前使用的网络接口；两端必须能互访。首次连接会通过 USB 绑定 Receiver。
-4. 连接后点击 **手机输出** 开始播放。选择 **电脑输出** 可恢复电脑播放并保持手机连接。
+2. 在 AnPod 选择 **USB**，从手机卡片选择目标手机并点击 **连接**。
+3. 点击 **手机** 输出开始播放；点击 **电脑** 可恢复电脑输出。此 USB Legacy 路径无需安装 Receiver。
 
-手机卡片会区分 Receiver 安装状态、服务状态和手机已确认的播放状态。连接就绪不代表手机已开始播放。Receiver 没有 Launcher 图标，运行时通过前台服务通知显示。若用户强行停止 Receiver 或手机重启，需要用已授权 USB 再次启动；保留配对绑定即可，不需清除应用数据。点击卡片可展开设备列表；切换手机会先要求确认。结束时点击卡片旁的 **断开连接**，或从托盘菜单退出程序。
+### Wi-Fi：直接连接 Receiver
 
-### Wi-Fi 连接
+主界面的 **添加手机** 按钮会打开 **直接连接 Receiver** 弹窗；在没有活动连接且未选择无线调试设备时，点击 **手机** 输出也会打开该弹窗。
 
-1. 按上面的首次设置步骤，通过 USB 安装 Receiver 并完成一次绑定。手机与电脑接入可互访的网络。
-2. 在 AnPod 中选择 **Wi-Fi → 直接连接 Receiver**，分别选择电脑网络接口和手机网络接口。
-3. 选择已配对 Receiver；也可先发现候选地址或手动输入手机地址。发现结果只是提示，连接时会执行双向认证。
-4. 认证连接后点击 **手机输出**。若 Receiver 被强行停止或手机重启，使用 USB 再次启动服务。
+首次设置时，在弹窗里选择 **USB 首次绑定**，选定电脑网络接口和已授权 USB 手机；检查 Receiver 状态，必要时明确点击 **安装/更新 Receiver** 并接受 Android 系统安装、通知权限提示。随后选择手机当前 IPv4 接口，点击 **通过 USB 绑定并连接**。成功认证后 AnPod 自动切换到手机输出并开始网络音频，不需要再点一次输出按钮。安装和服务状态显示在该弹窗；手机卡片显示会话连接方式与 Receiver 确认的播放状态。
 
-无线调试二维码、配对码与地址连接位于 **无线调试（过渡/诊断）** 入口，不是直接 Receiver 主路径。若 Android Package Manager 因签名不同拒绝更新，请停止并保留应用数据；不要卸载 Receiver 或清除数据来绕过签名检查。候选包的 debug signer 与旧 P2 候选相同、与 P1 不同，因此没有验证或承诺从 P1 原地升级。
+已绑定后可以不连接 USB：选择 **已配对接收端**，选择电脑网络接口、保存的绑定和发现候选或手动输入的 Receiver IPv4 地址及控制端口，然后点击 **连接已配对 Receiver**。该路径不再选择手机网络接口；发现结果只是地址候选，连接仍执行双向认证并自动开始手机输出。
+
+无线调试扫码、配对码和地址连接位于 **无线调试（过渡/诊断）** 入口。若 Receiver 被 Android 强行停止或手机重启，需通过已授权 USB 再启动服务；保留绑定即可，不需清除数据。若系统因签名不同拒绝更新，应停止并保留现有应用数据，不要卸载或清除数据绕过检查。本次审计的候选 APK 使用的 debug signer 与旧 P2 候选相同、与 P1 不同；其他开发机默认 debug 密钥可能不同，因此不能据此推断候选包之间的升级兼容性。
 
 ## 延迟测试
 
@@ -140,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.
 
 ### Receiver v2 候选包
 
-v2 使用 `artifacts/` 下独立的 Receiver、Native、Legacy payload 和 Rust target 目录，不读取或覆盖 `deps/` 中的运行文件或既有 ZIP。准备 JDK 17、Android SDK Platform 35 / Build-Tools、Rust stable 1.90+、MSVC x64、Node.js，以及仓库已经安装的前端依赖，然后从仓库根目录执行：
+v2 的 Receiver、Native、Legacy payload 和 Rust target 使用 `artifacts/` 下隔离目录；配套的 ADB、Platform-Tools DLL 和其 NOTICE 仍从 `deps/` 读取。打包会写入独立候选名，不覆盖稳定版、P1 或 P2 包。准备 JDK 17、Android SDK Platform 35 / Build-Tools、Rust stable 1.90+、MSVC x64、Node.js，以及仓库已经安装的前端依赖，然后从仓库根目录执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\build-native.ps1 -BuildDirectory artifacts\p8-v2-native-build -OutputDirectory artifacts\p8-v2-native
@@ -149,7 +147,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build-receiver.ps1 -Variant d
 powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.0.4 -IncludeReceiverCandidate -ReceiverCandidate v2 -ReceiverArtifactDirectory artifacts\p8-v2-receiver -NativeArtifactDirectory artifacts\p8-v2-native -LegacyPayloadDirectory artifacts\p8-v2-legacy -RustTargetDirectory artifacts\p8-v2-tauri-target -AndroidSdkRoot $env:ANDROID_SDK_ROOT -Offline
 ```
 
-若要沿用本机已有的候选 debug 密钥，可在构建 Receiver 时通过 `-DebugKeyStorePath` 指定；密钥文件不应放入仓库或候选包。若签名不匹配，Android 会拒绝覆盖安装；不要卸载或清除数据。生成的 APK 是 `0.3.0-v2-candidate` / versionCode 3 / targetSdk 35 的 debug 候选。它的 signer 与旧 P2 候选相同、与 P1 不同；P1 原地升级、真机安装、播放及设备生命周期行为均未验证。候选包不代表 release 签名或发布版本。
+若要沿用本机已有的候选 debug 密钥，可在构建 Receiver 时通过 `-DebugKeyStorePath` 指定；密钥文件不应放入仓库或候选包。若签名不匹配，Android 会拒绝覆盖安装；不要卸载或清除数据。生成的 APK 是 `0.3.0-v2-candidate` / versionCode 3 / targetSdk 35 的 debug 候选。本次已构建 APK 的 signer 与旧 P2 候选相同、与 P1 不同；未指定同一密钥的其他开发机可能生成不同 signer。P1 原地升级、真机安装、播放及设备生命周期行为均未验证。候选包不代表 release 签名或发布版本。
 
 开发运行时由 Tauri 启动 Vite，在仓库根目录中执行：
 
