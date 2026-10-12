@@ -8,8 +8,17 @@ import java.util.ArrayList;
 /** Short-lock packet queue and byte-stream adapter for the existing AudioTrack worker. */
 final class UdpPcmQueue {
     static final int CAPACITY_PACKETS = 8;
+    private static final int LOW_LATENCY_INITIAL_MS = 5;
+    private static final int BALANCED_INITIAL_MS = 15;
+    private static final int LOW_LATENCY_MAX_MS = 20;
+    private static final int BALANCED_MAX_MS = 40;
+    private static final int STEP_MS = 5;
+    private static final int FADE_MS = 3;
+    private static final long STABLE_DECAY_NS = 1_000_000_000L;
+
     private final ArrayList<AudioPacket> packets = new ArrayList<>(CAPACITY_PACKETS);
     private final PairingProtocol.AudioParameters expectedParameters;
+    private final boolean lowLatency;
     private UdpPacketDecoder.Format format;
     private boolean paused;
     private boolean stopped;
@@ -18,11 +27,66 @@ final class UdpPcmQueue {
     private long playoutFrame;
     private long payloadGeneration;
     private long droppedFrames;
+    private long expiredFrames;
+    private long queuedFrames;
+    private QueueInputStream activePayloadStream;
+    private long trackUnderruns = -1;
+    private long stableSinceNanos;
+    private int trackPreRollFrames;
+    private int initialTargetFrames;
+    private int targetFrames;
+    private int maxTargetFrames;
+    private int maxQueuedFrames;
+    private long maxPacketAgeNanos;
+    private long waitBudgetNanos;
+    private boolean rebuffering = true;
+    private long rebufferDeadlineNanos;
+    private boolean gapWaitActive;
+    private long gapWaitFrame;
+    private long gapDeadlineNanos;
+    private boolean fadeNext;
 
-    UdpPcmQueue() { this(null); }
+    UdpPcmQueue() { this(null, "balanced"); }
 
     UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters) {
+        this(expectedParameters, expectedParameters != null && expectedParameters.mode == 1
+                ? "lowlatency" : "balanced");
+    }
+
+    UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters, String playbackMode) {
         this.expectedParameters = expectedParameters;
+        lowLatency = "lowlatency".equalsIgnoreCase(playbackMode);
+        if (expectedParameters != null) updateBudget(expectedParameters.sampleRate, 0);
+    }
+
+    synchronized void configureAudioTrack(int preRollFrames) {
+        if (format == null) return;
+        updateBudget(format.sampleRate, Math.max(0, preRollFrames));
+        targetFrames = initialTargetFrames;
+        updateWaitBudget();
+        stableSinceNanos = System.nanoTime();
+        rebufferDeadlineNanos = packets.isEmpty() ? 0 : packets.get(0).enqueuedAtNanos + waitBudgetNanos;
+        notifyAll();
+    }
+
+    synchronized void reportTrackUnderruns(int currentCount) {
+        if (currentCount < 0) return;
+        long now = System.nanoTime();
+        if (trackUnderruns < 0) {
+            trackUnderruns = currentCount;
+            stableSinceNanos = now;
+            return;
+        }
+        long increase = Math.max(0, (long) currentCount - trackUnderruns);
+        trackUnderruns = currentCount;
+        if (increase > 0) {
+            int stepFrames = framesForMillis(STEP_MS);
+            targetFrames = (int) Math.min(maxTargetFrames,
+                    targetFrames + Math.min(increase, CAPACITY_PACKETS) * stepFrames);
+            updateWaitBudget();
+            stableSinceNanos = now;
+            notifyAll();
+        }
     }
 
     synchronized void accept(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder)
@@ -37,6 +101,8 @@ final class UdpPcmQueue {
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
             decoder.commit(packet.sequence);
             format = acceptedFormat;
+            updateBudget(format.sampleRate, trackPreRollFrames);
+            stableSinceNanos = System.nanoTime();
             notifyAll();
             return;
         }
@@ -59,32 +125,51 @@ final class UdpPcmQueue {
         }
         if (hasPlayoutFrame && Long.compareUnsigned(packet.sampleFrameIndex, playoutFrame) < 0) {
             droppedFrames += frameCount;
+            if (Long.compareUnsigned(frameEnd, playoutFrame) > 0) {
+                advancePlayoutFrame(frameEnd);
+                markDiscontinuity();
+            }
             return;
         }
 
-        AudioPacket audio = new AudioPacket(packet.sequence, packet.sampleFrameIndex, frameCount, packet.payload);
+        long now = System.nanoTime();
+        expireStalePackets(now);
+        discardBehindWatermark();
+        AudioPacket audio = new AudioPacket(packet.sequence, packet.sampleFrameIndex, frameCount,
+                packet.payload, now);
         int insertAt = 0;
         while (insertAt < packets.size()
                 && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) <= 0) insertAt++;
-        if (packets.size() == CAPACITY_PACKETS) {
-            if (insertAt == 0) {
-                droppedFrames += frameCount;
-                return;
-            }
-            AudioPacket stale = packets.remove(0);
-            droppedFrames += stale.frameCount;
-            long staleEnd = stale.frameIndex + stale.frameCount;
-            if (!hasPlayoutFrame || Long.compareUnsigned(staleEnd, playoutFrame) > 0) {
-                playoutFrame = staleEnd;
-                hasPlayoutFrame = true;
-            }
-            if (Long.compareUnsigned(audio.frameIndex, playoutFrame) < 0) {
-                droppedFrames += frameCount;
-                return;
-            }
-            insertAt--;
+        if (insertAt < packets.size()
+                && packets.get(insertAt).frameIndex == audio.frameIndex) {
+            droppedFrames += frameCount;
+            return;
         }
+        while (!packets.isEmpty() && (packets.size() == CAPACITY_PACKETS
+                || queuedFrames + frameCount > maxQueuedFrames)) {
+            AudioPacket stale = packets.remove(0);
+            queuedFrames -= stale.frameCount;
+            dropQueuedPacket(stale, true);
+            insertAt = Math.max(0, insertAt - 1);
+        }
+        discardBehindWatermark();
+        insertAt = 0;
+        while (insertAt < packets.size()
+                && Long.compareUnsigned(packets.get(insertAt).frameIndex, audio.frameIndex) <= 0) insertAt++;
+        if ((hasPlayoutFrame && Long.compareUnsigned(audio.frameIndex, playoutFrame) < 0)
+                || queuedFrames + frameCount > maxQueuedFrames) {
+            droppedFrames += frameCount;
+            expiredFrames += frameCount;
+            long end = audio.frameIndex + frameCount;
+            boolean future = !hasPlayoutFrame || Long.compareUnsigned(end, playoutFrame) > 0;
+            advancePlayoutFrame(end);
+            if (future) markDiscontinuity();
+            return;
+        }
+        boolean wasEmpty = packets.isEmpty();
         packets.add(insertAt, audio);
+        queuedFrames += frameCount;
+        if (rebuffering && wasEmpty) rebufferDeadlineNanos = now + waitBudgetNanos;
         notifyAll();
     }
 
@@ -99,6 +184,7 @@ final class UdpPcmQueue {
         if (packets.isEmpty() && failure != null) throw failure;
         if (stopped) return null;
         AudioPacket packet = packets.remove(0);
+        queuedFrames -= packet.frameCount;
         playoutFrame = packet.frameIndex + packet.frameCount;
         hasPlayoutFrame = true;
         return packet;
@@ -108,15 +194,99 @@ final class UdpPcmQueue {
         if (paused == value) return;
         paused = value;
         payloadGeneration++;
+        gapWaitActive = false;
+        rebuffering = true;
+        rebufferDeadlineNanos = 0;
         if (paused) {
             for (AudioPacket packet : packets) {
                 droppedFrames += packet.frameCount;
-                long end = packet.frameIndex + packet.frameCount;
-                advancePlayoutFrame(end);
+                advancePlayoutFrame(packet.frameIndex + packet.frameCount);
             }
             packets.clear();
+            queuedFrames = 0;
+            if (activePayloadStream != null && activePayloadStream.currentPayload != null) {
+                droppedFrames += (activePayloadStream.currentPayload.length
+                        - activePayloadStream.payloadOffset) / (format.channels * 2);
+                activePayloadStream.currentPayload = null;
+                activePayloadStream.payloadOffset = 0;
+                activePayloadStream.enqueuedAtNanos = 0;
+            }
+            activePayloadStream = null;
+        } else {
+            fadeNext = true;
         }
         notifyAll();
+    }
+
+    private void updateBudget(int sampleRate, int preRollFrames) {
+        if (sampleRate <= 0) return;
+        int initialMs = lowLatency ? LOW_LATENCY_INITIAL_MS : BALANCED_INITIAL_MS;
+        int maxMs = lowLatency ? LOW_LATENCY_MAX_MS : BALANCED_MAX_MS;
+        int initialTotalFrames = Math.max(1, sampleRate * initialMs / 1000);
+        int maxTotalFrames = Math.max(initialTotalFrames, sampleRate * maxMs / 1000);
+        trackPreRollFrames = Math.max(0, preRollFrames);
+        initialTargetFrames = Math.max(0, initialTotalFrames - trackPreRollFrames);
+        maxTargetFrames = Math.max(initialTargetFrames, maxTotalFrames - trackPreRollFrames);
+        targetFrames = Math.min(Math.max(targetFrames, initialTargetFrames), maxTargetFrames);
+        maxQueuedFrames = maxTotalFrames;
+        maxPacketAgeNanos = maxMs * 1_000_000L;
+        updateWaitBudget();
+    }
+
+    private void updateWaitBudget() {
+        int sampleRate = format != null ? format.sampleRate
+                : expectedParameters != null ? expectedParameters.sampleRate : 0;
+        waitBudgetNanos = sampleRate <= 0 ? 0 : (long) targetFrames * 1_000_000_000L / sampleRate;
+    }
+
+    private int framesForMillis(int millis) {
+        int sampleRate = format != null ? format.sampleRate
+                : expectedParameters != null ? expectedParameters.sampleRate : 0;
+        return sampleRate <= 0 ? 1 : Math.max(1, sampleRate * millis / 1000);
+    }
+
+    synchronized void decayTarget(long now) {
+        if (targetFrames <= initialTargetFrames || now - stableSinceNanos < STABLE_DECAY_NS) return;
+        targetFrames = Math.max(initialTargetFrames, targetFrames - framesForMillis(STEP_MS));
+        updateWaitBudget();
+        stableSinceNanos = now;
+    }
+
+    synchronized void expireStalePackets(long nowNanos) {
+        boolean changed = false;
+        for (int index = packets.size() - 1; index >= 0; index--) {
+            AudioPacket packet = packets.get(index);
+            if (nowNanos - packet.enqueuedAtNanos > maxPacketAgeNanos) {
+                packets.remove(index);
+                queuedFrames -= packet.frameCount;
+                dropQueuedPacket(packet, true);
+                changed = true;
+            }
+        }
+        if (changed) {
+            discardBehindWatermark();
+            rebuffering = true;
+            rebufferDeadlineNanos = packets.isEmpty() ? 0 : System.nanoTime() + waitBudgetNanos;
+        }
+    }
+
+    private void discardBehindWatermark() {
+        while (hasPlayoutFrame && !packets.isEmpty()
+                && Long.compareUnsigned(packets.get(0).frameIndex, playoutFrame) < 0) {
+            AudioPacket stale = packets.remove(0);
+            queuedFrames -= stale.frameCount;
+            droppedFrames += stale.frameCount;
+            expiredFrames += stale.frameCount;
+        }
+    }
+
+    private void dropQueuedPacket(AudioPacket packet, boolean expired) {
+        droppedFrames += packet.frameCount;
+        if (expired) expiredFrames += packet.frameCount;
+        long end = packet.frameIndex + packet.frameCount;
+        boolean future = !hasPlayoutFrame || Long.compareUnsigned(end, playoutFrame) > 0;
+        advancePlayoutFrame(end);
+        if (future) markDiscontinuity();
     }
 
     private void advancePlayoutFrame(long frame) {
@@ -126,12 +296,26 @@ final class UdpPcmQueue {
         }
     }
 
+    private void markDiscontinuity() {
+        payloadGeneration++;
+        fadeNext = true;
+        gapWaitActive = false;
+    }
+
     private synchronized int readPayload(QueueInputStream stream, byte[] target, int offset, int length)
             throws IOException {
         while (true) {
             if (stream.payloadGeneration != payloadGeneration) {
-                stream.currentPayload = null;
-                stream.payloadOffset = 0;
+                if (stream.currentPayload != null) {
+                    int frameBytes = format.channels * 2;
+                    droppedFrames += (stream.currentPayload.length - stream.payloadOffset) / frameBytes;
+                    stream.currentPayload = null;
+                    stream.payloadOffset = 0;
+                    stream.enqueuedAtNanos = 0;
+                    if (activePayloadStream == stream) {
+                        activePayloadStream = null;
+                    }
+                }
                 stream.payloadGeneration = payloadGeneration;
             }
             if (failure != null) throw failure;
@@ -140,20 +324,113 @@ final class UdpPcmQueue {
                 waitForChange();
                 continue;
             }
-            if (stream.currentPayload == null || stream.payloadOffset == stream.currentPayload.length) {
-                if (packets.isEmpty()) {
-                    waitForChange();
+
+            long now = System.nanoTime();
+            decayTarget(now);
+            if (stream.currentPayload != null) {
+                if (expireCurrentPayload(stream, now)) {
+                    stream.payloadGeneration = payloadGeneration;
                     continue;
                 }
-                AudioPacket packet = packets.remove(0);
-                advancePlayoutFrame(packet.frameIndex + packet.frameCount);
-                stream.currentPayload = packet.payload;
-                stream.payloadOffset = 0;
+                int count = Math.min(length, stream.currentPayload.length - stream.payloadOffset);
+                System.arraycopy(stream.currentPayload, stream.payloadOffset, target, offset, count);
+                stream.payloadOffset += count;
+                if (stream.payloadOffset == stream.currentPayload.length) {
+                    stream.currentPayload = null;
+                    stream.payloadOffset = 0;
+                    stream.enqueuedAtNanos = 0;
+                    if (activePayloadStream == stream) {
+                        activePayloadStream = null;
+                    }
+                }
+                return count;
             }
-            int count = Math.min(length, stream.currentPayload.length - stream.payloadOffset);
-            System.arraycopy(stream.currentPayload, stream.payloadOffset, target, offset, count);
-            stream.payloadOffset += count;
-            return count;
+
+            expireStalePackets(now);
+            if (packets.isEmpty()) {
+                rebuffering = true;
+                rebufferDeadlineNanos = 0;
+                waitForChange();
+                continue;
+            }
+
+            long packetWaitDeadline = rebufferDeadlineNanos;
+            if (rebuffering && targetFrames > 0 && queuedFrames < targetFrames) {
+                if (rebufferDeadlineNanos == 0)
+                    rebufferDeadlineNanos = packets.get(0).enqueuedAtNanos + waitBudgetNanos;
+                long remaining = rebufferDeadlineNanos - now;
+                if (remaining > 0) {
+                    waitForChange(remaining);
+                    continue;
+                }
+            }
+            packetWaitDeadline = rebufferDeadlineNanos;
+            rebuffering = false;
+            rebufferDeadlineNanos = 0;
+
+            AudioPacket next = packets.get(0);
+            if (hasPlayoutFrame && Long.compareUnsigned(next.frameIndex, playoutFrame) > 0) {
+                if (!gapWaitActive || gapWaitFrame != playoutFrame) {
+                    gapWaitActive = true;
+                    gapWaitFrame = playoutFrame;
+                    gapDeadlineNanos = packetWaitDeadline > 0
+                            ? packetWaitDeadline : next.enqueuedAtNanos + waitBudgetNanos;
+                }
+                long remaining = gapDeadlineNanos - now;
+                if (remaining > 0) {
+                    waitForChange(remaining);
+                    continue;
+                }
+                markDiscontinuity();
+            }
+
+            next = packets.remove(0);
+            queuedFrames -= next.frameCount;
+            if (hasPlayoutFrame && Long.compareUnsigned(next.frameIndex, playoutFrame) > 0) fadeNext = true;
+            if (fadeNext) {
+                fadeIn(next.payload, format.channels, format.sampleRate);
+                fadeNext = false;
+            }
+            playoutFrame = next.frameIndex + next.frameCount;
+            hasPlayoutFrame = true;
+            gapWaitActive = false;
+            stream.currentPayload = next.payload;
+            stream.payloadOffset = 0;
+            stream.enqueuedAtNanos = next.enqueuedAtNanos;
+            stream.payloadGeneration = payloadGeneration;
+            activePayloadStream = stream;
+        }
+    }
+
+    synchronized boolean expireCurrentPayload(QueueInputStream stream, long nowNanos) {
+        if (stream.currentPayload == null || nowNanos - stream.enqueuedAtNanos <= maxPacketAgeNanos) return false;
+        int frameBytes = format.channels * 2;
+        int remainingFrames = (stream.currentPayload.length - stream.payloadOffset) / frameBytes;
+        droppedFrames += remainingFrames;
+        expiredFrames += remainingFrames;
+        stream.currentPayload = null;
+        stream.payloadOffset = 0;
+        stream.enqueuedAtNanos = 0;
+        if (activePayloadStream == stream) {
+            activePayloadStream = null;
+        }
+        markDiscontinuity();
+        return true;
+    }
+
+    private void fadeIn(byte[] payload, int channels, int sampleRate) {
+        int frameBytes = channels * 2;
+        int frames = payload.length / frameBytes;
+        int fadeFrames = Math.min(frames, Math.max(1, sampleRate * FADE_MS / 1000));
+        for (int frame = 0; frame < fadeFrames; frame++) {
+            int gainNumerator = frame + 1;
+            for (int channel = 0; channel < channels; channel++) {
+                int index = frame * frameBytes + channel * 2;
+                short sample = (short) ((payload[index] & 0xff) | (payload[index + 1] << 8));
+                int faded = sample * gainNumerator / fadeFrames;
+                payload[index] = (byte) faded;
+                payload[index + 1] = (byte) (faded >>> 8);
+            }
         }
     }
 
@@ -161,6 +438,9 @@ final class UdpPcmQueue {
         if (stopped) return;
         stopped = true;
         packets.clear();
+        queuedFrames = 0;
+        activePayloadStream = null;
+        payloadGeneration++;
         notifyAll();
     }
 
@@ -169,11 +449,16 @@ final class UdpPcmQueue {
         failure = error;
         stopped = true;
         packets.clear();
+        queuedFrames = 0;
+        activePayloadStream = null;
+        payloadGeneration++;
         notifyAll();
     }
 
     synchronized int size() { return packets.size(); }
     synchronized long droppedFrames() { return droppedFrames; }
+    synchronized long expiredFrames() { return expiredFrames; }
+    synchronized int targetFrames() { return targetFrames; }
     synchronized UdpPacketDecoder.Format format() { return format; }
 
     InputStream asPcmInputStream() { return new QueueInputStream(this); }
@@ -189,21 +474,36 @@ final class UdpPcmQueue {
         }
     }
 
+    private void waitForChange(long nanos) throws InterruptedIOException {
+        try {
+            long millis = nanos / 1_000_000L;
+            int extraNanos = (int) (nanos % 1_000_000L);
+            wait(millis, extraNanos);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            InterruptedIOException error = new InterruptedIOException("UDP playback interrupted");
+            error.initCause(interrupted);
+            throw error;
+        }
+    }
+
     static final class AudioPacket {
         final long sequence;
         final long frameIndex;
         final int frameCount;
         final byte[] payload;
+        final long enqueuedAtNanos;
 
-        AudioPacket(long sequence, long frameIndex, int frameCount, byte[] payload) {
+        AudioPacket(long sequence, long frameIndex, int frameCount, byte[] payload, long enqueuedAtNanos) {
             this.sequence = sequence;
             this.frameIndex = frameIndex;
             this.frameCount = frameCount;
             this.payload = payload;
+            this.enqueuedAtNanos = enqueuedAtNanos;
         }
     }
 
-    private static final class QueueInputStream extends InputStream {
+    static final class QueueInputStream extends InputStream {
         private final UdpPcmQueue queue;
         private final byte[] formatHeader = new byte[8];
         private boolean headerReady;
@@ -212,6 +512,7 @@ final class UdpPcmQueue {
         private byte[] currentPayload;
         private int payloadOffset;
         private long payloadGeneration = -1;
+        private long enqueuedAtNanos;
 
         QueueInputStream(UdpPcmQueue queue) { this.queue = queue; }
 

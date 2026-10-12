@@ -24,6 +24,7 @@ public final class AnPodUdpVectorCheck {
     public static void main(String[] args) throws Exception {
         checkJavaVectorThroughReceiverParser();
         checkAuthenticatedQueueAndReplay();
+        checkJitterQueueExpiryAndFade();
         checkFormatSequenceRejected();
         checkLoopbackReceiveThread();
         checkPairingSecurity();
@@ -356,8 +357,8 @@ public final class AnPodUdpVectorCheck {
 
                 byte[] newest = encode(key, sessionId, 10, 1440, UdpPacketDecoder.AUDIO, pcm(240, 0x44));
                 check(accept(receiver, newest, sender) == UdpReceiver.ProcessResult.AUDIO, "fresh audio rejected");
-                byte[] resumedPayload = new byte[64];
-                check(pauseInput.read(resumedPayload) == resumedPayload.length && (resumedPayload[0] & 0xff) == 0x44,
+                byte[] resumedPayload = new byte[800];
+                check(pauseInput.read(resumedPayload) == resumedPayload.length && (resumedPayload[720] & 0xff) == 0x44,
                         "the partially consumed pre-pause payload continued after resume");
 
                 byte[] oldWindowPacket = null;
@@ -415,6 +416,96 @@ public final class AnPodUdpVectorCheck {
                         "rejected Format sequence committed replay state");
                 check(queue.format().sampleRate == 48_000 && queue.format().channels == 2,
                         "valid Format after rejected sequence was not negotiated");
+            } finally {
+                context.destroy();
+                Arrays.fill(key, (byte) 0);
+            }
+        }
+    }
+
+    private static void checkJitterQueueExpiryAndFade() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
+        UdpPcmQueue lowLatency = new UdpPcmQueue(parameters, "lowlatency");
+        UdpPcmQueue balanced = new UdpPcmQueue(parameters, "balanced");
+        check(lowLatency.targetFrames() < balanced.targetFrames(),
+                "low-latency queue budget must start shorter than balanced");
+        lowLatency.reportTrackUnderruns(0);
+        for (int underrun = 1; underrun <= 10; underrun++) lowLatency.reportTrackUnderruns(underrun);
+        check(lowLatency.targetFrames() == 48_000 * 20 / 1000,
+                "AudioTrack underruns did not raise the jitter target to its bounded cap: "
+                        + lowLatency.targetFrames());
+        lowLatency.decayTarget(System.nanoTime() + 2_000_000_000L);
+        check(lowLatency.targetFrames() == 48_000 * 15 / 1000,
+                "stable playback did not step the target back down gradually");
+
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        byte[] key = filledKey(0x39);
+        long sessionId = 0x1122334455667788L;
+        try (DatagramSocket sender = new DatagramSocket(new InetSocketAddress(loopback, 0))) {
+            UdpSessionContext context = new UdpSessionContext(
+                    new InetSocketAddress(loopback, 0), (InetSocketAddress) sender.getLocalSocketAddress(),
+                    sessionId, key, "balanced");
+            UdpPcmQueue queue = new UdpPcmQueue(parameters, "balanced");
+            try (UdpReceiver receiver = new UdpReceiver(context, queue)) {
+                check(accept(receiver, encode(key, sessionId, 0, 0, UdpPacketDecoder.FORMAT,
+                        formatPayload(48_000, 2)), sender) == UdpReceiver.ProcessResult.FORMAT,
+                        "jitter scenario format was rejected");
+                queue.configureAudioTrack(0);
+                InputStream input = queue.asPcmInputStream();
+                byte[] header = new byte[8];
+                new DataInputStream(input).readFully(header);
+                Pcm16FrameStream pcm = new Pcm16FrameStream(2);
+                byte[] output = new byte[960];
+
+                check(accept(receiver, encode(key, sessionId, 1, 0, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x1234)), sender) == UdpReceiver.ProcessResult.AUDIO, "first PCM rejected");
+                check(accept(receiver, encode(key, sessionId, 3, 480, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x3456)), sender) == UdpReceiver.ProcessResult.AUDIO, "out-of-order PCM rejected");
+                check(accept(receiver, encode(key, sessionId, 2, 240, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x2345)), sender) == UdpReceiver.ProcessResult.AUDIO, "reordered PCM rejected");
+                for (int sample = 0x1234; sample <= 0x3456; sample += 0x1111) {
+                    check(pcm.readFrames(input, output, output.length) == output.length,
+                            "short-reorder playback lost a packet");
+                    int actual = (output[0] & 0xff) | (output[1] << 8);
+                    check(actual == sample, "short-reorder playback was not in frame order");
+                }
+
+                check(accept(receiver, encode(key, sessionId, 4, 720, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x4567)), sender) == UdpReceiver.ProcessResult.AUDIO, "partial payload rejected");
+                byte[] partial = new byte[64];
+                check(input.read(partial) == partial.length, "could not hold a partial packet payload");
+                check(accept(receiver, encode(key, sessionId, 5, 960, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x5678)), sender) == UdpReceiver.ProcessResult.AUDIO, "queued stale PCM rejected");
+                check(accept(receiver, encode(key, sessionId, 6, 1200, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x6789)), sender) == UdpReceiver.ProcessResult.AUDIO, "queued stale PCM rejected");
+                queue.expireStalePackets(System.nanoTime() + 200_000_000L);
+                check(queue.expiredFrames() == 480, "local-age expiry did not account the queued backlog");
+                check(accept(receiver, encode(key, sessionId, 7, 1440, UdpPacketDecoder.AUDIO,
+                        pcm(240, 0x7fff)), sender) == UdpReceiver.ProcessResult.AUDIO, "fresh PCM rejected after expiry");
+                check(pcm.readFrames(input, output, output.length) == output.length,
+                        "fresh PCM did not resume after expired backlog");
+                int faded = (output[0] & 0xff) | (output[1] << 8);
+                check(faded > 0 && faded < 0x7fff,
+                        "discontinuity was not faded at the start of a complete PCM frame");
+                check(queue.droppedFrames() >= 704, "expired backlog did not invalidate the held payload tail");
+
+                queue.setPaused(true);
+                CountDownLatch waiting = new CountDownLatch(1);
+                AtomicReference<Integer> stoppedRead = new AtomicReference<>();
+                Thread blockedReader = new Thread(() -> {
+                    waiting.countDown();
+                    try { stoppedRead.set(input.read()); }
+                    catch (Exception error) { throw new AssertionError(error); }
+                }, "UDP queue stop wakeup check");
+                blockedReader.start();
+                check(waiting.await(1, TimeUnit.SECONDS), "paused queue reader did not start");
+                Thread.sleep(5);
+                check(blockedReader.getState() == Thread.State.WAITING,
+                        "paused empty queue reader was not waiting without polling");
+                queue.stop();
+                blockedReader.join(1_000);
+                check(!blockedReader.isAlive() && Integer.valueOf(-1).equals(stoppedRead.get()),
+                        "stopping the paused queue did not wake its reader");
             } finally {
                 context.destroy();
                 Arrays.fill(key, (byte) 0);

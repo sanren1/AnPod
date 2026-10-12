@@ -56,6 +56,8 @@ public final class ReceiverService extends Service {
     static volatile int effectiveBufferFrames = -1;
     static volatile int startThresholdFrames = -1;
     static volatile int underrunCount = -1;
+    static volatile int udpJitterTargetFrames = -1;
+    static volatile long udpExpiredFrames;
     static volatile String networkAudioState = "stopped";
     static volatile String networkAudioFailure = "";
     static volatile String networkAudioAddress = "";
@@ -82,6 +84,8 @@ public final class ReceiverService extends Service {
         effectiveBufferFrames = -1;
         startThresholdFrames = -1;
         underrunCount = -1;
+        udpJitterTargetFrames = -1;
+        udpExpiredFrames = 0;
         startedAtElapsedMs = 0;
         startFailure = "";
         synchronized (STATUS_LOCK) { statusAudioId = 0; }
@@ -217,6 +221,8 @@ public final class ReceiverService extends Service {
             effectiveBufferFrames = -1;
             startThresholdFrames = -1;
             underrunCount = -1;
+            udpJitterTargetFrames = -1;
+            udpExpiredFrames = 0;
             startFailure = "";
         }
         if (request.udpContext != null) PCM_BYTES_WRITTEN.set(0);
@@ -444,7 +450,8 @@ public final class ReceiverService extends Service {
             try (ownedSocket) {
                 InputStream input;
                 if (ownedSocket == null) {
-                    udpQueue = new UdpPcmQueue(session.request.udpContext.parameters);
+                    udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
+                            session.request.udpContext.playbackMode);
                     udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
                     UdpReceiver receiverForThread = udpReceiver;
                     networkThread = new Thread(() -> {
@@ -533,6 +540,10 @@ public final class ReceiverService extends Service {
                 int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
                 int preRollFrames = currentMode(session).startsWith("low-latency") && thresholdFrames > 0
                         ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
+                if (udpQueue != null) {
+                    udpQueue.configureAudioTrack(preRollFrames);
+                    publishUdpQueueMetrics(session, udpQueue);
+                }
                 int preRollBytes = preRollFrames * frameBytes;
                 int preRolled = 0;
                 while (preRolled < preRollBytes) {
@@ -578,9 +589,11 @@ public final class ReceiverService extends Service {
                     writeFrames(session, track, pcm, buffer, count, frameBytes);
                     if (Build.VERSION.SDK_INT >= 24) {
                         int underruns = track.getUnderrunCount();
+                        if (udpQueue != null) udpQueue.reportTrackUnderruns(underruns);
                         synchronized (STATUS_LOCK) {
                             if (statusAudioId == session.id) underrunCount = underruns;
                         }
+                        if (udpQueue != null) publishUdpQueueMetrics(session, udpQueue);
                     }
                 }
             }
@@ -704,6 +717,14 @@ public final class ReceiverService extends Service {
 
     private void publishMode(AudioSession session, String mode) {
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) actualMode = mode; }
+    }
+
+    private void publishUdpQueueMetrics(AudioSession session, UdpPcmQueue queue) {
+        synchronized (STATUS_LOCK) {
+            if (statusAudioId != session.id) return;
+            udpJitterTargetFrames = queue.targetFrames();
+            udpExpiredFrames = queue.expiredFrames();
+        }
     }
 
     private String currentMode(AudioSession session) {

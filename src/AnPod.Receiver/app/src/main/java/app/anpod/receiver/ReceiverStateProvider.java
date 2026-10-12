@@ -39,6 +39,7 @@ public final class ReceiverStateProvider extends ContentProvider {
             "applicationId", "versionName", "versionCode", "serviceActive",
             "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
             "bufferCapacityFrames", "effectiveBufferFrames", "startThresholdFrames", "underrunCount",
+            "udpJitterTargetFrames", "udpExpiredFrames",
             "startedAtElapsedMs", "error"
     };
     private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
@@ -111,6 +112,8 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "effectiveBufferFrames": values[i] = metric(ReceiverService.effectiveBufferFrames); break;
                 case "startThresholdFrames": values[i] = metric(ReceiverService.startThresholdFrames); break;
                 case "underrunCount": values[i] = metric(ReceiverService.underrunCount); break;
+                case "udpJitterTargetFrames": values[i] = metric(ReceiverService.udpJitterTargetFrames); break;
+                case "udpExpiredFrames": values[i] = ReceiverService.udpExpiredFrames; break;
                 case "startedAtElapsedMs": values[i] = ReceiverService.startedAtElapsedMs; break;
                 case "error": values[i] = ReceiverService.startFailure; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");
