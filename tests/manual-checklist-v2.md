@@ -233,3 +233,14 @@
 - Android `:app:compileDebugJavaWithJavac -x :app:processDebugResources --offline --no-daemon`: PASS；未处理资源、未组装 APK。Native 隔离 Release build：PASS，`artifacts/p3-native-build/bin/audio_capture.dll`。`dumpbin /exports` 确认新增 `AudioCapture_GetPcmFormat`，既有 13 个 ABI 导出均保留；未启动 WASAPI capture。
 - Native 初始化后的 negotiated PCM metadata 决定握手采样率；StartPcmSink 在开始采集/静音前复核格式，不等待首包。Computer→Phone 通过 owner fresh auth session/new queue 后再挂 capture；START 后、队列创建前收到的 PAUSE 会在队列附着时应用。异常 worker、失败/超时 START 会立即启动有限 recovery/cleanup window；healthy idle 且没有 PCM 仍报告 ReceiverRunning。
 - 本轮仅运行上述两个定向 Rust 用例；两项均 PASS。Rust 编译输出有既有 unused/dead-code 警告。真实 USB、Android runtime、LAN/hotspot、WASAPI capture、AudioTrack output、可听结果及设备恢复仍为 NOT_TESTED。未运行 ADB、未组装/安装 APK、未替换稳定包或候选包。
+
+## P8-B Windows x64 Receiver v2 portable candidate（本机构建与包审计）
+
+- Source commit：`20e42fac0274252dccb8ccc8b7d5e416ab8e958b`。`receiver.json` 的 `sourceCommit` 与该 APK 构建提交相同；APK identity 为 `app.anpod.receiver` / `0.3.0-v2-candidate` / code 3 / targetSdk 35 / debug variant。
+- Android Gradle `:app:assembleDebug --offline --no-daemon`：PASS，33 个任务。合并 Manifest、APK 内容、aapt badging、apksigner 和 metadata 哈希审计：PASS。APK SHA-256：`de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77`；signer SHA-256：`f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。该候选 signer 与历史 P2 候选相同、与 P1 不同；没有验证 P1 原地升级。
+- Legacy Android payload 通过 SDK direct (`javac` + `d8`) 从源码构建：PASS；`server` SHA-256：`b916a3b0bfdd02ce6c369963f4bd1b33e85c712f73b46f8f959a72a0a92a2e70`。Native DLL 复用已验证的 P3 x64 Release 构建，确认 `AudioCapture_GetPcmFormat` 导出；SHA-256：`0a816b7bfc71779944f892d54aa2c5dc6ab381b16b05d3acecc54ca9202296f5`。
+- `dumpbin /dependents` 确认 Native DLL 依赖 MSVC C++ Runtime（`MSVCP140.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll`）；这些运行时不在 ZIP 中，目标 Windows 需要预先安装相应 x64 VC++ Runtime。WebView2 Runtime 也仍是系统前置条件。
+- 首次打包尝试误走 PNPM fallback，PNPM 完成了依赖安装并写入 `本机共享 PNPM 缓存`；之后恢复了原有直接依赖目录、删除生成的 `frontend/pnpm-lock.yaml`，并改用本地 `tsc.cmd`/`vite.cmd` 与 Cargo `--offline` 完成最终构建。`本机共享 PNPM 缓存` 未清理，以免删除其他任务缓存。
+- 前端 TypeScript (`tsc -b`) 与 Vite production build：PASS。Cargo Windows x64 Release `build --release --locked --offline`：PASS。Tauri EXE 为 PE x64；未运行 EXE。打包脚本及 ZIP 复核：PASS，ZIP 共 24 项，无绝对路径、越界条目、私密构建路径、计划/探针/密钥/日志/音频样本文件；历史稳定 ZIP、`deps/` 与候选签名密钥均未纳入或覆盖。
+- 候选 ZIP：`artifacts/AnPod-1.0.4-receiver-v2-candidate-tauri-win-x64-portable.zip`；SHA-256：`bd19e8e3be22db788800384a46ab17ac476be5c18fdeaafa2443d9e22572d9fd6`。主程序 SHA-256：`043444422b90f8e95828e896e90a57c6d37ce61d5e4736d5543f2806032a1912`。
+- 真机安装、P1 升级、USB 授权/绑定、直接网络认证、Receiver 前台服务通知、Android AudioTrack 出声、WASAPI 实际采集、手机强行停止/重启恢复及长时间稳定性均为 **NOT_TESTED**。没有对手机运行 ADB、安装 APK 或播放测试音；本节仅记录本地构建与静态包审计结果。
