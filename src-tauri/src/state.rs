@@ -288,7 +288,7 @@ impl AppState {
     }
 
     pub async fn receiver_network_interfaces(&self, serial: &str) -> Result<Vec<receiver::ReceiverInterface>, String> {
-        let (generation, token, _guard) = self.begin_receiver_operation(true).await?;
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
         let result = receiver::network_interfaces(&self.adb_path, serial, &self.receiver_apk_path,
             &self.receiver_metadata_path, &token).await;
         self.finish_operation(generation);

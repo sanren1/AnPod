@@ -61,6 +61,7 @@ button:disabled { cursor: default; }
 .status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #8190a5; }
 .state-ready .status-dot, .state-connected .status-dot, .state-streaming .status-dot, .state-phoneReady .status-dot { background: var(--positive); }
 .state-connecting .status-dot, .state-reconnecting .status-dot { background: #c1780b; animation: pulse 1.2s ease-in-out infinite alternate; }
+.state-paused .status-dot { background: var(--warning); }
 .state-error .status-dot { background: var(--danger); }
 .status-device { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .audio-bitrate { margin-left: auto; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; white-space: nowrap; font-size: 11px; }
@@ -171,7 +172,7 @@ button:disabled { cursor: default; }
 .network-refresh { justify-self: start; min-height: 36px; margin: -7px 0; }
 .network-methods { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 3px; border-radius: 9px; background: var(--wash); }
 .network-methods button { min-height: 42px; padding: 6px 8px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; }
-.network-methods button[aria-selected="true"] { border-color: var(--line); color: var(--text); background: var(--surface); font-weight: 650; box-shadow: 0 1px 3px #19243a1c; }
+.network-methods button[aria-pressed="true"] { border-color: var(--line); color: var(--text); background: var(--surface); font-weight: 650; box-shadow: 0 1px 3px #19243a1c; }
 .network-methods button:disabled { opacity: .62; cursor: default; }
 .candidate-list { display: grid; gap: 5px; max-height: 140px; overflow: auto; }
 .candidate-list button { min-width: 0; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--surface); text-align: left; cursor: pointer; overflow-wrap: anywhere; }
