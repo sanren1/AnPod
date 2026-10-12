@@ -450,6 +450,16 @@ are included in the queue counter. Android's network jitter reserve starts at
 reserve is independent of AudioTrack's own buffer and startup pre-roll; these
 values are tuning bounds, not an end-to-end latency budget.
 
+AudioTrack is configured independently: the balanced mode requests a 50 ms
+effective application buffer where `setBufferSizeInFrames` is available;
+low-latency keeps its 15 ms request and 5 ms API 31+ start-threshold request.
+Each request is bounded by the track's reported capacity. Diagnostics preserve
+the requested, accepted, effective, capacity, start-threshold, and actual
+pre-roll frame counts separately; on API 23 the system buffer remains in use.
+The pending-frame diagnostic includes pre-roll writes and subtracts the
+unsigned, wrap-aware playback head. It describes queued PCM frames, not acoustic
+output latency.
+
 ## Cross-language vector
 
 The Rust test `protocol::tests::java_jca_aes_gcm_vector` and

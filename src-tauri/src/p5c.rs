@@ -1164,6 +1164,7 @@ mod tests {
         let mut command = Command::new(javac);
         command.arg("-source").arg("17").arg("-target").arg("17").arg("-d").arg(&output);
         for source in JAVA_SOURCES { command.arg(package.join(source)); }
+        command.arg(repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java"));
         command.arg(repo.join("tests/P5cLoopbackEndpoint.java"));
         let result = command.output().expect("run JDK 17 javac for the P5-C Java receiver");
         assert!(result.status.success(), "javac failed:\n{}\n{}",

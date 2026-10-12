@@ -71,6 +71,26 @@ final class PcmCheck {
         if (!"balanced".equals(balanced.playbackMode) || !"low-latency".equals(lowLatency.playbackMode))
             throw new AssertionError("playback mode arguments did not default/parse");
 
+        if (Pcm16FrameStream.requestedAudioTrackBufferFrames(48000, 10000, true) != 720
+                || Pcm16FrameStream.requestedAudioTrackBufferFrames(48000, 10000, false) != 2400
+                || Pcm16FrameStream.requestedAudioTrackBufferFrames(48000, 1200, false) != 1200
+                || Pcm16FrameStream.requestedAudioTrackBufferFrames(48000, 0, false) != 0) {
+            throw new AssertionError("AudioTrack buffer request was not mode-bounded by actual capacity");
+        }
+        Pcm16FrameStream.PlaybackHeadTracker playbackHead = new Pcm16FrameStream.PlaybackHeadTracker();
+        playbackHead.reset(0xffff_fffe);
+        if (playbackHead.update(0xffff_ffff) != 1 || playbackHead.update(0) != 2
+                || Pcm16FrameStream.pendingFrames(600, playbackHead.update(100)) != 498
+                || Pcm16FrameStream.pendingFrames(100, 150) != 0) {
+            throw new AssertionError("AudioTrack pending frames lost pre-roll or unsigned head wrap");
+        }
+        Pcm16FrameStream monoStream = new Pcm16FrameStream(1);
+        byte[] monoBuffer = new byte[6];
+        if (monoStream.readFrames(new ByteArrayInputStream(new byte[] {1, 2, 3, 4, 5, 6}), monoBuffer,
+                monoBuffer.length) != monoBuffer.length) {
+            throw new AssertionError("mono AudioTrack pre-roll did not preserve mono frame boundaries");
+        }
+
         try {
             Pcm16FrameStream truncated = new Pcm16FrameStream();
             ByteArrayInputStream truncatedInput = new ByteArrayInputStream(new byte[] {1, 2, 3});

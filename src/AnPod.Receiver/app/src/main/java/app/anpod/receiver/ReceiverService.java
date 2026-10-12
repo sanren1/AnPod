@@ -53,8 +53,11 @@ public final class ReceiverService extends Service {
     static volatile String actualMode = "";
     static volatile int actualSampleRate = -1;
     static volatile int bufferCapacityFrames = -1;
+    static volatile int requestedBufferFrames = -1;
+    static volatile int acceptedBufferFrames = -1;
     static volatile int effectiveBufferFrames = -1;
     static volatile int startThresholdFrames = -1;
+    static volatile int preRollFrames = -1;
     static volatile int underrunCount = -1;
     static volatile int udpJitterTargetFrames = -1;
     static volatile long udpExpiredFrames;
@@ -67,7 +70,7 @@ public final class ReceiverService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable timeout;
-    private volatile AudioSession currentAudio;
+    private static volatile AudioSession currentAudio;
     private AudioRequest pendingAudio;
     private int latestStartId;
     private volatile boolean destroyed;
@@ -82,8 +85,11 @@ public final class ReceiverService extends Service {
         actualMode = "";
         actualSampleRate = -1;
         bufferCapacityFrames = -1;
+        requestedBufferFrames = -1;
+        acceptedBufferFrames = -1;
         effectiveBufferFrames = -1;
         startThresholdFrames = -1;
+        preRollFrames = -1;
         underrunCount = -1;
         udpJitterTargetFrames = -1;
         udpExpiredFrames = 0;
@@ -220,8 +226,11 @@ public final class ReceiverService extends Service {
             actualMode = "";
             actualSampleRate = -1;
             bufferCapacityFrames = -1;
+            requestedBufferFrames = -1;
+            acceptedBufferFrames = -1;
             effectiveBufferFrames = -1;
             startThresholdFrames = -1;
+            preRollFrames = -1;
             underrunCount = -1;
             udpJitterTargetFrames = -1;
             udpExpiredFrames = 0;
@@ -494,7 +503,10 @@ public final class ReceiverService extends Service {
                 int frameBytes = channels * 2;
                 int capacityFrames;
                 int requestedBufferFrames = -1;
+                int acceptedBufferFrames = -1;
                 int requestedStartFrames = -1;
+                boolean startThresholdRequestLimited = false;
+                String configuredMode;
                 int minBufferFrames = Math.max(1, (minBuffer + frameBytes - 1) / frameBytes);
                 synchronized (session) {
                     ensureRunning(session);
@@ -508,34 +520,50 @@ public final class ReceiverService extends Service {
                     track = builder.build();
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("AudioTrack initialization failed");
                     session.audioTrack = track;
+                    session.trackWrittenFrames = 0;
+                    session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
                     capacityFrames = Build.VERSION.SDK_INT >= 24
                             ? track.getBufferCapacityInFrames() : track.getBufferSizeInFrames();
                     if ("lowlatency".equalsIgnoreCase(session.request.playbackMode)) {
-                        if (Build.VERSION.SDK_INT >= 24) {
-                            int requested = Math.min(capacityFrames, Math.max(1, sampleRate * 15 / 1000));
-                            int accepted = track.setBufferSizeInFrames(requested);
-                            if (accepted < 0) publishMode(session, "balanced-fallback");
+                        if (Build.VERSION.SDK_INT >= 24 && capacityFrames > 0) {
+                            int desired = Math.max(1,
+                                    sampleRate * Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS / 1000);
+                            requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                                    sampleRate, capacityFrames, true);
+                            acceptedBufferFrames = track.setBufferSizeInFrames(requestedBufferFrames);
+                            if (acceptedBufferFrames < 0) configuredMode = "balanced-fallback";
                             else {
-                                requestedBufferFrames = requested;
-                                String mode = accepted == requested ? "low-latency" : "low-latency-limited";
-                                if (Build.VERSION.SDK_INT >= 31) {
-                                    requestedStartFrames = Math.min(accepted, Math.max(1, sampleRate * 5 / 1000));
-                                    track.setStartThresholdInFrames(requestedStartFrames);
-                                }
-                                publishMode(session, mode);
+                                configuredMode = acceptedBufferFrames == requestedBufferFrames
+                                        && capacityFrames >= desired ? "low-latency" : "low-latency-limited";
+                                if (Build.VERSION.SDK_INT >= 31 && acceptedBufferFrames > 0) {
+                                    requestedStartFrames = Math.min(acceptedBufferFrames,
+                                            Math.max(1, sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
+                                    int acceptedStartFrames = track.setStartThresholdInFrames(requestedStartFrames);
+                                    startThresholdRequestLimited = acceptedStartFrames < 0
+                                            || acceptedStartFrames != requestedStartFrames;
+                                } else if (Build.VERSION.SDK_INT >= 31) startThresholdRequestLimited = true;
                             }
-                        } else publishMode(session, "balanced-fallback");
-                    } else publishMode(session, "balanced");
+                        } else configuredMode = "balanced-fallback";
+                    } else if (Build.VERSION.SDK_INT >= 24 && capacityFrames > 0) {
+                        int desired = Math.max(1, sampleRate * Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS / 1000);
+                        requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                                sampleRate, capacityFrames, false);
+                        acceptedBufferFrames = track.setBufferSizeInFrames(requestedBufferFrames);
+                        configuredMode = acceptedBufferFrames < 0 ? "balanced-fallback"
+                                : capacityFrames >= desired && acceptedBufferFrames == requestedBufferFrames
+                                        ? "balanced" : "balanced-limited";
+                    } else configuredMode = "balanced-system";
                     int effectiveFrames = track.getBufferSizeInFrames();
                     int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
-                    String mode = currentMode(session);
-                    if (mode.startsWith("low-latency")
-                            && ((requestedBufferFrames > 0 && effectiveFrames != requestedBufferFrames)
-                                    || (requestedStartFrames > 0 && thresholdFrames != requestedStartFrames))) {
-                        mode = "low-latency-limited";
+                    if (configuredMode.startsWith("low-latency")
+                            && (effectiveFrames != requestedBufferFrames
+                                    || (requestedStartFrames > 0 && thresholdFrames != requestedStartFrames)
+                                    || startThresholdRequestLimited)) {
+                        configuredMode = "low-latency-limited";
+                    } else if (configuredMode.equals("balanced") && effectiveFrames != requestedBufferFrames) {
+                        configuredMode = "balanced-limited";
                     }
-                    publishMetrics(session, track.getSampleRate(), capacityFrames, effectiveFrames, thresholdFrames,
-                            Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, mode);
+                    publishMode(session, configuredMode);
                 }
 
                 byte[] buffer = new byte[Math.max(frameBytes, minBuffer + frameBytes - 1)];
@@ -544,6 +572,9 @@ public final class ReceiverService extends Service {
                 int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
                 int preRollFrames = currentMode(session).startsWith("low-latency") && thresholdFrames > 0
                         ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
+                publishMetrics(session, track.getSampleRate(), capacityFrames, requestedBufferFrames,
+                        acceptedBufferFrames, effectiveFrames, thresholdFrames,
+                        Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, preRollFrames, currentMode(session));
                 if (udpQueue != null) {
                     udpQueue.configureAudioTrack(preRollFrames);
                     publishUdpQueueMetrics(session, udpQueue);
@@ -566,6 +597,7 @@ public final class ReceiverService extends Service {
                     writeFrames(session, track, pcm, buffer, count, frameBytes);
                     preRolled += count;
                 }
+                publishPreRollFrames(session, preRolled / frameBytes);
 
                 manager = getSystemService(AudioManager.class);
                 final AudioSession focusSession = session;
@@ -588,7 +620,6 @@ public final class ReceiverService extends Service {
                     ensureRunning(session);
                     track.play();
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) throw new IOException("AudioTrack did not start");
-                    session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
                     session.trackPlaying = true;
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) audioActive = true;
@@ -666,6 +697,7 @@ public final class ReceiverService extends Service {
                 ensureRunning(session);
                 int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
                 if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
+                session.trackWrittenFrames += written / frameBytes;
                 if (session.request.udpContext != null) {
                     PCM_BYTES_WRITTEN.addAndGet(written);
                     session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
@@ -724,15 +756,38 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private void publishMetrics(AudioSession session, int rate, int capacity, int effective, int threshold, int undrruns, String mode) {
+    private void publishMetrics(AudioSession session, int rate, int capacity, int requested, int accepted,
+            int effective, int threshold, int undrruns, int preRoll, String mode) {
         synchronized (STATUS_LOCK) {
             if (statusAudioId != session.id) return;
             actualSampleRate = rate;
             bufferCapacityFrames = capacity;
+            requestedBufferFrames = requested;
+            acceptedBufferFrames = accepted;
             effectiveBufferFrames = effective;
             startThresholdFrames = threshold;
+            preRollFrames = preRoll;
             underrunCount = undrruns;
             actualMode = mode;
+        }
+    }
+
+    private void publishPreRollFrames(AudioSession session, int frames) {
+        synchronized (STATUS_LOCK) {
+            if (statusAudioId == session.id) preRollFrames = frames;
+        }
+    }
+
+    static long trackPendingFrames() {
+        AudioSession session = currentAudio;
+        if (session == null) return -1;
+        AudioTrack track = session.audioTrack;
+        if (track == null) return -1;
+        try {
+            long played = session.playbackActivity.playedFrames(track.getPlaybackHeadPosition());
+            return Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, played);
+        } catch (RuntimeException unavailable) {
+            return -1;
         }
     }
 
@@ -853,6 +908,7 @@ public final class ReceiverService extends Service {
         volatile UdpPcmQueue udpQueue;
         final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
         volatile AudioTrack audioTrack;
+        volatile long trackWrittenFrames;
         volatile boolean trackPlaying;
         volatile boolean udpPaused;
         volatile boolean cancelled;

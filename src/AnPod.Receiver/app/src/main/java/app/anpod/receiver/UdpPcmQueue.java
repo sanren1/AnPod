@@ -1,5 +1,7 @@
 package app.anpod.receiver;
 
+import com.anpod.server.Pcm16FrameStream;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
@@ -633,20 +635,22 @@ final class UdpPcmQueue {
 /** Per-session evidence that AudioTrack is consuming recently received and written PCM. */
 final class UdpPlaybackActivity {
     private static final long ACTIVE_WINDOW_NANOS = 2_000_000_000L;
-    private static final long HEAD_MASK = 0xffff_ffffL;
-    private static final long MAX_FORWARD_DELTA = 0x8000_0000L;
 
-    private boolean hasPlaybackHead;
-    private long lastPlaybackHead;
+    private final Pcm16FrameStream.PlaybackHeadTracker playbackHead = new Pcm16FrameStream.PlaybackHeadTracker();
+    private long lastPlayedFrames;
     private boolean hasHeadAdvance;
     private long lastHeadAdvanceAtNanos;
     private volatile boolean hasSuccessfulWrite;
     private volatile long lastSuccessfulWriteAtNanos;
 
-    void resetPlaybackHead(int position) {
-        hasPlaybackHead = true;
-        lastPlaybackHead = Integer.toUnsignedLong(position);
+    synchronized void resetPlaybackHead(int position) {
+        playbackHead.reset(position);
+        lastPlayedFrames = 0;
         hasHeadAdvance = false;
+    }
+
+    synchronized long playedFrames(int position) {
+        return updatePlaybackHead(position, System.nanoTime());
     }
 
     void noteSuccessfulWrite(long nowNanos) {
@@ -656,22 +660,21 @@ final class UdpPlaybackActivity {
 
     synchronized boolean isActive(long nowNanos, int playbackHeadPosition,
             boolean hasReceivedAudio, long lastReceivedAudioAtNanos, boolean paused) {
-        long position = Integer.toUnsignedLong(playbackHeadPosition);
-        if (!hasPlaybackHead) {
-            hasPlaybackHead = true;
-            lastPlaybackHead = position;
-        } else {
-            long advance = (position - lastPlaybackHead) & HEAD_MASK;
-            if (advance > 0 && advance < MAX_FORWARD_DELTA) {
-                lastHeadAdvanceAtNanos = nowNanos;
-                hasHeadAdvance = true;
-            }
-            lastPlaybackHead = position;
-        }
+        updatePlaybackHead(playbackHeadPosition, nowNanos);
         return !paused && hasReceivedAudio && hasSuccessfulWrite && hasHeadAdvance
                 && isRecent(nowNanos, lastReceivedAudioAtNanos)
                 && isRecent(nowNanos, lastSuccessfulWriteAtNanos)
                 && isRecent(nowNanos, lastHeadAdvanceAtNanos);
+    }
+
+    private long updatePlaybackHead(int position, long nowNanos) {
+        long played = playbackHead.update(position);
+        if (played > lastPlayedFrames) {
+            lastHeadAdvanceAtNanos = nowNanos;
+            hasHeadAdvance = true;
+        }
+        lastPlayedFrames = played;
+        return played;
     }
 
     private static boolean isRecent(long nowNanos, long activityAtNanos) {

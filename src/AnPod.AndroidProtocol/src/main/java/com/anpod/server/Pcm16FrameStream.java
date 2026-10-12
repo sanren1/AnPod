@@ -7,6 +7,9 @@ import java.io.InterruptedIOException;
 /** Preserves PCM16 frame boundaries across arbitrary socket reads/writes. */
 public final class Pcm16FrameStream {
     public static final int FRAME_BYTES = 4;
+    public static final int LOW_LATENCY_AUDIO_TRACK_BUFFER_MS = 15;
+    public static final int LOW_LATENCY_START_THRESHOLD_MS = 5;
+    public static final int BALANCED_AUDIO_TRACK_BUFFER_MS = 50;
     private final byte[] tail = new byte[FRAME_BYTES - 1];
     private final int frameBytes;
     private int tailLength;
@@ -32,6 +35,44 @@ public final class Pcm16FrameStream {
         int lowLatencyLimit = Math.max(fiveMs, millisToFrames(sampleRate, 20) - preRollFrames);
         return lowLatency ? lowLatencyLimit
                 : Math.max(lowLatencyLimit + 1, preRollFrames + millisToFrames(sampleRate, 20));
+    }
+
+    public static int requestedAudioTrackBufferFrames(int sampleRate, int capacityFrames, boolean lowLatency) {
+        if (sampleRate <= 0 || capacityFrames <= 0) return 0;
+        int targetMs = lowLatency ? LOW_LATENCY_AUDIO_TRACK_BUFFER_MS : BALANCED_AUDIO_TRACK_BUFFER_MS;
+        return Math.min(capacityFrames, Math.max(1, sampleRate * targetMs / 1000));
+    }
+
+    public static long pendingFrames(long framesWritten, long framesPlayed) {
+        return Math.max(0, framesWritten - framesPlayed);
+    }
+
+    public static final class PlaybackHeadTracker {
+        private static final long HEAD_MASK = 0xffff_ffffL;
+        private static final long MAX_FORWARD_DELTA = 0x8000_0000L;
+
+        private boolean initialized;
+        private long lastPosition;
+        private long framesPlayed;
+
+        public synchronized void reset(int position) {
+            initialized = true;
+            lastPosition = Integer.toUnsignedLong(position);
+            framesPlayed = 0;
+        }
+
+        public synchronized long update(int position) {
+            long current = Integer.toUnsignedLong(position);
+            if (!initialized) {
+                initialized = true;
+                lastPosition = current;
+                return framesPlayed;
+            }
+            long advance = (current - lastPosition) & HEAD_MASK;
+            if (advance > 0 && advance < MAX_FORWARD_DELTA) framesPlayed += advance;
+            lastPosition = current;
+            return framesPlayed;
+        }
     }
 
     public void setBacklogLimit(int maxFrames, int fadeFrames) {

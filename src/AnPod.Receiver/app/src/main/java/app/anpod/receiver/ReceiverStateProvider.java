@@ -38,7 +38,8 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
             "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
-            "bufferCapacityFrames", "effectiveBufferFrames", "startThresholdFrames", "underrunCount",
+            "bufferCapacityFrames", "requestedBufferFrames", "acceptedBufferFrames",
+            "effectiveBufferFrames", "startThresholdFrames", "preRollFrames", "trackPendingFrames", "underrunCount",
             "udpJitterTargetFrames", "udpExpiredFrames", "tcpDroppedBacklogFrames",
             "startedAtElapsedMs", "error"
     };
@@ -109,8 +110,12 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "actualMode": values[i] = ReceiverService.actualMode; break;
                 case "actualSampleRate": values[i] = metric(ReceiverService.actualSampleRate); break;
                 case "bufferCapacityFrames": values[i] = metric(ReceiverService.bufferCapacityFrames); break;
+                case "requestedBufferFrames": values[i] = ReceiverService.requestedBufferFrames; break;
+                case "acceptedBufferFrames": values[i] = ReceiverService.acceptedBufferFrames; break;
                 case "effectiveBufferFrames": values[i] = metric(ReceiverService.effectiveBufferFrames); break;
                 case "startThresholdFrames": values[i] = metric(ReceiverService.startThresholdFrames); break;
+                case "preRollFrames": values[i] = metric(ReceiverService.preRollFrames); break;
+                case "trackPendingFrames": values[i] = metric(ReceiverService.trackPendingFrames()); break;
                 case "underrunCount": values[i] = metric(ReceiverService.underrunCount); break;
                 case "udpJitterTargetFrames": values[i] = metric(ReceiverService.udpJitterTargetFrames); break;
                 case "udpExpiredFrames": values[i] = ReceiverService.udpExpiredFrames; break;
@@ -279,6 +284,10 @@ public final class ReceiverStateProvider extends ContentProvider {
 
     private static String metric(int value) {
         return value < 0 ? "unknown" : Integer.toString(value);
+    }
+
+    private static String metric(long value) {
+        return value < 0 ? "unknown" : Long.toString(value);
     }
 
     private static byte[] readBindingRecord(ParcelFileDescriptor pipe, CancellationSignal signal,
