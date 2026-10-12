@@ -131,6 +131,7 @@ pub(crate) struct HostSession {
     tcp: Option<TcpStream>,
     udp_socket: Option<UdpSocket>,
     sender: Option<UdpSender>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
     queue: Arc<PcmQueue>,
     keys: SessionKeys,
     parameters: AudioParameters,
@@ -200,10 +201,12 @@ impl HostSession {
         drop(keys);
         let format = PcmFormat { sample_rate: authenticated_parameters.sample_rate,
             channels: authenticated_parameters.channels as u16 };
+        let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
         Ok(Self {
             tcp: Some(tcp),
             udp_socket: Some(udp_socket),
             sender: None,
+            pcm_payload_bytes_sent,
             queue: Arc::new(PcmQueue::for_session(format)),
             keys: session_keys,
             parameters: authenticated_parameters,
@@ -249,7 +252,7 @@ impl HostSession {
     pub(crate) fn session_id(&self) -> u64 { self.session_id }
     pub(crate) fn pcm_queue(&self) -> Arc<PcmQueue> { self.queue.clone() }
     pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
-        self.sender.as_ref().map_or(0, UdpSender::pcm_payload_bytes_sent)
+        self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
     }
 
     pub(crate) fn bind_audio(&mut self) -> Result<(), String> {
@@ -291,7 +294,7 @@ impl HostSession {
             let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
             let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
             self.sender = Some(UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
-                material, self.parameters)?);
+                material, self.parameters, self.pcm_payload_bytes_sent.clone())?);
             Ok(())
         })();
         if let Err(error) = result {
@@ -487,6 +490,7 @@ enum OwnerCommand {
     SetPaused(bool),
     UpdateEndpoint(SessionEndpoint),
     SetMode(u8),
+    Reconnect,
     Stop,
 }
 
@@ -564,6 +568,11 @@ impl SessionOwner {
     pub(crate) fn set_mode(&self, mode: u8) -> Result<(), String> {
         if mode > 1 { return Err("P5-C playback mode is invalid.".into()); }
         self.commands.send(OwnerCommand::SetMode(mode))
+            .map_err(|_| "P5-D session owner has stopped.".to_string())
+    }
+
+    pub(crate) fn reconnect(&self) -> Result<(), String> {
+        self.commands.send(OwnerCommand::Reconnect)
             .map_err(|_| "P5-D session owner has stopped.".to_string())
     }
 
@@ -686,6 +695,11 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                 retry_index = 0;
                 continue 'owner;
             }
+            PendingCommands::Reconnect => {
+                drop(session);
+                retry_index = 0;
+                continue 'owner;
+            }
             PendingCommands::Applied => {}
         }
         if cancellation.is_cancelled() || !enabled.load(Ordering::Acquire) { break; }
@@ -772,6 +786,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                     endpoint_changed = true;
                     break;
                 }
+                Ok(OwnerCommand::Reconnect) => {
+                    let sent = session.pcm_payload_bytes_sent();
+                    pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
+                    session.close_local();
+                    endpoint_changed = true;
+                    break;
+                }
                 Ok(OwnerCommand::Stop) => {
                     enabled.store(false, Ordering::Release);
                     let sent = session.pcm_payload_bytes_sent();
@@ -783,6 +804,8 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                 Err(mpsc::RecvTimeoutError::Disconnected) => { enabled.store(false, Ordering::Release); break 'owner; }
             }
         }
+        let sent = session.pcm_payload_bytes_sent();
+        pcm_payload_bytes_sent.fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
         *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
         drop(session);
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break; }
@@ -823,12 +846,13 @@ fn publish_session(status: &Mutex<SessionSnapshot>, state: SessionLifecycleState
 
 enum RetryWait { Stop, ReconnectNow, DelayElapsed }
 
-enum PendingCommands { Stop, EndpointChanged, ModeChanged, Applied }
+enum PendingCommands { Stop, EndpointChanged, ModeChanged, Reconnect, Applied }
 
 fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mut SessionEndpoint,
     parameters: &mut AudioParameters, paused: &mut bool, enabled: &AtomicBool) -> PendingCommands {
     let mut endpoint_changed = false;
     let mut mode_changed = false;
+    let mut reconnect = false;
     loop {
         match commands.try_recv() {
             Ok(OwnerCommand::SetPaused(value)) => *paused = value,
@@ -844,6 +868,7 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mu
                 mode_changed |= parameters.mode != mode;
                 parameters.mode = mode;
             }
+            Ok(OwnerCommand::Reconnect) => reconnect = true,
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 enabled.store(false, Ordering::Release);
@@ -851,7 +876,8 @@ fn apply_pending_commands(commands: &mpsc::Receiver<OwnerCommand>, endpoint: &mu
             }
         }
     }
-    if endpoint_changed { PendingCommands::EndpointChanged }
+    if reconnect { PendingCommands::Reconnect }
+    else if endpoint_changed { PendingCommands::EndpointChanged }
     else if mode_changed { PendingCommands::ModeChanged }
     else { PendingCommands::Applied }
 }
@@ -877,6 +903,7 @@ fn wait_for_reconnect(delay: Duration, commands: &mpsc::Receiver<OwnerCommand>, 
             Ok(OwnerCommand::SetMode(mode)) => {
                 if parameters.mode != mode { parameters.mode = mode; return RetryWait::ReconnectNow; }
             }
+            Ok(OwnerCommand::Reconnect) => return RetryWait::ReconnectNow,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => { enabled.store(false, Ordering::Release); return RetryWait::Stop; }
         }
@@ -1259,6 +1286,8 @@ mod tests {
         host.resume().unwrap();
         assert_eq!(host.state(), ReceiverState::ReceiverRunning);
         host.stop().unwrap();
+        assert!(host.pcm_payload_bytes_sent() >= 3_840,
+            "sender byte count must survive sender teardown");
         assert_eq!(host.state(), ReceiverState::Stopped);
         drop(host);
         let result = finish_endpoint(child, stdout);
@@ -1326,10 +1355,35 @@ mod tests {
             && status.session_id.is_some() && status.state == SessionLifecycleState::Paused);
         assert_ne!(after.session_id, before.session_id, "playback mode must use a fresh authenticated session");
         assert!(after.paused, "the user's pause intent must survive fresh mode authentication");
+
+        let mode_queue = owner.pcm_queue().unwrap();
+        owner.set_paused(false).unwrap();
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+        let samples = vec![0x3456i16; 960 * 2];
+        assert!(mode_queue.push_raw(samples.as_ptr(), 960, 48_000, 2, 0));
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+        owner.set_paused(true).unwrap();
+        let paused = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Paused);
+
+        owner.reconnect().unwrap();
+        let resumed = wait_for_owner(&owner, |status| status.generation > paused.generation
+            && status.session_id.is_some() && status.state == SessionLifecycleState::Paused);
+        assert_ne!(resumed.session_id, paused.session_id, "output recovery must use a fresh authenticated session");
+        let resumed_queue = owner.pcm_queue().unwrap();
+        assert!(!Arc::ptr_eq(&mode_queue, &resumed_queue), "fresh session must publish a new PCM queue");
+        owner.set_paused(false).unwrap();
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+        assert!(resumed_queue.push_raw(samples.as_ptr(), 960, 48_000, 2, 0),
+            "new session audio frame zero must be accepted by its fresh queue");
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+        assert!(owner.pcm_payload_bytes_sent() >= 7_680,
+            "both output sessions' frame-zero PCM must reach the fake sink");
         owner.stop();
         let result = finish_endpoint(child, stdout);
         let fields: Vec<_> = result.split(',').collect();
-        assert_eq!(fields[1], "2", "mode change must start exactly one new playback session: {result}");
+        assert_eq!(fields[1], "3", "mode change and output recovery must start fresh playback sessions: {result}");
+        assert!(fields[5].parse::<usize>().unwrap() >= 7_680,
+            "frame-zero PCM after fresh output recovery must reach the fake sink: {result}");
     }
 
     fn wait_for_owner(owner: &SessionOwner, predicate: impl Fn(&SessionSnapshot) -> bool) -> SessionSnapshot {

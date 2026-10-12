@@ -1,9 +1,10 @@
 use libloading::Library;
+use crate::protocol::PcmFormat;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use crate::network::PcmQueue;
 use tokio::sync::{mpsc as async_mpsc, Mutex as AsyncMutex};
@@ -24,6 +25,7 @@ enum Request {
     Listen(u16, String, mpsc::SyncSender<Result<(), String>>),
     Start(mpsc::SyncSender<Result<(), String>>),
     StartPcmSink(Arc<PcmQueue>, mpsc::SyncSender<Result<(), String>>),
+    PcmFormat(mpsc::SyncSender<Result<PcmFormat, String>>),
     StopPcmSink(mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
     StopAndCleanup(mpsc::SyncSender<Result<(), String>>),
@@ -41,6 +43,7 @@ struct NativeFns {
     listen: unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32,
     start: unsafe extern "C" fn() -> i32,
     set_pcm_callback: Option<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>,
+    get_pcm_format: Option<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>,
     set_stream: unsafe extern "C" fn(i32),
     stop: unsafe extern "C" fn(),
     cleanup: unsafe extern "C" fn(),
@@ -58,11 +61,14 @@ impl NativeFns {
         macro_rules! sym { ($name:literal, $ty:ty) => { *library.get::<$ty>(concat!($name, "\0").as_bytes()).map_err(|_| format!("音频采集组件缺少函数 {}", $name))? }; }
         let set_pcm_callback = library.get::<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>(b"AudioCapture_SetPcmCallback\0")
             .ok().map(|symbol| *symbol);
+        let get_pcm_format = library.get::<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>(b"AudioCapture_GetPcmFormat\0")
+            .ok().map(|symbol| *symbol);
         Ok(Self {
             initialize: sym!("AudioCapture_Initialize", unsafe extern "C" fn() -> i32),
             listen: sym!("AudioCapture_Listen", unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32),
             start: sym!("AudioCapture_Start", unsafe extern "C" fn() -> i32),
             set_pcm_callback,
+            get_pcm_format,
             set_stream: sym!("AudioCapture_SetStreamingEnabled", unsafe extern "C" fn(i32)),
             stop: sym!("AudioCapture_Stop", unsafe extern "C" fn()),
             cleanup: sym!("AudioCapture_Cleanup", unsafe extern "C" fn()),
@@ -83,6 +89,17 @@ impl NativeFns {
             if ptr.is_null() { String::new() } else { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
         };
         if message.is_empty() { format!("{fallback} (错误 {code})") } else { message }
+    }
+
+    fn pcm_format(&self) -> Result<PcmFormat, String> {
+        let get_format = self.get_pcm_format.ok_or_else(||
+            "当前音频采集组件不支持读取已协商的 PCM 格式；请更新 Native DLL。".to_string())?;
+        let mut sample_rate = 0;
+        let mut channels = 0;
+        if unsafe { get_format(&mut sample_rate, &mut channels) } == 0 {
+            return Err(self.describe_error("无法读取 WASAPI 已协商的 PCM 格式"));
+        }
+        Ok(PcmFormat { sample_rate, channels })
     }
 }
 
@@ -144,42 +161,28 @@ impl AudioActor {
                                     if !initialized {
                                         Err(native.describe_error("无法初始化 PCM sink 采集"))
                                     } else {
-                                        let user_data = Arc::as_ptr(&queue) as *mut c_void;
-                                        pcm_sink = Some(queue);
-                                        if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
-                                            drop(pcm_sink.take());
-                                            Err(native.describe_error("无法设置 PCM sink"))
-                                        } else {
-                                            unsafe { (native.set_stream)(1); }
-                                            if unsafe { (native.start)() } == 0 {
-                                                let error = native.describe_error("无法开始 PCM sink 采集");
-                                                unsafe { (native.cleanup)(); }
-                                                if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
+                                        match native.pcm_format() {
+                                            Err(error) => Err(error),
+                                            Ok(format) if expected_format != Some(format) => Err(format!(
+                                                "WASAPI PCM 格式不匹配；认证会话需要 {:?}，设备输出为 {:?}，电脑声音保持未静音。",
+                                                expected_format, format)),
+                                            Ok(_) => {
+                                                let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                                                pcm_sink = Some(queue);
+                                                if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
                                                     drop(pcm_sink.take());
-                                                }
-                                                Err(error)
-                                            } else {
-                                                let deadline = Instant::now() + Duration::from_millis(500);
-                                                loop {
-                                                    match pcm_sink.as_ref().and_then(|queue| queue.observed_format()) {
-                                                        Some(format) if expected_format == Some(format) => break Ok(()),
-                                                        Some(_) => {
-                                                            let error = "WASAPI PCM 格式与认证会话不匹配；电脑声音保持未静音。".to_string();
-                                                            unsafe { (native.cleanup)(); }
-                                                            if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
-                                                                drop(pcm_sink.take());
-                                                            }
-                                                            break Err(error);
+                                                    Err(native.describe_error("无法设置 PCM sink"))
+                                                } else {
+                                                    unsafe { (native.set_stream)(1); }
+                                                    if unsafe { (native.start)() } == 0 {
+                                                        let error = native.describe_error("无法开始 PCM sink 采集");
+                                                        unsafe { (native.cleanup)(); }
+                                                        if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
+                                                            drop(pcm_sink.take());
                                                         }
-                                                        None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-                                                        None => {
-                                                            let error = "未能确认 WASAPI PCM 格式；电脑声音保持未静音。".to_string();
-                                                            unsafe { (native.cleanup)(); }
-                                                            if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
-                                                                drop(pcm_sink.take());
-                                                            }
-                                                            break Err(error);
-                                                        }
+                                                        Err(error)
+                                                    } else {
+                                                        Ok(())
                                                     }
                                                 }
                                             }
@@ -188,6 +191,11 @@ impl AudioActor {
                                 }
                             }
                         } else { Err("音频采集组件尚未初始化。".into()) };
+                        let _ = reply.send(result);
+                    }
+                    Request::PcmFormat(reply) => {
+                        let result = native.as_ref().ok_or_else(|| "音频采集组件尚未初始化。".to_string())
+                            .and_then(NativeFns::pcm_format);
                         let _ = reply.send(result);
                     }
                     Request::StopPcmSink(reply) => {
@@ -278,6 +286,7 @@ impl AudioActor {
     pub fn listen(&self, port: u16, token: &str) -> Result<(), String> { self.call(|reply| Request::Listen(port, token.into(), reply)) }
     pub fn start(&self) -> Result<(), String> { self.call(Request::Start) }
     pub fn start_pcm_sink(&self, queue: Arc<PcmQueue>) -> Result<(), String> { self.call(|reply| Request::StartPcmSink(queue, reply)) }
+    pub fn pcm_format(&self) -> Result<PcmFormat, String> { self.call(Request::PcmFormat) }
     pub fn stop_pcm_sink(&self) -> Result<(), String> { self.call(Request::StopPcmSink) }
     pub fn set_streaming(&self, enabled: bool) -> Result<(), String> { self.call(|reply| Request::Stream(enabled, reply)) }
     pub fn stop_and_cleanup(&self) -> Result<(), String> { self.call(Request::StopAndCleanup) }

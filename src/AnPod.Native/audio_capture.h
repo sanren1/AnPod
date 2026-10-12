@@ -95,6 +95,9 @@ ANPOD_API int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
  */
 ANPOD_API int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData);
 
+/* Returns the negotiated output PCM format after Initialize, before capture starts. */
+ANPOD_API int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channels);
+
 /* Starts the capture thread. Call after the callback has fired. 1 = ok. */
 ANPOD_API int ANPOD_CALL AudioCapture_Start(void);
 

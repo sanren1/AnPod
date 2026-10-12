@@ -251,6 +251,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             if (state != STATE_TRANSPORT_CONNECTED || !modeSelected || command.payload.length != 0 || context == null) {
                                 result = RESULT_REJECTED;
                             } else if (!playback.start(context)) {
+                                playback.stop();
                                 result = RESULT_FAILED;
                                 context.destroy();
                                 context = null;
@@ -299,6 +300,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     }
                 } catch (IOException | RuntimeException error) {
                     result = RESULT_FAILED;
+                    if (command.type == P5cControlProtocol.START && !playbackStarted) playback.stop();
                     if (command.type == P5cControlProtocol.HEARTBEAT) shutdownRequested = true;
                 }
 

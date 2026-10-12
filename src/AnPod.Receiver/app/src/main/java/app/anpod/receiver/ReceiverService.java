@@ -265,6 +265,9 @@ public final class ReceiverService extends Service {
                                 if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification,
                                         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
                                 else startForeground(NOTIFICATION_ID, notification);
+                                networkRecoveryDeadlineElapsedMs = 0;
+                                networkAudioFailure = "";
+                                networkAudioState = "receiverRunning";
                                 AudioSession accepted = startAudio(AudioRequest.udp(context));
                                 if (accepted == null || accepted.request.udpContext != context || currentAudio != accepted) {
                                     throw new IOException("NetworkAudioSessionNotAccepted");
@@ -274,10 +277,9 @@ public final class ReceiverService extends Service {
                                 if (timeout != null) handler.removeCallbacks(timeout);
                                 timeout = null;
                                 foregroundReady = true;
-                                networkRecoveryDeadlineElapsedMs = 0;
-                                networkAudioState = "receiverRunning";
                             } catch (IOException | RuntimeException error) {
                                 recordNetworkFailure(error instanceof IOException ? error.getMessage() : error.getClass().getSimpleName());
+                                networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
                                 context.destroy();
                             } finally { ticket.finished.countDown(); }
                         }
@@ -289,6 +291,7 @@ public final class ReceiverService extends Service {
                                 ticket.cancelled = true;
                                 if (ticket.accepted != null) cancelAudio(ticket.accepted, "NetworkStartTimedOut");
                             }
+                            networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
                             return false;
                         }
                     } catch (InterruptedException interrupted) {
@@ -297,10 +300,11 @@ public final class ReceiverService extends Service {
                             ticket.cancelled = true;
                             if (ticket.accepted != null) cancelAudio(ticket.accepted, "NetworkStartInterrupted");
                         }
+                        networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
                         return false;
                     }
                     return ticket.accepted != null && currentAudio == ticket.accepted
-                            && ticket.accepted.request.udpContext == context;
+                            && ticket.accepted.request.udpContext == context && !"failed".equals(networkAudioState);
                 }
                 @Override public void pause() throws IOException {
                     setUdpAudioPaused(ownedSession, true);
@@ -320,7 +324,8 @@ public final class ReceiverService extends Service {
                     if ("failed".equals(networkAudioState)) throw new IOException(networkAudioFailure.isEmpty()
                             ? "NetworkAudioWorkerFailed" : networkAudioFailure);
                     AudioSession session = ownedSession;
-                    boolean streaming = session != null && currentAudio == session && PCM_BYTES_WRITTEN.get() > 0;
+                    if (session == null || currentAudio != session) throw new IOException("NetworkAudioSessionNoLongerOwned");
+                    boolean streaming = PCM_BYTES_WRITTEN.get() > 0;
                     if (streaming) networkAudioState = "streaming";
                     else if (session != null && currentAudio == session && "streaming".equals(networkAudioState)) networkAudioState = "receiverRunning";
                     return streaming;
@@ -414,9 +419,13 @@ public final class ReceiverService extends Service {
 
     /** Internal pause hook: drop pending and incoming history without adding a control datagram. */
     private void setUdpAudioPaused(AudioSession session, boolean paused) throws IOException {
-        if (session == null || currentAudio != session || session.request.udpContext == null || session.udpQueue == null)
+        if (session == null || currentAudio != session || session.request.udpContext == null)
             throw new IOException("NetworkAudioSessionNotOwned");
-        session.udpQueue.setPaused(paused);
+        synchronized (session) {
+            ensureRunning(session);
+            session.udpPaused = paused;
+            if (session.udpQueue != null) session.udpQueue.setPaused(paused);
+        }
     }
 
     private void receiveAudio(AudioSession session) {
@@ -445,6 +454,7 @@ public final class ReceiverService extends Service {
                     synchronized (session) {
                         ensureRunning(session);
                         session.udpQueue = udpQueue;
+                        udpQueue.setPaused(session.udpPaused);
                         session.udpReceiver = udpReceiver;
                         session.networkThread = networkThread;
                         networkThread.start();
@@ -613,6 +623,7 @@ public final class ReceiverService extends Service {
                 networkAudioFailure = finalFailure;
                 networkAudioState = "failed";
                 startFailure = finalFailure;
+                networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
             }
             handler.post(() -> finishAudio(session, finalFailure));
         }
@@ -642,7 +653,11 @@ public final class ReceiverService extends Service {
             if (!destroyed && statusAudioId == session.id) startFailure = failure;
             if (session.request.udpContext != null) {
                 if (failure.isEmpty() || "NetworkSessionStopped".equals(failure)) networkAudioState = networkCoordinator != null ? "authenticated" : "stopped";
-                else if (!networkAudioState.equals("failed")) recordNetworkFailure(failure);
+                else {
+                    if (!networkAudioState.equals("failed")) recordNetworkFailure(failure);
+                    if (networkCoordinator == null) stopSelf(latestStartId);
+                    else networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
+                }
             }
             if (session.request.udpContext == null || "stopped".equals(networkAudioState)) stopSelf(latestStartId);
         }
@@ -786,6 +801,7 @@ public final class ReceiverService extends Service {
         volatile LocalSocket socket;
         volatile UdpReceiver udpReceiver;
         volatile UdpPcmQueue udpQueue;
+        boolean udpPaused;
         volatile boolean cancelled;
         volatile String stopReason = "";
 

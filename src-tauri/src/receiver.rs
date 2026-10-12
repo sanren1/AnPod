@@ -1076,11 +1076,17 @@ mod tests {
         let files = ArtifactFiles::new();
         let cancel = CancellationToken::new();
         let timeout = Duration::from_millis(40);
+        let binding_reference = binding_reference_for(SERIAL, TEST_USER);
+        let binding_path = |case: &str| {
+            let directory = files.dir.join(case);
+            fs::create_dir_all(&directory).unwrap();
+            directory.join(format!("{binding_reference}.dpapi"))
+        };
 
         let successful = FakeAdb::new(true, files.digest.clone());
-        let binding_path = files.dir.join("binding.dpapi");
+        let successful_path = binding_path("successful");
         let commitment = provision_with(&successful, SERIAL, &files.apk, &files.metadata,
-            &binding_path, &cancel, timeout).await.unwrap();
+            &successful_path, &cancel, timeout).await.unwrap();
         assert_eq!(successful.0.lock().unwrap().binding_commitment.as_deref(), Some(commitment.as_str()));
         let calls = successful.calls();
         let write_index = calls.iter().position(|call| call.starts_with(&[
@@ -1091,13 +1097,13 @@ mod tests {
         assert!(calls.iter().flat_map(|call| call.iter()).all(|arg| !arg.contains(&commitment)));
 
         let retry_commitment = provision_with(&successful, SERIAL, &files.apk, &files.metadata,
-            &binding_path, &cancel, timeout).await.unwrap();
+            &successful_path, &cancel, timeout).await.unwrap();
         assert_eq!(retry_commitment, commitment);
         let successful_inputs = successful.0.lock().unwrap().binding_input_commitments.clone();
         assert_eq!(successful_inputs.len(), 2);
         assert_eq!(successful_inputs[0], successful_inputs[1]);
 
-        let cancelled_path = files.dir.join("cancelled.dpapi");
+        let cancelled_path = binding_path("cancelled");
         let cancelled_adb = FakeAdb::new(true, files.digest.clone());
         cancelled_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::Cancel;
         let cancelled_token = CancellationToken::new();
@@ -1113,7 +1119,7 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], seen[1], "retry generated different binding material");
 
-        let conflict_path = files.dir.join("conflict.dpapi");
+        let conflict_path = binding_path("conflict");
         let conflict_adb = FakeAdb::new(true, files.digest.clone());
         conflict_adb.0.lock().unwrap().binding_commitment = Some("f".repeat(64));
         let conflict = provision_with(&conflict_adb, SERIAL, &files.apk, &files.metadata,
@@ -1123,7 +1129,7 @@ mod tests {
         let expected_conflict = "f".repeat(64);
         assert_eq!(conflict_adb.0.lock().unwrap().binding_commitment.as_deref(), Some(expected_conflict.as_str()));
 
-        let failed_write_path = files.dir.join("failed-write.dpapi");
+        let failed_write_path = binding_path("failed-write");
         let failed_write_adb = FakeAdb::new(true, files.digest.clone());
         failed_write_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::ErrorText;
         let failed_write = provision_with(&failed_write_adb, SERIAL, &files.apk, &files.metadata,
@@ -1137,7 +1143,7 @@ mod tests {
         assert!(!failed_write.contains(&secret_hex), "remote error leaked the binding secret");
         failed_record.0.fill(0);
 
-        let wrong_user_path = files.dir.join("wrong-user.dpapi");
+        let wrong_user_path = binding_path("wrong-user");
         let wrong_user_adb = FakeAdb::new(true, files.digest.clone());
         wrong_user_adb.0.lock().unwrap().binding_write_mode = FakeBindingWrite::WrongUser;
         let wrong_user = provision_with(&wrong_user_adb, SERIAL, &files.apk, &files.metadata,
@@ -1149,7 +1155,7 @@ mod tests {
 
         let non_usb = FakeAdb::new(false, files.digest.clone());
         non_usb.0.lock().unwrap().device_state = "unauthorized";
-        let non_usb_path = files.dir.join("non-usb.dpapi");
+        let non_usb_path = binding_path("non-usb");
         assert!(provision_with(&non_usb, SERIAL, &files.apk, &files.metadata,
             &non_usb_path, &cancel, timeout).await.is_err());
         assert!(!non_usb_path.exists());
@@ -1158,7 +1164,7 @@ mod tests {
         ])));
 
         let wrong_apk = FakeAdb::new(true, "a".repeat(64));
-        let wrong_apk_path = files.dir.join("wrong-apk.dpapi");
+        let wrong_apk_path = binding_path("wrong-apk");
         assert!(provision_with(&wrong_apk, SERIAL, &files.apk, &files.metadata,
             &wrong_apk_path, &cancel, timeout).await.is_err());
         assert!(!wrong_apk_path.exists());

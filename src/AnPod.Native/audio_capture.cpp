@@ -917,6 +917,19 @@ int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData)
     return 1;
 }
 
+int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channels)
+{
+    if (g_pAudioClient == NULL || sampleRate == NULL || channels == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM format is unavailable before audio initialization");
+        return 0;
+    }
+    *sampleRate = g_nSampleRate;
+    *channels = kOutputChannels;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
 int ANPOD_CALL AudioCapture_Start(void)
 {
     if (g_pAudioClient == NULL)

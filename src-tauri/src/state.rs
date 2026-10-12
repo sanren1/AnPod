@@ -337,6 +337,9 @@ impl AppState {
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
             let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
                 .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
+            audio_initialized = true;
+            self.audio.initialize()?;
+            let capture_format = self.audio.pcm_format()?;
             let (binding_ref, binding_path, peer) = if let Some(serial) = bootstrap_serial {
                 let address = receiver_address.ok_or_else(|| "USB/bootstrap 需要明确选择手机 IPv4 接口。".to_string())?;
                 let prefix = receiver_prefix.ok_or_else(|| "USB/bootstrap 需要手机接口前缀长度。".to_string())?;
@@ -383,7 +386,7 @@ impl AppState {
             if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) { return Err("接收端点不在所选 IPv4 接口的本地网段内。".into()); }
             token_check(&token)?;
             let binding = BindingStore::load(&binding_path).map_err(|_| "本机 DPAPI 绑定材料不可用；请通过授权 USB/bootstrap 建立绑定。".to_string())?;
-            let parameters = AudioParameters { sample_rate: 48_000, channels: 2,
+            let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
             let mut owner = SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -397,7 +400,6 @@ impl AppState {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
             audio_initialized = true;
-            self.audio.initialize()?;
             if let Err(error) = self.audio.start_pcm_sink(queue.clone()) {
                 let _ = self.audio.stop_and_cleanup();
                 let _ = self.audio.restore_muted();
@@ -1216,7 +1218,8 @@ impl AppState {
                 self.update_mode_setting(kind, value)?;
                 let owner = active.network_owner.as_ref().expect("network session owner");
                 if let Err(error) = owner.set_mode(mode).and_then(|_| owner.set_paused(active.output == "computer")) {
-                    let rollback = self.update_mode_setting("playback", &previous.to_ascii_lowercase());
+                    let rollback_mode = if previous.eq_ignore_ascii_case("lowlatency") { "lowLatency" } else { "balanced" };
+                    let rollback = self.update_mode_setting("playback", rollback_mode);
                     return Err(rollback.err().map_or(error.clone(), |rollback| format!("{error}；设置回滚失败：{rollback}")));
                 }
                 {
@@ -1391,21 +1394,47 @@ impl AppState {
             if let Some(active) = session.as_mut().filter(|session| session.network_owner.is_some()) {
                 token_check(token)?;
                 let owner = active.network_owner.as_ref().expect("network session owner");
-                let change = (|| -> Result<(), String> {
-                    owner.set_paused(output == "computer")?;
+                let change = async {
                     if output == "phone" {
-                        if let Some(queue) = owner.pcm_queue() {
-                            self.audio.start_pcm_sink(queue.clone())?;
-                            self.audio.mute_active()?;
-                            active.network_sink_queue = Some(queue);
-                        }
+                        let queue = if active.output == "computer" {
+                            let old_queue = owner.pcm_queue();
+                            owner.reconnect()?;
+                            owner.set_paused(false)?;
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                            loop {
+                                token_check(token)?;
+                                let snapshot = owner.snapshot();
+                                if snapshot.state == SessionLifecycleState::Stopped {
+                                    return Err(snapshot.last_error.unwrap_or_else(|| "Receiver session stopped".into()));
+                                }
+                                if let Some(queue) = owner.pcm_queue() {
+                                    let is_fresh = old_queue.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &queue));
+                                    if is_fresh && matches!(snapshot.state, SessionLifecycleState::ReceiverRunning
+                                        | SessionLifecycleState::Streaming | SessionLifecycleState::Paused) {
+                                        break queue;
+                                    }
+                                }
+                                if tokio::time::Instant::now() >= deadline {
+                                    return Err("手机未在 30 秒内恢复认证会话；请重新连接。".into());
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        } else {
+                            owner.set_paused(false)?;
+                            let Some(queue) = owner.pcm_queue() else { return Ok(()); };
+                            queue
+                        };
+                        self.audio.start_pcm_sink(queue.clone())?;
+                        self.audio.mute_active()?;
+                        active.network_sink_queue = Some(queue);
                     } else {
+                        owner.set_paused(true)?;
                         self.audio.stop_pcm_sink()?;
                         self.audio.restore_muted()?;
                         active.network_sink_queue = None;
                     }
                     Ok(())
-                })();
+                }.await;
                 if let Err(error) = change {
                     let mut cleanup = Vec::new();
                     if let Err(stop_error) = self.audio.stop_pcm_sink() { cleanup.push(stop_error); }

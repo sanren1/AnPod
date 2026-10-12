@@ -363,10 +363,16 @@ and audible output remain NOT_TESTED.
 
 The desktop backend exposes explicit Tauri commands and routes their work
 through the existing session state; there is no UI caller or default network
-listener. The selected output and
-balanced/low-latency mode flow through the existing session state. Computer
-output uses the existing Legacy path; phone output requires an explicitly
-selected private IPv4 interface and receiver binding reference. USB bootstrap
+listener. The selected output and balanced/low-latency mode flow through the
+existing session state. Computer output uses the existing Legacy path; phone
+output requires an explicitly selected private IPv4 interface and receiver
+binding reference. Native initialization exposes its negotiated stereo PCM
+rate through the optional `AudioCapture_GetPcmFormat` C ABI before the
+authenticated handshake. The handshake uses that rate, and the capture sink
+compares the metadata again before starting capture or muting computer output;
+it does not wait for a PCM packet. An older DLL without the metadata export
+reports an explicit unsupported-capability error while its Legacy exports
+remain usable. USB bootstrap
 is allowed only after checking Receiver network protocol version 1. The host
 then queries the Receiver's actual bound address and nonzero control port; it
 does not guess an address or port. Discovery candidates remain unauthenticated
@@ -376,18 +382,25 @@ Saved bindings are isolated by USB serial and Android user. The UI-facing list
 contains opaque SHA-256 references only; binding bytes remain in the existing
 DPAPI store and Android app-private store. A selected reference is rechecked
 against the current USB identity/user before provisioning or connecting.
-Changing playback mode closes the old authenticated session and establishes a
-fresh one while preserving pause intent. Live bitrate uses successful PCM
-payload byte deltas from the active session. Native capture replacement joins
-the previous capture before releasing callback state, and a new phone-output
-sink starts only after its actual callback rate/channel format matches the
-negotiated format. Capture or format failure follows local cleanup and restores
+Changing playback mode or returning from computer output closes the old
+authenticated session and establishes a fresh one with a fresh PCM queue while
+preserving pause intent. Recovered frame zero therefore belongs to a new
+session and queue. A pause received after START but before UDP queue creation is
+recorded on its owned audio session and applied atomically when that queue is
+attached. Live bitrate uses successful PCM payload byte deltas from a shared
+sender counter that survives sender teardown, including the final unsampled
+tail. Native capture replacement joins the previous capture before releasing
+callback state. Capture or format failure follows local cleanup and restores
 computer output.
 
-The Receiver keeps its listener for at most 30 seconds after disconnect so the
-host can recover with a fresh authenticated session. This does not cover loss
-of USB provisioning or an unavailable service. The only current verification
-for this backend is local compilation and synthetic localhost coverage; real
+An unexpected Receiver audio-worker failure and a rejected or timed-out START
+begin a bounded cleanup/recovery window immediately; a stale owned playback
+session fails its next heartbeat instead of being reported as merely idle. A
+healthy idle stream with no PCM packets stays ReceiverRunning. The Receiver
+keeps its listener for at most 30 seconds after disconnect so the host can
+recover with a fresh authenticated session. This does not cover loss of USB
+provisioning or an unavailable service. The only current verification for
+this backend is local compilation and synthetic localhost coverage; real
 USB bootstrap, Android runtime, LAN/hotspot, WASAPI capture, AudioTrack output,
 audible output, and recovery on devices remain NOT_TESTED. No APK was assembled
 or installed during this work.

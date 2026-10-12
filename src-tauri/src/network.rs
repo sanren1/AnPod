@@ -3,7 +3,7 @@ use crate::protocol::{PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MA
 use crate::protocol::{PacketDecoder, ProtocolError, MAX_DATAGRAM_LEN};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering}, Arc, Condvar, Mutex, TryLockError},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, TryLockError},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -39,8 +39,6 @@ pub struct PcmQueue {
     wake: Condvar,
     dropped_frames: AtomicU64,
     target_format: Option<PcmFormat>,
-    observed_sample_rate: AtomicU32,
-    observed_channels: AtomicU16,
     stopped: AtomicBool,
 }
 
@@ -52,8 +50,7 @@ impl PcmQueue {
             info: PcmBlockInfo { frame_count: 0, sample_rate: 0, channels: PCM_CHANNELS, frame_index: 0 },
         }).collect();
         Self { state: Mutex::new(QueueState { slots, head: 0, len: 0 }), wake: Condvar::new(),
-            dropped_frames: AtomicU64::new(0), target_format: None, observed_sample_rate: AtomicU32::new(0),
-            observed_channels: AtomicU16::new(0), stopped: AtomicBool::new(false) }
+            dropped_frames: AtomicU64::new(0), target_format: None, stopped: AtomicBool::new(false) }
     }
 
     pub fn dropped_frames(&self) -> u64 { self.dropped_frames.load(Ordering::Relaxed) }
@@ -62,11 +59,6 @@ impl PcmQueue {
         let mut queue = Self::new();
         queue.target_format = Some(format);
         queue
-    }
-
-    pub(crate) fn observed_format(&self) -> Option<PcmFormat> {
-        let sample_rate = self.observed_sample_rate.load(Ordering::Acquire);
-        (sample_rate != 0).then(|| PcmFormat { sample_rate, channels: self.observed_channels.load(Ordering::Acquire) })
     }
 
     pub(crate) fn expected_format(&self) -> Option<PcmFormat> { self.target_format }
@@ -91,8 +83,6 @@ impl PcmQueue {
             self.add_dropped(frame_count as u64);
             return false;
         }
-        self.observed_channels.store(channels, Ordering::Relaxed);
-        self.observed_sample_rate.store(sample_rate, Ordering::Release);
         let sample_count = sample_count.unwrap();
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
@@ -212,18 +202,19 @@ impl UdpSender {
             return Err("P3 unauthenticated UDP prototype only permits 127.0.0.1.".into());
         }
         let socket = UdpSocket::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
-        Self::spawn_inner(remote, queue, socket, material, format)
+        Self::spawn_inner(remote, queue, socket, material, format, Arc::new(AtomicU64::new(0)))
     }
 
     pub(crate) fn spawn_authenticated(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
-        material: UdpSessionMaterial, parameters: crate::security::AudioParameters) -> Result<Self, String> {
+        material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
+        pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
         parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
         let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
-        Self::spawn_inner(remote, queue, socket, material, format)
+        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent)
     }
 
     fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
-        material: UdpSessionMaterial, format: PcmFormat) -> Result<Self, String> {
+        material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
         if !matches!(format.channels, 1 | 2) || format.sample_rate == 0
             || !remote.is_ipv4()
             || !socket.local_addr().map_err(|error| error.to_string())?.is_ipv4() {
@@ -232,7 +223,6 @@ impl UdpSender {
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let worker_queue = queue.clone();
-        let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
         let worker_bytes = pcm_payload_bytes_sent.clone();
         let worker = thread::Builder::new().name("AnPod local UDP audio".into()).spawn(move || {
             send_loop(socket, remote, worker_queue, worker_stopping, material, format, worker_bytes)
@@ -413,11 +403,10 @@ mod tests {
     use crate::protocol::{PacketType, PcmFormat};
 
     #[test]
-    fn session_queue_reports_real_capture_format_before_discarding_mismatch() {
+    fn session_queue_discards_audio_that_does_not_match_negotiated_format() {
         let queue = PcmQueue::for_session(PcmFormat { sample_rate: 48_000, channels: 2 });
         let samples = vec![0i16; 480 * 2];
         assert!(!queue.push_raw(samples.as_ptr(), 480, 44_100, 2, 0));
-        assert_eq!(queue.observed_format(), Some(PcmFormat { sample_rate: 44_100, channels: 2 }));
         assert_eq!(queue.len(), 0);
     }
 
