@@ -164,11 +164,21 @@ button:disabled { cursor: default; }
 .form-pane > small { color: var(--muted); line-height: 18px; }
 .form-pane .primary-button { width: 100%; }
 .network-pane { display: grid; gap: 11px; padding: 15px 18px 0; }
+.network-primary { display: grid; gap: 10px; }
+.network-summary { min-width: 0; display: grid; gap: 3px; padding: 2px 1px; overflow-wrap: anywhere; }
+.network-summary span { color: var(--muted); font-size: 12px; line-height: 18px; }
+.network-connect { width: 100%; min-height: 44px; }
+.network-recovery { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 8px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--warning); background: var(--bg); line-height: 18px; }
+.network-advanced { border-top: 1px solid var(--line); }
+.network-advanced > summary { min-height: 40px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 600; }
+.network-advanced > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.network-advanced-body { display: grid; gap: 10px; padding: 2px 0 12px; }
 .network-intro, .network-note { margin: 0; color: var(--muted); line-height: 19px; overflow-wrap: anywhere; }
 .network-field { min-width: 0; display: grid; gap: 6px; font-weight: 600; }
 .network-field select, .network-field input { width: 100%; min-width: 0; min-height: 42px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--bg); }
 .network-field option { overflow-wrap: anywhere; }
 .network-hint { color: var(--muted); line-height: 18px; }
+.network-validation-warning { color: var(--warning); line-height: 18px; }
 .receiver-manager { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
 .receiver-status-row { display: grid; gap: 9px; }
 .receiver-status-copy { min-width: 0; display: grid; gap: 3px; overflow-wrap: anywhere; }
@@ -192,6 +202,7 @@ button:disabled { cursor: default; }
 .network-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin-top: 2px; }
 .network-actions > button { min-width: 0; min-height: 44px; padding-inline: 8px; white-space: normal; }
 .network-actions .primary-button { background: #2454b7; }
+.network-advanced-body > .dialog-secondary { justify-self: start; }
 .discover-button { justify-self: start; }
 .inline-error { margin: 12px 18px 0; color: var(--danger); line-height: 19px; }
 .help-pane { gap: 8px; line-height: 21px; }

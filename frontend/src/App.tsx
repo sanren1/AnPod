@@ -32,6 +32,7 @@ type Credentials = { instanceName: string; password: string; payload: string };
 type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };
 type PrivateIpv4Interface = { index: number; name: string; address: string; prefixLength: number; gateways: string[] };
 type ReceiverIpv4Interface = { address: string; prefixLength: number; interfaceIndex: number; interfaceName: string };
+type NetworkInterfacePair = { local: PrivateIpv4Interface; receiver: ReceiverIpv4Interface };
 type ReceiverStatus = {
   installed: boolean; versionName: string | null; versionCode: number | null; serviceActive: boolean;
   foreground: boolean; healthy: boolean; audioActive: boolean; error: string | null; message: string;
@@ -59,6 +60,25 @@ const bindingLabel = (reference: string | null | undefined) => reference ? `已�
 const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
   return !!match && match[1].split(".").every(part => Number(part) <= 255) && Number(match[2]) > 0 && Number(match[2]) <= 65535;
+};
+const ipv4Number = (address: string) => {
+  const parts = address.split(".");
+  if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return null;
+  return parts.reduce((value, part) => ((value << 8) | Number(part)) >>> 0, 0);
+};
+const sameIpv4Subnet = (first: string, firstPrefix: number, second: string, secondPrefix: number) => {
+  const a = ipv4Number(first); const b = ipv4Number(second);
+  if (a === null || b === null || firstPrefix < 0 || firstPrefix > 32 || secondPrefix < 0 || secondPrefix > 32) return false;
+  const prefix = Math.max(firstPrefix, secondPrefix);
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (a & mask) >>> 0 === (b & mask) >>> 0;
+};
+const bootstrapNetworkPairs = (locals: PrivateIpv4Interface[], receivers: ReceiverIpv4Interface[]): NetworkInterfacePair[] =>
+  locals.flatMap(local => receivers.filter(receiver => sameIpv4Subnet(local.address, local.prefixLength, receiver.address, receiver.prefixLength))
+    .map(receiver => ({ local, receiver })));
+const endpointFitsInterface = (endpoint: string, local: PrivateIpv4Interface | undefined) => {
+  const address = endpoint.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/)?.[1];
+  return !!local && isIpv4Endpoint(endpoint) && !!address && sameIpv4Subnet(local.address, local.prefixLength, address, local.prefixLength);
 };
 
 function App() {
@@ -398,6 +418,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   onStart: (request: NetworkStartRequest) => void; onDisconnect: () => void; onLegacy: () => void; onClose: () => void;
 }) {
   const [method, setMethod] = useState<"bootstrap" | "paired">("bootstrap");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [interfaces, setInterfaces] = useState<PrivateIpv4Interface[]>([]);
   const [receiverInterfaces, setReceiverInterfaces] = useState<ReceiverIpv4Interface[]>([]);
   const [bindings, setBindings] = useState<string[]>([]);
@@ -411,10 +432,24 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   const [receiverAction, setReceiverAction] = useState<"checking" | "installing" | null>(null);
   const [receiverStatus, setReceiverStatus] = useState<ReceiverStatus | null>(null);
   const [receiverError, setReceiverError] = useState("");
+  const [receiverInstallFailed, setReceiverInstallFailed] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [addressNotice, setAddressNotice] = useState("");
   const alertRef = useRef<HTMLParagraphElement>(null);
   const receiverGeneration = useRef(0);
+  const discoveryGeneration = useRef(0);
+  const methodManuallySelected = useRef(false);
+  const peerManuallyEdited = useRef(false);
   const busy = disabled || loading || receiverAction !== null;
+  const usbDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
+  const selectedUsbDevice = usbDevices.find(device => device.serial === serial);
+  const validBootstrapPairs = useMemo(() => bootstrapNetworkPairs(interfaces, receiverInterfaces), [interfaces, receiverInterfaces]);
+  const compatibleReceiverInterfaces = useMemo(() => localAddress
+    ? receiverInterfaces.filter(receiver => {
+      const local = interfaces.find(value => value.address === localAddress);
+      return !!local && sameIpv4Subnet(local.address, local.prefixLength, receiver.address, receiver.prefixLength);
+    }) : [], [interfaces, localAddress, receiverInterfaces]);
+  const selectedBootstrapPair = validBootstrapPairs.find(pair => pair.local.address === localAddress && pair.receiver.address === receiverAddress);
 
   useEffect(() => {
     if (error || localError || receiverError) alertRef.current?.focus();
@@ -433,13 +468,18 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
       if (interfacesResult.value.length === 0) errors.push("没有可用的电脑 IPv4 网络接口。请启用 Wi-Fi 或有线网络后刷新。");
     } else errors.push(String(interfacesResult.reason));
     if (bindingsResult.status === "fulfilled") {
-      setBindings(bindingsResult.value);
-      if (!bindingsResult.value.includes(bindingReference)) setBindingReference("");
+      const values = bindingsResult.value;
+      setBindings(values);
+      setBindingReference(current => values.includes(current) ? current : values.length === 1 ? values[0] : "");
+      if (!methodManuallySelected.current) setMethod(values.length > 0 ? "paired" : "bootstrap");
     } else errors.push(String(bindingsResult.reason));
     setLocalError(errors.join("；"));
     setLoading(false);
   };
   useEffect(() => { void loadNetworkInfo(); }, []);
+  useEffect(() => {
+    setSerial(current => usbDevices.some(device => device.serial === current) ? current : usbDevices.length === 1 ? usbDevices[0].serial : "");
+  }, [usbDeviceKey]);
   const readReceiverStatusAndInterfaces = async (deviceSerial: string, generation: number) => {
     const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: deviceSerial });
     if (receiverGeneration.current !== generation) return;
@@ -457,7 +497,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   };
   const checkReceiver = async (deviceSerial: string) => {
     const generation = ++receiverGeneration.current;
-    setReceiverStatus(null); setReceiverError(""); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+    setReceiverStatus(null); setReceiverError(""); setReceiverInstallFailed(false); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
     setReceiverAction("checking");
     try { await readReceiverStatusAndInterfaces(deviceSerial, generation); }
     catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
@@ -468,31 +508,72 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
     if (audioSessionActive) { setReceiverError("请先断开音频会话，再安装或更新 Receiver。"); return; }
     const deviceSerial = serial;
     const generation = ++receiverGeneration.current;
-    setReceiverAction("installing"); setReceiverError(""); setReceiverStatus(null); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+    setReceiverAction("installing"); setReceiverError(""); setReceiverInstallFailed(false); setReceiverStatus(null); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
     try {
-      await invokeApp<ReceiverStatus>("receiver_install", { serial: deviceSerial });
+      try { await invokeApp<ReceiverStatus>("receiver_install", { serial: deviceSerial }); }
+      catch (reason) {
+        if (receiverGeneration.current === generation) { setReceiverError(String(reason)); setReceiverInstallFailed(true); }
+        return;
+      }
       if (receiverGeneration.current === generation) await readReceiverStatusAndInterfaces(deviceSerial, generation);
     } catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
     finally { if (receiverGeneration.current === generation) setReceiverAction(null); }
   };
   useEffect(() => {
     setReceiverInterfaces([]); setReceiverAddress("");
-    setReceiverStatus(null); setReceiverError(""); setLocalError("");
+    setReceiverStatus(null); setReceiverError(""); setReceiverInstallFailed(false); setLocalError("");
     if (serial) void checkReceiver(serial);
     else setReceiverAction(null);
     return () => { receiverGeneration.current++; };
   }, [serial]);
 
-  const discover = async () => {
-    if (!localAddress) return;
-    setLoading(true); setLocalError(""); setCandidates([]);
+  useEffect(() => {
+    if (method === "paired") {
+      if (!interfaces.some(value => value.address === localAddress)) setLocalAddress(interfaces.length === 1 ? interfaces[0].address : "");
+      return;
+    }
+    if (receiverStatus?.installed !== true) return;
+    if (interfaces.some(value => value.address === localAddress)) {
+      const choices = validBootstrapPairs.filter(pair => pair.local.address === localAddress);
+      if (choices.some(pair => pair.receiver.address === receiverAddress)) return;
+      setReceiverAddress(choices.length === 1 ? choices[0].receiver.address : "");
+      return;
+    }
+    if (validBootstrapPairs.length === 1) {
+      setLocalAddress(validBootstrapPairs[0].local.address);
+      setReceiverAddress(validBootstrapPairs[0].receiver.address);
+    } else {
+      setLocalAddress(""); setReceiverAddress("");
+    }
+  }, [interfaces, localAddress, method, receiverAddress, receiverStatus?.installed, validBootstrapPairs]);
+
+  const discoverCandidates = async (automatic = false) => {
+    const local = interfaces.find(value => value.address === localAddress);
+    if (!local) return;
+    const generation = ++discoveryGeneration.current;
+    setLoading(true); setCandidates([]);
+    if (!automatic) setLocalError("");
+    setAddressNotice("正在搜索候选地址…");
     try {
       const values = await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress });
-      setCandidates(values);
-      if (values.length === 0) setLocalError("没有发现接收端。确认两端位于可互访网络后，可手动输入接收端地址。");
-    } catch (reason) { setLocalError(String(reason)); }
-    finally { setLoading(false); }
+      if (discoveryGeneration.current !== generation) return;
+      const usable = values.filter(value => endpointFitsInterface(value.endpoint, local));
+      setCandidates(usable);
+      if (!peerManuallyEdited.current) setPeer(usable.length === 1 ? usable[0].endpoint : "");
+      setAddressNotice(usable.length === 1 ? "找到一个未验证的地址建议；点击连接后仍会进行双向认证。"
+        : usable.length > 1 ? "找到多个未验证的地址建议，请在高级选项中明确选择。"
+          : "未发现地址建议；可在高级选项中重新搜索或手动输入。");
+      if (usable.length === 0 && !automatic) setLocalError("没有发现接收端。确认两端位于可互访网络后，可重试搜索或手动输入地址。");
+    } catch (reason) { if (discoveryGeneration.current === generation) { setAddressNotice(""); setLocalError(String(reason)); } }
+    finally { if (discoveryGeneration.current === generation) setLoading(false); }
   };
+  useEffect(() => {
+    if (method !== "paired" || !localAddress) return;
+    setCandidates([]);
+    if (!peerManuallyEdited.current) setPeer("");
+    void discoverCandidates(true);
+    return () => { discoveryGeneration.current++; };
+  }, [interfaces, localAddress, method]);
   const submit = (event: React.FormEvent) => {
     event.preventDefault(); setLocalError(""); onError("");
     if (!localAddress) { setLocalError("请明确选择电脑使用的网络接口。"); return; }
@@ -504,78 +585,107 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
       return;
     }
     if (!bindingReference) { setLocalError("请选择已配对的接收端绑定。"); return; }
-    if (!isIpv4Endpoint(peer)) { setLocalError("请输入有效的 IPv4 地址和端口，例如 192.0.2.20:45678。"); return; }
+    const local = interfaces.find(value => value.address === localAddress);
+    if (!isIpv4Endpoint(peer)) { setLocalError("请选择一个候选地址，或在高级选项中输入有效的 IPv4 地址和端口。"); return; }
+    if (!endpointFitsInterface(peer, local)) { setLocalError("接收端地址不在所选电脑接口的本地网段内；请检查网络接口或地址。"); return; }
     onStart({ localAddress, peer: peer.trim(), bindingReference });
   };
   const shownError = error || localError;
+  const selectedLocalInterface = interfaces.find(value => value.address === localAddress);
+  const peerOutsideSubnet = method === "paired" && isIpv4Endpoint(peer) && !endpointFitsInterface(peer, selectedLocalInterface);
   const canStart = method === "bootstrap"
-    ? !!serial && receiverStatus?.installed === true && receiverInterfaces.some(value => value.address === receiverAddress)
-    : !!bindingReference && isIpv4Endpoint(peer);
+    ? !!serial && receiverStatus?.installed === true && !!selectedBootstrapPair
+    : !!bindingReference && endpointFitsInterface(peer, selectedLocalInterface);
+  const receiverCompatibilityError = /(签名|核验|版本|协议|不兼容|不匹配|signature|version)/i.test(receiverError);
+  const receiverNeedsInstall = !!serial && (receiverStatus?.installed === false || receiverInstallFailed || receiverCompatibilityError);
+  const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
+  const mainSummary = method === "paired"
+    ? bindingReference ? bindingLabel(bindingReference) : "选择已配对接收端"
+    : selectedUsbDevice?.displayName ?? "选择 USB 手机";
+  const addressSummary = localAddress
+    ? `${interfaces.find(value => value.address === localAddress)?.name ?? "电脑接口"} · ${localAddress}${method === "paired" && peer ? ` → ${peer}` : method === "bootstrap" && receiverAddress ? ` ↔ ${receiverAddress}` : ""}`
+    : "网络接口待选择";
+  const advancedRequired = method === "paired"
+    ? bindings.length !== 1 || !bindingReference || interfaces.length !== 1 && !localAddress || !isIpv4Endpoint(peer) || !endpointFitsInterface(peer, selectedLocalInterface)
+    : usbDevices.length !== 1 || !serial || receiverStatus?.installed !== true || !selectedBootstrapPair;
 
   return <Modal title="直接连接 Receiver" onClose={onClose} className="network-dialog">
     <form className="network-pane" onSubmit={submit}>
-      <p className="network-intro">先安装已通过版本和签名核验的 Receiver。选择电脑网络接口，再通过 USB 首次绑定，或使用已配对接收端；发现结果只是地址提示，连接仍会进行双向认证。</p>
-      <label className="network-field">电脑网络接口
-        <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-          <option value="">请选择 IPv4 接口</option>
-          {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
-        </select>
-      </label>
-      <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />刷新接口和配对信息</button>
-      <div className="network-methods" role="group" aria-label="Receiver 连接方式">
-        <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次绑定</button>
-        <button type="button" aria-pressed={method === "paired"} disabled={busy} onClick={() => { setMethod("paired"); onError(""); setLocalError(""); }}>已配对接收端</button>
+      <div className="network-primary">
+        <div className="network-summary"><strong>{mainSummary}</strong><span>{addressSummary}</span></div>
+        {pairedServiceStopped && <div className="network-recovery" role="status">
+          <span>Receiver 服务已停止。可切换到 USB 首次绑定以重新启动。</span>
+          <button type="button" className="text-button" disabled={busy} onClick={() => { setMethod("bootstrap"); setAdvancedOpen(true); }}>USB 重新启动</button>
+        </div>}
+        {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
+        {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装 Receiver…" : "正在读取网络信息…"}</p>}
+        <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "首次绑定并连接" : "连接已配对手机"}</button>
       </div>
-      {method === "bootstrap" ? <>
-        <label className="network-field">已授权的 USB 手机
-          <select required value={serial} disabled={busy} onChange={event => { setSerial(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-            <option value="">请选择 USB 设备</option>
-            {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
-          </select>
-        </label>
-        <section className="receiver-manager" aria-label="Receiver 安装管理">
-          <div className="receiver-status-row">
-            <div className="receiver-status-copy" role="status" aria-live="polite">
-              <strong>{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装/更新 Receiver…" : !serial ? "请选择 USB 手机以检查 Receiver" : receiverError ? "Receiver 检查失败" : !receiverStatus ? "等待 Receiver 检查" : !receiverStatus.installed ? "Receiver 未安装" : receiverStatus.serviceActive ? receiverStatus.healthy ? "Receiver 已安装 · 服务正常" : "Receiver 已安装 · 服务异常" : "Receiver 已安装 · 服务未启动"}</strong>
-              {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : `版本码 ${receiverStatus.versionCode}`, receiverStatus.foreground ? "前台服务" : ""].filter(Boolean).join(" · ")}</small>}
-              {receiverStatus?.audioActive && <small>Receiver 报告音频活动；安装状态、服务状态和手机实际播放分别显示。</small>}
-              {receiverStatus && <small>{receiverStatus.message}</small>}
-            </div>
-            <div className="receiver-status-actions">
-              <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? "检查中…" : "检查状态"}</button>
-              <button className="primary-button" type="button" disabled={busy || !serial || audioSessionActive} onClick={() => void installReceiver()}>{receiverAction === "installing" ? "安装中…" : "安装/更新 Receiver"}</button>
-            </div>
+      <details className="network-advanced" open={advancedOpen || advancedRequired} onToggle={event => setAdvancedOpen(event.currentTarget.open)}>
+        <summary>高级选项与诊断</summary>
+        <div className="network-advanced-body">
+          <p className="network-intro">候选地址仅作提示；连接仍使用已保存的绑定进行双向认证。</p>
+          <div className="network-methods" role="group" aria-label="Receiver 连接方式">
+            <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次绑定</button>
+            <button type="button" aria-pressed={method === "paired"} disabled={busy || bindings.length === 0} onClick={() => { methodManuallySelected.current = true; setMethod("paired"); onError(""); setLocalError(""); }}>连接已配对手机</button>
           </div>
-          {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverError}</p>}
-          {audioSessionActive && <div className="receiver-session-warning"><span>当前有音频会话；请先断开后才能安装/更新 Receiver。</span><button type="button" className="text-button" disabled={busy} onClick={onDisconnect}>断开音频会话</button></div>}
-          <p className="network-note">将使用本便携包附带的 Receiver APK。手机系统可能要求确认安装或通知权限；签名不匹配时 Android 会拒绝覆盖并保留现有应用数据。</p>
-        </section>
-        <label className="network-field">手机当前 IPv4 地址
-          <select required value={receiverAddress} disabled={busy || !serial} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-            <option value="">请选择手机网络接口</option>
-            {receiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
-          </select>
-        </label>
-        {serial && receiverStatus?.installed && <button className="text-button network-refresh" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}><Search size={15} />检查状态并刷新手机接口</button>}
-        <p className="network-note">USB 查询所选手机的实际网络地址，并用于首次绑定或重新启动 Receiver；不会猜测热点地址。Receiver 安装成功不等于服务已启动或手机正在播放。</p>
-      </> : <>
-        <label className="network-field">已配对接收端
-          <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-            <option value="">请选择配对绑定</option>
-            {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
-          </select>
-        </label>
-        {bindings.length === 0 && <p className="network-note">没有已保存的配对绑定。请先通过 USB 首次授权。</p>}
-        <label className="network-field">接收端 IPv4 地址和控制端口
-          <input required value={peer} disabled={busy} onChange={event => { setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || undefined} aria-describedby={`network-peer-hint${shownError ? " network-flow-error" : ""}`} />
-        </label>
-        <small id="network-peer-hint" className="network-hint">也可以先发现候选地址。候选未经验证，不会自动绑定或配对。</small>
-        <button className="text-button network-refresh" type="button" onClick={() => void discover()} disabled={busy || !localAddress}><Search size={15} />发现接收端候选</button>
-        {candidates.length > 0 && <div className="candidate-list" aria-label="未验证的发现候选">{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>未经验证 · 仅填入地址</small></button>)}</div>}
-      </>}
-      {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
-      {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在读取网络信息…</p>}
-      <div className="network-actions"><button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button><button className="primary-button" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "通过 USB 绑定并连接" : "连接已配对 Receiver"}</button></div>
+          <label className="network-field">电脑网络接口
+            <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (!peerManuallyEdited.current) setPeer(""); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+              <option value="">请选择 IPv4 接口</option>
+              {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
+            </select>
+          </label>
+          {method === "bootstrap" ? <>
+            <label className="network-field">已授权的 USB 手机
+              <select required value={serial} disabled={busy} onChange={event => { setSerial(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+                <option value="">请选择 USB 设备</option>
+                {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
+              </select>
+            </label>
+            {serial && <section className="receiver-manager" aria-label="Receiver 安装管理">
+              <div className="receiver-status-row">
+                <div className="receiver-status-copy" role="status" aria-live="polite">
+                  <strong>{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装/更新 Receiver…" : receiverError ? "Receiver 检查失败" : !receiverStatus ? "等待 Receiver 检查" : !receiverStatus.installed ? "Receiver 未安装" : receiverStatus.serviceActive ? receiverStatus.healthy ? "Receiver 已安装 · 服务正常" : "Receiver 已安装 · 服务异常" : "Receiver 已安装 · 服务未启动"}</strong>
+                  {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : `版本码 ${receiverStatus.versionCode}`, receiverStatus.foreground ? "前台服务" : ""].filter(Boolean).join(" · ")}</small>}
+                  {receiverStatus?.audioActive && <small>Receiver 报告音频活动；这不代表手机正在播放。</small>}
+                  {receiverStatus && <small>{receiverStatus.message}</small>}
+                </div>
+                <div className="receiver-status-actions">
+                  <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? "检查中…" : "检查状态"}</button>
+                  {receiverNeedsInstall && <button className="primary-button" type="button" disabled={busy || audioSessionActive} onClick={() => void installReceiver()}>{receiverAction === "installing" ? "安装中…" : "安装/更新 Receiver"}</button>}
+                </div>
+              </div>
+              {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverError}</p>}
+              {audioSessionActive && receiverNeedsInstall && <div className="receiver-session-warning"><span>当前有音频会话；请先断开后才能安装/更新 Receiver。</span><button type="button" className="text-button" disabled={busy} onClick={onDisconnect}>断开音频会话</button></div>}
+              {receiverNeedsInstall && <p className="network-note">将使用本便携包附带的 Receiver APK。手机系统可能要求确认安装或通知权限；签名不匹配时 Android 会拒绝覆盖并保留现有应用数据。</p>}
+            </section>}
+            <label className="network-field">手机当前 IPv4 地址
+              <select required value={receiverAddress} disabled={busy || !serial || receiverStatus?.installed !== true} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+                <option value="">请选择手机网络接口</option>
+                {compatibleReceiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
+              </select>
+            </label>
+            <p className="network-note">只显示与所选电脑接口处于同一网段的手机地址。</p>
+          </> : <>
+            <label className="network-field">已配对接收端
+              <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+                <option value="">请选择配对绑定</option>
+                {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
+              </select>
+            </label>
+            <label className="network-field">接收端 IPv4 地址和控制端口
+              <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
+            </label>
+            <small id="network-peer-hint" className="network-hint">地址建议未经验证；选择或填写后仍需点击连接。</small>
+            {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">此地址不在所选电脑接口的网段内，连接按钮不可用。</small>}
+            <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
+            <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />重新搜索地址</button>
+            {candidates.length > 0 && <div className="candidate-list" aria-label="未验证的发现候选">{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>未经验证 · 仅填入地址</small></button>)}</div>}
+          </>}
+          <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />刷新接口和配对信息</button>
+          <button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button>
+        </div>
+      </details>
     </form>
   </Modal>;
 }
