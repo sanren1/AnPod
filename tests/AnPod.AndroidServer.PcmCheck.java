@@ -84,8 +84,8 @@ final class PcmCheck {
                 >= Pcm16FrameStream.backlogLimitFrames(48000, 240, false)) {
             throw new AssertionError("low-latency backlog limit must be smaller than balanced");
         }
-        byte[] backlog = new byte[6 * Pcm16FrameStream.FRAME_BYTES];
-        for (int frame = 0; frame < 6; frame++) {
+        byte[] backlog = new byte[20 * Pcm16FrameStream.FRAME_BYTES];
+        for (int frame = 0; frame < 20; frame++) {
             int sample = 10000 + frame * 100;
             for (int channel = 0; channel < 2; channel++) {
                 int offset = frame * Pcm16FrameStream.FRAME_BYTES + channel * 2;
@@ -102,11 +102,12 @@ final class PcmCheck {
         }
         int backlogBytes = backlogStream.readFrames(backlogInput, backlogBuffer, backlogBuffer.length);
         if (backlogBytes != 2 * Pcm16FrameStream.FRAME_BYTES
-                || backlogStream.getDroppedBacklogFrames() != 4) {
+                || backlogStream.getDroppedBacklogFrames() != 18 || backlogInput.unreadBytes() != 0
+                || backlogInput.availableCalls != 2) {
             throw new AssertionError("backlog trim did not discard the oldest complete frames");
         }
         if (readSample(backlogBuffer, 0) != 0 || readSample(backlogBuffer, 2) != 0
-                || readSample(backlogBuffer, 4) != 5250 || readSample(backlogBuffer, 6) != 5250) {
+                || readSample(backlogBuffer, 4) != 5950 || readSample(backlogBuffer, 6) != 5950) {
             throw new AssertionError("backlog trim lost frame alignment or did not fade in");
         }
         System.out.println("Android PCM framing and mode checks passed.");
@@ -142,11 +143,12 @@ final class PcmCheck {
     private static final class BacklogInput extends InputStream {
         private final byte[] data;
         private int offset;
-        private int availableCalls;
+        int availableCalls;
 
         BacklogInput(byte[] data) { this.data = data; }
         @Override public int available() { return availableCalls++ == 0 ? 0 : data.length - offset; }
         @Override public int read() { return offset == data.length ? -1 : data[offset++] & 0xff; }
+        int unreadBytes() { return data.length - offset; }
         @Override public int read(byte[] target, int start, int length) {
             if (offset == data.length) return -1;
             int count = availableCalls == 1 ? 1 : Math.min(length, data.length - offset);

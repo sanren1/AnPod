@@ -2,6 +2,7 @@ package com.anpod.server;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 
 /** Preserves PCM16 frame boundaries across arbitrary socket reads/writes. */
 public final class Pcm16FrameStream {
@@ -88,19 +89,27 @@ public final class Pcm16FrameStream {
         long excessFrames = completeFrames - maxBacklogFrames;
         if (excessFrames <= 0) return;
 
-        int framesToDrop = (int) Math.min(excessFrames, Math.max(1, buffer.length / frameBytes));
-        int inputBytesToDrop = framesToDrop * frameBytes - tailLength;
-        int remaining = inputBytesToDrop;
+        long framesToDrop = excessFrames;
+        long remaining = framesToDrop * frameBytes - tailLength;
         while (remaining > 0) {
-            int count = input.read(buffer, 0, Math.min(remaining, buffer.length));
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedIOException("PCM backlog trim interrupted");
+            }
+            int count = input.read(buffer, 0, (int) Math.min(remaining, (long) buffer.length));
             if (count < 0) throw new IOException("PCM backlog trim ended before a frame boundary");
-            if (count == 0) throw new IOException("PCM backlog trim made no progress");
+            if (count == 0) {
+                pauseOnNoProgress();
+                continue;
+            }
             remaining -= count;
         }
 
         tailLength = 0;
         droppedBacklogFrames += framesToDrop;
         fadeFramesRemaining = fadeFramesTotal;
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("PCM backlog trim interrupted");
+        }
     }
 
     private void fadeIn(byte[] buffer, int length) {
