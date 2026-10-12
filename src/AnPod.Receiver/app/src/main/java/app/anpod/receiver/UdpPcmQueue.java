@@ -274,6 +274,10 @@ final class UdpPcmQueue {
         trackPreRollFrames = Math.max(0, preRollFrames);
         initialTargetFrames = Math.max(0, initialTotalFrames - trackPreRollFrames);
         maxTargetFrames = Math.max(initialTargetFrames, maxTotalFrames - trackPreRollFrames);
+        if (lowLatency && trackPreRollFrames > 0) {
+            initialTargetFrames = Math.min(maxTargetFrames,
+                    Math.max(initialTargetFrames, sampleRate * 5 / 1000));
+        }
         targetFrames = Math.min(Math.max(targetFrames, initialTargetFrames), maxTargetFrames);
         maxQueuedFrames = maxTotalFrames;
         maxPacketAgeNanos = maxMs * 1_000_000L;

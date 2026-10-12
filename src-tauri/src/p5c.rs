@@ -1130,26 +1130,31 @@ mod tests {
     }
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, false, false)
+        spawn_endpoint_mode(classes, false, false, false, false, false)
     }
 
     fn spawn_endpoint_until_disconnect(classes: &Path, fail_resume: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, fail_resume, false, false)
+        spawn_endpoint_mode(classes, true, fail_resume, false, false, false)
     }
 
     fn spawn_discoverable_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, true, false)
+        spawn_endpoint_mode(classes, false, false, true, false, false)
+    }
+
+    fn spawn_mode_switch_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        spawn_endpoint_mode(classes, false, false, true, false, true)
     }
 
     fn spawn_persistent_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, true, false, true, false)
+        spawn_endpoint_mode(classes, true, false, true, false, false)
     }
 
     fn spawn_stop_ack_drop_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-        spawn_endpoint_mode(classes, false, false, false, true)
+        spawn_endpoint_mode(classes, false, false, false, true, false)
     }
 
-    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool, stop_ack_drop: bool)
+    fn spawn_endpoint_mode(classes: &Path, wait_for_disconnect: bool, fail_resume: bool, discoverable: bool,
+        stop_ack_drop: bool, verify_mode_switch: bool)
         -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         let (_, java) = java_paths();
         let mut command = Command::new(java);
@@ -1158,6 +1163,7 @@ mod tests {
         if fail_resume { command.arg("--fail-resume"); }
         if discoverable { command.arg("--discovery"); }
         if stop_ack_drop { command.arg("--stop-ack-drop"); }
+        if verify_mode_switch { command.arg("--verify-mode-switch"); }
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut stdout = stdout;
@@ -1342,19 +1348,40 @@ mod tests {
     }
 
     fn mode_change_uses_a_fresh_session_and_preserves_pause(classes: &Path) {
-        let (child, stdout, peer) = spawn_discoverable_endpoint(classes);
+        let (child, stdout, peer) = spawn_mode_switch_endpoint(classes);
         let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
         let mut owner = SessionOwner::start_on_interface(&interface, peer, test_binding_material(), AudioParameters {
-            sample_rate: 48_000, channels: 2, mode: 0,
+            sample_rate: 48_000, channels: 2, mode: 1,
         }, CancellationToken::new()).unwrap();
         let before = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+
+        // One 10 ms synthetic WASAPI capture block is split into two 5 ms UDP
+        // packets and sent as a burst, as the production sender does.
+        let old_queue = owner.pcm_queue().unwrap();
+        let first_block = vec![0x2345i16; 480 * 2];
+        assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 0));
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+        thread::sleep(Duration::from_millis(10));
+        assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 480));
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+
+        owner.set_mode(1).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let same_mode = owner.snapshot();
+        assert_eq!(same_mode.generation, before.generation,
+            "reselecting the active playback mode must not rebuild the session");
+        assert_eq!(same_mode.session_id, before.session_id,
+            "reselecting the active playback mode must keep the authenticated session");
+
         owner.set_paused(true).unwrap();
         wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Paused);
-        owner.set_mode(1).unwrap();
+        owner.set_mode(0).unwrap();
         let after = wait_for_owner(&owner, |status| status.generation > before.generation
             && status.session_id.is_some() && status.state == SessionLifecycleState::Paused);
         assert_ne!(after.session_id, before.session_id, "playback mode must use a fresh authenticated session");
         assert!(after.paused, "the user's pause intent must survive fresh mode authentication");
+        assert!(!old_queue.push_raw(first_block.as_ptr(), 1, 48_000, 2, 960),
+            "mode change must stop and clear the previous PCM queue");
 
         let mode_queue = owner.pcm_queue().unwrap();
         owner.set_paused(false).unwrap();
@@ -1377,13 +1404,13 @@ mod tests {
             "new session audio frame zero must be accepted by its fresh queue");
         wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
         owner.stop();
-        assert_eq!(owner.pcm_payload_bytes_sent(), 7_680,
-            "both output sessions' frame-zero PCM payloads must be counted exactly once");
+        assert_eq!(owner.pcm_payload_bytes_sent(), 11_520,
+            "initial, mode-change, and recovered session PCM payloads must be counted exactly once");
         let result = finish_endpoint(child, stdout);
         let fields: Vec<_> = result.split(',').collect();
         assert_eq!(fields[1], "3", "mode change and output recovery must start fresh playback sessions: {result}");
-        assert_eq!(fields[5].parse::<usize>().unwrap(), 7_680,
-            "both frame-zero PCM payloads must reach the fake sink exactly once: {result}");
+        assert_eq!(fields[5].parse::<usize>().unwrap(), 11_520,
+            "initial, mode-change, and recovered frame-zero PCM payloads must reach the fake sink exactly once: {result}");
     }
 
     fn wait_for_owner(owner: &SessionOwner, predicate: impl Fn(&SessionSnapshot) -> bool) -> SessionSnapshot {

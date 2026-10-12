@@ -24,7 +24,8 @@ public final class P5cLoopbackEndpoint {
         verifyHeartbeatDeadline();
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
-        FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"));
+        boolean verifyModeSwitch = Arrays.asList(args).contains("--verify-mode-switch");
+        FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"), verifyModeSwitch);
         P5cReceiverCoordinator opened = Arrays.asList(args).contains("--stop-ack-drop")
                 ? P5cReceiverCoordinator.openLoopbackDropStopAckForTest(binding, playback)
                 : Arrays.asList(args).contains("--discovery")
@@ -44,6 +45,7 @@ public final class P5cLoopbackEndpoint {
             }
             if (!endpoint.await(15, TimeUnit.SECONDS)) throw new IOException("P5-C test endpoint timed out");
             endpoint.close();
+            if (verifyModeSwitch) playback.verifyModeSwitch();
             System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
                     + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get() + "," + playback.shutdowns.get());
@@ -141,20 +143,31 @@ public final class P5cLoopbackEndpoint {
         final AtomicBoolean udpClosed = new AtomicBoolean();
         final AtomicBoolean stopped = new AtomicBoolean();
         final AtomicBoolean failResume;
+        final AtomicInteger modeSequenceErrors = new AtomicInteger();
+        final AtomicReference<String> queueBudgetFailure = new AtomicReference<>();
+        final boolean verifyModeSwitch;
         volatile UdpPcmQueue queue;
         volatile UdpReceiver receiver;
         volatile UdpSessionContext context;
         volatile Thread receiverThread;
         volatile Thread sinkThread;
 
-        FakePlayback(boolean failResume) { this.failResume = new AtomicBoolean(failResume); }
+        FakePlayback(boolean failResume, boolean verifyModeSwitch) {
+            this.failResume = new AtomicBoolean(failResume);
+            this.verifyModeSwitch = verifyModeSwitch;
+        }
 
         @Override public boolean start(UdpSessionContext context) throws IOException {
-            starts.incrementAndGet();
+            int startNumber = starts.incrementAndGet();
+            if (verifyModeSwitch) {
+                int expectedMode = startNumber == 1 ? 1 : 0;
+                if (context.parameters.mode != expectedMode) modeSequenceErrors.incrementAndGet();
+            }
             stopped.set(false);
             streaming.set(false);
             this.context = context;
             queue = new UdpPcmQueue(context.parameters);
+            UdpPcmQueue sessionQueue = queue;
             receiver = new UdpReceiver(context, queue);
             receiverThread = new Thread(receiver, "P5-C test UDP receiver");
             receiverThread.start();
@@ -163,6 +176,10 @@ public final class P5cLoopbackEndpoint {
                 try (pcm) {
                     byte[] header = new byte[8];
                     readFully(pcm, header);
+                    int preRollFrames = context.parameters.mode == 1 ? 240 : 480;
+                    sessionQueue.configureAudioTrack(preRollFrames);
+                    if (sessionQueue.targetFrames() < 240)
+                        queueBudgetFailure.compareAndSet(null, context.playbackMode + " queue had no 5 ms startup headroom");
                     byte[] buffer = new byte[1024];
                     int count;
                     while ((count = pcm.read(buffer)) >= 0) {
@@ -185,6 +202,13 @@ public final class P5cLoopbackEndpoint {
         }
         @Override public boolean streaming() { return streaming.get(); }
         @Override public void shutdown() { shutdowns.incrementAndGet(); }
+
+        void verifyModeSwitch() throws IOException {
+            if (starts.get() != 3 || modeSequenceErrors.get() != 0)
+                throw new IOException("initial low-latency session, balanced mode rebuild, and balanced reconnect were not observed");
+            String budgetFailure = queueBudgetFailure.get();
+            if (budgetFailure != null) throw new IOException(budgetFailure);
+        }
 
         @Override public void stop() {
             stops.incrementAndGet();
