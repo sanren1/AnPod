@@ -32,6 +32,10 @@ type Credentials = { instanceName: string; password: string; payload: string };
 type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };
 type PrivateIpv4Interface = { index: number; name: string; address: string; prefixLength: number; gateways: string[] };
 type ReceiverIpv4Interface = { address: string; prefixLength: number; interfaceIndex: number; interfaceName: string };
+type ReceiverStatus = {
+  installed: boolean; versionName: string | null; versionCode: number | null; serviceActive: boolean;
+  foreground: boolean; healthy: boolean; audioActive: boolean; error: string | null; message: string;
+};
 type NetworkCandidate = { endpoint: string };
 type NetworkStartRequest = {
   localAddress: string; peer: string; bootstrapSerial?: string; receiverAddress?: string;
@@ -357,7 +361,7 @@ function App() {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {panel === "network" && <NetworkReceiverDialog usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} disabled={working || snapshot.busy} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onLegacy={() => setPanel("pair")} onClose={() => setPanel(null)} />}
+    {panel === "network" && <NetworkReceiverDialog usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} disabled={working || snapshot.busy} audioSessionActive={active} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onDisconnect={() => void disconnect()} onLegacy={() => setPanel("pair")} onClose={() => setPanel(null)} />}
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={snapshot.busy} onClose={() => setPanel("network")} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.transport} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
@@ -389,9 +393,9 @@ function Modal({ title, children, onClose, className = "" }: { title: string; ch
   </dialog>;
 }
 
-function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, onLegacy, onClose }: {
-  usbDevices: Device[]; disabled: boolean; error: string; onError: (error: string) => void;
-  onStart: (request: NetworkStartRequest) => void; onLegacy: () => void; onClose: () => void;
+function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error, onError, onStart, onDisconnect, onLegacy, onClose }: {
+  usbDevices: Device[]; disabled: boolean; audioSessionActive: boolean; error: string; onError: (error: string) => void;
+  onStart: (request: NetworkStartRequest) => void; onDisconnect: () => void; onLegacy: () => void; onClose: () => void;
 }) {
   const [method, setMethod] = useState<"bootstrap" | "paired">("bootstrap");
   const [interfaces, setInterfaces] = useState<PrivateIpv4Interface[]>([]);
@@ -404,14 +408,17 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
   const [bindingReference, setBindingReference] = useState("");
   const [peer, setPeer] = useState("");
   const [loading, setLoading] = useState(false);
+  const [receiverAction, setReceiverAction] = useState<"checking" | "installing" | null>(null);
+  const [receiverStatus, setReceiverStatus] = useState<ReceiverStatus | null>(null);
+  const [receiverError, setReceiverError] = useState("");
   const [localError, setLocalError] = useState("");
   const alertRef = useRef<HTMLParagraphElement>(null);
-  const receiverInterfaceGeneration = useRef(0);
-  const busy = disabled || loading;
+  const receiverGeneration = useRef(0);
+  const busy = disabled || loading || receiverAction !== null;
 
   useEffect(() => {
-    if (error || localError) alertRef.current?.focus();
-  }, [error, localError]);
+    if (error || localError || receiverError) alertRef.current?.focus();
+  }, [error, localError, receiverError]);
 
   const loadNetworkInfo = async () => {
     setLoading(true); setLocalError("");
@@ -433,16 +440,47 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
     setLoading(false);
   };
   useEffect(() => { void loadNetworkInfo(); }, []);
+  const readReceiverStatusAndInterfaces = async (deviceSerial: string, generation: number) => {
+    const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: deviceSerial });
+    if (receiverGeneration.current !== generation) return;
+    setReceiverStatus(status);
+    setReceiverError("");
+    if (!status.installed) {
+      setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+      return;
+    }
+    const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial: deviceSerial });
+    if (receiverGeneration.current !== generation) return;
+    setReceiverInterfaces(values);
+    if (!values.some(value => value.address === receiverAddress)) setReceiverAddress("");
+    setLocalError(values.length === 0 ? "Receiver 已安装，但手机没有报告可用的 IPv4 地址；请检查手机网络并重试检查状态。" : "");
+  };
+  const checkReceiver = async (deviceSerial: string) => {
+    const generation = ++receiverGeneration.current;
+    setReceiverStatus(null); setReceiverError(""); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+    setReceiverAction("checking");
+    try { await readReceiverStatusAndInterfaces(deviceSerial, generation); }
+    catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
+    finally { if (receiverGeneration.current === generation) setReceiverAction(null); }
+  };
+  const installReceiver = async () => {
+    if (!serial || busy) return;
+    if (audioSessionActive) { setReceiverError("请先断开音频会话，再安装或更新 Receiver。"); return; }
+    const deviceSerial = serial;
+    const generation = ++receiverGeneration.current;
+    setReceiverAction("installing"); setReceiverError(""); setReceiverStatus(null); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+    try {
+      await invokeApp<ReceiverStatus>("receiver_install", { serial: deviceSerial });
+      if (receiverGeneration.current === generation) await readReceiverStatusAndInterfaces(deviceSerial, generation);
+    } catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
+    finally { if (receiverGeneration.current === generation) setReceiverAction(null); }
+  };
   useEffect(() => {
     setReceiverInterfaces([]); setReceiverAddress("");
-    const generation = ++receiverInterfaceGeneration.current;
-    if (!serial) return () => { receiverInterfaceGeneration.current++; };
-    setLoading(true); setLocalError("");
-    void invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial })
-      .then(values => { if (receiverInterfaceGeneration.current === generation) { setReceiverInterfaces(values); if (values.length === 0) setLocalError("手机没有报告可用的 IPv4 地址；请检查手机网络并刷新设备列表。"); } })
-      .catch(reason => { if (receiverInterfaceGeneration.current === generation) setLocalError(String(reason)); })
-      .finally(() => { if (receiverInterfaceGeneration.current === generation) setLoading(false); });
-    return () => { receiverInterfaceGeneration.current++; };
+    setReceiverStatus(null); setReceiverError(""); setLocalError("");
+    if (serial) void checkReceiver(serial);
+    else setReceiverAction(null);
+    return () => { receiverGeneration.current++; };
   }, [serial]);
 
   const discover = async () => {
@@ -459,6 +497,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
     event.preventDefault(); setLocalError(""); onError("");
     if (!localAddress) { setLocalError("请明确选择电脑使用的网络接口。"); return; }
     if (method === "bootstrap") {
+      if (!receiverStatus?.installed) { setLocalError("请先检查并安装/更新已核验的 Receiver，再选择手机网络接口。"); return; }
       const receiver = receiverInterfaces.find(value => value.address === receiverAddress);
       if (!serial || !receiver) { setLocalError("请选择已授权的 USB 手机及其当前 IPv4 地址。"); return; }
       onStart({ localAddress, peer: "", bootstrapSerial: serial, receiverAddress: receiver.address, receiverPrefixLength: receiver.prefixLength });
@@ -469,6 +508,9 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
     onStart({ localAddress, peer: peer.trim(), bindingReference });
   };
   const shownError = error || localError;
+  const canStart = method === "bootstrap"
+    ? !!serial && receiverStatus?.installed === true && receiverInterfaces.some(value => value.address === receiverAddress)
+    : !!bindingReference && isIpv4Endpoint(peer);
 
   return <Modal title="直接连接 Receiver" onClose={onClose} className="network-dialog">
     <form className="network-pane" onSubmit={submit}>
@@ -481,7 +523,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
       </label>
       <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />刷新接口和配对信息</button>
       <div className="network-methods" role="group" aria-label="Receiver 连接方式">
-        <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次授权</button>
+        <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次绑定</button>
         <button type="button" aria-pressed={method === "paired"} disabled={busy} onClick={() => { setMethod("paired"); onError(""); setLocalError(""); }}>已配对接收端</button>
       </div>
       {method === "bootstrap" ? <>
@@ -491,23 +533,31 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
             {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
           </select>
         </label>
-        {usbDevices.length === 0 && <p className="network-note">未检测到已授权 USB 手机。Receiver 需先正确安装并通过版本、签名核验；USB 用于首次绑定或重新启动，不会代替安装。</p>}
+        <section className="receiver-manager" aria-label="Receiver 安装管理">
+          <div className="receiver-status-row">
+            <div className="receiver-status-copy" role="status" aria-live="polite">
+              <strong>{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装/更新 Receiver…" : !serial ? "请选择 USB 手机以检查 Receiver" : receiverError ? "Receiver 检查失败" : !receiverStatus ? "等待 Receiver 检查" : !receiverStatus.installed ? "Receiver 未安装" : receiverStatus.serviceActive ? receiverStatus.healthy ? "Receiver 已安装 · 服务正常" : "Receiver 已安装 · 服务异常" : "Receiver 已安装 · 服务未启动"}</strong>
+              {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : `版本码 ${receiverStatus.versionCode}`, receiverStatus.foreground ? "前台服务" : ""].filter(Boolean).join(" · ")}</small>}
+              {receiverStatus?.audioActive && <small>Receiver 报告音频活动；安装状态、服务状态和手机实际播放分别显示。</small>}
+              {receiverStatus && <small>{receiverStatus.message}</small>}
+            </div>
+            <div className="receiver-status-actions">
+              <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? "检查中…" : "检查状态"}</button>
+              <button className="primary-button" type="button" disabled={busy || !serial || audioSessionActive} onClick={() => void installReceiver()}>{receiverAction === "installing" ? "安装中…" : "安装/更新 Receiver"}</button>
+            </div>
+          </div>
+          {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverError}</p>}
+          {audioSessionActive && <div className="receiver-session-warning"><span>当前有音频会话；请先断开后才能安装/更新 Receiver。</span><button type="button" className="text-button" disabled={busy} onClick={onDisconnect}>断开音频会话</button></div>}
+          <p className="network-note">将使用本便携包附带的 Receiver APK。手机系统可能要求确认安装或通知权限；签名不匹配时 Android 会拒绝覆盖并保留现有应用数据。</p>
+        </section>
         <label className="network-field">手机当前 IPv4 地址
           <select required value={receiverAddress} disabled={busy || !serial} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
             <option value="">请选择手机网络接口</option>
             {receiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
           </select>
         </label>
-        {serial && <button className="text-button network-refresh" type="button" disabled={busy} onClick={async () => {
-          const generation = ++receiverInterfaceGeneration.current;
-          setLoading(true); setLocalError("");
-          try {
-            const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial });
-            if (receiverInterfaceGeneration.current === generation) { setReceiverInterfaces(values); setReceiverAddress(""); if (values.length === 0) setLocalError("手机没有报告可用的 IPv4 地址；请检查手机网络。"); }
-          } catch (reason) { if (receiverInterfaceGeneration.current === generation) setLocalError(String(reason)); }
-          finally { if (receiverInterfaceGeneration.current === generation) setLoading(false); }
-        }}><Search size={15} />刷新手机接口</button>}
-        <p className="network-note">USB 会查询所选手机的实际网络地址，并用于首次绑定或重新启动 Receiver；不会猜测热点地址。未安装或版本、签名不匹配时，此流程会报错，请先完成受支持的安装或升级。</p>
+        {serial && receiverStatus?.installed && <button className="text-button network-refresh" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}><Search size={15} />检查状态并刷新手机接口</button>}
+        <p className="network-note">USB 查询所选手机的实际网络地址，并用于首次绑定或重新启动 Receiver；不会猜测热点地址。Receiver 安装成功不等于服务已启动或手机正在播放。</p>
       </> : <>
         <label className="network-field">已配对接收端
           <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
@@ -525,7 +575,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, error, onError, onStart, 
       </>}
       {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
       {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />正在读取网络信息…</p>}
-      <div className="network-actions"><button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button><button className="primary-button" disabled={busy}>{disabled ? "正在处理…" : method === "bootstrap" ? "通过 USB 绑定并连接" : "连接已配对 Receiver"}</button></div>
+      <div className="network-actions"><button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button><button className="primary-button" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "通过 USB 绑定并连接" : "连接已配对 Receiver"}</button></div>
     </form>
   </Modal>;
 }
@@ -645,7 +695,7 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
 
 function HelpDialog({ transport, onClose }: { transport: "usb" | "wifi"; onClose: () => void }) {
   return <Modal title="连接帮助" onClose={onClose} className="help-dialog">
-    {transport === "usb" ? <><h3>USB 与 Receiver</h3><ol><li>在手机开发者选项中开启 USB 调试，用支持数据的线连接，并允许此电脑进行 USB 调试。</li><li>请先安装已通过版本与签名核验的 Receiver。USB 仅用于首次绑定或重新启动，不会自动安装 Receiver。</li><li>连接时明确选择电脑与手机正在使用的网络接口，两端需要位于可互访网络。</li></ol></> : <><h3>直接网络连接</h3><ol><li>主入口使用已安装并通过版本、签名核验的 Receiver，在可互访网络上进行加密认证。</li><li>首次绑定或 Receiver 需重新启动时，需要已授权 USB 连接；未安装或核验不通过时请先完成受支持的安装或升级。</li><li>无线调试扫码、配对码和地址连接保留为过渡/诊断方式。</li></ol></>}
+    {transport === "usb" ? <><h3>USB 与 Receiver</h3><ol><li>在手机开发者选项中开启 USB 调试，用支持数据的线连接，并允许此电脑进行 USB 调试。</li><li>在直接连接弹窗中选中 USB 手机后，可检查 Receiver 状态，并由你明确点击“安装/更新 Receiver”；系统可能要求确认安装或通知权限。</li><li>连接时明确选择电脑与手机正在使用的网络接口，两端需要位于可互访网络。</li></ol></> : <><h3>直接网络连接</h3><ol><li>主入口使用已安装并通过版本、签名核验的 Receiver，在可互访网络上进行加密认证。</li><li>首次绑定或 Receiver 需重新启动时，需要已授权 USB 连接；可在弹窗检查状态并明确点击“安装/更新 Receiver”。系统可能要求安装或通知权限确认。</li><li>无线调试扫码、配对码和地址连接保留为过渡/诊断方式。</li></ol></>}
     <p>请在手机上允许所需的 USB 调试和 Receiver 通知权限。如果 Receiver 被强行停止或手机重启，需要重新通过 USB 启动。连接就绪不代表手机已开始播放；播放状态会在 Receiver 确认后显示。</p><button className="dialog-secondary" onClick={onClose}>完成</button>
   </Modal>;
 }
