@@ -438,6 +438,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   const alertRef = useRef<HTMLParagraphElement>(null);
   const receiverGeneration = useRef(0);
   const discoveryGeneration = useRef(0);
+  const networkInfoGeneration = useRef(0);
   const methodManuallySelected = useRef(false);
   const peerManuallyEdited = useRef(false);
   const busy = disabled || loading || receiverAction !== null;
@@ -456,15 +457,17 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   }, [error, localError, receiverError]);
 
   const loadNetworkInfo = async () => {
+    const generation = ++networkInfoGeneration.current;
     setLoading(true); setLocalError("");
     const [interfacesResult, bindingsResult] = await Promise.allSettled([
       invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
       invokeApp<string[]>("receiver_binding_references"),
     ]);
+    if (networkInfoGeneration.current !== generation) return;
     const errors: string[] = [];
     if (interfacesResult.status === "fulfilled") {
       setInterfaces(interfacesResult.value);
-      if (!interfacesResult.value.some(value => value.address === localAddress)) setLocalAddress("");
+      setLocalAddress(current => interfacesResult.value.some(value => value.address === current) ? current : "");
       if (interfacesResult.value.length === 0) errors.push("没有可用的电脑 IPv4 网络接口。请启用 Wi-Fi 或有线网络后刷新。");
     } else errors.push(String(interfacesResult.reason));
     if (bindingsResult.status === "fulfilled") {
@@ -474,9 +477,12 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
       if (!methodManuallySelected.current) setMethod(values.length > 0 ? "paired" : "bootstrap");
     } else errors.push(String(bindingsResult.reason));
     setLocalError(errors.join("；"));
-    setLoading(false);
+    if (networkInfoGeneration.current === generation) setLoading(false);
   };
-  useEffect(() => { void loadNetworkInfo(); }, []);
+  useEffect(() => {
+    void loadNetworkInfo();
+    return () => { networkInfoGeneration.current++; };
+  }, []);
   useEffect(() => {
     setSerial(current => usbDevices.some(device => device.serial === current) ? current : usbDevices.length === 1 ? usbDevices[0].serial : "");
   }, [usbDeviceKey]);
@@ -492,7 +498,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
     const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial: deviceSerial });
     if (receiverGeneration.current !== generation) return;
     setReceiverInterfaces(values);
-    if (!values.some(value => value.address === receiverAddress)) setReceiverAddress("");
+    setReceiverAddress(current => values.some(value => value.address === current) ? current : "");
     setLocalError(values.length === 0 ? "Receiver 已安装，但手机没有报告可用的 IPv4 地址；请检查手机网络并重试检查状态。" : "");
   };
   const checkReceiver = async (deviceSerial: string) => {
@@ -572,7 +578,10 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
     setCandidates([]);
     if (!peerManuallyEdited.current) setPeer("");
     void discoverCandidates(true);
-    return () => { discoveryGeneration.current++; };
+    return () => {
+      discoveryGeneration.current++;
+      setLoading(false);
+    };
   }, [interfaces, localAddress, method]);
   const submit = (event: React.FormEvent) => {
     event.preventDefault(); setLocalError(""); onError("");
@@ -614,14 +623,14 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
       <div className="network-primary">
         <div className="network-summary"><strong>{mainSummary}</strong><span>{addressSummary}</span></div>
         {pairedServiceStopped && <div className="network-recovery" role="status">
-          <span>Receiver 服务已停止。可切换到 USB 首次绑定以重新启动。</span>
-          <button type="button" className="text-button" disabled={busy} onClick={() => { setMethod("bootstrap"); setAdvancedOpen(true); }}>USB 重新启动</button>
+          <span>当前 USB 手机的 Receiver 服务未启动；可通过 USB 启动所选手机。</span>
+          <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); setAdvancedOpen(true); }}>USB 启动所选手机</button>
         </div>}
         {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
         {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装 Receiver…" : "正在读取网络信息…"}</p>}
         <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "首次绑定并连接" : "连接已配对手机"}</button>
       </div>
-      <details className="network-advanced" open={advancedOpen || advancedRequired} onToggle={event => setAdvancedOpen(event.currentTarget.open)}>
+      <details className="network-advanced" open={advancedOpen || advancedRequired} onToggle={event => { if (!advancedRequired) setAdvancedOpen(event.currentTarget.open); }}>
         <summary>高级选项与诊断</summary>
         <div className="network-advanced-body">
           <p className="network-intro">候选地址仅作提示；连接仍使用已保存的绑定进行双向认证。</p>
