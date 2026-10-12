@@ -130,13 +130,26 @@ powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.
 
 ZIP 和解压目录会写入 `artifacts/`。脚本会检查运行依赖、构建 React 前端和 Rust 桌面程序，并将许可证、上游记录和运行文件放进同一目录。打包脚本只构建 Tauri 主应用；WPF 回退版本保留在 `src/AnPod.Desktop/`，其旧打包入口为 `packaging/publish.ps1`。
 
-Receiver P1 候选包使用单独名称，不覆盖上面的稳定 ZIP。先运行 `packaging/build-receiver.ps1` 生成本机 debug 签名的 `deps/receiver.apk` 和校验清单，再执行：
+历史 Receiver P1 候选包使用单独名称，不覆盖稳定 ZIP。先运行 `packaging/build-receiver.ps1` 生成本机 debug 签名的 `deps/receiver.apk` 和校验清单，再执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.0.4 -IncludeReceiverCandidate
 ```
 
 候选包会额外携带 Receiver APK 和 README 所用的 `icon.png`。Receiver 文件对常规旧版便携包是可选的，原有五个桌面运行依赖仍可独立构建。P1 APK 以 targetSdk 35 验收；targetSdk 36 的 target 专属行为尚未覆盖。debug 签名只用于本地 Spike，不代表 release 签名。
+
+### Receiver v2 候选包
+
+v2 使用 `artifacts/` 下独立的 Receiver、Native、Legacy payload 和 Rust target 目录，不读取或覆盖 `deps/` 中的运行文件或既有 ZIP。准备 JDK 17、Android SDK Platform 35 / Build-Tools、Rust stable 1.90+、MSVC x64、Node.js，以及仓库已经安装的前端依赖，然后从仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build-native.ps1 -BuildDirectory artifacts\p8-v2-native-build -OutputDirectory artifacts\p8-v2-native
+powershell -ExecutionPolicy Bypass -File packaging\build-android.ps1 -ForceSdkDirect -JavaHome $env:JAVA_HOME -AndroidSdkRoot $env:ANDROID_SDK_ROOT -BuildDirectory artifacts\p8-v2-legacy-build -OutputDirectory artifacts\p8-v2-legacy
+powershell -ExecutionPolicy Bypass -File packaging\build-receiver.ps1 -Variant debug -Offline -JavaHome $env:JAVA_HOME -AndroidSdkRoot $env:ANDROID_SDK_ROOT -OutputDirectory artifacts\p8-v2-receiver
+powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.0.4 -IncludeReceiverCandidate -ReceiverCandidate v2 -ReceiverArtifactDirectory artifacts\p8-v2-receiver -NativeArtifactDirectory artifacts\p8-v2-native -LegacyPayloadDirectory artifacts\p8-v2-legacy -RustTargetDirectory artifacts\p8-v2-tauri-target -AndroidSdkRoot $env:ANDROID_SDK_ROOT -Offline
+```
+
+若要沿用本机已有的候选 debug 密钥，可在构建 Receiver 时通过 `-DebugKeyStorePath` 指定；密钥文件不应放入仓库或候选包。若签名不匹配，Android 会拒绝覆盖安装；不要卸载或清除数据。生成的 APK 是 `0.3.0-v2-candidate` / versionCode 3 / targetSdk 35 的 debug 候选。它的 signer 与旧 P2 候选相同、与 P1 不同；P1 原地升级、真机安装、播放及设备生命周期行为均未验证。候选包不代表 release 签名或发布版本。
 
 开发运行时由 Tauri 启动 Vite，在仓库根目录中执行：
 
