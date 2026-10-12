@@ -260,5 +260,14 @@
 - Receiver 使用已认证会话的采样率和声道数初始化 PCM 格式与流头，不依赖一次性 FORMAT 包；FORMAT 若到达，必须为 sequence 0 并匹配已认证参数，否则丢弃而不改变 replay state 或播放。`Streaming` 需要近期有效会话 PCM、成功写入以及 AudioTrack 播放头推进；该状态不等同于可听出声。
 - Native 采集队列按帧数与本地单调时间有界，低延迟/均衡上限分别为 20/40 ms；超大块保留较新的尾部，过期数据在发送前继续淘汰并计入 drop 统计。Android 网络 jitter reserve 从 5/15 ms 起步，可随 underrun 增至 20/40 ms；它独立于 AudioTrack 缓冲和 startup pre-roll。
 - AudioTrack 均衡模式请求 50 ms，低延迟模式请求 15 ms，API 31+ 请求 5 ms start threshold；请求受 capacity 限制，日志/Provider 区分 requested、accepted、effective、capacity、threshold 和 pre-roll。pending frames 包含已写入的 pre-roll，并以 wrap-aware playback head 扣除；它是 PCM 排队帧数，不是声学延迟。倒序/过期 playback-head 样本不推进累计播放位置，显式 reset 与正常 unsigned wrap 保持有效。
-- 既有定向检查复用结果：PCM framing/mode 与 playback-head 检查 PASS；Receiver Java 编译 PASS；Legacy Java 编译 PASS；`p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup` PASS，1/1。C 修复后的 PcmCheck 和 P5c 集成检查再次通过；Receiver/Legacy 源码自对应编译后未再变化。
+- 既有定向检查复用结果：PCM framing/mode 与 playback-head 检查 PASS；Receiver Java 编译 PASS；Legacy Java 编译 PASS；`p5c::tests::java_receiver_and_rust_sender_share_authenticated_session_and_cleanup` PASS，1/1。C 修复后的 PcmCheck 和 P5c 集成检查再次通过。Receiver/Legacy 调用代码未变化；共享 PCM helper 的倒序采样修复通过 PCM 检查，本次 APK/Legacy 重建覆盖该修改。
 - 历史声学测量只代表其明确记录的旧测试路径，不代表这批 A/B/C 候选。当前统一候选的真机安装、音频出声、连接恢复和 UI 检查均为 **NOT_TESTED**；此前两声预检音不作为本候选验收，不进行手机操作或真实音频验证。
+
+### A/B/C 统一候选构建与交付审计（2026-10-12）
+
+- 构建输入提交：`608c98c75ec04e11555e9e547caa516c96d4e0dd`（Anonymous）。Tauri Release EXE、Receiver APK metadata 的 `sourceCommit` 与本次源码构建一致；本条审计仅为之后的清单文档提交，不改变 APK/Tauri 构建输入，也不改写 metadata。
+- 本次重建组件：EXE SHA-256 `cb3da8a25c291175522ada748c2479756f66b7c848b9adb3a25eb19436cca38f`；Receiver APK SHA-256 `22af84b1989011d3cd214ff321ccd37bc4fe4de03546850f65d5db778f49d8c9`；APK 为 `app.anpod.receiver` / `0.3.0-v2-candidate` / versionCode 3 / targetSdk 35 / debug，signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`；Legacy `server` SHA-256 `9552af169e4c2b2ab82c39719d3afd7c2c5dd729551d8d487e836013eeb9cfa3`。APK DEX 与 Legacy `server` 均由本次构建从最新共享 Java/PCM helper 源码生成，包含 `2c2dbbc` 倒序采样修复。
+- Native DLL 从既有已审计组件复用，SHA-256 `eeda608983ef520f281d72c4f0021634b4e87c251ab83dea7f8dcb413068761e`；既有审计确认 x64、静态 CRT、14 个导出，EXE 无额外 MSVCP/VCRUNTIME 依赖。Platform-Tools 是独立外部进程组件。
+- Review ZIP：`artifacts/AnPod-1.0.4-receiver-v2-candidate-review-tauri-win-x64-portable.zip`，8,166,288 bytes，SHA-256 `1be79b2ee09cc88cc9d29091f01ffb70b9d7017be9b112e95351a1b5be10cdc3`。外层 30 项；3 个 ZIP（外层、APK、Legacy server）递归共 40 个文件项。根任务最终审计未发现不安全路径、禁止文件、已知私密构建路径或私钥；17 项许可逐字节匹配来源，README、notices、APK/JSON、server 与 Native 均匹配各自构建输入。旧 canonical 候选目录保留未覆盖；包中不含 PDB、密钥、临时 probe、日志、测量文件或私有计划。
+- 本次前端生产构建、Tauri Release、Receiver APK assemble 与 Legacy `server` 重建均通过。既有针对性 PCM/Receiver/Legacy/P5c 检查复用；没有重复全量测试。真机安装、P1 升级、USB 授权/绑定、Receiver 通知、实际 AudioTrack 出声、WASAPI 采集、连接恢复、UI 视觉及长期稳定性均为 **NOT_TESTED**；此前两声预检音不计为当前候选验收。未使用 ADB、手机或真实音频。
+
