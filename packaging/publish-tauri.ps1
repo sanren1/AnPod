@@ -110,18 +110,20 @@ if ($IncludeReceiverCandidate) {
         & git -C $root merge-base --is-ancestor $receiverMetadata.sourceCommit $currentSourceCommit
         if ($LASTEXITCODE -ne 0) { throw 'V2 Receiver source commit is not an ancestor of the current source.' }
         $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1')
-        $receiverInputChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
-        $receiverInputChanges += @(& git -C $root diff --name-only HEAD -- @receiverInputPaths)
-        $receiverInputChanges += @(& git -C $root diff --cached --name-only HEAD -- @receiverInputPaths)
-        if ($LASTEXITCODE -ne 0 -or $receiverInputChanges.Count) {
+        $receiverCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
+        if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
+        $receiverWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
+        if ($receiverCommittedChanges.Count -or $receiverWorkingChanges.Count) {
             throw "V2 Receiver build inputs changed after source commit $($receiverMetadata.sourceCommit); rebuild the Receiver artifact before packaging."
         }
         if ($ReuseExistingBuild) {
             $tauriInputPaths = @('src-tauri', 'frontend')
-            $tauriInputChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @tauriInputPaths)
-            $tauriInputChanges += @(& git -C $root diff --name-only HEAD -- @tauriInputPaths)
-            $tauriInputChanges += @(& git -C $root diff --cached --name-only HEAD -- @tauriInputPaths)
-            if ($LASTEXITCODE -ne 0 -or $tauriInputChanges.Count) {
+            $tauriCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @tauriInputPaths)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Tauri/frontend build inputs.' }
+            $tauriWorkingChanges = @(& git -C $root status --porcelain=v1 -- @tauriInputPaths)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Tauri/frontend build input state.' }
+            if ($tauriCommittedChanges.Count -or $tauriWorkingChanges.Count) {
                 throw "Tauri/frontend build inputs changed after source commit $($receiverMetadata.sourceCommit); cannot reuse the existing Tauri build."
             }
         }
