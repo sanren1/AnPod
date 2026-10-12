@@ -171,6 +171,7 @@ public final class Main {
         }
 
         AudioTrack audioTrack = builder.build();
+        Pcm16FrameStream pcm = new Pcm16FrameStream();
 
         try {
             // A track that failed to initialise reports it here rather than by
@@ -249,7 +250,11 @@ public final class Main {
             attachPlayerContext(audioTrack);
 
             byte[] readBuffer = new byte[Math.max(Pcm16FrameStream.FRAME_BYTES, minBuffer + 3)];
-            Pcm16FrameStream pcm = new Pcm16FrameStream();
+            int backlogLimitFrames = Pcm16FrameStream.backlogLimitFrames(
+                    audioTrack.getSampleRate(), preRollFrames, lowLatencyBufferApplied);
+            pcm.setBacklogLimit(backlogLimitFrames,
+                    (audioTrack.getSampleRate() * 3 + 999) / 1000);
+            log("PCM_BACKLOG limitFrames=" + backlogLimitFrames);
             int preRollTargetBytes = preRollFrames * frameBytes;
             int preRolledBytes = 0;
             while (preRolledBytes < preRollTargetBytes) {
@@ -274,16 +279,19 @@ public final class Main {
                 writeFrames(audioTrack, readBuffer, bytesRead);
                 long now = System.currentTimeMillis();
                 if (Build.VERSION.SDK_INT >= 24 && now - lastUnderrunLog >= 5000) {
-                    log("UNDERRUNS count=" + audioTrack.getUnderrunCount());
+                    log("UNDERRUNS count=" + audioTrack.getUnderrunCount()
+                            + " droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
                     lastUnderrunLog = now;
                 }
             }
         } finally {
             if (Build.VERSION.SDK_INT >= 24) {
                 try {
-                    log("UNDERRUNS final=" + audioTrack.getUnderrunCount());
+                    log("UNDERRUNS final=" + audioTrack.getUnderrunCount()
+                            + " droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
                 } catch (Throwable unavailable) {
-                    log("UNDERRUNS final=unavailable");
+                    log("UNDERRUNS final=unavailable droppedBacklogFrames="
+                            + pcm.getDroppedBacklogFrames());
                 }
             }
             // Teardown must never replace the real failure. Under app_process

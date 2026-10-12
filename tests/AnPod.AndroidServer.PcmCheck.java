@@ -79,7 +79,41 @@ final class PcmCheck {
         } catch (IOException expectedFailure) {
             if (!expectedFailure.getMessage().contains("incomplete stereo frame")) throw expectedFailure;
         }
+
+        if (Pcm16FrameStream.backlogLimitFrames(48000, 240, true)
+                >= Pcm16FrameStream.backlogLimitFrames(48000, 240, false)) {
+            throw new AssertionError("low-latency backlog limit must be smaller than balanced");
+        }
+        byte[] backlog = new byte[6 * Pcm16FrameStream.FRAME_BYTES];
+        for (int frame = 0; frame < 6; frame++) {
+            int sample = 10000 + frame * 100;
+            for (int channel = 0; channel < 2; channel++) {
+                int offset = frame * Pcm16FrameStream.FRAME_BYTES + channel * 2;
+                backlog[offset] = (byte) sample;
+                backlog[offset + 1] = (byte) (sample >> 8);
+            }
+        }
+        Pcm16FrameStream backlogStream = new Pcm16FrameStream();
+        backlogStream.setBacklogLimit(2, 2);
+        BacklogInput backlogInput = new BacklogInput(backlog);
+        byte[] backlogBuffer = new byte[16];
+        if (backlogStream.readFrames(backlogInput, backlogBuffer, backlogBuffer.length) != 0) {
+            throw new AssertionError("partial frame should stay buffered until completed");
+        }
+        int backlogBytes = backlogStream.readFrames(backlogInput, backlogBuffer, backlogBuffer.length);
+        if (backlogBytes != 2 * Pcm16FrameStream.FRAME_BYTES
+                || backlogStream.getDroppedBacklogFrames() != 4) {
+            throw new AssertionError("backlog trim did not discard the oldest complete frames");
+        }
+        if (readSample(backlogBuffer, 0) != 0 || readSample(backlogBuffer, 2) != 0
+                || readSample(backlogBuffer, 4) != 5250 || readSample(backlogBuffer, 6) != 5250) {
+            throw new AssertionError("backlog trim lost frame alignment or did not fade in");
+        }
         System.out.println("Android PCM framing and mode checks passed.");
+    }
+
+    private static int readSample(byte[] data, int offset) {
+        return (short) ((data[offset] & 0xff) | (data[offset + 1] << 8));
     }
 
     private static byte[] toArray(List<Byte> bytes) {
@@ -99,6 +133,23 @@ final class PcmCheck {
         @Override public int read(byte[] target, int start, int length) {
             if (offset == data.length) return -1;
             int count = Math.min(Math.min(length, fragments[next++ % fragments.length]), data.length - offset);
+            System.arraycopy(data, offset, target, start, count);
+            offset += count;
+            return count;
+        }
+    }
+
+    private static final class BacklogInput extends InputStream {
+        private final byte[] data;
+        private int offset;
+        private int availableCalls;
+
+        BacklogInput(byte[] data) { this.data = data; }
+        @Override public int available() { return availableCalls++ == 0 ? 0 : data.length - offset; }
+        @Override public int read() { return offset == data.length ? -1 : data[offset++] & 0xff; }
+        @Override public int read(byte[] target, int start, int length) {
+            if (offset == data.length) return -1;
+            int count = availableCalls == 1 ? 1 : Math.min(length, data.length - offset);
             System.arraycopy(data, offset, target, start, count);
             offset += count;
             return count;
