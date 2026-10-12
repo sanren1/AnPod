@@ -280,15 +280,6 @@ impl HostSession {
     }
 
     pub(crate) fn start(&mut self) -> Result<(), String> {
-        self.start_with_format(true)
-    }
-
-    #[cfg(test)]
-    fn start_without_format_for_test(&mut self) -> Result<(), String> {
-        self.start_with_format(false)
-    }
-
-    fn start_with_format(&mut self, send_format: bool) -> Result<(), String> {
         if self.state != ReceiverState::TransportConnected || self.sender.is_some() {
             return Err("P5-C START is out of order.".into());
         }
@@ -302,13 +293,35 @@ impl HostSession {
                 .try_clone().map_err(|_| "Unable to transfer the authenticated UDP socket.".to_string())?;
             let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
             let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
-            self.sender = Some(if send_format {
-                UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
-                    material, self.parameters, self.pcm_payload_bytes_sent.clone())?
-            } else {
-                UdpSender::spawn_authenticated_without_format_for_test(remote, self.queue.clone(), socket,
-                    material, self.parameters, self.pcm_payload_bytes_sent.clone())?
-            });
+            self.sender = Some(UdpSender::spawn_authenticated(remote, self.queue.clone(), socket,
+                material, self.parameters, self.pcm_payload_bytes_sent.clone())?);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.close_local();
+            return Err(error);
+        }
+        self.state = ack.state;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn start_without_format_for_test(&mut self) -> Result<(), String> {
+        if self.state != ReceiverState::TransportConnected || self.sender.is_some() {
+            return Err("P5-C START is out of order.".into());
+        }
+        let ack = self.command(START, &[])?;
+        if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
+            self.close_local();
+            return Err("P5-C receiver did not confirm playback start.".into());
+        }
+        let result = (|| {
+            let socket = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
+                .try_clone().map_err(|_| "Unable to transfer the authenticated UDP socket.".to_string())?;
+            let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
+            let material = UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
+            self.sender = Some(UdpSender::spawn_authenticated_without_format_for_test(remote,
+                self.queue.clone(), socket, material, self.parameters, self.pcm_payload_bytes_sent.clone())?);
             Ok(())
         })();
         if let Err(error) = result {

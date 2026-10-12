@@ -208,24 +208,18 @@ impl UdpSender {
     pub(crate) fn spawn_authenticated(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
         material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
         pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
-        Self::spawn_authenticated_with_format(remote, queue, socket, material, parameters,
-            pcm_payload_bytes_sent, true)
+        parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
+        let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
+        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent, true)
     }
 
     #[cfg(test)]
     pub(crate) fn spawn_authenticated_without_format_for_test(remote: SocketAddr, queue: Arc<PcmQueue>,
         socket: UdpSocket, material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
         pcm_payload_bytes_sent: Arc<AtomicU64>) -> Result<Self, String> {
-        Self::spawn_authenticated_with_format(remote, queue, socket, material, parameters,
-            pcm_payload_bytes_sent, false)
-    }
-
-    fn spawn_authenticated_with_format(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
-        material: UdpSessionMaterial, parameters: crate::security::AudioParameters,
-        pcm_payload_bytes_sent: Arc<AtomicU64>, send_format: bool) -> Result<Self, String> {
         parameters.validate().map_err(|_| "Unsupported authenticated PCM parameters.".to_string())?;
         let format = PcmFormat { sample_rate: parameters.sample_rate, channels: parameters.channels as u16 };
-        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent, send_format)
+        Self::spawn_inner(remote, queue, socket, material, format, pcm_payload_bytes_sent, false)
     }
 
     fn spawn_inner(remote: SocketAddr, queue: Arc<PcmQueue>, socket: UdpSocket,
