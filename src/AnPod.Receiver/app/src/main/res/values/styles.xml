@@ -1,0 +1,7 @@
+<resources>
+    <style name="AnPodTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#126B75</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

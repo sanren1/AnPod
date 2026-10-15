@@ -37,10 +37,10 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static final int POLL_SLICE_MS = 100;
     private static final String[] COLUMNS = {
             "applicationId", "versionName", "versionCode", "serviceActive",
-            "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate",
+            "foreground", "healthy", "audioActive", "actualMode", "actualSampleRate", "actualChannels",
             "bufferCapacityFrames", "requestedBufferFrames", "acceptedBufferFrames",
-            "effectiveBufferFrames", "startThresholdFrames", "preRollFrames", "trackPendingFrames", "underrunCount",
-            "udpJitterTargetFrames", "udpExpiredFrames", "tcpDroppedBacklogFrames",
+            "effectiveBufferFrames", "startThresholdFrames", "preRollFrames", "trackPendingFrames", "underrunCount", "underrunIncrement",
+            "udpJitterTargetFrames", "udpQueuedFrames", "udpExpiredFrames", "tcpDroppedBacklogFrames", "playbackAdvancing",
             "startedAtElapsedMs", "error"
     };
     private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
@@ -98,6 +98,7 @@ public final class ReceiverStateProvider extends ContentProvider {
                 && ReceiverService.startFailure.isEmpty();
         MatrixCursor result = new MatrixCursor(columns, 1);
         Object[] values = new Object[columns.length];
+        ReceiverService.PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
         for (int i = 0; i < columns.length; i++) {
             switch (columns[i]) {
                 case "applicationId": values[i] = BuildConfig.APPLICATION_ID; break;
@@ -108,18 +109,22 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "healthy": values[i] = healthy; break;
                 case "audioActive": values[i] = ReceiverService.audioActive; break;
                 case "actualMode": values[i] = ReceiverService.actualMode; break;
-                case "actualSampleRate": values[i] = metric(ReceiverService.actualSampleRate); break;
-                case "bufferCapacityFrames": values[i] = metric(ReceiverService.bufferCapacityFrames); break;
-                case "requestedBufferFrames": values[i] = ReceiverService.requestedBufferFrames; break;
-                case "acceptedBufferFrames": values[i] = ReceiverService.acceptedBufferFrames; break;
-                case "effectiveBufferFrames": values[i] = metric(ReceiverService.effectiveBufferFrames); break;
-                case "startThresholdFrames": values[i] = metric(ReceiverService.startThresholdFrames); break;
-                case "preRollFrames": values[i] = metric(ReceiverService.preRollFrames); break;
-                case "trackPendingFrames": values[i] = metric(ReceiverService.trackPendingFrames()); break;
-                case "underrunCount": values[i] = metric(ReceiverService.underrunCount); break;
-                case "udpJitterTargetFrames": values[i] = metric(ReceiverService.udpJitterTargetFrames); break;
-                case "udpExpiredFrames": values[i] = ReceiverService.udpExpiredFrames; break;
-                case "tcpDroppedBacklogFrames": values[i] = ReceiverService.tcpDroppedBacklogFrames; break;
+                case "actualSampleRate": values[i] = metric(metrics.sampleRate); break;
+                case "actualChannels": values[i] = metric(metrics.channels); break;
+                case "bufferCapacityFrames": values[i] = metric(metrics.capacityFrames); break;
+                case "requestedBufferFrames": values[i] = metric(metrics.requestedFrames); break;
+                case "acceptedBufferFrames": values[i] = metric(metrics.acceptedFrames); break;
+                case "effectiveBufferFrames": values[i] = metric(metrics.effectiveFrames); break;
+                case "startThresholdFrames": values[i] = metric(metrics.startThresholdFrames); break;
+                case "preRollFrames": values[i] = metric(metrics.preRollFrames); break;
+                case "trackPendingFrames": values[i] = metric(metrics.pendingFrames); break;
+                case "underrunCount": values[i] = metric(metrics.underrunCount); break;
+                case "underrunIncrement": values[i] = metric(ReceiverService.underrunIncrement); break;
+                case "udpJitterTargetFrames": values[i] = metric(metrics.jitterTargetFrames); break;
+                case "udpQueuedFrames": values[i] = metric(metrics.queuedFrames); break;
+                case "udpExpiredFrames": values[i] = metric(metrics.udpQueueActive ? metrics.expiredFrames : -1); break;
+                case "tcpDroppedBacklogFrames": values[i] = metric(metrics.tcpDroppedFrames); break;
+                case "playbackAdvancing": values[i] = metrics.advancing; break;
                 case "startedAtElapsedMs": values[i] = ReceiverService.startedAtElapsedMs; break;
                 case "error": values[i] = ReceiverService.startFailure; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");

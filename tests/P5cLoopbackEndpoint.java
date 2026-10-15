@@ -25,6 +25,18 @@ import javax.crypto.spec.SecretKeySpec;
 /** Test-only Java endpoint used by Rust's merged P5-C localhost check. */
 public final class P5cLoopbackEndpoint {
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && "--verify-coordinator-discovery-recovery".equals(args[0])) {
+            verifyCoordinatorDiscoveryRecovery();
+            System.out.println("JAVA_P5C_DISCOVERY_RECOVERY=PASS");
+            return;
+        }
+        if (args.length == 2 && "--verify-v2-discovery".equals(args[0])) {
+            verifyV2DiscoveryLoopback(InetAddress.getByName(args[1]));
+            System.out.println("JAVA_V2_DISCOVERY=PASS");
+            return;
+        }
+        verifyCapabilityPayloadVectors();
+        verifyV2DiscoveryVectors();
         verifyFragmentedControlFrame();
         verifyHeartbeatDeadline();
         verifyAuthenticatedParametersQueueWithoutFormat();
@@ -40,12 +52,19 @@ public final class P5cLoopbackEndpoint {
         boolean verifyAudioWindow = Arrays.asList(args).contains("--verify-audio-window");
         FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"),
                 verifyModeSwitch, verifyAudioWindow);
-        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--stop-ack-drop")
+        String capabilityMode = Arrays.stream(args).filter(value -> value.startsWith("--capabilities-"))
+                .map(value -> value.substring("--capabilities-".length())).findFirst().orElse("");
+        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--connection-intent")
+                ? P5cReceiverCoordinator.openLoopbackIntentTest(binding, playback, repeated((byte) 0x5a, 16))
+                : !capabilityMode.isEmpty()
+                ? P5cReceiverCoordinator.openLoopbackCapabilityTest(binding, playback, capabilityMode)
+                : Arrays.asList(args).contains("--stop-ack-drop")
                 ? P5cReceiverCoordinator.openLoopbackDropStopAckForTest(binding, playback)
                 : Arrays.asList(args).contains("--discovery")
                 ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : P5cReceiverCoordinator.openLoopback(binding, playback);
         try (P5cReceiverCoordinator endpoint = opened) {
+            if (Arrays.asList(args).contains("--cancel-before-handoff")) playback.beforeStart = endpoint::cancelPendingConnectionIntent;
             endpoint.start();
             if (Arrays.asList(args).contains("--discovery")) {
                 endpoint.startDiscovery();
@@ -53,6 +72,18 @@ public final class P5cLoopbackEndpoint {
             }
             System.out.println("PORT=" + endpoint.port());
             System.out.flush();
+            if (Arrays.asList(args).contains("--cancel-intent-on-stdin")) {
+                Thread cancel = new Thread(() -> {
+                    try {
+                        if (System.in.read() < 0) throw new IOException("missing cancel signal");
+                        endpoint.cancelPendingConnectionIntent();
+                        System.out.println("INTENT_CANCELLED");
+                        System.out.flush();
+                    } catch (IOException error) { throw new RuntimeException(error); }
+                });
+                cancel.setDaemon(true);
+                cancel.start();
+            }
             if (args.length > 0 && "--drop-on-stdin".equals(args[0])) {
                 if (System.in.read() < 0) throw new IOException("P5-D test disconnect signal was not supplied");
                 endpoint.close();
@@ -65,6 +96,112 @@ public final class P5cLoopbackEndpoint {
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get() + "," + playback.shutdowns.get());
             System.out.flush();
         }
+    }
+
+    private static void verifyCapabilityPayloadVectors() {
+        byte[] query = P5cControlProtocol.capabilitiesQueryPayload(3, 1,
+                P5cControlProtocol.CAP_AUTHENTICATED_STATUS);
+        byte[] expectedQuery = {0, 3, 1, 0, 0, 0, 0, 2};
+        if (!Arrays.equals(query, expectedQuery)) throw new AssertionError("CAPABILITIES_QUERY vector changed");
+        byte[] info = P5cControlProtocol.capabilitiesInfoPayload(0, 3, 1, 0, 3, 4);
+        byte[] expectedInfo = {0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0,
+                0, 0, 0, 3, 0, 0, 0, 4};
+        if (!Arrays.equals(info, expectedInfo)) throw new AssertionError("CAPABILITIES_INFO vector changed");
+    }
+
+    private static void verifyV2DiscoveryVectors() {
+        byte[] nonce = repeated((byte) 0x5a, 16);
+        byte[] probe = P5cDiscovery.hostProbe(nonce);
+        byte[] expectedProbe = new byte[24];
+        expectedProbe[0] = 'A'; expectedProbe[1] = 'N'; expectedProbe[2] = 'P'; expectedProbe[3] = 'D';
+        expectedProbe[4] = 2; expectedProbe[5] = 3; System.arraycopy(nonce, 0, expectedProbe, 8, 16);
+        if (!Arrays.equals(probe, expectedProbe)) throw new AssertionError("V2 HOST_PROBE vector changed");
+        byte[] candidate = P5cDiscovery.hostPacket(4, nonce, P5cDiscovery.PORT);
+        byte[] expectedCandidate = new byte[26]; System.arraycopy(expectedProbe, 0, expectedCandidate, 0, 24);
+        expectedCandidate[5] = 4; expectedCandidate[24] = (byte) (P5cDiscovery.PORT >>> 8);
+        expectedCandidate[25] = (byte) P5cDiscovery.PORT;
+        if (!Arrays.equals(candidate, expectedCandidate)) throw new AssertionError("V2 HOST_CANDIDATE vector changed");
+        byte[] offer = P5cDiscovery.hostPacket(5, nonce, P5cDiscovery.PORT);
+        expectedCandidate[5] = 5;
+        if (!Arrays.equals(offer, expectedCandidate)) throw new AssertionError("V2 CONNECT_OFFER vector changed");
+    }
+
+    private static void verifyV2DiscoveryLoopback(InetAddress hostAddress) throws Exception {
+        try (P5cDiscovery discovery = P5cDiscovery.openLoopbackForTest(
+                InetAddress.getByName("127.0.0.1"), 8, 45_678)) {
+            discovery.start();
+            P5cDiscovery.SearchSnapshot search = discovery.startSearchForTest(hostAddress, true);
+            if (!search.active || !search.candidates.isEmpty()) throw new AssertionError("loopback search did not start cleanly");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            P5cDiscovery.SearchCandidate candidate = null;
+            while (System.nanoTime() < deadline) {
+                P5cDiscovery.SearchSnapshot current = discovery.searchSnapshot();
+                if (!current.candidates.isEmpty()) { candidate = current.candidates.get(0); break; }
+                Thread.sleep(10);
+            }
+            if (candidate == null || !hostAddress.getHostAddress().equals(candidate.address)
+                    || candidate.offerPort != P5cDiscovery.PORT)
+                throw new AssertionError("Rust PC candidate was not received by the Java search path");
+            if (!"sent".equals(discovery.searchSnapshot().lastRequestStatus))
+                throw new AssertionError("Java automatic CONNECT_OFFER was not sent");
+            try { discovery.requestConnection(candidate.id); throw new AssertionError("duplicate offer accepted"); }
+            catch (IOException expected) { }
+            P5cDiscovery.SearchSnapshot cancelled = discovery.stopSearch();
+            if (cancelled.active || !cancelled.candidates.isEmpty() || !"stopped".equals(cancelled.lastRequestStatus))
+                throw new AssertionError("Java search cancellation did not clear candidates");
+        }
+    }
+
+    private static void verifyCoordinatorDiscoveryRecovery() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        AtomicInteger socketBinds = new AtomicInteger();
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
+                repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
+        FakePlayback playback = new FakePlayback(false, false, false);
+        try (P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openOnInterface(
+                binding, playback, loopback, 32)) {
+            endpoint.start();
+            try (Socket first = new Socket(loopback, endpoint.port())) {
+                awaitActiveSocket(endpoint);
+                endpoint.startDiscovery(socket -> socketBinds.incrementAndGet());
+                if (socketBinds.get() != 0)
+                    throw new AssertionError("discovery started while the accepted session was active");
+            }
+            awaitDiscoveryBinds(endpoint, socketBinds, 2);
+
+            try (Socket second = new Socket(loopback, endpoint.port())) {
+                awaitActiveSocket(endpoint);
+            }
+            awaitDiscoveryBinds(endpoint, socketBinds, 4);
+            if (endpoint.failure().startsWith("listener_failed"))
+                throw new AssertionError("discovery listener did not recover: " + endpoint.failure());
+        }
+    }
+
+    private static void awaitActiveSocket(P5cReceiverCoordinator endpoint) throws Exception {
+        java.lang.reflect.Field activeSocket = P5cReceiverCoordinator.class.getDeclaredField("activeSocket");
+        activeSocket.setAccessible(true);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (activeSocket.get(endpoint) != null) return;
+            Thread.sleep(5);
+        }
+        throw new AssertionError("coordinator did not accept the localhost session");
+    }
+
+    private static void awaitDiscoveryBinds(P5cReceiverCoordinator endpoint, AtomicInteger socketBinds,
+            int expected) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (socketBinds.get() >= expected) {
+                if (endpoint.failure().startsWith("listener_failed"))
+                    throw new AssertionError("discovery listener did not recover: " + endpoint.failure());
+                return;
+            }
+            Thread.sleep(5);
+        }
+        throw new AssertionError("discovery sockets were not rebound after the session ended: "
+                + endpoint.failure() + ", binds=" + socketBinds.get());
     }
 
     private static void verifyInvalidDiscoveryDoesNotStartPlayback(FakePlayback playback) throws IOException {
@@ -389,6 +526,7 @@ public final class P5cLoopbackEndpoint {
         volatile UdpSessionContext context;
         volatile Thread receiverThread;
         volatile Thread sinkThread;
+        Runnable beforeStart = () -> {};
 
         FakePlayback(boolean failResume, boolean verifyModeSwitch, boolean verifyAudioWindow) {
             this.failResume = new AtomicBoolean(failResume);
@@ -396,7 +534,11 @@ public final class P5cLoopbackEndpoint {
             this.verifyAudioWindow = verifyAudioWindow;
         }
 
-        @Override public boolean start(UdpSessionContext context) throws IOException {
+        @Override public boolean supportsPlaybackProgress() { return true; }
+
+        @Override public boolean start(UdpSessionContext context, P5cReceiverCoordinator.StartPermission permission) throws IOException {
+            beforeStart.run();
+            if (!permission.allowed()) return false;
             int startNumber = starts.incrementAndGet();
             if (verifyModeSwitch) {
                 int expectedMode = startNumber == 1 ? 1 : 0;

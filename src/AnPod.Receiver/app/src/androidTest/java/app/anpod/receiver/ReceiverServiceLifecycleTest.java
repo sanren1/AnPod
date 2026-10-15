@@ -60,6 +60,11 @@ public final class ReceiverServiceLifecycleTest extends InstrumentationTestCase 
         }
     }
 
+    public void testUiBootstrapGetsBoundedPreparationWindowAndAdbKeepsShortTimeout() {
+        assertEquals(120_000L, ReceiverService.networkBootstrapTimeoutMs(true));
+        assertEquals(25_000L, ReceiverService.networkBootstrapTimeoutMs(false));
+    }
+
     private LocalSocket acceptAndReadToken(LocalServerSocket server, String socketName) throws Exception {
         startAudio(socketName);
         return acceptConnection(server);

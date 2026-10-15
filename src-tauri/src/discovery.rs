@@ -2,8 +2,11 @@ use crate::network_interface::Ipv4Interface;
 use getrandom::fill;
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -17,12 +20,231 @@ const FRAME_BYTES: usize = 26;
 const IO_POLL: Duration = Duration::from_millis(50);
 const MAX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CANDIDATES: usize = 16;
+const V2_VERSION: u8 = 2;
+const HOST_PROBE: u8 = 3;
+const HOST_CANDIDATE: u8 = 4;
+const CONNECT_OFFER: u8 = 5;
+const HOST_PROBE_BYTES: usize = 24;
+const HOST_PACKET_BYTES: usize = 26;
+const HOST_REQUEST_TTL: Duration = Duration::from_secs(10);
+const HOST_OFFER_TTL: Duration = Duration::from_secs(30);
 
 /// Unauthenticated network hint. Callers must authenticate it with P5-A before START.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Candidate {
     pub(crate) endpoint: SocketAddr,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionOffer {
+    pub(crate) id: String,
+    pub(crate) endpoint: SocketAddr,
+    #[serde(skip)]
+    expires_at: Instant,
+    #[serde(skip)]
+    pub(crate) nonce: [u8; 16],
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostDiscoverySnapshot {
+    pub(crate) active: bool,
+    pub(crate) automatic_binding: Option<String>,
+    pub(crate) interface_address: Option<Ipv4Addr>,
+    pub(crate) interface_prefix_length: Option<u8>,
+    pub(crate) offers: Vec<ConnectionOffer>,
+}
+
+impl Default for HostDiscoverySnapshot {
+    fn default() -> Self { Self { active: false, automatic_binding: None, interface_address: None, interface_prefix_length: None, offers: Vec::new() } }
+}
+
+pub(crate) struct HostOfferListener {
+    pub(crate) automatic_binding: Option<String>,
+    pub(crate) attempt_cancel: Option<CancellationToken>,
+    cancellation: CancellationToken,
+    snapshot: Arc<Mutex<HostDiscoverySnapshot>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl HostOfferListener {
+    pub(crate) fn start(interface: &Ipv4Interface) -> Result<Self, String> {
+        Self::start_inner(interface, false)
+    }
+
+    fn start_inner(interface: &Ipv4Interface, allow_loopback: bool) -> Result<Self, String> {
+        if !((interface.address.is_private() && !interface.address.is_link_local())
+            || (allow_loopback && interface.address.is_loopback()))
+            || interface.prefix_length == 0 || interface.prefix_length > 32 {
+            return Err("Select one active private IPv4 interface before allowing wireless UDP connections.".into());
+        }
+        let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)))
+            .map_err(|_| "Unable to listen for connection requests on the selected interface.".to_string())?;
+        socket.set_read_timeout(Some(IO_POLL)).map_err(|_| "Unable to configure selected-interface discovery polling.".to_string())?;
+        let response_socket = UdpSocket::bind(SocketAddr::from((interface.address, 0)))
+            .map_err(|_| "Unable to prepare replies on the selected interface.".to_string())?;
+        let local = interface.address;
+        let prefix = interface.prefix_length;
+        let cancellation = CancellationToken::new();
+        let worker_cancel = cancellation.clone();
+        let snapshot = Arc::new(Mutex::new(HostDiscoverySnapshot {
+            active: true, automatic_binding: None, interface_address: Some(local), interface_prefix_length: Some(prefix), offers: Vec::new(),
+        }));
+        let worker_snapshot = snapshot.clone();
+        let worker = thread::Builder::new().name("AnPod selected-interface connection offers".into())
+            .spawn(move || run_host_offer_listener(socket, response_socket, local, prefix, worker_cancel, worker_snapshot))
+            .map_err(|error| format!("Unable to start selected-interface offer listener: {error}"))?;
+        Ok(Self { automatic_binding: None, attempt_cancel: None, cancellation, snapshot, worker: Some(worker) })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_loopback_for_test(interface: &Ipv4Interface) -> Result<Self, String> {
+        Self::start_inner(interface, true)
+    }
+
+    pub(crate) fn snapshot(&self) -> HostDiscoverySnapshot {
+        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        discard_expired_offers(&mut snapshot.offers);
+        let mut result = snapshot.clone();
+        result.automatic_binding = self.automatic_binding.clone();
+        result
+    }
+
+    pub(crate) fn interface_address(&self) -> Option<Ipv4Addr> {
+        self.snapshot.lock().expect("host discovery snapshot lock poisoned").interface_address
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken { self.cancellation.clone() }
+
+    pub(crate) fn take_offer(&self, id: &str) -> Option<ConnectionOffer> {
+        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        discard_expired_offers(&mut snapshot.offers);
+        let index = snapshot.offers.iter().position(|offer| offer.id == id)?;
+        Some(snapshot.offers.remove(index))
+    }
+}
+
+impl Drop for HostOfferListener {
+    fn drop(&mut self) {
+        if let Some(token) = self.attempt_cancel.take() { token.cancel(); }
+        self.cancellation.cancel();
+        if let Some(worker) = self.worker.take() {
+            if worker.thread().id() != thread::current().id() { let _ = worker.join(); }
+        }
+        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        snapshot.active = false;
+        snapshot.interface_address = None;
+        snapshot.interface_prefix_length = None;
+        snapshot.offers.clear();
+    }
+}
+
+fn discard_expired_offers(offers: &mut Vec<ConnectionOffer>) {
+    let now = Instant::now();
+    offers.retain(|offer| offer.expires_at > now);
+}
+
+fn run_host_offer_listener(socket: UdpSocket, response_socket: UdpSocket, local: Ipv4Addr, prefix: u8,
+    cancellation: CancellationToken, snapshot: Arc<Mutex<HostDiscoverySnapshot>>) {
+    let mut pending_nonces: VecDeque<([u8; 16], Ipv4Addr, Instant)> = VecDeque::new();
+    let mut used_nonces: VecDeque<([u8; 16], Instant)> = VecDeque::new();
+    let mut bytes = [0; 128];
+    while !cancellation.is_cancelled() {
+        match socket.recv_from(&mut bytes) {
+            Ok((length, source)) => {
+                let SocketAddr::V4(source) = source else { continue; };
+                if source.port() != DISCOVERY_PORT || !ipv4_in_prefix(local, prefix, *source.ip()) { continue; }
+                let packet = &bytes[..length];
+                if let Some(nonce) = decode_host_probe(packet) {
+                    pending_nonces.retain(|(_, _, at)| at.elapsed() <= HOST_REQUEST_TTL);
+                    used_nonces.retain(|(_, at)| at.elapsed() <= HOST_OFFER_TTL);
+                    if used_nonces.iter().any(|(used, _)| used == &nonce) { continue; }
+                    if !pending_nonces.iter().any(|(pending, _, _)| pending == &nonce) {
+                        if pending_nonces.len() == MAX_CANDIDATES || used_nonces.len() == MAX_CANDIDATES { continue; }
+                        pending_nonces.push_back((nonce, *source.ip(), Instant::now()));
+                    }
+                    let response = encode_host_candidate(nonce, DISCOVERY_PORT);
+                    let _ = response_socket.send_to(&response, source);
+                    continue;
+                }
+                let Some((nonce, port)) = decode_connect_offer(packet) else { continue; };
+                pending_nonces.retain(|(_, _, at)| at.elapsed() <= HOST_REQUEST_TTL);
+                used_nonces.retain(|(_, at)| at.elapsed() <= HOST_OFFER_TTL);
+                if port == 0 || used_nonces.iter().any(|(used, _)| used == &nonce) { continue; }
+                let Some(index) = pending_nonces.iter().position(|(pending, address, _)|
+                    pending == &nonce && address == source.ip()) else { continue; };
+                pending_nonces.remove(index).expect("pending nonce index");
+                if used_nonces.len() == MAX_CANDIDATES { continue; }
+                let received_at = Instant::now();
+                used_nonces.push_back((nonce, received_at));
+                let offer = ConnectionOffer {
+                    nonce,
+                    id: format!("{}:{}:{}", source.ip(), port, hex_nonce(&nonce)),
+                    endpoint: SocketAddr::new((*source.ip()).into(), port),
+                    expires_at: received_at + HOST_OFFER_TTL,
+                };
+                let mut current = snapshot.lock().expect("host discovery snapshot lock poisoned");
+                discard_expired_offers(&mut current.offers);
+                if current.active && !current.offers.iter().any(|item| item.id == offer.id) {
+                    if current.offers.len() == MAX_CANDIDATES { continue; }
+                    current.offers.push(offer);
+                }
+            }
+            Err(error) if is_poll_timeout(&error) => {}
+            Err(_) => break,
+        }
+    }
+    let mut current = snapshot.lock().expect("host discovery snapshot lock poisoned");
+    current.active = false;
+    current.interface_address = None;
+    current.interface_prefix_length = None;
+}
+
+fn ipv4_in_prefix(local: Ipv4Addr, prefix: u8, remote: Ipv4Addr) -> bool {
+    if prefix == 0 || prefix > 32 { return false; }
+    let mask = if prefix == 32 { u32::MAX } else { u32::MAX << (32 - prefix) };
+    u32::from(local) & mask == u32::from(remote) & mask
+}
+
+fn encode_host_probe(nonce: [u8; 16]) -> [u8; HOST_PROBE_BYTES] {
+    let mut frame = [0; HOST_PROBE_BYTES];
+    frame[..4].copy_from_slice(MAGIC); frame[4] = V2_VERSION; frame[5] = HOST_PROBE;
+    frame[8..24].copy_from_slice(&nonce);
+    frame
+}
+
+fn encode_host_candidate(nonce: [u8; 16], port: u16) -> [u8; HOST_PACKET_BYTES] {
+    encode_host_packet(HOST_CANDIDATE, nonce, port)
+}
+
+pub(crate) fn encode_connect_offer(nonce: [u8; 16], receiver_control_port: u16) -> [u8; HOST_PACKET_BYTES] {
+    encode_host_packet(CONNECT_OFFER, nonce, receiver_control_port)
+}
+
+fn encode_host_packet(kind: u8, nonce: [u8; 16], port: u16) -> [u8; HOST_PACKET_BYTES] {
+    let mut frame = [0; HOST_PACKET_BYTES];
+    frame[..4].copy_from_slice(MAGIC); frame[4] = V2_VERSION; frame[5] = kind;
+    frame[8..24].copy_from_slice(&nonce); frame[24..].copy_from_slice(&port.to_be_bytes());
+    frame
+}
+
+fn decode_host_probe(frame: &[u8]) -> Option<[u8; 16]> {
+    if frame.len() != HOST_PROBE_BYTES || &frame[..4] != MAGIC || frame[4] != V2_VERSION
+        || frame[5] != HOST_PROBE || frame[6..8] != [0, 0] || frame[8..24].iter().all(|byte| *byte == 0) { return None; }
+    Some(frame[8..24].try_into().ok()?)
+}
+
+fn decode_connect_offer(frame: &[u8]) -> Option<([u8; 16], u16)> {
+    if frame.len() != HOST_PACKET_BYTES || &frame[..4] != MAGIC || frame[4] != V2_VERSION
+        || frame[5] != CONNECT_OFFER || frame[6..8] != [0, 0] || frame[8..24].iter().all(|byte| *byte == 0) { return None; }
+    Some((frame[8..24].try_into().ok()?, u16::from_be_bytes([frame[24], frame[25]])))
+}
+
+fn hex_nonce(nonce: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    nonce.iter().flat_map(|byte| [HEX[(byte >> 4) as usize] as char, HEX[(byte & 15) as usize] as char]).collect()
 }
 
 pub(crate) fn probe_targets(interface: &Ipv4Interface) -> Vec<Ipv4Addr> {
@@ -86,6 +308,10 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
                 }
             }
             Err(error) if is_poll_timeout(&error) => {}
+            Err(_) if cancellation.is_cancelled() => return Err("Network discovery was cancelled.".into()),
+            // Windows reports ICMP port-unreachable for an earlier UDP response as a
+            // connection reset on the next receive; it is not a listener failure.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
             Err(_) => return Err("Discovery receive failed on the selected interface.".into()),
         }
     }
@@ -121,4 +347,63 @@ fn is_poll_timeout(error: &io::Error) -> bool {
 #[cfg(test)]
 pub(crate) fn candidate_for_test(token: [u8; 16], port: u16) -> [u8; FRAME_BYTES] {
     encode(CANDIDATE, token, port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network_interface::interface_for_test;
+
+    #[test]
+    fn selected_interface_listener_correlates_single_use_connection_offers() {
+        let host_address = Ipv4Addr::new(127, 0, 0, 2);
+        let receiver_address = Ipv4Addr::new(127, 0, 0, 1);
+        let interface = interface_for_test(host_address, 24);
+        let mut listener = HostOfferListener::start_loopback_for_test(&interface).unwrap();
+        let receiver = UdpSocket::bind(SocketAddr::from((receiver_address, DISCOVERY_PORT))).unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let nonce = [0xA7; 16];
+        receiver.send_to(&encode_host_probe(nonce), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        let mut response = [0; 64];
+        let (length, source) = receiver.recv_from(&mut response).unwrap();
+        assert_eq!(source.ip(), host_address);
+        assert_ne!(source.port(), 0, "candidate reply uses an ephemeral selected-interface port");
+        assert_eq!(response[..length], encode_host_candidate(nonce, DISCOVERY_PORT));
+
+        receiver.send_to(&encode_connect_offer([0xA8; 16], 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert!(listener.snapshot().offers.is_empty(), "unrelated nonce must not create a connection request");
+        receiver.send_to(&encode_connect_offer(nonce, 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let offer = loop {
+            let snapshot = listener.snapshot();
+            if let Some(offer) = snapshot.offers.into_iter().next() { break offer; }
+            assert!(Instant::now() < deadline, "correlated connection request was not captured");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(offer.endpoint, SocketAddr::from((receiver_address, 41_001)));
+        assert_eq!(HOST_OFFER_TTL, Duration::from_secs(30));
+        assert!(offer.expires_at.duration_since(Instant::now()) > HOST_REQUEST_TTL,
+            "the offer window starts when CONNECT_OFFER arrives, separately from the search nonce window");
+        assert!(listener.take_offer(&offer.id).is_some());
+        assert!(listener.take_offer(&offer.id).is_none(), "a connection request is accepted at most once");
+        {
+            let mut current = listener.snapshot.lock().unwrap();
+            current.offers.push(ConnectionOffer {
+                nonce: [1; 16],
+                id: "expired".into(), endpoint: SocketAddr::from((receiver_address, 41_002)),
+                expires_at: Instant::now() - Duration::from_millis(1),
+            });
+        }
+        assert!(listener.snapshot().offers.iter().all(|item| item.id != "expired"),
+            "expired offers must disappear from snapshots");
+        assert!(listener.take_offer("expired").is_none(), "expired offers cannot be accepted");
+        receiver.send_to(&encode_connect_offer(nonce, 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert!(listener.snapshot().offers.is_empty(), "a consumed nonce cannot replay a connection request");
+        let attempt = CancellationToken::new();
+        listener.attempt_cancel = Some(attempt.clone());
+        drop(listener);
+        assert!(attempt.is_cancelled(), "stopping discovery cancels an in-flight authentication attempt");
+    }
 }

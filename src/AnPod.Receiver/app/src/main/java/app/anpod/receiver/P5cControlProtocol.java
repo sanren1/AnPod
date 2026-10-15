@@ -26,7 +26,18 @@ final class P5cControlProtocol {
     static final int RESUME = 5;
     static final int STOP = 6;
     static final int HEARTBEAT = 7;
+    static final int CAPABILITIES_QUERY = 8;
+    static final int CAPABILITIES_INFO = 9;
+    static final int PLAYBACK_PROGRESS_QUERY = 16;
+    static final int CONNECTION_INTENT = 17;
     static final int ACK = 127;
+    static final int MANAGEMENT_CONTROL_MAJOR = 3;
+    static final int AUDIO_PROTOCOL_MAJOR = 1;
+    static final int CAP_RECEIVER_UI = 0x00000001;
+    static final int CAP_AUTHENTICATED_STATUS = 0x00000002;
+    static final int CAP_PLAYBACK_PROGRESS = 0x00000008;
+    static final int CAP_CONNECTION_INTENT = 0x00000010;
+    static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
     private static final long FRAME_READ_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(3);
 
     private P5cControlProtocol() {}
@@ -122,6 +133,10 @@ final class P5cControlProtocol {
     }
 
     static byte[] ackPayload(int commandType, long commandSequence, int result, int state, int udpPort) {
+        return ackPayload(commandType, commandSequence, result, state, udpPort, new byte[0]);
+    }
+
+    static byte[] ackPayload(int commandType, long commandSequence, int result, int state, int udpPort, byte[] extra) {
         byte[] payload = new byte[13];
         payload[0] = (byte) commandType;
         putLong(payload, 1, commandSequence);
@@ -129,6 +144,50 @@ final class P5cControlProtocol {
         payload[10] = (byte) state;
         payload[11] = (byte) (udpPort >>> 8);
         payload[12] = (byte) udpPort;
+        byte[] combined = Arrays.copyOf(payload, payload.length + extra.length);
+        System.arraycopy(extra, 0, combined, payload.length, extra.length);
+        return combined;
+    }
+
+    static byte[] playbackProgressPayload(int sampleRate, int channels, int jitterTargetFrames,
+            long expiredFrames, long queuedFrames, long pendingFrames, int underrunCount,
+            long tcpDroppedFrames, Boolean playbackAdvancing, int requestedFrames,
+            int acceptedFrames, int effectiveFrames, int capacityFrames, int startThresholdFrames,
+            int preRollFrames) {
+        byte[] payload = new byte[70];
+        putInt(payload, 0, sampleRate);
+        payload[4] = (byte) channels;
+        putInt(payload, 5, jitterTargetFrames);
+        putLong(payload, 9, expiredFrames);
+        putLong(payload, 17, queuedFrames);
+        putLong(payload, 25, pendingFrames);
+        putInt(payload, 33, underrunCount);
+        putLong(payload, 37, tcpDroppedFrames);
+        payload[45] = playbackAdvancing == null ? (byte) 0xff : (byte) (playbackAdvancing ? 1 : 0);
+        putInt(payload, 46, requestedFrames);
+        putInt(payload, 50, acceptedFrames);
+        putInt(payload, 54, effectiveFrames);
+        putInt(payload, 58, capacityFrames);
+        putInt(payload, 62, startThresholdFrames);
+        putInt(payload, 66, preRollFrames);
+        return payload;
+    }
+
+    static byte[] capabilitiesQueryPayload(int controlMajor, int audioMajor, int requiredCapabilities) {
+        byte[] payload = new byte[8];
+        payload[0] = (byte) (controlMajor >>> 8); payload[1] = (byte) controlMajor;
+        payload[2] = (byte) audioMajor;
+        putInt(payload, 4, requiredCapabilities);
+        return payload;
+    }
+
+    static byte[] capabilitiesInfoPayload(long querySequence, int controlMajor, int audioMajor,
+            int result, int capabilities, int versionCode) {
+        byte[] payload = new byte[20];
+        putLong(payload, 0, querySequence);
+        payload[8] = (byte) (controlMajor >>> 8); payload[9] = (byte) controlMajor;
+        payload[10] = (byte) audioMajor; payload[11] = (byte) result;
+        putInt(payload, 12, capabilities); putInt(payload, 16, versionCode);
         return payload;
     }
 
@@ -141,6 +200,14 @@ final class P5cControlProtocol {
     private static int getInt(byte[] bytes, int offset) {
         return ((bytes[offset] & 0xff) << 24) | ((bytes[offset + 1] & 0xff) << 16)
                 | ((bytes[offset + 2] & 0xff) << 8) | (bytes[offset + 3] & 0xff);
+    }
+    static int getUnsignedInt(byte[] bytes, int offset) {
+        return getInt(bytes, offset);
+    }
+    static long getUnsignedLong(byte[] bytes, int offset) {
+        long value = getLong(bytes, offset);
+        if (value < 0) throw new IllegalArgumentException("unsigned value exceeds supported range");
+        return value;
     }
     private static void putInt(byte[] bytes, int offset, int value) {
         for (int i = 3; i >= 0; i--) { bytes[offset + i] = (byte) value; value >>>= 8; }

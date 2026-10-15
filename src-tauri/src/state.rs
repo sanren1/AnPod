@@ -1,5 +1,5 @@
-use crate::{audio::AudioActor, discovery::{self, Candidate}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{SessionLifecycleState, SessionOwner}};
-use crate::receiver::{self, ReceiverStatus};
+use crate::{audio::AudioActor, discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{ReceiverCapabilities, SessionLifecycleState, SessionOwner}, protocol::PcmFormat};
+use crate::receiver::{self, PlaybackDiagnostics, ReceiverStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -48,6 +48,10 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     #[serde(default = "usb")]
     pub preferred_transport: String,
+    #[serde(default)]
+    pub wireless_protocol: String,
+    #[serde(default)]
+    pub audio_backend: String,
     #[serde(default = "yes")]
     pub auto_reconnect_wifi: bool,
     #[serde(default)]
@@ -61,6 +65,8 @@ pub struct AppSettings {
 fn schema_version() -> u32 { 1 }
 fn yes() -> bool { true }
 fn usb() -> String { "Usb".into() }
+fn udp() -> String { "udp".into() }
+fn legacy() -> String { "legacy".into() }
 fn balanced() -> String { "Balanced".into() }
 fn system() -> String { "System".into() }
 
@@ -73,6 +79,8 @@ impl Default for AppSettings {
             minimize_to_tray: true,
             launch_at_login: false,
             preferred_transport: usb(),
+            wireless_protocol: udp(),
+            audio_backend: legacy(),
             auto_reconnect_wifi: true,
             last_wireless_endpoint: None,
             playback_mode: balanced(),
@@ -92,7 +100,14 @@ pub struct AppSnapshot {
     pub session_serial: Option<String>,
     pub session_receiver_binding: Option<String>,
     pub session_transport: Option<String>,
+    pub session_connection_transport: Option<String>,
+    pub session_wireless_protocol: Option<String>,
+    pub session_capabilities: Option<ReceiverCapabilities>,
+    pub playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub wireless_connection_offers: HostDiscoverySnapshot,
     pub session_android_version: Option<String>,
+    /// Canonical v2 choice; `transport` remains the `usb`/`wifi` frontend alias.
+    pub connection_transport: String,
     pub transport: String,
     pub output: String,
     pub settings: AppSettings,
@@ -110,6 +125,16 @@ pub struct OperationResult {
     pub success: bool,
     pub message: String,
     pub snapshot: AppSnapshot,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverUpdateCandidate {
+    pub version_code: u32,
+    pub version_name: String,
+    pub size_bytes: u64,
+    pub current_version_code: Option<u32>,
+    pub binding_reference: Option<String>,
 }
 
 struct Session {
@@ -152,10 +177,13 @@ struct ViewState {
     busy: bool,
     session_active: bool,
     audio_bitrate_bps: Option<u64>,
+    session_capabilities: Option<ReceiverCapabilities>,
+    playback_diagnostics: Option<PlaybackDiagnostics>,
 }
 
 pub struct AppState {
     view: Mutex<ViewState>,
+    host_offer_listener: Mutex<Option<HostOfferListener>>,
     operation: Mutex<Option<ActiveOperation>>,
     operation_generation: AtomicU64,
     recovering: AtomicBool,
@@ -168,6 +196,7 @@ pub struct AppState {
     gate: AsyncMutex<()>,
     session: AsyncMutex<Option<Session>>,
     pcm_rate_sample: Mutex<Option<(u64, u64, Instant)>>,
+    receiver_health_sample: Mutex<Option<(u64, u32)>>,
     audio: AudioActor,
     data_dir: PathBuf,
     adb_path: PathBuf,
@@ -177,6 +206,40 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub async fn receiver_update_candidate(&self) -> Result<Option<ReceiverUpdateCandidate>, String> {
+        let (version_code, version_name, size_bytes) = receiver::local_upgrade_candidate(
+            &self.receiver_apk_path,
+            &self.receiver_metadata_path,
+        )?;
+        let current = {
+            let session = self.session.lock().await;
+            session.as_ref().and_then(|active| {
+                let owner = active.network_owner.as_ref()?;
+                let binding_reference = active.network_binding_ref.as_ref()?;
+                let snapshot = owner.snapshot();
+                if !matches!(snapshot.state, SessionLifecycleState::Authenticated | SessionLifecycleState::TransportConnected
+                        | SessionLifecycleState::ReceiverRunning | SessionLifecycleState::Streaming | SessionLifecycleState::Paused) {
+                    return None;
+                }
+                let capabilities = snapshot.capabilities?;
+                if !capabilities.management_compatible || capabilities.version_code == 0 {
+                    return None;
+                }
+                Some((capabilities.version_code, binding_reference.clone()))
+            })
+        };
+        let (current_version_code, binding_reference) = current
+            .map(|(version, binding)| (Some(version), Some(binding)))
+            .unwrap_or((None, None));
+        Ok(Some(ReceiverUpdateCandidate {
+            version_code,
+            version_name,
+            size_bytes,
+            current_version_code,
+            binding_reference,
+        }))
+    }
+
     pub fn new() -> Self {
         let data_dir = env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -210,7 +273,10 @@ impl AppState {
                 busy: false,
                 session_active: false,
                 audio_bitrate_bps: None,
+                session_capabilities: None,
+                playback_diagnostics: None,
             }),
+            host_offer_listener: Mutex::new(None),
             operation: Mutex::new(None),
             operation_generation: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
@@ -223,6 +289,7 @@ impl AppState {
             gate: AsyncMutex::new(()),
             session: AsyncMutex::new(None),
             pcm_rate_sample: Mutex::new(None),
+            receiver_health_sample: Mutex::new(None),
             audio: AudioActor::new(audio_path, data_dir.join("muted-endpoints.txt")),
             data_dir,
             adb_path,
@@ -256,10 +323,52 @@ impl AppState {
     }
 
     pub async fn receiver_install(&self, serial: &str) -> Result<ReceiverStatus, String> {
-        let (generation, token, _guard) = self.begin_receiver_operation(true).await?;
-        let result = receiver::install(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let result = async {
+            receiver::validate_usb_install(&self.adb_path, serial, &self.receiver_apk_path,
+                &self.receiver_metadata_path, &token).await?;
+            self.ensure_receiver_operation_target(serial, None).await?;
+            let has_session = self.session.lock().await.is_some();
+            if token.is_cancelled() { return Err("Receiver 管理操作已取消。".into()); }
+            if has_session { self.teardown(None).await?; }
+            receiver::install(&self.adb_path, serial, &self.receiver_apk_path,
+                &self.receiver_metadata_path, &token).await
+        }.await;
         self.finish_operation(generation);
         result
+    }
+
+    pub async fn receiver_upgrade_usb(&self, serial: &str, binding_reference: &str) -> Result<ReceiverStatus, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let result = async {
+            let path = binding_store_path(&self.data_dir, binding_reference)?;
+            let actual_reference = receiver::binding_reference(&self.adb_path, serial, &token).await?;
+            if actual_reference != binding_reference {
+                return Err("USB 设备序列号或 Android 用户与所选 Receiver 绑定不匹配；未执行升级。".into());
+            }
+            receiver::validate_usb_upgrade(&self.adb_path, serial, binding_reference,
+                &self.receiver_apk_path, &path, &self.receiver_metadata_path, &token).await?;
+            self.ensure_receiver_operation_target(serial, Some(binding_reference)).await?;
+            let has_session = self.session.lock().await.is_some();
+            if token.is_cancelled() { return Err("Receiver 管理操作已取消。".into()); }
+            if has_session { self.teardown(None).await?; }
+            receiver::upgrade_usb(&self.adb_path, serial, binding_reference, &path, &self.receiver_apk_path,
+                &self.receiver_metadata_path, &token).await
+        }.await;
+        self.finish_operation(generation);
+        result
+    }
+
+    async fn ensure_receiver_operation_target(&self, serial: &str, binding_reference: Option<&str>) -> Result<(), String> {
+        let session = self.session.lock().await;
+        let Some(active) = session.as_ref() else { return Ok(()); };
+        let matches = if active.network_owner.is_some() {
+            binding_reference.is_some() && active.network_binding_ref.as_deref() == binding_reference
+        } else {
+            active.serial == serial
+        };
+        if matches { Ok(()) }
+        else { Err("AnPod 正在使用另一台设备；未中断当前会话或执行 Receiver 操作。".into()) }
     }
 
     pub async fn receiver_start(&self, serial: &str) -> Result<ReceiverStatus, String> {
@@ -324,17 +433,121 @@ impl AppState {
             Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
     }
 
+    pub fn set_wireless_connection_offers(&self, local_address: &str, allowed: bool,
+        selected_binding: Option<&str>) -> Result<HostDiscoverySnapshot, String> {
+        if !allowed {
+            self.host_offer_listener.lock().expect("offer listener lock").take();
+            return Ok(HostDiscoverySnapshot::default());
+        }
+        let (interface, settings, active, busy) = {
+            let view = self.view.lock().expect("app view lock");
+            (self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address),
+                view.settings.clone(), view.session_active, view.busy)
+        };
+        if !settings.preferred_transport.eq_ignore_ascii_case("wifi") || settings.wireless_protocol != "udp" {
+            return Err("请先将无线连接方式明确设为 UDP，再允许 Receiver 发起连接请求。".into());
+        }
+        if active { return Err("活动会话期间不能更改无线连接请求监听。".into()); }
+        if busy { return Err("AnPod 正在处理连接操作；请稍后再更改连接请求监听。".into()); }
+        if self.operation.lock().expect("operation lock").is_some() {
+            return Err("连接操作尚未结束；请稍后再允许手机连接。".into());
+        }
+        let references = self.receiver_binding_references()?;
+        let binding = automatic_reception_binding(&references, selected_binding)?;
+        let interface = interface.ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
+        let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
+        if let Some(current) = listener.as_ref() {
+            let snapshot = current.snapshot();
+            if snapshot.active && snapshot.interface_address == Some(interface.address)
+                && snapshot.interface_prefix_length == Some(interface.prefix_length) {
+                listener.as_mut().expect("current listener").automatic_binding = binding;
+                return Ok(snapshot);
+            }
+            listener.take();
+        }
+        *listener = Some(HostOfferListener::start(&interface)?);
+        listener.as_mut().expect("listener was just installed").automatic_binding = binding;
+        Ok(listener.as_ref().expect("listener was just installed").snapshot())
+    }
+
+    pub fn wireless_connection_offers(&self) -> HostDiscoverySnapshot {
+        let Some((Some(address), Some(prefix))) = self.host_offer_listener.lock().expect("offer listener lock").as_ref()
+            .map(|listener| (listener.interface_address(), listener.snapshot().interface_prefix_length)) else {
+            return HostDiscoverySnapshot::default();
+        };
+        let active_interface_valid = match self.network_interfaces() {
+            Ok(interfaces) => interfaces.iter().any(|interface| interface.address == address && interface.prefix_length == prefix),
+            Err(_) => false,
+        };
+        if !active_interface_valid {
+            self.host_offer_listener.lock().expect("offer listener lock").take();
+            return HostDiscoverySnapshot::default();
+        }
+        self.host_offer_listener.lock().expect("offer listener lock").as_ref()
+            .map(HostOfferListener::snapshot).unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    pub async fn accept_wireless_connection_offer(&self, app: &AppHandle, offer_id: &str,
+        binding_ref: &str) -> Result<AppSnapshot, String> {
+        if !valid_binding_reference(binding_ref) { return Err("必须明确选择已保存的 Receiver 绑定。".into()); }
+        {
+            let view = self.view.lock().expect("app view lock");
+            if !view.settings.preferred_transport.eq_ignore_ascii_case("wifi") || view.settings.wireless_protocol != "udp" {
+                return Err("无线连接方式已更改；请先明确选择 UDP 并重新允许连接。".into());
+            }
+            if view.session_active { return Err("已有活动会话；请先断开后再接受连接请求。".into()); }
+            if view.busy { return Err("AnPod 正在处理连接操作；请稍后再接受连接请求。".into()); }
+        }
+        let (offer, address, cancellation) = {
+            let listener = self.host_offer_listener.lock().expect("offer listener lock");
+            let listener = listener.as_ref().ok_or("无线连接请求监听已关闭。")?;
+            let snapshot = listener.snapshot();
+            let address = snapshot.interface_address.ok_or("监听接口已不可用；请重新选择网络接口。")?;
+            if !self.network_interfaces()?.iter().any(|item| item.address == address
+                && Some(item.prefix_length) == snapshot.interface_prefix_length) {
+                return Err("监听接口已变化；旧连接请求已失效，请重新选择接口并允许连接。".into());
+            }
+            let offer = listener.take_offer(offer_id).ok_or("连接请求已过期或已处理，请让 Receiver 重新搜索。")?;
+            (offer, address, listener.cancellation())
+        };
+        self.start_network_audio_inner(app, &address.to_string(), &offer.endpoint.to_string(), None,
+            None, None, Some(binding_ref), Some((offer.nonce, false, cancellation)), None).await
+    }
+
+    #[cfg(not(windows))]
+    pub async fn accept_wireless_connection_offer(&self, _app: &AppHandle, _offer_id: &str,
+        _binding_ref: &str) -> Result<AppSnapshot, String> {
+        Err("Windows 网络音频接收仅在 Windows 上可用。".into())
+    }
+
     #[cfg(windows)]
     pub async fn start_network_audio(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
         selected_binding_ref: Option<&str>) -> Result<AppSnapshot, String> {
+        self.start_network_audio_inner(app, local_address, peer, bootstrap_serial, receiver_address,
+            receiver_prefix, selected_binding_ref, None, None).await
+    }
+
+    #[cfg(windows)]
+    async fn start_network_audio_inner(&self, app: &AppHandle, local_address: &str, peer: &str,
+        bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
+        selected_binding_ref: Option<&str>, intent: Option<([u8; 16], bool, CancellationToken)>,
+        reservation: Option<(u64, CancellationToken)>) -> Result<AppSnapshot, String> {
         use crate::security::{AudioParameters, BindingStore};
-        let (generation, token) = self.start_operation();
+        let (generation, token) = reservation.unwrap_or_else(|| self.start_operation());
         let mut audio_initialized = false;
+        let _gate = self.gate.lock().await;
         let result = async {
-            let _gate = self.gate.lock().await;
             token_check(&token)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
+            {
+                let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
+                if let Some((_, _, cancellation)) = &intent {
+                    token_check(cancellation)?;
+                    listener.as_mut().ok_or("无线接收已停止；旧连接请求无效。")?.attempt_cancel = Some(token.clone());
+                } else { listener.take(); }
+            }
             let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
                 .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
             audio_initialized = true;
@@ -388,29 +601,43 @@ impl AppState {
             let binding = BindingStore::load(&binding_path).map_err(|_| "本机 DPAPI 绑定材料不可用；请通过授权 USB/bootstrap 建立绑定。".to_string())?;
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
-            let mut owner = SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())?;
+            let mut owner = if let Some((nonce, required, _)) = &intent {
+                SessionOwner::start_on_interface_with_intent(&interface, peer, binding, parameters, token.clone(), *nonce, *required)?
+            } else { SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())? };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let queue = loop {
                 token_check(&token)?;
-                if let Some(queue) = owner.pcm_queue() { break queue; }
-                if owner.snapshot().state == SessionLifecycleState::Stopped || tokio::time::Instant::now() >= deadline {
+                if let Some(queue) = owner.pcm_queue() { break Some(queue); }
+                let snapshot = owner.snapshot();
+                if snapshot.state == SessionLifecycleState::Authenticated
+                    && snapshot.capabilities.as_ref().is_some_and(|info| info.management_compatible && !info.compatible) {
+                    break None;
+                }
+                if snapshot.state == SessionLifecycleState::Stopped || tokio::time::Instant::now() >= deadline {
                     owner.stop();
-                    return Err("手机未在认证窗口内确认接收；请重新通过 USB/bootstrap 启动。".into());
+                    return Err(snapshot.last_error.unwrap_or_else(|| "手机未在认证窗口内确认接收；请在手机重新开始接收。".into()));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
-            audio_initialized = true;
-            if let Err(error) = self.audio.start_pcm_sink(queue.clone()) {
-                let _ = self.audio.stop_and_cleanup();
-                let _ = self.audio.restore_muted();
-                owner.stop();
-                return Err(error);
-            }
-            if let Err(error) = self.audio.mute_active() {
-                let _ = self.audio.stop_pcm_sink();
-                let _ = self.audio.restore_muted();
-                owner.stop();
-                return Err(error);
+            let management_only = queue.is_none();
+            if management_only {
+                self.audio.stop_and_cleanup()?;
+                self.audio.restore_muted()?;
+            } else {
+                audio_initialized = true;
+                let queue_ref = queue.as_ref().expect("audio-compatible session queue");
+                if let Err(error) = self.audio.start_pcm_sink(queue_ref.clone()) {
+                    let _ = self.audio.stop_and_cleanup();
+                    let _ = self.audio.restore_muted();
+                    owner.stop();
+                    return Err(error);
+                }
+                if let Err(error) = self.audio.mute_active() {
+                    let _ = self.audio.stop_pcm_sink();
+                    let _ = self.audio.restore_muted();
+                    owner.stop();
+                    return Err(error);
+                }
             }
             if let Err(error) = token_check(&token) {
                 let _ = self.audio.stop_pcm_sink();
@@ -418,12 +645,21 @@ impl AppState {
                 owner.stop();
                 return Err(error);
             }
+            let session_output = if management_only { "computer" } else { "phone" };
+            if intent.is_some() {
+                let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
+                token_check(&token)?;
+                if let Some(current) = listener.as_mut() { current.attempt_cancel = None; }
+                listener.take();
+            }
             *self.session.lock().await = Some(Session {
                 generation: NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
-                installed_receiver: false, output: "phone".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
-                network_owner: Some(owner), network_sink_queue: Some(queue), network_binding_ref: Some(binding_ref.clone()),
+                installed_receiver: false, output: session_output.into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
+                network_owner: Some(owner), network_sink_queue: queue, network_binding_ref: Some(binding_ref.clone()),
             });
+            let capabilities = self.session.lock().await.as_ref().and_then(|session| session.network_owner.as_ref())
+                .and_then(|owner| owner.snapshot().capabilities);
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = true;
@@ -431,11 +667,14 @@ impl AppState {
                 view.session_receiver_binding = Some(binding_ref);
                 view.session_transport = Some("lan".into());
                 view.session_android_version = None;
-                view.output = "phone".into();
-                view.state = "phoneReady".into();
-                view.message = "手机接收已就绪".into();
-                view.status_detail = "P5-A 已认证；本机 PCM 已接入所选 LAN 接收会话。".into();
-                view.audio_bitrate_bps = Some(0);
+                view.session_capabilities = capabilities;
+                view.playback_diagnostics = None;
+                view.output = session_output.into();
+                view.state = if management_only { "managementOnly" } else { "phoneReady" }.into();
+                view.message = if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
+                view.status_detail = if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
+                    else { "P5-A 已认证；本机 PCM 已接入所选 LAN 接收会话。" }.into();
+                view.audio_bitrate_bps = if management_only { None } else { Some(0) };
             }
             *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
             self.emit(app);
@@ -520,7 +759,13 @@ impl AppState {
             session_serial: view.session_serial.clone(),
             session_receiver_binding: view.session_receiver_binding.clone(),
             session_transport: view.session_transport.clone(),
+            session_connection_transport: view.session_transport.as_deref().and_then(session_connection_transport).map(str::to_owned),
+            session_wireless_protocol: view.session_transport.as_deref().and_then(session_wireless_protocol).map(str::to_owned),
+            session_capabilities: view.session_capabilities.clone(),
+            playback_diagnostics: view.playback_diagnostics.clone(),
+            wireless_connection_offers: self.wireless_connection_offers(),
             session_android_version: view.session_android_version.clone(),
+            connection_transport: selected_connection_transport(&view.settings.preferred_transport).into(),
             transport,
             output: view.output.clone(),
             settings: view.settings.clone(),
@@ -572,22 +817,35 @@ impl AppState {
         let _ = app.emit("anpod://snapshot", self.snapshot());
     }
 
-    fn update_receiver_playback_status(&self, phone_output: bool, audio_active: bool) -> bool {
+    async fn update_usb_playback_status(&self, generation: u64, serial: &str, phone_output: bool,
+        audio_active: bool, diagnostics: Option<PlaybackDiagnostics>, format: Option<PcmFormat>) -> bool {
+        let session = self.session.lock().await;
+        let Some(_active) = session.as_ref().filter(|active| active.generation == generation
+            && active.serial == serial && active.network_owner.is_none() && active.output == "phone") else { return false; };
         if !phone_output { return false; }
+        let diagnostics = {
+            let mut sample = self.receiver_health_sample.lock().expect("receiver health sample lock");
+            let (diagnostics, next) = merge_usb_playback_diagnostics(
+                diagnostics.unwrap_or_default(), format, generation, *sample);
+            *sample = next;
+            diagnostics
+        };
         let mut view = self.view.lock().expect("app view lock");
         let (state, message, detail) = if audio_active {
             ("streaming", "正在手机播放", "Receiver 已确认 AudioTrack 正在播放。")
         } else {
             ("phoneReady", "手机接收已就绪", "手机接收端已就绪；电脑有声音发送后将开始播放。")
         };
+        let changed = view.state != state || view.message != message || view.status_detail != detail
+            || view.playback_diagnostics.as_ref() != Some(&diagnostics);
         if view.state != state || view.message != message || view.status_detail != detail {
             view.state = state.into();
             view.message = message.into();
             view.status_detail = detail.into();
-            true
-        } else {
-            false
         }
+        view.playback_diagnostics = Some(diagnostics);
+        drop(session);
+        changed
     }
 
     fn set_state(&self, app: &AppHandle, state: &str, message: impl Into<String>, device: Option<String>) {
@@ -607,7 +865,13 @@ impl AppState {
             .and_then(|json| serde_json::from_str::<AppSettings>(&json).ok())
             .filter(|s| s.schema_version == 1)
             .map(normalize_settings)
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                let mut settings = AppSettings::default();
+                if std::env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value == "installed-receiver") {
+                    settings.audio_backend = "receiver".into();
+                }
+                settings
+            });
         self.view.lock().expect("app view lock").settings = settings;
     }
 
@@ -686,7 +950,47 @@ impl AppState {
         Ok(self.snapshot())
     }
 
+    #[cfg(windows)]
+    async fn connect_pending_wireless_offer(&self, app: &AppHandle) -> bool {
+        {
+            let view = self.view.lock().expect("app view lock");
+            if view.session_active || view.busy || !view.settings.preferred_transport.eq_ignore_ascii_case("wifi")
+                || view.settings.wireless_protocol != "udp" { return false; }
+        }
+        let snapshot = self.wireless_connection_offers();
+        // Several pending targets require explicit selection; hints never establish identity.
+        if !snapshot.active || snapshot.offers.len() != 1 { return false; }
+        let candidate = {
+            let listener = self.host_offer_listener.lock().expect("offer listener lock");
+            listener.as_ref().and_then(|current| current.automatic_binding.clone()
+                .zip(snapshot.interface_address).map(|(binding, address)| (binding, address, current.cancellation())))
+        };
+        let Some((binding, address, cancellation)) = candidate else { return false; };
+        let Some(reservation) = self.start_background_operation() else { return false; };
+        let offer = self.host_offer_listener.lock().expect("offer listener lock").as_ref()
+            .and_then(|current| if cancellation.is_cancelled() { None } else { current.take_offer(&snapshot.offers[0].id) });
+        let Some(offer) = offer else { self.finish_operation(reservation.0); return false; };
+        let generation = reservation.0;
+        let result = self.start_network_audio_inner(app, &address.to_string(), &offer.endpoint.to_string(),
+            None, None, None, Some(&binding), Some((offer.nonce, true, cancellation)), Some(reservation)).await;
+        if let Err(error) = result {
+            self.log(&format!("Wireless reception intent failed: {error}"));
+            let mut view = self.view.lock().expect("app view lock");
+            if !view.session_active && self.operation_generation.load(Ordering::Acquire) == generation {
+                view.state = "error".into();
+                view.device_name = None;
+                view.message = "手机自动连接未完成".into();
+                view.status_detail = error;
+            }
+            drop(view);
+            self.emit(app);
+        }
+        true
+    }
+
     pub async fn monitor_once(&self, app: &AppHandle) {
+        #[cfg(windows)]
+        if self.connect_pending_wireless_offer(app).await { return; }
         let Ok(_gate) = self.gate.try_lock() else { return; };
         if self.operation.lock().expect("operation lock").as_ref().is_some_and(|operation| !operation.token.is_cancelled()) { return; }
         if self.monitor_network_session(app).await { return; }
@@ -702,9 +1006,9 @@ impl AppState {
         }
         let session = self.session.lock().await.as_mut().map(|session| {
             let exited = session.child.as_mut().and_then(|child| child.try_wait().ok().flatten()).is_some();
-            (session.serial.clone(), session.transport.clone(), session.output.clone(), session.output_tail.clone(), session.reverse.clone(), session.installed_receiver, exited)
+            (session.generation, session.serial.clone(), session.transport.clone(), session.output.clone(), session.output_tail.clone(), session.reverse.clone(), session.installed_receiver, exited)
         });
-        if let Some((serial, transport, output, tail, session_key, installed_receiver, exited)) = session {
+        if let Some((session_generation, serial, transport, output, tail, session_key, installed_receiver, exited)) = session {
             let device_present = snapshot.as_ref().map(|snapshot| snapshot.devices.iter().any(|device| device.serial == serial && device.state == "device"));
             let connected = self.audio.is_connected().unwrap_or(false);
             let capture_error = self.audio.take_last_error().ok().flatten();
@@ -730,7 +1034,9 @@ impl AppState {
                     Ok(status) => match status.monitoring_error() {
                         Some(error) => Some(error),
                         None => {
-                            if self.update_receiver_playback_status(output == "phone", status.audio_active) { self.emit(app); }
+                            let format = self.audio.pcm_format().ok();
+                            if self.update_usb_playback_status(session_generation, &serial, output == "phone",
+                                status.audio_active, status.playback_diagnostics, format).await { self.emit(app); }
                             None
                         }
                     },
@@ -757,7 +1063,7 @@ impl AppState {
         if snapshot.settings.last_wireless_endpoint.as_ref().is_some_and(|endpoint| snapshot.devices.iter().any(|device| &device.serial == endpoint)) {
             self.wireless_probe_attempted.store(false, Ordering::Release);
         }
-        if !settings.auto_connect_last_device { return; }
+        if !settings.auto_connect_last_device || !selected_transport_allows_auto_adb(&settings) { return; }
         let target = settings.last_device_id.as_deref();
         let suppressed = self.suppressed_auto_connect.lock().expect("auto-connect suppression lock").clone();
         let failed = self.failed_auto_connect.lock().expect("auto-connect failure lock").clone();
@@ -777,7 +1083,7 @@ impl AppState {
             }
             return;
         }
-        if snapshot.transport == "wifi" && settings.auto_reconnect_wifi {
+        if snapshot.transport == "wifi" && wireless_adb_enabled(&settings) && settings.auto_reconnect_wifi {
             if let Some(endpoint) = settings.last_wireless_endpoint.filter(|endpoint| endpoint.contains(':')) {
                 if self.wireless_probe_attempted.swap(true, Ordering::AcqRel) { return; }
                 if checked_adb(&self.adb_path, None, &["connect", &endpoint], Duration::from_secs(8), None).await.is_ok() {
@@ -793,13 +1099,19 @@ impl AppState {
         let owner = active.network_owner.as_ref().expect("network session owner");
         let snapshot = owner.snapshot();
         let needs_bootstrap = snapshot.state == SessionLifecycleState::Stopped;
+        let management_only = snapshot.state == SessionLifecycleState::Authenticated
+            && snapshot.capabilities.as_ref().is_some_and(|info| info.management_compatible && !info.compatible);
         let queue = owner.pcm_queue();
         let mut failure = self.audio.take_last_error().ok().flatten();
         if failure.is_none() && needs_bootstrap {
             failure = Some(snapshot.last_error.clone().unwrap_or_else(|| "Receiver session stopped".into()));
         }
         if failure.is_none() {
-            if active.output == "phone" {
+            if management_only {
+                active.network_sink_queue = None;
+                if let Err(error) = self.audio.stop_pcm_sink() { failure = Some(error); }
+                if let Err(error) = self.audio.restore_muted() { failure.get_or_insert(error); }
+            } else if active.output == "phone" {
                 if let Some(queue) = queue.as_ref() {
                     if pcm_queue_identity_changed(active.network_sink_queue.as_ref(), Some(queue)) {
                         if let Err(error) = self.audio.start_pcm_sink(queue.clone()) { failure = Some(error); }
@@ -834,11 +1146,13 @@ impl AppState {
                 view.session_serial = None;
                 view.session_receiver_binding = None;
                 view.session_transport = None;
+                view.session_capabilities = None;
+                view.playback_diagnostics = None;
                 view.session_android_version = None;
                 view.output = "computer".into();
                 view.state = "error".into();
                 view.message = "LAN 音频会话已停止".into();
-                view.status_detail = format!("本机音频已清理；Receiver 会话停止：{detail}");
+                view.status_detail = format!("本机音频已清理；{detail}");
                 view.audio_bitrate_bps = None;
             }
             *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
@@ -846,7 +1160,9 @@ impl AppState {
             self.emit(app);
             return true;
         }
-        let state = if active.output == "computer" { "connected" }
+        active.output = monitored_network_output(&active.output, management_only).into();
+        let state = if management_only { "managementOnly" }
+            else if active.output == "computer" { "connected" }
             else if queue.is_none() || snapshot.state == SessionLifecycleState::Reconnecting { "reconnecting" }
             else { match snapshot.state {
                 SessionLifecycleState::Streaming => "streaming",
@@ -857,6 +1173,8 @@ impl AppState {
             ("网络音频切换失败".to_string(), format!("本机 PCM sink 操作失败：{error}"))
         } else if state == "reconnecting" {
             ("正在重新连接手机".into(), "网络接收暂时中断；电脑声音已恢复，正在尝试重新认证。".into())
+        } else if management_only {
+            ("Receiver 管理连接已认证，音频协议不兼容".into(), "已认证管理查询保持在线；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。".into())
         } else if active.output == "computer" {
             ("已连接 · 电脑播放".into(), "网络会话保持暂停；电脑声音已恢复到本机扬声器。".into())
         } else if state == "streaming" {
@@ -868,12 +1186,15 @@ impl AppState {
         };
         let changed = {
             let mut view = self.view.lock().expect("app view lock");
-            let changed = view.state != state || view.message != message || view.status_detail != detail;
+            let changed = view.state != state || view.message != message || view.status_detail != detail
+                || view.playback_diagnostics != snapshot.playback_diagnostics;
             view.state = state.into();
             view.message = message;
             view.status_detail = detail;
             view.output = active.output.clone();
             view.session_receiver_binding = active.network_binding_ref.clone();
+            view.session_capabilities = snapshot.capabilities.clone();
+            view.playback_diagnostics = snapshot.playback_diagnostics.clone();
             changed
         };
         drop(session);
@@ -899,7 +1220,8 @@ impl AppState {
             return;
         }
         let settings = self.snapshot().settings;
-        if !settings.auto_connect_last_device || (transport == "wifi" && !settings.auto_reconnect_wifi) {
+        if !settings.auto_connect_last_device || (transport == "wifi"
+            && (!settings.auto_reconnect_wifi || !wireless_adb_enabled(&settings))) {
             self.set_state(app, "error", reason, device_name);
             self.recovering.store(false, Ordering::Release);
             return;
@@ -1065,8 +1387,7 @@ impl AppState {
     async fn connect_inner(&self, app: &AppHandle, device: &Device, token: &CancellationToken, play_on_phone: bool) -> Result<String, String> {
         let serial = device.serial.as_str();
         token_check(&token)?;
-        let installed_receiver = device.transport == "usb"
-            && env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value.eq_ignore_ascii_case("installed-receiver"));
+        let installed_receiver = self.view.lock().expect("view lock").settings.audio_backend == "receiver";
         self.audio.initialize()?;
         self.audio.set_streaming(false)?;
         let port = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
@@ -1084,6 +1405,8 @@ impl AppState {
             view.session_serial = Some(device.serial.clone());
             view.session_receiver_binding = None;
             view.session_transport = Some(device.transport.clone());
+            view.session_capabilities = None;
+            view.playback_diagnostics = None;
             view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
             view.audio_bitrate_bps = Some(0);
         }
@@ -1199,19 +1522,22 @@ impl AppState {
     }
 
     pub async fn reconfigure_session(&self, app: &AppHandle, kind: &str, value: &str) -> Result<AppSnapshot, String> {
+        let selection = reconfigure_selection(kind, value, &self.snapshot().settings)?;
         let (generation, token) = self.start_operation();
-        let result = self.reconfigure_locked(app, kind, value, generation, &token).await;
+        let result = self.reconfigure_locked(app, selection, kind, value, generation, &token).await;
         self.finish_operation(generation);
         result
     }
 
-    async fn reconfigure_locked(&self, app: &AppHandle, kind: &str, value: &str, generation: u64, token: &CancellationToken) -> Result<AppSnapshot, String> {
+    async fn reconfigure_locked(&self, app: &AppHandle, selection: ReconfigureSelection, kind: &str, value: &str, generation: u64, token: &CancellationToken) -> Result<AppSnapshot, String> {
         let _guard = self.gate.lock().await;
         token_check(token)?;
         {
             let session = self.session.lock().await;
             if let Some(active) = session.as_ref().filter(|session| session.network_owner.is_some()) {
-                if kind != "playback" { return Err("LAN 会话不能直接切换到 USB/Wi-Fi 传输；请先断开。".into()); }
+                if kind != "playback" {
+                    drop(session);
+                } else {
                 let mode = match value { "balanced" => 0, "lowLatency" => 1,
                     _ => return Err("未知的播放模式。".into()) };
                 let previous = self.snapshot().settings.playback_mode;
@@ -1232,6 +1558,7 @@ impl AppState {
                 }
                 self.emit(app);
                 return Ok(self.snapshot());
+                }
             }
         }
         let (had_session, serial, old_output, old_transport, old_device) = {
@@ -1244,6 +1571,15 @@ impl AppState {
         if !had_session {
             self.update_mode_setting(kind, value)?;
             let _ = self.refresh_devices().await?;
+            let guidance = match selection {
+                ReconfigureSelection::WirelessUdp => "已选择无线 UDP；请提供本地接口、已保存绑定和接收端点后启动网络音频。",
+                ReconfigureSelection::WirelessAdb => "已选择无线 ADB；请选择无线调试设备后连接。",
+                ReconfigureSelection::Usb => "连接方式已切换到 USB；请连接并授权手机。",
+                ReconfigureSelection::Playback => "播放模式已保存。",
+                ReconfigureSelection::AudioBackend => "接收后端已保存。",
+            };
+            self.view.lock().expect("view lock").output = "computer".into();
+            self.set_state(app, "ready", guidance, None);
             self.emit(app);
             return Ok(self.snapshot());
         }
@@ -1261,7 +1597,8 @@ impl AppState {
         token_check(token)?;
         self.update_mode_setting(kind, value)?;
 
-        if old_transport == "wifi" && self.snapshot().settings.auto_reconnect_wifi {
+        if old_transport == "wifi" && self.snapshot().settings.wireless_protocol == "adb"
+            && self.snapshot().settings.auto_reconnect_wifi && matches!(selection, ReconfigureSelection::WirelessAdb | ReconfigureSelection::Playback | ReconfigureSelection::AudioBackend) {
             if let Some(endpoint) = serial.as_deref().filter(|endpoint| endpoint.contains(':')) {
                 let _ = checked_adb(&self.adb_path, None, &["connect", endpoint], Duration::from_secs(10), Some(token)).await;
             }
@@ -1269,23 +1606,42 @@ impl AppState {
         token_check(token)?;
         self.refresh_devices().await?;
 
-        let transport = self.snapshot().transport;
+        let settings = self.snapshot().settings;
         let devices = self.snapshot().devices;
-        let target = if kind == "playback" {
-            serial.as_ref().and_then(|serial| devices.iter().find(|device| &device.serial == serial && device.connectable)).map(|device| device.serial.clone())
-        } else if let Some(previous) = old_device.as_ref() {
-            let matching: Vec<_> = devices.iter().filter(|device|
-                device.connectable && device.transport == transport && same_physical_device(previous, device)
-            ).collect();
-            (matching.len() == 1).then(|| matching[0].serial.clone())
-        } else { None };
+        let target = match selection {
+            ReconfigureSelection::WirelessUdp => None,
+            ReconfigureSelection::WirelessAdb => {
+                let explicit = serial.clone().or(self.snapshot().selected_serial);
+                explicit.as_ref().and_then(|serial| devices.iter().find(|device| &device.serial == serial && device.connectable && device.transport == "wifi"))
+                    .map(|device| device.serial.clone())
+                    .or_else(|| old_device.as_ref().and_then(|previous| {
+                        let matching: Vec<_> = devices.iter().filter(|device| device.connectable && device.transport == "wifi" && same_physical_device(previous, device)).collect();
+                        (matching.len() == 1).then(|| matching[0].serial.clone())
+                    }))
+            }
+            ReconfigureSelection::Usb => old_device.as_ref().and_then(|previous| {
+                let matching: Vec<_> = devices.iter().filter(|device| device.connectable && device.transport == "usb" && same_physical_device(previous, device)).collect();
+                (matching.len() == 1).then(|| matching[0].serial.clone())
+            }),
+            ReconfigureSelection::Playback | ReconfigureSelection::AudioBackend => {
+                if old_transport == "lan" || (old_transport == "wifi" && !wireless_adb_enabled(&settings)) { None }
+                else { serial.as_ref().and_then(|serial| devices.iter().find(|device| &device.serial == serial && device.connectable)).map(|device| device.serial.clone()) }
+            }
+        };
 
         if let Some(serial) = target {
             let result = self.connect_locked(app, &serial, generation, token, old_output == "phone").await?;
             if !result.success { return Err(result.message); }
             if old_output == "computer" { self.set_output_locked("computer", token).await?; }
         } else {
-            let guidance = if transport == "wifi" { "连接方式已切换到 Wi-Fi；请添加手机或搜索无线调试设备。" } else { "连接方式已切换到 USB；请连接并授权手机。" };
+            let guidance = match selection {
+                ReconfigureSelection::WirelessUdp => "已选择无线 UDP；请提供本地接口、已保存绑定和接收端点后启动网络音频。",
+                ReconfigureSelection::WirelessAdb if devices.iter().any(|device| device.transport == "wifi") => "已选择无线 ADB；请选择无线调试设备后连接。",
+                ReconfigureSelection::WirelessAdb => "已选择无线 ADB；请添加手机或搜索无线调试设备。",
+                ReconfigureSelection::Usb => "连接方式已切换到 USB；请连接并授权手机。",
+                ReconfigureSelection::Playback => "播放模式已保存；请从设备卡片连接手机。",
+                ReconfigureSelection::AudioBackend => "接收后端已保存；请从设备卡片连接手机。",
+            };
             self.view.lock().expect("view lock").output = "computer".into();
             self.set_state(app, "ready", guidance, None);
         }
@@ -1295,7 +1651,12 @@ impl AppState {
     fn update_mode_setting(&self, kind: &str, value: &str) -> Result<(), String> {
         let (key, normalized) = match (kind, value) {
             ("transport", "usb") => ("preferredTransport", "Usb"),
+            ("transport", "wireless") => ("preferredTransport", "Wifi"),
             ("transport", "wifi") => ("preferredTransport", "Wifi"),
+            ("audioBackend", "receiver") => ("audioBackend", "receiver"),
+            ("audioBackend", "legacy") => ("audioBackend", "legacy"),
+            ("wirelessProtocol", "udp") => ("wirelessProtocol", "udp"),
+            ("wirelessProtocol", "adb") => ("wirelessProtocol", "adb"),
             ("playback", "balanced") => ("playbackMode", "Balanced"),
             ("playback", "lowLatency") => ("playbackMode", "LowLatency"),
             _ => return Err("未知的连接或播放模式。".into()),
@@ -1304,10 +1665,16 @@ impl AppState {
         let mut settings = view.settings.clone();
         match key {
             "preferredTransport" => settings.preferred_transport = normalized.into(),
+            "audioBackend" => settings.audio_backend = normalized.into(),
+            "wirelessProtocol" => {
+                settings.wireless_protocol = normalized.into();
+                settings.preferred_transport = "Wifi".into();
+            }
             "playbackMode" => settings.playback_mode = normalized.into(),
             _ => unreachable!(),
         }
         self.save_settings(&settings)?;
+        self.host_offer_listener.lock().expect("offer listener lock").take();
         view.settings = settings;
         Ok(())
     }
@@ -1318,10 +1685,11 @@ impl AppState {
     }
 
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
+        self.host_offer_listener.lock().expect("offer listener lock").take();
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
             let network_session = session.network_owner.is_some();
-            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_capabilities = None; view.playback_diagnostics = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -1394,6 +1762,9 @@ impl AppState {
             if let Some(active) = session.as_mut().filter(|session| session.network_owner.is_some()) {
                 token_check(token)?;
                 let owner = active.network_owner.as_ref().expect("network session owner");
+                if output == "phone" && owner.snapshot().capabilities.as_ref().is_some_and(|info| !info.compatible) {
+                    return Err("Receiver 管理连接已认证，但音频协议不兼容；请通过授权 ADB 或手动安装兼容版本。".into());
+                }
                 let change = async {
                     if output == "phone" {
                         let queue = if active.output == "computer" {
@@ -1447,6 +1818,8 @@ impl AppState {
                     view.session_serial = None;
                     view.session_receiver_binding = None;
                     view.session_transport = None;
+                    view.session_capabilities = None;
+                    view.playback_diagnostics = None;
                     view.session_android_version = None;
                     view.output = "computer".into();
                     view.state = "error".into();
@@ -1544,7 +1917,7 @@ impl AppState {
         if view.busy {
             return Err("正在连接期间无法更改设置。".into());
         }
-        if matches!(key, "preferredTransport" | "playbackMode") && self.session.try_lock().map_or(true, |session| session.is_some()) {
+        if matches!(key, "transport" | "preferredTransport" | "wirelessProtocol" | "audioBackend" | "playbackMode") && self.session.try_lock().map_or(true, |session| session.is_some()) {
             return Err("请使用连接方式或播放模式控件切换当前会话。".into());
         }
         let mut settings = view.settings.clone();
@@ -1554,9 +1927,27 @@ impl AppState {
             "launchAtLogin" => settings.launch_at_login = value.as_bool().ok_or("无效设置值")?,
             "autoReconnectWifi" => settings.auto_reconnect_wifi = value.as_bool().ok_or("无效设置值")?,
             "preferredTransport" => settings.preferred_transport = normalize_transport(value.as_str().ok_or("无效连接方式")?).into(),
+            "transport" => settings.preferred_transport = match value.as_str().ok_or("无效连接方式")? {
+                "usb" => "Usb".into(),
+                "wireless" => "Wifi".into(),
+                _ => return Err("transport 必须为 usb 或 wireless。".into()),
+            },
+            "wirelessProtocol" => settings.wireless_protocol = match value.as_str().ok_or("无效无线协议")? {
+                value if value.eq_ignore_ascii_case("udp") => "udp".into(),
+                value if value.eq_ignore_ascii_case("adb") => "adb".into(),
+                _ => return Err("无线协议必须为 udp 或 adb。".into()),
+            },
+            "audioBackend" => settings.audio_backend = match value.as_str().ok_or("无效 Receiver 后端")? {
+                value if value.eq_ignore_ascii_case("receiver") => "receiver".into(),
+                value if value.eq_ignore_ascii_case("legacy") => "legacy".into(),
+                _ => return Err("Receiver 后端必须为 receiver 或 legacy。".into()),
+            },
             "playbackMode" => settings.playback_mode = normalize_playback(value.as_str().ok_or("无效播放模式")?).into(),
             "appearanceTheme" => settings.appearance_theme = normalize_theme(value.as_str().ok_or("无效主题")?).into(),
             _ => return Err("未知设置项。".into()),
+        }
+        if matches!(key, "transport" | "preferredTransport" | "wirelessProtocol") {
+            self.host_offer_listener.lock().expect("offer listener lock").take();
         }
         self.save_settings(&settings)?;
         view.settings = settings;
@@ -1770,6 +2161,21 @@ fn receiver_health_needed(installed_receiver: bool, device_present: Option<bool>
     installed_receiver && !session_is_lost(device_present, process_exited, audio_connected)
 }
 
+fn merge_usb_playback_diagnostics(mut diagnostics: PlaybackDiagnostics, format: Option<PcmFormat>,
+    generation: u64, previous: Option<(u64, u32)>) -> (PlaybackDiagnostics, Option<(u64, u32)>) {
+    if let Some(format) = format {
+        diagnostics.sample_rate = Some(format.sample_rate);
+        diagnostics.channels = u8::try_from(format.channels).ok();
+    }
+    diagnostics.underrun_increment = match (previous, diagnostics.underrun_count) {
+        (Some((sample_generation, previous)), Some(current))
+            if sample_generation == generation && current >= previous => Some(u64::from(current - previous)),
+        _ => None,
+    };
+    let next = diagnostics.underrun_count.map(|count| (generation, count));
+    (diagnostics, next)
+}
+
 fn commit_pcm_bitrate_sample(current_session: Option<u64>, expected_session: u64,
     previous: &mut Option<(u64, u64, Instant)>, current_rate: &mut Option<u64>, bytes: u64, now: Instant) -> bool {
     if current_session != Some(expected_session) { return false; }
@@ -1797,12 +2203,25 @@ fn valid_binding_reference(reference: &str) -> bool {
     reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn automatic_reception_binding(references: &[String], selected: Option<&str>) -> Result<Option<String>, String> {
+    match selected.filter(|value| !value.is_empty()) {
+        Some(value) if references.iter().any(|item| item == value) => Ok(Some(value.to_owned())),
+        Some(_) => Err("所选 Receiver 绑定已不可用；请重新选择。".into()),
+        None if references.len() == 1 => Ok(references.first().cloned()),
+        None => Ok(None),
+    }
+}
+
 fn pcm_queue_identity_changed(current: Option<&Arc<PcmQueue>>, next: Option<&Arc<PcmQueue>>) -> bool {
     match (current, next) {
         (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
         (None, None) => false,
         _ => true,
     }
+}
+
+fn monitored_network_output(current: &str, management_only: bool) -> &str {
+    if management_only { "computer" } else { current }
 }
 
 fn binding_store_path(data_dir: &Path, reference: &str) -> Result<PathBuf, String> {
@@ -2044,12 +2463,47 @@ fn normalize_mdns_instance(value: &str) -> String {
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.schema_version = 1;
     settings.preferred_transport = match settings.preferred_transport.to_ascii_lowercase().as_str() { "wifi" => "Wifi".into(), _ => "Usb".into() };
+    settings.wireless_protocol = if settings.wireless_protocol.is_empty() {
+        if settings.preferred_transport == "Wifi" { "adb" } else { "udp" }.into()
+    } else { normalize_wireless_protocol(&settings.wireless_protocol).into() };
+    settings.audio_backend = if settings.audio_backend.is_empty()
+        && std::env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value == "installed-receiver") {
+        "receiver".into()
+    } else { normalize_audio_backend(&settings.audio_backend).into() };
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() { "lowlatency" | "low_latency" => "LowLatency".into(), _ => "Balanced".into() };
     settings.appearance_theme = match settings.appearance_theme.to_ascii_lowercase().as_str() { "light" => "Light".into(), "dark" => "Dark".into(), _ => "System".into() };
     settings
 }
 
 fn normalize_transport(value: &str) -> &'static str { if value.eq_ignore_ascii_case("wifi") { "Wifi" } else { "Usb" } }
+fn normalize_wireless_protocol(value: &str) -> &'static str { if value.eq_ignore_ascii_case("adb") { "adb" } else { "udp" } }
+fn normalize_audio_backend(value: &str) -> &'static str { if value.eq_ignore_ascii_case("receiver") { "receiver" } else { "legacy" } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconfigureSelection { Playback, AudioBackend, Usb, WirelessAdb, WirelessUdp }
+fn wireless_adb_enabled(settings: &AppSettings) -> bool { settings.wireless_protocol == "adb" }
+fn selected_transport_allows_auto_adb(settings: &AppSettings) -> bool {
+    !settings.preferred_transport.eq_ignore_ascii_case("wifi") || wireless_adb_enabled(settings)
+}
+fn reconfigure_selection(kind: &str, value: &str, settings: &AppSettings) -> Result<ReconfigureSelection, String> {
+    match (kind, value) {
+        ("playback", "balanced" | "lowLatency") => Ok(ReconfigureSelection::Playback),
+        ("audioBackend", "receiver" | "legacy") => Ok(ReconfigureSelection::AudioBackend),
+        ("transport", "usb") => Ok(ReconfigureSelection::Usb),
+        ("transport", "wireless" | "wifi") => Ok(if settings.wireless_protocol == "adb" {
+            ReconfigureSelection::WirelessAdb
+        } else { ReconfigureSelection::WirelessUdp }),
+        ("wirelessProtocol", "udp") => Ok(ReconfigureSelection::WirelessUdp),
+        ("wirelessProtocol", "adb") => Ok(ReconfigureSelection::WirelessAdb),
+        _ => Err("未知的连接或播放模式。".into()),
+    }
+}
+fn selected_connection_transport(preferred: &str) -> &'static str { if preferred.eq_ignore_ascii_case("wifi") { "wireless" } else { "usb" } }
+fn session_connection_transport(transport: &str) -> Option<&'static str> {
+    match transport { "usb" => Some("usb"), "wifi" | "lan" => Some("wireless"), _ => None }
+}
+fn session_wireless_protocol(transport: &str) -> Option<&'static str> {
+    match transport { "wifi" => Some("adb"), "lan" => Some("udp"), _ => None }
+}
 fn normalize_playback(value: &str) -> &'static str { if value.eq_ignore_ascii_case("lowLatency") { "LowLatency" } else { "Balanced" } }
 fn normalize_theme(value: &str) -> &'static str { match value.to_ascii_lowercase().as_str() { "light" => "Light", "dark" => "Dark", _ => "System" } }
 fn uuid_token() -> Result<String, String> {
@@ -2078,6 +2532,34 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_playback_diagnostics_use_session_scoped_health_intervals() {
+        let mut receiver = PlaybackDiagnostics { receiver_sample_rate: Some(48_000), receiver_channels: Some(2),
+            pc_dropped_frames: None, pc_queued_frames: None, underrun_count: Some(12), ..PlaybackDiagnostics::default() };
+        let (first, sample) = merge_usb_playback_diagnostics(receiver.clone(),
+            Some(PcmFormat { sample_rate: 48_000, channels: 2 }), 7, None);
+        assert_eq!(first.sample_rate, Some(48_000));
+        assert_eq!(first.channels, Some(2));
+        assert_eq!(first.pc_dropped_frames, None);
+        assert_eq!(first.pc_queued_frames, None);
+        assert_eq!(first.underrun_increment, None);
+        assert_eq!(sample, Some((7, 12)));
+
+        receiver.underrun_count = Some(15);
+        let (next, sample) = merge_usb_playback_diagnostics(receiver.clone(), None, 7, sample);
+        assert_eq!(next.underrun_increment, Some(3));
+        assert_eq!(sample, Some((7, 15)));
+
+        receiver.underrun_count = Some(1);
+        let (new_session, sample) = merge_usb_playback_diagnostics(receiver.clone(), None, 8, sample);
+        assert_eq!(new_session.underrun_increment, None);
+        assert_eq!(sample, Some((8, 1)));
+        receiver.underrun_count = None;
+        let (unknown, sample) = merge_usb_playback_diagnostics(receiver, None, 8, sample);
+        assert_eq!(unknown.underrun_increment, None);
+        assert_eq!(sample, None);
+    }
 
     struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -2161,6 +2643,10 @@ mod tests {
             &mut current_rate, 192_010, started + Duration::from_secs(1)));
         assert_eq!(previous.as_ref().map(|(id, count, _)| (*id, *count)), Some((2, 10)));
         assert_eq!(current_rate, None);
+        assert!(commit_pcm_bitrate_sample(Some(2), 2, &mut previous,
+            &mut current_rate, 192_010, started + Duration::from_secs(1)));
+        assert_eq!(previous.as_ref().map(|(id, count, _)| (*id, *count)), Some((2, 192_010)));
+        assert_eq!(current_rate, Some(1_536_000));
     }
 
     #[test]
@@ -2169,6 +2655,11 @@ mod tests {
         let new = Arc::new(PcmQueue::new());
         assert!(!pcm_queue_identity_changed(Some(&old), Some(&old)));
         assert!(pcm_queue_identity_changed(Some(&old), Some(&new)));
+    }
+
+    #[test]
+    fn management_only_recovery_selects_computer_output() {
+        assert_eq!(monitored_network_output("phone", true), "computer");
     }
 
     #[test]
@@ -2186,7 +2677,44 @@ mod tests {
         let value = serde_json::to_value(AppSettings::default()).unwrap();
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["preferredTransport"], "Usb");
+        assert_eq!(value["wirelessProtocol"], "udp");
+        assert_eq!(value["audioBackend"], "legacy");
         assert_eq!(value["playbackMode"], "Balanced");
+        let settings = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "preferredTransport": "Wifi",
+            "wirelessProtocol": "adb", "audioBackend": "receiver"
+        })).unwrap());
+        assert_eq!(settings.preferred_transport, "Wifi");
+        assert_eq!(settings.wireless_protocol, "adb");
+        assert_eq!(settings.audio_backend, "receiver");
+        let old_saved = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "preferredTransport": "Wifi"
+        })).unwrap());
+        assert_eq!(old_saved.preferred_transport, "Wifi");
+        assert_eq!(old_saved.wireless_protocol, "adb");
+        assert_eq!(old_saved.audio_backend, "legacy");
+        let new_saved = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "preferredTransport": "Usb", "wirelessProtocol": "udp"
+        })).unwrap());
+        assert_eq!(new_saved.wireless_protocol, "udp");
+        assert_eq!(selected_transport_allows_auto_adb(&old_saved), true);
+        assert_eq!(selected_transport_allows_auto_adb(&new_saved), true);
+        let explicit_udp_wifi = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "preferredTransport": "Wifi", "wirelessProtocol": "udp"
+        })).unwrap());
+        assert_eq!(explicit_udp_wifi.wireless_protocol, "udp");
+        assert!(!selected_transport_allows_auto_adb(&explicit_udp_wifi));
+        assert_eq!(reconfigure_selection("transport", "wireless", &old_saved), Ok(ReconfigureSelection::WirelessAdb));
+        assert_eq!(reconfigure_selection("wirelessProtocol", "udp", &old_saved), Ok(ReconfigureSelection::WirelessUdp));
+        assert!(reconfigure_selection("wirelessProtocol", "invalid", &old_saved).is_err());
+        let state = AppState::new();
+        state.view.lock().unwrap().settings.preferred_transport = "Wifi".into();
+        assert_eq!(state.snapshot().connection_transport, "wireless");
+        assert_eq!(state.snapshot().transport, "wifi");
+        assert_eq!(session_connection_transport("lan"), Some("wireless"));
+        assert_eq!(session_wireless_protocol("lan"), Some("udp"));
+        assert_eq!(session_connection_transport("wifi"), Some("wireless"));
+        assert_eq!(session_wireless_protocol("wifi"), Some("adb"));
         assert_eq!(normalize_endpoint("192.0.2.2:5555").unwrap(), "192.0.2.2:5555");
         assert!(normalize_endpoint("192.0.2.2:0").is_err());
     }
@@ -2204,6 +2732,18 @@ mod tests {
     }
 
     #[test]
+    fn wireless_protocol_switch_rejects_completion_from_previous_owner() {
+        let generation = AtomicU64::new(0);
+        let slot = Mutex::new(None);
+        let (old_generation, old_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+        let (new_generation, new_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+        assert!(old_token.is_cancelled());
+        finish_operation_slot(&slot, old_generation);
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|operation| operation.generation == new_generation));
+        assert!(!new_token.is_cancelled());
+    }
+
+    #[test]
     fn background_operation_does_not_preempt_a_foreground_request() {
         let generation = AtomicU64::new(0);
         let slot = Mutex::new(None);
@@ -2211,6 +2751,12 @@ mod tests {
         assert!(begin_operation_slot(&generation, &slot, true).is_none());
         assert!(slot.lock().unwrap().as_ref().is_some_and(|active| active.generation == foreground_generation));
         assert!(!foreground_token.is_cancelled());
+        assert_eq!(automatic_reception_binding(&[], None).unwrap(), None);
+        let references = vec!["saved-a".to_string(), "saved-b".to_string()];
+        assert_eq!(automatic_reception_binding(&references[..1], None).unwrap(), Some("saved-a".into()));
+        assert_eq!(automatic_reception_binding(&references, None).unwrap(), None, "several saved identities need selection");
+        assert_eq!(automatic_reception_binding(&references, Some("saved-b")).unwrap(), Some("saved-b".into()));
+        assert!(automatic_reception_binding(&references, Some("untrusted-hint")).is_err());
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # AnPod v2 验收记录与必要检查
 
+## USB / 一键接收本地审查候选（2026-10-15）
+
+- U1 USB-only 升级与安装后核验、旧网络 APK 安装退役，U5 绑定认证的一键接收与取消边界，U6 两端界面精简已通过源码审查。首次绑定仍 USB，不以发现地址建立信任，不抢占活动会话；HMAC type17/bit0x10 关联接收意图，退役编号不复用，音频预算未改。
+- 最小离线检查：Java/Rust合并回环PASS（1项，30.93秒，含错误/缺失/超时/取消意图及启动交接取消）；发现单次消费/监听停止取消PASS；保存绑定选择/后台不抢占PASS。无线19项、USB升级15项、主操作与焦点等15项headless断言PASS，24个小屏/主题布局无横向溢出，放大文字与配对输入焦点模拟PASS。模拟不等于真机无障碍或播放结果。
+- APK9完整隔离assembleDebug PASS（37tasks，44秒）；旧审计规则仍要求网络安装权限的问题已修正，随后37项全复用，DUMP保护、非公开服务和退役权限禁入审计PASS。APK SHA-256 `2b5ac4120d02ef46d8a96776d82c671622020357ce3e6b9739ce638f0bfd6cc5`，签名证书 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`，与原候选连续；本地运行时metadata读取PASS。
+- 桌面release隔离构建PASS（1分48秒），EXE SHA-256 `9ade3a2a3ddf18565515d01ff6a3409563059a9c70a950a52dc1cfa6be54e3fd`。基线提交 `61f32f7798f29bb39cf256997de50992a85ea519` 未变化，源码仍未提交；包内metadata用 workingTreeReview 和源码输入摘要区分实际构建内容，不能声称该基线提交本身包含本轮变更。Native/Legacy输入和已审计二进制未变，复用原608c98c来源。
+- 独立 ZIP：`artifacts/AnPod-1.0.4-receiver-v3-usb-oneclick-review-tauri-win-x64-portable.zip`，17,836,433 bytes，SHA-256 `21fa5ae9d3677aac16a5f2100387a8428152f4dca7348c554592d5b3873bf24e`。31/31项与目录逐字节一致；组件/来源/源码摘要、许可证/notice/upstream、路径安全、禁入文件和私有路径（含APK内部）审计PASS，旧网络安装类不在DEX。当前扫描不证明公开Git历史已脱敏。
+- 上述为本地候选构建时的记录。2026-10-15 后续已通过 USB 6→9 升级并核验原绑定保留；无线重试后用户确认出声，但均衡仍卡顿/破音，首次握手失败和 PC 操作顺序问题未关闭。USB Receiver 均衡/低延迟均完成 10 个声学短测样本，中位数分别 172.160 / 125.651 ms，含麦克风回录耗时，音质仍 NOT_PASSED；详细范围与计数见文末。通知/停止/生命周期、大字体/TalkBack等未完成项仍 NOT_TESTED。旧长测不恢复，原始证据和私有计划不提交或打包。
+
 ## 当前验证政策（2026-10-11 用户修订）
 
 - **20 次拔插、30 分钟锁屏和延迟对照测试：`CANCELLED_BY_USER`**。这些不再是阶段或发布关卡；不自动替换为固定次数切换、两小时播放或其他长测矩阵。
@@ -132,7 +141,7 @@
 
 ### 本地实现与构建
 
-- 新增 opt-in 后端：只有在启动 AnPod 的进程环境中将 `ANPOD_AUDIO_BACKEND` 设为 `installed-receiver` 时，USB 音频连接才走 APK Receiver；未设置时仍走 `app_process`，Wi-Fi 也继续走原有路径。P2 不自动安装或升级 APK。
+- V2 把 `audioBackend=receiver|legacy` 作为独立于传输协议的持久后端选择；`connect_device` 对 USB 与无线 ADB 均使用所选后端，无线 ADB 不会因 `wirelessProtocol=udp` 被误路由到 UDP。为遵守 USB 默认迁移门槛，当前默认仍是 Legacy；Receiver 路径须明确选择，失败不会静默切换后端。
 - Receiver version `0.2.0-p2-candidate` / versionCode `2`。音频服务使用 `mediaPlayback` 前台服务类型，管理健康检查继续使用原来的 120 秒 `shortService`；两者不共用短服务时限。
 - 两条 Android 路径复用同一 PCM16 帧对齐实现、8-byte little-endian 音频头及已有随机 token 握手。原 Native C ABI 保留，并新增只读本会话 PCM 成功发送字节计数。
 - P2 Native DLL、APK、Legacy Android payload 和 Rust target 都必须在隔离目录构建，例如分别使用 `build-native.ps1 -BuildDirectory artifacts/p2-native-build -OutputDirectory artifacts/p2-native`、`build-receiver.ps1 -OutputDirectory artifacts/p2-receiver`、`build-android.ps1 -ForceSdkDirect -BuildDirectory artifacts/p2-legacy-build -OutputDirectory artifacts/p2-legacy-payload`，再用 `publish-tauri.ps1 -IncludeReceiverCandidate -ReceiverCandidate p2 -NativeArtifactDirectory artifacts/p2-native -LegacyPayloadDirectory artifacts/p2-legacy-payload -ReceiverArtifactDirectory artifacts/p2-receiver -RustTargetDirectory artifacts/p2-tauri-target` 生成独立 portable candidate。不得指向 `deps/` 或原 Rust target，不得覆盖 P1 或稳定包。
@@ -169,7 +178,7 @@
 - 安装并启动后，用一次 USB 核心功能冒烟确认实际手机播放、Provider `audioActive` 与 `actualMode`、两种模式与电脑/手机输出切换、暂停/恢复、断开/停止后资源释放和电脑音量恢复；相关 token/PCM 逻辑引用已有检查，不逐项重复真机验证。
 - 当前核心冒烟仍为 `NOT_TESTED`，不写成已通过。20 次拔插、30 分钟锁屏和延迟对照为 `CANCELLED_BY_USER`，不再等待执行。生命周期/并发等已发现缺陷用最小针对性检查验证，只有真实系统行为仍缺证据时追加相应操作。
 - 若 LocalSocket abstract endpoint 被应用 UID / SELinux 拒绝，先保存脱敏的拒绝证据；只有复现后才评估 TCP reverse adapter。不得仅因假设修改现有 P1 `app_process` 路径。
-- 本地快速回退：关闭启动进程的 `ANPOD_AUDIO_BACKEND` 环境变量并重启 AnPod，即回到默认 `LegacyAppProcess`；保持已安装 APK，不需要设备卸载或数据清理。
+- 本地回退：断开当前会话后将 `audioBackend` 明确切回 `legacy`；保留已安装 APK，不需要设备卸载或数据清理。
 
 ## P3 Rust/C++ PCM Sink + localhost UDP 原型
 
@@ -271,3 +280,208 @@
 - Review ZIP：`artifacts/AnPod-1.0.4-receiver-v2-candidate-review-tauri-win-x64-portable.zip`，8,166,288 bytes，SHA-256 `1be79b2ee09cc88cc9d29091f01ffb70b9d7017be9b112e95351a1b5be10cdc3`。外层 30 项；3 个 ZIP（外层、APK、Legacy server）递归共 40 个文件项。根任务最终审计未发现不安全路径、禁止文件、已知私密构建路径或私钥；17 项许可逐字节匹配来源，README、notices、APK/JSON、server 与 Native 均匹配各自构建输入。旧 canonical 候选目录保留未覆盖；包中不含 PDB、密钥、临时 probe、日志、测量文件或私有计划。
 - 本次前端生产构建、Tauri Release、Receiver APK assemble 与 Legacy `server` 重建均通过。既有针对性 PCM/Receiver/Legacy/P5c 检查复用；没有重复全量测试。真机安装、P1 升级、USB 授权/绑定、Receiver 通知、实际 AudioTrack 出声、WASAPI 采集、连接恢复、UI 视觉及长期稳定性均为 **NOT_TESTED**；此前两声预检音不计为当前候选验收。未使用 ADB、手机或真实音频。
 
+## Receiver v3 兼容性 V0（本地源码与协议契约）
+
+- V0 在 Rust 安装身份检查中只信任当前本地 Receiver APK 的精确 SHA-256，或下列具有来源提交、versionCode 与 signer 记录的历史 APK；身份判断要求 package 与 signer 匹配，不用本机目标 APK 版本高低否定已审计安装身份。已审计条目：`20e42fac0274252dccb8ccc8b7d5e416ab8e958b` / code 3 / SHA-256 `de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77`；`81dda7630e2728881d4aa556698ba8f6bb36c453` / code 3 / SHA-256 `4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050`；`608c98c75ec04e11555e9e547caa516c96d4e0dd` / code 3 / SHA-256 `22af84b1989011d3cd214ff321ccd37bc4fe4de03546850f65d5db778f49d8c9`。三者 signer SHA-256 均为 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。候选更新仍须 versionCode 高于已安装版本且 signer 相同，因此不会自动降级。
+- P1 code 1 因 signer 不同而排除。P2 code 2 的审计 SHA-256 为 `eebb9fe4f566f6e23165f1494d1c5b08491ed2a090653bd56ce6ab78845e988c`，但可用审计记录没有保留其 `sourceCommit`，所以不加入受信历史名单；不推测来源提交。公开 Releases 页面当前没有发布包，已审计本地候选最高为 code 3，因此 V1 新 APK 的首个 versionCode 至少为 4。
+- `protocol.md` 记录 V3 管理能力协商草案：沿用 P5-C 外层 v1 帧和原有 13-byte ACK，新增固定 8-byte 能力查询与独立 20-byte 响应。只有已认证、身份可信、管理 major 为 3 且明确通告 `apk-update-v1`，才允许网络更新命令；音频 major 不兼容时仍可更新。未知/未协商管理端、旧 major 或缺更新能力只允许本机预检与 ADB/人工引导，不能发送未知更新命令；认证失败或未知身份拒绝。V0 不实现能力网络交换或 APK 网络更新；v2→v3 首次升级仍须通过已授权 ADB/人工方式安装同 signer 包。
+- 保留的音频基线：Native 队列低延迟/均衡上限 20/40 ms，Android jitter reserve 从 5/15 ms 独立增长至 20/40 ms，AudioTrack 请求 15/50 ms，API 31+ 仅低延迟请求 5 ms start threshold；播放头按 unsigned wrap 处理并拒绝倒序/过期样本。相关修复提交：`e6ad36a`、`d56a3a3`、`9d2c4f7`、`2c2dbbc`。
+- install 命令返回成功后，Receiver APK 摘要还必须精确匹配本次目标 APK；仅同 versionCode/versionName 的旧受信包不得作为成功安装报告。
+- `cargo test --manifest-path src-tauri\Cargo.toml --locked --offline --bin anpod-tauri receiver::tests::`：PASS，20/20；覆盖兼容性权限断言和“安装命令成功但仍读回同 code/name 历史 APK” fake ADB 场景。显式真机 USB 用例因未设置 `ANPOD_P1_USB_SERIAL` 而跳过。未重建 APK/ZIP、未运行产品构建，也未安装/操作手机；本候选真机安装、视觉和音频仍为 **NOT_TESTED**。此前手机两声预检音只确认手机发声，不作为本候选验收。
+
+## Receiver v3 V1 Launcher candidate
+
+- `MainActivity` 是唯一普通 Launcher，使用 Compose Material 3；`ReceiverService` 提供进程内 Binder 状态快照、可用私有 IPv4 列表以及开始/停止入口。音频、网络协调器和恢复意图仍由服务持有；停止会先使旧 generation 失效再清理会话与监听器。UI 不展示绑定名、binding commitment，也不提供 V2/V3 搜索、模式切换或网络更新功能。
+- `packaging/build-receiver.ps1`：PASS。Gradle 8.9 / JDK 17 `assembleDebug` 成功；合并 Manifest 仅允许 `MainActivity`、受 DUMP 保护的 Bootstrap/Provider 与受 DUMP 保护的 AndroidX ProfileInstallReceiver 导出；ReceiverService 保持私有。APK 为 `app.anpod.receiver`、code 4、`0.4.0-v3-candidate`、targetSdk 35，debug signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。源码提交 `ca380b04e6b1d6e774eef45240dd995385f67bce`。
+- 产物：`artifacts/v3-v1-receiver/receiver.apk`，SHA-256 `ef4a37ea1e5ffeb733cbc6483f914f2b6c51aec3cd28c1c1cb99ba17fd70702a`；`receiver.json` 内的 SHA、签名和源码提交已与产物核对。
+- 桌面端声音输出卡片保持图标在左、名称在右，高度调整为 48px；播放模式下的额外说明段已移除。前端 `tsc -b` 与 Vite production build 均通过。
+- Receiver UI 停止入口覆盖 UDP 与 USB/本地会话，并以 generation 拒绝已停止会话的过期回调；只显示当前会话报告的实际播放模式。
+- 没有运行 ADB、安装 APK、启动模拟器或操作手机；Receiver 真实 Binder 生命周期、通知授权流程、TalkBack、横竖屏视觉和实际音频仍为 **NOT_TESTED**。离线构建曾因 Kotlin Compose 插件缓存缺失停止；在线解析依赖后，构建通过。Windows 沙箱中 AAPT2 曾异常退出，最终包在核准的本地构建环境中成功链接并完成审计。
+
+## Receiver v3 V1 review correction
+
+- `ReceiverUiOperation` 是 Binder/UI 与 `ReceiverService` 回调共同使用的生产 owner/phase gate。`tests/ReceiverUiOperationCheck.java` 由 JDK 17 直接编译运行：PASS；覆盖外部 owner 停止、停止及失败后重开、过期 owner 回调拒绝，以及监听 prepared 不等同于已连接。
+- 外部 Bootstrap 会获得稳定 owner ID 并显示在 Binder 快照；UI 停止必须匹配当前 owner。会话终止统一先撤销 generation，再取消音频/关闭 coordinator；完成后即使 Activity 仍绑定也会清除 FGS 通知并留下可重开的 stopped/error 状态。回调在主线程执行副作用时再次检查 owner 和 generation。监听打开状态显示“接收已准备，等待电脑连接”。
+- OutputCard 使用原生 Vector 电脑/手机图标并保持装饰图标不重复读名；卡片、主按钮和网络选择按钮采用内容自适应高度并保留至少 48dp 触控高度。
+- 修复源码提交：`9a2d97d5560532428bf6eef4bfc9d69316f50f1b`。独立候选 `artifacts/v3-v1-receiver-review-2/receiver.apk`，SHA-256 `6805e13e6149fbceeab5ad23a9d9f974d2112255a4df5132b45d6c774023bb8b`；签名仍为已审计 debug signer `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。打包脚本完整构建与包审计：PASS，metadata 源码提交与上列源码提交一致。
+- 真机 Binder 生命周期、通知权限交互、TalkBack、放大字体/横竖屏视觉和真实播放均未运行，保持 **NOT_TESTED**；未使用 ADB、模拟器或手机。
+
+
+### Receiver v3 V1 `startId` lifecycle correction (2026-10-13)
+
+- `ReceiverService` separately records the latest Android-delivered `startId` before every early return; operation ownership retains its own `operationStartId`. After current-owner resources are cleaned up, the started lifecycle stops using the latest delivered ID, including a higher ignored management request.
+- A late cancelled `UI_START` is rejected before foreground-service work. It stops through the latest delivered ID only when there is no active operation; an active newer owner suppresses that stop decision.
+- `ReceiverUiOperationCheck`: PASS. Covers late rejected start cleanup, suppression while a newer owner is active, and an ignored management ID being included when the owner terminates.
+- Final debug APK: `artifacts/v3-v1-receiver-review-3/receiver.apk`; SHA-256 `2b2c3c5c80f33b4d999e3445c83d78150df506b6e6608425966500db7c6872d1`; source commit `55fa1b070c7c6386f0298f4b263c52ff129b8817`; metadata source commit and APK digest match. Package: `app.anpod.receiver`, version `0.4.0-v3-candidate`, versionCode 4, targetSdk 35, debug signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`.
+- Android-delivered `startId` and foreground-service behavior remain **NOT_TESTED** on a device. No ADB, emulator, or phone operation was performed; installation prompts and device installation remain **NOT_TESTED**.
+
+### V2 Receiver backend handoff (2026-10-13)
+
+- Canonical backend setting contract: `transport=usb|wireless`; wireless selection separately persists `wirelessProtocol=udp|adb`, defaulting new settings to UDP. A legacy saved `preferredTransport=Wifi` with no protocol field migrates to ADB; explicit `udp`/`adb` remains unchanged. The old `ANPOD_AUDIO_BACKEND=installed-receiver` opt-in is migrated only when the new `audioBackend` field is missing. Snapshot adds `connectionTransport=usb|wireless` plus active-session transport/protocol fields; the current frontend's `transport=usb|wifi` and `preferredTransport` remain compatible aliases.
+- Active `reconfigure_session` validates `transport`, `wirelessProtocol`, `audioBackend`, and `playback` values before beginning an operation. A route change cleans the old owner/session before reconnecting to a known same-device target. When UDP endpoint/binding/interface information or an ADB device is missing, it returns to computer output with an explicit ready/pending-selection status; UDP does not guess a peer or fall back to ADB. Monitoring and automatic reconnect honor the saved wireless protocol, while explicit `connect_device*` commands remain ADB operations.
+- `connect_device` / `connect_device_only` / `switch_device` are ADB commands. The existing `start_network_audio` entry explicitly selects the authenticated UDP path. `audioBackend=receiver|legacy` is a separate persisted choice, not a wireless protocol. Receiver uses the existing ADB reverse + LocalSocket schedule on USB or wireless ADB; failure cleans the selected path and does not retry Legacy.
+- The USB default remains Legacy because the minimum real-device Receiver smoke is unavailable and no USB default migration has been performed. Selecting the Receiver backend explicitly is available for source-level review. ADB preflight accepts only exact local or audited same-signer APK identities, compares service health with the installed artifact's version (so a newer compatible Receiver is not rejected by an older PC target), blocks older targets, and requires exact target APK digest after install.
+- Operation/session generations, owner teardown, output restoration, 20/40 ms PC queue bounds, Android jitter reserve, AudioTrack settings, FORMAT checks and playback-head stale/wrap fixes remain unchanged. The existing stale PCM callback test now checks both rejection of the old session sample and acceptance of the current session sample.
+- Targeted V2 checks: prior unchanged fake ADB group passed 12/12. After the routing/migration changes, `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --bin anpod-tauri state::tests::` passed (14 passed, 1 ignored), covering legacy Wifi-to-ADB migration, explicit protocol preservation, auto-ADB gating, selection validation, and stale operation completion. `ReceiverUiOperationCheck` passed with bootstrap STOP owner routing and duplicate-stop coverage; `:app:compileDebugJavaWithJavac` passed. The compile needed elevated local execution because sandboxed AAPT2 resource linking exited unexpectedly. No APK/ZIP rebuild, full portable build, real ADB/phone operation, or audio playback test was performed. USB Receiver smoke and Binder/foreground-service STOP runtime remain **NOT_TESTED**.
+
+### V2 desktop connection selection UI (2026-10-13)
+
+- Connection controls now use canonical `connectionTransport=usb|wireless`; wireless exposes separate `wirelessProtocol=udp|adb` choices. Idle changes persist through `update_setting`; older `preferredTransport=Wifi` migrations are rendered from backend settings and are not overwritten on load. Active selections use `reconfigure_session` and apply its returned snapshot. Displayed active route labels use `sessionConnectionTransport/sessionWirelessProtocol`.
+- UDP intent routes the phone output, add-phone, device-card action and device list to the existing Receiver network dialog; it does not expose Wi-Fi ADB devices or call `connect_device*`. ADB intent reuses the existing wireless-debug pairing/address flow and explicit ADB connect commands. Candidate addresses remain labelled unverified and require an explicit connect action. Normal UDP bootstrap remains USB-only. The secondary-menu Receiver manager requires explicit selection from authorized, online USB or wireless ADB devices, calls `receiver_status` without network-interface/binding discovery, and only calls `receiver_install` after an explicit install click; it cannot start UDP. Receiver/Legacy remains a separate preference, with USB default Legacy.
+- UDP intent or active UDP session shows a fixed Receiver backend and hides the irrelevant Legacy/Receiver selector without changing the saved preference. Missing UDP interface/binding/endpoint leaves the backend's ready/computer-output snapshot in place and opens the existing network selection dialog; no peer is guessed and there is no UDP-to-ADB fallback. Busy states disable duplicate selection; when cleanup is pending, connection switches stay disabled but the device-card action still allows a retry of `disconnect`. Cancelling confirmation leaves the backend selection unchanged.
+- Frontend verification: TypeScript project build (`tsc -b`) PASS; Vite production build PASS (1,911 modules). No browser/mock interaction or visual viewport check was run: the repository has no mock snapshot entry, and outside the Tauri runtime the page remains on its startup screen. USB/ADB/UDP connection behavior and audio remain **NOT_TESTED** in this UI turn.
+
+### V3 authenticated negotiation and bidirectional discovery (2026-10-13)
+
+- P5-C authenticates P5-A first, then negotiates management control major 3, audio major 1, and the implemented `receiver-ui` / `authenticated-status` bits before BIND/START. Unsupported control, missing required management bits, replay, malformed payload, invalid HMAC, or management-incompatible capabilities terminate that owner without retry or downgrade. If management is compatible but audio is incompatible, the authenticated owner remains online in management-only state on computer output; it sends no BIND, START, or PCM. `versionCode` remains informational and APK update is not advertised.
+- V2 discovery records reuse UDP port 49772. Android binds its discovery sockets to the explicitly selected Android `Network`, with its receive socket bound wildcard; it searches for ten seconds and exposes candidate/request state through the existing private service Binder. PC offers are enabled only by an explicit command while saved transport is Wifi + UDP. The PC receive socket also binds wildcard on 49772, filters source port and subnet against the selected private IPv4 interface, and sends replies through a socket bound to that selected local address. Both directions correlate nonce/source/port, expire pending requests, and reject replay. A candidate remains unauthenticated until the user chooses a saved binding and explicitly accepts; then the PC initiates P5-A.
+- Targeted verification: Rust/Java localhost P5-C negotiation and cleanup `PASS`; the merged loopback check now runs the Java search/PC-candidate/CONNECT_OFFER/cancel path against the Rust host listener; Rust offer replay and expiry checks `PASS`. Android `:app:compileDebugJavaWithJavac` `PASS`. The selected-Network/wildcard binding and PC wildcard-receive/selected-interface-reply behavior are verified in source and localhost checks; these checks do not verify actual LAN broadcast delivery, Binder interaction, or device network-loss revocation. LAN/hotspot discovery, Android runtime, real P5-A, audio output and installation remain **NOT_TESTED**.
+
+### V3 P5-C isolated candidate device install and Launcher check (2026-10-13)
+
+- Candidate `artifacts/v3-p5c-role-fix-review-1/receiver.apk`: package `app.anpod.receiver`, version `0.4.0-v3-candidate` / code 4 / targetSdk 35; source commit `b3e57077c61be64c6f0db3b1c1fad61080d40313`; APK SHA-256 `48d0ff9d6b4437343dedb97c752143b84969ceb72d9c2a9579850cd59f545345`; debug signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`.
+- The first authorized `adb install -r` returned `INSTALL_FAILED_ABORTED: User rejected permissions` while the phone was locked. After the user unlocked the phone and explicitly authorized one retry, the same in-place update returned successfully. Read-back reported code 4 and version `0.4.0-v3-candidate`; pulling the installed `base.apk` and hashing it produced the exact candidate SHA-256 above. No uninstall, data clear, permission grant, downgrade, or additional install attempt was performed.
+- Launched the existing `MainActivity` and visually inspected its Launcher screen. It showed “等待连接” and the expected candidate version; `ReceiverService` was bound for its UI snapshot, with `startForegroundCount=0`. The screen reported no available private IPv4 interface, and both network-interface selection and “开始接收” were disabled. ADB showed Wi-Fi enabled but only loopback had an IPv4 address. No BIND, START, audio, or network-discovery operation was triggered.
+- After the user connected the phone to the PC hotspot, Android reported a private `wlan0` IPv4 address and `/24` prefix; the UI listed and selected that interface. Pressing “开始接收” changed the screen to “接收已准备，等待电脑连接”; the foreground notification/service became active and UDP 49772 appeared in the socket list. No audio session started (`actualMode` was still not reported), and no user audio was played.
+- Pressing the existing UI “停止接收” ended the started service lifecycle. After cleanup, `startRequested=false`, the foreground-service state was gone, and UDP 49772 no longer appeared in the socket list. Returning the Activity to Home then removed the bound `ReceiverService` record as well; no receiver listener remained active.
+- The current Launcher explicitly says computer search is not open. Although the PC Tauri commands for `set_wireless_connection_offers` and `accept_wireless_connection_offer` are registered, repository search found no frontend caller; the Android Binder `startSearch`/`requestConnection` methods likewise have no Launcher controls. The available authenticated `start_network_audio` route can start the audio path, so it was not used as a substitute for a management-only P5-A/capability query.
+- Result: package install, Launcher rendering, hotspot interface preparation, UI start, and UI STOP/socket cleanup **PASS**. Actual Android↔PC V3 broadcast discovery, real P5-A/capability query, active-session cancellation, network-loss cleanup, and candidate audio output remain **NOT_TESTED** because neither product UI exposes the required discovery/request controls or management-only authenticated query path. P5-C localhost Java/Rust and source-level checks remain separate evidence and are not device results.
+
+### V3 bidirectional discovery UI (2026-10-13)
+
+- Android: start Receiver on a selected private IPv4 interface; verify the interface picker is locked while running, then start/stop the ten-second PC search. Candidate rows must show only the address and an unverified hint; select a row and explicitly request connection. Verify errors are visible, the button reports a sent request, and leaving/reopening the Activity shows service state without stale callbacks or a second Receiver session.
+- Desktop: from the wireless UDP network dialog, explicitly select an interface and allow phone searches. Verify the main window retains a visible stop control after closing the dialog; changing interface/transport/protocol and changing or accepting the listener are disabled while an audio session is active.
+- Desktop offers: when one current interface, saved binding, or unexpired request exists, verify it is preselected; multiple choices remain explicit. Keep still-valid choices across snapshot refresh and clear a request selection when that request expires. The single selected request remains unauthenticated until the user clicks **接受并连接所选手机**. Its PC acceptance window is 30 seconds from `CONNECT_OFFER` receipt; Android search nonce expiry remains 10 seconds. Search/accept controls stay disabled during an audio session or update lock.
+- Management-only session: verify computer output remains selected, the phone output is disabled, and the status never says phone-ready or streaming. Capability majors, compatibility flags, capability bits, and Receiver version code belong only in Diagnostics. No network APK update control is present.
+- Source verification: TypeScript project build and Vite production build **PASS**. `packaging/build-receiver.ps1` **PASS**, including Kotlin/Java compilation, merged-manifest/package checks, signature verification, and metadata write. Isolated APK: `artifacts/v3-ui-review-1/receiver.apk`, package `app.anpod.receiver`, version `0.4.0-v3-candidate` / code 4 / targetSdk 35; SHA-256 `b52a326f234ab84d6aba9b5ffbb840e75f90a101cb5479461da7a53d184a4abb`; signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`; metadata source commit `8f868708a83a32973be902fabf7dc8357f3c55a6`.
+- Device update: before installation, the installed code-4 APK digest matched the isolated `b3e5707` candidate exactly. One same-signature `adb install -r` succeeded after Android's `PackageInterceptActivity` confirmation; the installed package now reports code 4 / `0.4.0-v3-candidate`, and its `base.apk` SHA-256 exactly matches the new candidate (`b52a326f234ab84d6aba9b5ffbb840e75f90a101cb5479461da7a53d184a4abb`). User data was preserved; no repeat install, uninstall, data clear, or permission bypass was used.
+- Android visual lifecycle check: the installed Launcher showed the Receiver search section with an enabled “搜索电脑” button only while Receiver was prepared on the selected hotspot's private IPv4 interface. The button was not pressed; no LAN search, P5-A, or audio started. Pressing “停止接收” returned the page to “等待连接” and `ReceiverService.startRequested=false`. After Home and reopening MainActivity, it rebound cleanly with no started Receiver service and no stale search controls. At reopen Android reported no available private IPv4 interface, so “开始接收” was disabled; network settings were not changed.
+- Desktop visual/browser check, LAN discovery, real P5-A/capability query, and audio remain **NOT_TESTED**. No AnPod desktop process was running for this device check.
+
+### V3 PC review candidate hotspot smoke (2026-10-13)
+
+- Built the isolated Windows x64 portable candidate from desktop commit `840b457a664d8249e9f9b672b02ef708c55cced3`. Package: `artifacts/AnPod-1.0.4-receiver-v3-candidate-review-tauri-win-x64-portable.zip`, 17,745,536 bytes, SHA-256 `2258b3eaf5c37e86eb9d54961487eb8ddd97f30fee4c2302268be0c56fbfa0d8`. The ZIP audit found 31 entries, 18 license/notice entries, and no prohibited paths or private plan files.
+- Used a child-only isolated `LOCALAPPDATA` copy for desktop settings and the encrypted Receiver binding; the original user data was left untouched. The candidate showed Receiver `0.4.0-v3-candidate`, version code 4, installed on the phone, but its service was not running.
+- **PARTIAL PASS:** selected the PC hotspot interface, enabled the ten-second discovery listener, and confirmed the phone could find the PC and send its first connection request. The desktop displayed the request as unauthenticated and the saved binding was selected. The offer expired before acceptance, so no authenticated session was established.
+- **FAIL / NOT COMPLETED:** the subsequent paired-phone attempt reported that no Receiver answered on the selected interface; another attempt surfaced `BootstrapTimeout`. The desktop still reported the Receiver service stopped. No P5-A/capability query, audio output, or session cleanup path was reached. The listener was stopped; no pending offer or active Receiver session remained.
+- Usability follow-up from the user: reduce the manual mode/interface/listener/request steps and automate discovery/connection where possible, while keeping the first unauthenticated request subject to explicit acceptance.
+- Hotspot follow-up after the listener was enabled: the phone's resent request appeared on the PC as an unauthenticated offer. After the user authorized acceptance, AnPod returned to its main screen showing **Authenticated · waiting for phone playback confirmation**, wireless UDP, and 0 bps. Discovery delivery and the authenticated connection handshake **PASS**; audio playback and capability-query verification remain **NOT_TESTED**. The installed Receiver remains code 4; the new code-5 review APK was not installed, and no desktop package was rebuilt.
+
+### V3 hotspot request-window and Receiver bootstrap fix (2026-10-13)
+
+- Source fix: the PC now gives each received unauthenticated connection offer a separate 30-second acceptance window; the 10-second search nonce window remains unchanged. This addresses the observed offer expiring before the user could accept it. The first request still requires explicit PC-side acceptance before P5-A.
+- Source fix: UI-owned Receiver network preparation now waits up to the existing 120-second operation bound, while the ADB bootstrap path retains its 25-second timeout. The verified code-4 V3 Receiver artifact is recognized by exact digest and signer so code 5 can be offered as a same-signer update.
+- Targeted Rust tests `selected_interface_listener_correlates_single_use_connection_offers` and `receiver_identity_compatibility_and_update_decisions_are_independent` **PASS**. Android `:app:compileDebugAndroidTestJavaWithJavac` and `:app:assembleDebug` **PASS**.
+- Isolated review APK: `artifacts/v3-host-smoke-fix-review-2/receiver.apk`, package `app.anpod.receiver`, version `0.4.1-v3-candidate` / code 5 / targetSdk 35; SHA-256 `da69435dae3b521a02db030b8c4351ab2dde0af7df64062c3eed018124bb1e8a`; signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`; metadata source commit `5c726672250413cf55da7e874a820fd1126e793c`.
+- No phone reinstall or new desktop package was performed. Hotspot discovery after these fixes, authenticated P5-A/capability exchange, audio, and the shortened/automated connection UI remain **NOT_TESTED**. The user's request to reduce manual discovery/connection steps is carried forward; the first unauthenticated request remains explicitly confirmable.
+- The user then confirmed that audio was audible on the phone. During that playback, the PC preview package built from source commit `840b457a664d8249e9f9b672b02ef708c55cced3` showed authenticated wireless UDP playback and approximately 1.66 Mbps PCM payload rate. The phone still had Receiver code 4 (`b52a326f…` installed artifact); this confirms the existing connection/authentication/playback path only, not the new 30-second offer window, code-5 installation, or real-device capability fields. No new acoustic latency or long-term stability conclusion was measured.
+
+### V4 Receiver network update backend source checks (2026-10-14)
+
+- P5-C authenticated update frames, bounded private staging, hash/package/version/signer validation, PackageInstaller handoff, status persistence, and host-side authenticated reconnect/completion confirmation are implemented in the backend. APK `versionCode` is 6. The update capability is advertised only when the Android endpoint can use PackageInstaller for this source.
+- Targeted Rust checks: **PASS** (atomic concurrent reservation, exact compatible-version/transaction confirmation checks, Java↔Rust authenticated transfer/status/completion, commit ACK loss retained as pending, cancellation state, and staging cleanup). The merged endpoint uses the production authenticated parser/stager. Android receiver Java sources compile with JDK 17 against SDK API 35 `android.jar`: **PASS**. Actual Gradle `:app:compileDebugJavaWithJavac`: **PASS** after elevated local execution; no APK was built.
+- Real V4 PackageInstaller install/confirmation callback, Android status persistence across process restart, and device-side reconnect/completion remain **NOT_TESTED**. A later attempt through the V3 preview package could not reach the stopped/unreachable Receiver service and left phone output disabled; it provides no playback result and does not change the earlier user-confirmed UDP audio result. No USB/bootstrap was triggered.
+
+### V4 Receiver network update backend review fixes (2026-10-14)
+
+- Fixed the PackageInstaller status PendingIntent mutability on API 23–30; moved APK verification and session streaming out of the manager state lock; definite synchronous commit failures now abandon the uncommitted session and clear staging, while accepted commits remain pending for Android's asynchronous result.
+- Append failures now close and clear the staging transaction while preserving cleanup diagnostics, allowing a later update transaction. Foreground demotion checks the active owner/generation and current persisted update phase and uses the API 26 notification-channel guard.
+- PC treats a successful COMMIT ACK as `Installing` until an authenticated status query reports Android's result; phase order prevents stale status rollback. Pending update confirmation is tied to its saved Receiver binding. `AppSnapshot` exposes `receiverUpdateBindingRef` alongside `receiverUpdate` so UI can hide another phone's update and avoid offering its cancel action.
+- Targeted Rust update/binding checks: **PASS**, 4/4. Java↔Rust authenticated P5-C localhost check: **PASS**, 1/1; the production `transfer_update` path and status-query sequence `Installing` → `AwaitingUser` → `AwaitingReconnect` → `Completed` passed with exact target-version confirmation, plus failed-staging cleanup and retry. No Android source changed in this review-fix turn, so the previously passing Java/Kotlin compile is reused; no APK was built or installed. PackageInstaller callback, process-restart recovery, and real-device update confirmation remain **NOT_TESTED**.
+
+### V4 Receiver update UI (2026-10-14)
+
+- Desktop update candidate is read from the packaged, locally verified Receiver artifact and is returned only for the active authenticated network binding when the installed endpoint advertises compatible `apk-update-v1` and the candidate is newer. Start requires a review dialog; it explains playback stop, computer output restore, and Android system confirmation. Progress and cancel/stop-waiting actions use the real Receiver update snapshot and its binding. Main output, connection, device, and playback controls are disabled while that binding has a nonterminal update.
+- Android Launcher displays the actual update phase, byte transfer progress, target version code, and system-reported errors. The install-source button appears only when PackageManager reports that this app cannot install packages; the system-confirmation button appears only when Android reported `AwaitingUser` and the PackageInstaller confirmation Intent is present. Neither system screen launches automatically.
+- Historical note: during an earlier install attempt, the user replied **未看到** to a USB installation confirmation prompt. No installation prompt or confirmation was requested during this V4 UI review; no device or ADB action occurred. The V4 system confirmation and install-source settings flows remain **NOT_TESTED**.
+- TypeScript project build and Vite production build: **PASS**. Android Kotlin/Java source compilation previously passed only with resource processing excluded and a temporary `R` stub; this does not count as a complete Android build. Rust IPC compilation is rechecked from the existing local cache for this review. No APK or desktop package was built in this phase.
+- V4 UI review fixes: the saved update binding and its recovery action remain reachable after closing the manager; a completed update is not offered again at the same version; an update belonging to another binding cannot lock or cancel the current session. Candidate display and retry now use the active authenticated session even before a saved update record exists. Playback mode no longer shows the obsolete disconnect instruction, and output cards use icon-left/name-right layout.
+- Existing frontend browser harness, scoped to mocked Receiver update snapshots and layout at 420×590 and 360×500 in light/dark themes: **PASS**; no page errors or horizontal overflow. This checks simulated UI only. It is not Android installer, USB prompt, real-device, or audio evidence. Final `tsc -b`, Vite production build, and cached offline Rust `cargo check --locked` all **PASS**; Rust reports 12 existing dead-code warnings. No Android source changed, no Android build was repeated, and no package was built.
+
+### V5 Receiver observability and lifecycle source checks (2026-10-14)
+
+- Added negotiated authenticated P5-C `PLAYBACK_PROGRESS_QUERY` (type 16), capability bit `0x00000008`, and the fixed 70-byte diagnostic extension after the unchanged 13-byte ACK. `protocol.md` now documents exact offsets, widths, frame units, unknown sentinels, capability gating, and the one-second host query cadence. Legacy endpoints receive no query.
+- Connected protected USB health metrics to the same `playbackDiagnostics` AppSnapshot field as P5-C. USB host format comes from the current audio session; PC queue/drop fields remain unknown when not collected. Both paths compute underrun increment from cumulative count samples in the same session; first samples and counter resets are unknown. The Provider's historical `underrunIncrement` remains available but is not treated as that query-window delta.
+- Receiver notifications now provide owner/generation-bound Stop during UI and ADB network bootstrap as well as active playback. `ReceiverUiOperationCheck` covers rejection of stale owner and stale generation Stop attempts. App notification taps retain the single-top MainActivity path; update notifications keep their existing system-confirmation/cancel behavior.
+- `packaging/build-receiver.ps1` now guards the V5 candidate as `0.6.0-v5-candidate` / code 7. No package metadata/APK was generated in this source batch.
+- Rust P5-C tests: **PASS**, 4/4 including Java↔Rust authenticated localhost; USB diagnostic merge/session interval test: **PASS**, 1/1; health parser unknown-value test: **PASS**, 1/1. JDK `ReceiverUiOperationCheck`: **PASS**. Android Gradle Java/Kotlin compile with real resource processing, no `R` stub: **PASS** in an isolated build directory. No APK was assembled.
+- Real-device notification stop/stale-generation behavior, V5 metrics on phone, and lock-screen interaction remain **NOT_TESTED**. No phone, ADB, desktop AnPod UI, package installation, or audio routing was used in this source-only batch.
+
+### V5 desktop playback diagnostics UI (2026-10-14)
+
+- The existing secondary Diagnostics dialog now reads the single `playbackDiagnostics` field from `AppSnapshot`; it adds no polling path. It presents separate PC and Receiver formats, frame-count queue/drop data, AudioTrack pending/underrun values, and requested/accepted/effective/capacity/start-threshold/pre-roll buffers. Optional `null` values show `未提供`; measured zero remains `0`. Frame values are not converted to latency or combined across endpoints.
+- The dialog labels diagnostics as the latest snapshot and distinguishes computer output, paused playback, Receiver update, and no active session from current phone playback. Missing UDP diagnostics explain that the Receiver may be old or not have negotiated the capability; connection/playback continue. No keys, transaction IDs, or local paths were added.
+- Existing browser harness, one merged mocked-snapshot scenario at 360px: **PASS** for USB and UDP formats/queues, null versus zero, buffer labels, paused-state wording, unsupported old UDP capability, no-session wording, keyboard focus inside the modal, and no horizontal overflow. The inspected compact screenshot is `.tmp-frontend-check/receiver-diagnostics-compact.png`; the long metrics view scrolls vertically. This is simulated UI evidence only, not evidence of device playback or real Receiver values.
+- TypeScript `tsc -b` and Vite production build: **PASS**. Rust and Android sources were unchanged; reuse the V5 Rust/P5-C and real-resource Gradle compile results above. No phone/ADB/PC audio operation, APK/desktop package build, or installation was performed; actual V5 metrics on the device remain **NOT_TESTED**.
+
+### V6 PC wireless request flow UI (2026-10-14)
+
+- The PC search area now reuses the selected connection interface and saved binding. A single available interface/binding/request is preselected; multiple items remain explicit. A request list, 30-second PC acceptance message, selected binding summary, and explicit **接受并连接所选手机** action are in the dialog's primary area. Search is never enabled automatically; an unauthenticated request is never accepted automatically. Existing backend offer acceptance and P5-A authentication paths are unchanged.
+- Existing browser mock harness, one merged flow: **PASS** for single-item defaults, duplicate selector removal, listener not starting on open, valid selection retention and invalid selection revocation after refresh, automatic preselection without acceptance for one request, multi-request manual selection and refresh retention, expired request deselection, explicit acceptance payload, 30-second PC message, plus active-session and Receiver-update locks. Mocked browser only; real PC/phone discovery, 30-second wall-clock expiry, and audio remain **NOT_TESTED**.
+- TypeScript `tsc -b` and Vite production build: **PASS**. No Rust, protocol, Receiver, or Gradle source changed. No APK or portable package was built; no real AnPod window, phone, ADB, audio, or network was operated.
+
+### V6 本地候选构建与合并包审计（2026-10-14）
+
+- 本地 Tauri 生产候选从源码提交 `88bc3d0b89589aebf85f8cefa96824c0718a696e` 构建，使用全新隔离目标 `artifacts/v3-v5-candidate-tauri-target`。`publish-tauri.ps1` 的 Cargo release 调用带 `--locked --offline`，其非零退出会直接抛错；流程已到达最终 ZIP 和 SHA-256 输出，故 Cargo 生产构建通过。包装器没有保留可单独读取的数值退出码。
+- Receiver 候选 APK：`artifacts/v3-v5-candidate-receiver/receiver.apk`，源提交 `6c73a95d2a27b9e13db96572bae348d4f3434468`，`app.anpod.receiver`、code 7、`0.6.0-v5-candidate`、targetSdk 35、debug 签名；9,773,790 bytes，SHA-256 `d4a00b25ef5b023b9c2a2afc30763e2c9d99095077b9f767b349562fe1cf6381`，签名证书 SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`。Android code 6 更新种子另存于 `artifacts/v4-v6-network-update-seed/receiver.apk`，源提交 `20f2389af0526ebdbc20924cad42570ce51110ce`，9,773,796 bytes，SHA-256 `c514dfd555aa2734178131db47037875cf1086d934b45639b799471297668be3`，同签名证书；该种子未放入 portable ZIP。
+- Portable 目录：`artifacts/AnPod-1.0.4-receiver-v3-v5-candidate-review-tauri-win-x64-portable/`；ZIP：`artifacts/AnPod-1.0.4-receiver-v3-v5-candidate-review-tauri-win-x64-portable.zip`，17,852,741 bytes，SHA-256 `3cf78f40e4f14d50c1457525e5976e2783a05691e95ab560ff2c3f6d9da2fe25`。ZIP 有 31 个文件，与 staging 目录 31 个文件逐项 SHA-256 一致；build metadata 与文件实测一致。桌面 `AnPod.exe` 为 12,210,688 bytes，SHA-256 `1d5e493cf64a0c1226b12b2b5527d77fee9f181bb19bccc86aa0f8268232d31a`。
+- Native `audio_capture.dll` 与 Legacy `server` 复用已审查源码提交 `608c98c75ec04e11555e9e547caa516c96d4e0dd` 的二进制，SHA-256 分别为 `eeda608983ef520f281d72c4f0021634b4e87c251ab83dea7f8dcb413068761e`、`9552af169e4c2b2ab82c39719d3afd7c2c5dd729551d8d487e836013eeb9cfa3`；ZIP 内副本哈希一致。
+- 离线合并审计：归档路径安全检查、禁入文件名与本机私有路径扫描 **PASS**，未发现匹配项；APK 嵌套内容含 Android manifest 与签名元数据；`LICENSES` 16 个来源文件、`upstream` 2 个来源文件、`THIRD_PARTY_NOTICES.md` 均与仓库逐字节一致，无遗漏或额外许可证文件。`aapt` 确认 minSdk 23 / targetSdk 35；`apksigner verify --print-certs` **PASS**，证书摘要与 metadata 一致（工具另对未受 JAR 签名覆盖的 META-INF 信息文件发出警告）。
+- 本条只证明本地构建和归档审计。此次代码 7 候选安装/启动、USB/UDP 实机连接与手机出声、code 6→7 Android 安装确认/更新恢复、锁屏通知生命周期仍为 **NOT_TESTED**；不将历史试听或旧测试音计为本候选验收。
+
+### PC flow 精简候选包（2026-10-14）
+
+- 包含已审查的 PC flow 提交 `5a614573c8d6ff8313e681b771a0baa10a9ae06f`；包装器仅将 V3 review 输出重命名为 flow 专属路径，并写入候选标识 `receiver-v3-v5-flow-candidate-review`。包装器改动提交 `ae99285f55d3623fefbcd3b86a1464a4142a27d6`；portable metadata 的 desktop `sourceCommit` / `buildCommit` 均为该提交。
+- 输出目录：`artifacts/AnPod-1.0.4-receiver-v3-v5-flow-candidate-review-tauri-win-x64-portable/`；ZIP：`artifacts/AnPod-1.0.4-receiver-v3-v5-flow-candidate-review-tauri-win-x64-portable.zip`，17,852,857 bytes，SHA-256 `ff24fb5e7516d44fec855d7bd789882136ec9d0c17550bfa547e7235bddce94c`。桌面 `AnPod.exe` SHA-256 `fddc89e133f4482cb55d30eac6dc16ca0e9dbc4713b60957b8829bb7fb1ce5aa`，与隔离目标 `artifacts/v3-v5-flow-candidate-tauri-target` 中 release executable 相同。
+- 首次包装器调用在 `apksigner.bat` 预检处因当前进程未设置 `JAVA_HOME` 停止，未进入 Cargo 构建，也未生成目标产物。使用已存在的 JDK/SDK 进程环境后，唯一一次生产构建退出码 **0**；Vite 构建 **PASS**（1,911 modules），Cargo release **Finished**（1m 38s，12 条非致命 dead-code warnings）。
+- 复用的 Receiver code 7 APK 保持 9,773,790 bytes，SHA-256 `d4a00b25ef5b023b9c2a2afc30763e2c9d99095077b9f767b349562fe1cf6381`，来源 `6c73a95d2a27b9e13db96572bae348d4f3434468`，debug signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439`；Android code 6 更新种子继续保留在 `artifacts/v4-v6-network-update-seed/receiver.apk`，未重建。Native/Legacy 复用 `608c98c75ec04e11555e9e547caa516c96d4e0dd` 的已审查产物，哈希不变。
+- 最终归档 **31/31** 条目与 staging SHA-256 一致；ZIP 路径安全、禁入文件名与本机私有路径扫描 **PASS**，无发现；`LICENSES` 16 个来源文件、upstream 2 个文件及 `THIRD_PARTY_NOTICES.md` 逐字节一致。已存在的 V6 ZIP 未覆盖，SHA-256 仍为 `3cf78f40e4f14d50c1457525e5976e2783a05691e95ab560ff2c3f6d9da2fe25`。
+- 本轮没有重跑已通过的合并 mock、Android 或旧协议测试；没有构建桌面包或安装 code 7 APK。此 flow 候选后续真实认证和音频实测见下方 R2 记录；系统 code 6→7 更新确认/恢复及锁屏通知生命周期仍 **NOT_TESTED**。
+
+### Receiver 一键连接 UI（2026-10-14，待真机验收）
+
+- 空闲且已 USB 绑定时，手机只需点击一次 **连接电脑**；验证服务快照进入同一 `operationId` 的 `prepared` 后，搜索只启动一次。通知权限缺失时仍须 Android 系统授权；拒绝授权时不启动服务或搜索。
+- Receiver 已处于 `prepared` 时，点击主按钮应直接开始搜索且保持原 `operationId`；搜索中点击主按钮可停止搜索。打开或重开页面不会自动扫描。
+- 搜索结果每一行都提供明确的 **请求连接此电脑** 操作；发现或选中候选本身不发送请求。发送后需等待 PC 明确接受，候选地址始终视为未认证输入。
+- 验证多个可用网络接口初始不自动选择；单接口可预填。界面重开且服务运行时显示服务快照中的实际接口；已有效选择在刷新时保留。
+- 验证已认证、播放/暂停、Receiver 更新期间不可再次发起连接；停止、启动失败或 Activity 离开/重开后，不会因旧连接意图自动开始搜索。服务失败文案优先于本地发送提示，并显示为错误。
+- 源码编译：JDK 17 / SDK 35 隔离目录下，`:app:processDebugResources`、`:app:compileDebugKotlin` 和 `:app:compileDebugJavaWithJavac` **PASS**；Java 编译报告 deprecated API 提示。未 assemble APK。
+- 本条真机验收步骤尚未在手机、PC 或 ADB 上执行；Receiver 一键连接、生命周期取消、网络接口恢复及音频均 **NOT_TESTED**。
+
+### R2 无线认证与音频反馈（2026-10-14）
+
+- 核实电脑上唯一运行的程序为已审查的 flow 候选：SHA-256 `fddc89e133f4482cb55d30eac6dc16ca0e9dbc4713b60957b8829bb7fb1ce5aa`，metadata 源码/构建提交 `ae99285f55d3623fefbcd3b86a1464a4142a27d6`。手机仍安装 Receiver code 6，签名为已核验的 `f5`，本次未重装。
+- Receiver code 6 的已认证 P5-C `CAPABILITIES_INFO` 报告管理协议 3、音频协议 1、兼容、能力位 `0x7`。这证明已认证 INFO 及 `apk-update-v1` 能力已宣告；code 7 更新预检、传输和安装确认仍为 **NOT_TESTED**。
+- 用户确认手机可听到声音，但低延迟模式有卡顿/破音。48 kHz 实测快照中的 effective/start/jitter 缓冲为 720/240/960 帧，欠载从 3973 增至 5254、6084；过期帧从 1,714,320 增至 2,182,080、2,470,560。用户反馈均衡模式有所改善但仍偶发；其快照为 2400/—/720 帧、34 次欠载、29,040 个过期帧。这不构成音质通过。
+- 播放后 Receiver 报告 `healthy=false`、`audioActive=false` 和 `listener_failed`。本地 Java/localhost 检查复现了发现监听器初始化/会话结束恢复竞态；协调器修复后检查通过。修复尚未安装到手机复测；本源码批次未构建 APK 或桌面包。
+### Code 8 本地候选（2026-10-14）
+
+- Receiver 实际完整构建来源 `d7e5ed5c44d670f6a327ca6b8f04cf50339d7d63`，版本 `0.7.0-v3-flow-candidate` / code 8，minSdk 23 / targetSdk 35。唯一一次隔离 `assembleDebug` **PASS**（42 秒），包含真实资源、Kotlin、Java、DEX 和签名处理；APK 9,773,791 bytes，SHA-256 `6d631a768931367dbca3c6851584cd421fba10ab00dd03cba3a52d2d71d46baa`，候选 signer SHA-256 `f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439` 与已安装 code 6 连续。
+- 独立 ZIP `artifacts/AnPod-1.0.4-receiver-v3-mobile-flow-candidate-review-tauri-win-x64-portable.zip`，17,855,967 bytes，SHA-256 `0126c9f40e3cbafc7fc82815a18029a1ca256151fa29c7a9b46ed41350239936`。组合包记录提交 `5237aeecd2269030b9ad796634962f65983b9ac2`；PC 实际生产来源仍为 `ae99285f55d3623fefbcd3b86a1464a4142a27d6`，EXE `fddc89e133f4482cb55d30eac6dc16ca0e9dbc4713b60957b8829bb7fb1ce5aa`，没有重新编译 PC。
+- 已核对 PC 输入及原审核范围的 Native / AndroidServer / AndroidProtocol 输入未变。Native 与 Legacy 文件保持 `608c98c75ec04e11555e9e547caa516c96d4e0dd` 来源及原审核哈希；原 flow 和 V6 ZIP 哈希未变。
+- ZIP 与 staging **31/31** 项逐字节一致，27 项与原包未变；只更新 APK、receiver.json、build-metadata.json、README。来源、版本、签名、APK 实际新界面/恢复代码、归档路径及禁文件检查 **PASS**；新文件与 APK 内部文件的私有构建路径扫描 **PASS**，未变许可/notice 复用原审核。
+- 新候选尚未部署；网络 code 6→8 系统授权/确认、安装后认证版本证明、修复后的手机恢复/音质及两步 UI 真机操作仍 **NOT_TESTED**。旧 code 6 的出声和均衡改善不能代替新包验收；偶发卡顿仍未解决，未新增声学性能结论。
+
+### USB / 一键连接候选真机反馈（2026-10-15）
+
+- 本次为新的 usb-oneclick-review PC（EXE SHA-256 `9ade3a2a3ddf18565515d01ff6a3409563059a9c70a950a52dc1cfa6be54e3fd`）与 Receiver code 9；不沿用旧 code 6/8 的播放结果。
+- 软件内 USB 6→9 升级核心路径 **PASS**：所选 USB 身份与 Android user 0 核验、安装后实际 code 9、APK SHA-256 `2b5ac4120d02ef46d8a96776d82c671622020357ce3e6b9739ce638f0bfd6cc5` 与候选一致，原绑定 saved，应用执行升级前后目标绑定核验。
+- 首次手机开始接收后停在 prepared，PCM 为 0；PC 日志为 `P5-C peer closed during P5-A READY`，原因未定位。用户要求切换为手动验证后，重试确认连接、手机出声成功；成功会话未另采认证 INFO/播放指标，不能据此将连接可靠性或完整一键体验记为 PASS。
+- 用户实听：均衡模式仍卡顿、破音，**音质 NOT_PASSED**；PC 连接逻辑混乱、操作顺序不明确，**交互目标未达成**。没有新声学性能结论。
+- 当前版本低延迟、停止与电脑声音恢复、通知/生命周期、大字体/TalkBack继续 **NOT_TESTED**。用户决定本版本到此为止，后续改动另行规划；停止开发、排查、补测和派发，自动化保持暂停。
+
+### USB Receiver 均衡声学短测（2026-10-15，用户专项授权）
+
+- 用户自行选择 USB Receiver 后要求测量当前有线延迟，并确认手机扬声器靠近当前电脑麦克风、暂停其他播放、允许本地录音。真实状态为 Receiver code 9 / USB / Balanced / 48 kHz stereo，PC TCP 仅 loopback，手机非网络 AudioTrack，未切模式或调整音量。
+- 既有扫频/QPC 回录工具：预检 2/2，中位数 194.931 ms；约 24 秒正式组 **10/10**，中位数 **172.160 ms**、P95 **172.688 ms**、范围 **171.523–172.800 ms**，匹配 0.936–0.945，正式匹配片段无采集断点或时间戳错误。第二脚本样点/时差复核一致。私有分析副本修正了近静音归一化伪峰，并通过静音/自相关检查；原始录音、原始和修正分析均保留。
+- 正式组前后同一播放会话且 healthy=true；AudioTrack effective 2400、capacity/threshold 7688、pre-roll 2400 帧；欠载 **1→2**，TCP 丢积压帧 **960→960**。不能凭末次 underrunIncrement=0 认定整个测试无欠载。
+- 结果含麦克风/驱动/声学耗时；未重测电脑基线，不是纯传输延迟，不与历史数值作受控收益对比。预检和正式组约 23 ms 差异及新增欠载保留，不宣布长期稳定或音质 PASS；本次低延迟模式未测。
+- 本地证据 `.tmp-usb-receiver-latency-20261015` 不提交/打包。测试已结束并清理失效测量二进制，不改产品、不恢复自动化或旧长测，后续开发继续等用户规划。
+
+### USB Receiver 低延迟声学短测（2026-10-15，用户专项授权）
+
+- 用户自行切换模式后要求再测；核实 USB Receiver / code 9 / 实际 low-latency / 48 kHz stereo。复用上一组测量方法，音量/模式/产品参数未经代理修改。
+- 预检 **2/2**、中位数 **124.567 ms**；约 24 秒正式 **10/10**、中位数 **125.651 ms**、P95 **126.977 ms**、范围 **121.438–127.353 ms**；相关匹配 0.921–0.934，正式匹配片段无采集断点或时间戳错误，第二脚本复核一致。
+- 同一会话健康，effective 720、capacity 7688、threshold/pre-roll 240 帧；正式组欠载 **0→6**、TCP 丢积压帧 **4320→8160**。未声明这些计数必然对应扫频中可听故障，音质和长期稳定性不判 PASS。
+- 与前次均衡中位数相差 **46.509 ms**，两组录放采集端点与格式一致；先后短测不构成严格受控收益评估。数值包含麦克风/声学耗时，没有重测基线，不是纯 USB 传输延迟。
+- 证据仅在 `.tmp-usb-receiver-latency-20261015/low-latency`；测试结束、清理失效 EXE/OBJ、不改产品、不恢复自动化，后续改动仍等用户规划。

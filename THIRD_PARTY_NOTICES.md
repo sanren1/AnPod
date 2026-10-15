@@ -86,8 +86,11 @@ The P5-A/B pairing and USB binding code adds Rust crates `hmac` 0.12.1 and
 HKDF-SHA256 session key derivation. `subtle` 2.6.1 (BSD-3-Clause) is a
 transitive dependency used by HMAC tag verification. Exact locked versions
 are in `src-tauri/Cargo.lock`; no cryptographic implementation source is
-copied into AnPod. Android uses platform JCA, `AtomicFile`, and
-`ParcelFileDescriptor` APIs and adds no Android dependency. Original crate
+copied into AnPod. The Android Receiver UI uses AndroidX Activity Compose
+1.10.1 and Jetpack Compose Material 3 with BOM 2025.06.00 (Apache-2.0); the
+BOM pins its Compose UI, Foundation, and Runtime artifacts. Licence terms are
+included in `LICENSES/Apache-2.0.txt`. Android protocol and binding code use
+platform JCA, `AtomicFile`, and `ParcelFileDescriptor` APIs. Original crate
 copyright notices and MIT license texts are included in `LICENSES/` as
 `aes-gcm-MIT.txt`, `getrandom-MIT.txt`, `hkdf-MIT.txt`, `hmac-MIT.txt`, and
 `sha2-MIT.txt`; the complete original BSD-3-Clause text for transitive crate

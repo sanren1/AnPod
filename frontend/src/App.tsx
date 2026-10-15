@@ -17,14 +17,19 @@ type Device = {
 type Settings = {
   schemaVersion: number; autoConnectLastDevice: boolean; lastDeviceId: string | null;
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
+  wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
   autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
 type Snapshot = {
-  state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "error";
+  state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "managementOnly" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
-  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null; sessionAndroidVersion: string | null;
-  transport: "usb" | "wifi"; output: "computer" | "phone"; settings: Settings;
+  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null;
+  sessionConnectionTransport: "usb" | "wireless" | null; sessionWirelessProtocol: "udp" | "adb" | null;
+  sessionAndroidVersion: string | null; connectionTransport: "usb" | "wireless"; transport: "usb" | "wifi";
+  sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
+  playbackDiagnostics: PlaybackDiagnostics | null;
+  output: "computer" | "phone"; settings: Settings;
   busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
   audioBitrateBps: number | null; version: string;
 };
@@ -38,6 +43,27 @@ type ReceiverStatus = {
   foreground: boolean; healthy: boolean; audioActive: boolean; error: string | null; message: string;
 };
 type NetworkCandidate = { endpoint: string };
+type ReceiverCapabilities = {
+  controlMajor: number; audioMajor: number; managementCompatible: boolean;
+  audioCompatible: boolean; compatible: boolean; capabilityBits: number; versionCode: number;
+};
+type PlaybackDiagnostics = {
+  sampleRate: number | null; channels: number | null;
+  receiverSampleRate: number | null; receiverChannels: number | null;
+  pcDroppedFrames: number | null; pcQueuedFrames: number | null;
+  udpJitterTargetFrames: number | null; udpExpiredFrames: number | null; udpQueuedFrames: number | null;
+  tcpDroppedBacklogFrames: number | null; trackPendingFrames: number | null;
+  underrunCount: number | null; underrunIncrement: number | null; playbackAdvancing: boolean | null;
+  requestedBufferFrames: number | null; acceptedBufferFrames: number | null; effectiveBufferFrames: number | null;
+  capacityFrames: number | null; startThresholdFrames: number | null; preRollFrames: number | null;
+};
+type ReceiverPackageCandidate = { versionCode: number; versionName: string; sizeBytes: number; currentVersionCode: number | null; bindingReference: string | null };
+type ReceiverUsbOperation = { kind: "install" | "upgrade"; serial: string; bindingReference?: string; targetVersionCode: number; returnPanel: "network" | "receiver" };
+type ReceiverUsbOperationResult = { serial: string; kind: ReceiverUsbOperation["kind"]; targetVersionCode: number; status: ReceiverStatus };
+type ConnectionOffer = { id: string; endpoint: string };
+type HostDiscoverySnapshot = {
+  active: boolean; automaticBinding?: string | null; interfaceAddress: string | null; interfacePrefixLength: number | null; offers: ConnectionOffer[];
+};
 type NetworkStartRequest = {
   localAddress: string; peer: string; bootstrapSerial?: string; receiverAddress?: string;
   receiverPrefixLength?: number; bindingReference?: string;
@@ -49,14 +75,18 @@ const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
   if (!isDesktop) return Promise.reject(new Error("请从 AnPod 桌面程序打开此界面。"));
   return invoke<T>(command, args);
 };
-const byTransport = (snapshot: Snapshot) => snapshot.devices.filter(device => device.transport === snapshot.transport || device.transport === "unknown");
-const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot?.sessionSerial || !!snapshot?.sessionReceiverBinding || snapshot?.sessionTransport === "lan";
-const connectCommandForOutput = (output: Snapshot["output"]) => output === "phone" ? "connect_device" : "connect_device_only";
-const formatBitrate = (bps: number | null) => bps === null ? "—" : bps >= 1_000_000 ? `${(bps / 1_000_000).toFixed(2)} Mbps` : bps >= 1_000 ? `${(bps / 1_000).toFixed(1)} kbps` : `${bps} bps`;
-const bitrateHelp = "只统计实际成功发送的 PCM payload，不含 UDP/TCP/ADB 等网络开销。暂停或电脑输出时显示后端实际值（可能为 0）；不是延迟、链路带宽或接收端吞吐。";
-const transportLabel = (transport?: Snapshot["sessionTransport"]) => transport === "lan" ? "直接 UDP · 加密认证"
-  : transport === "usb" ? "USB · ADB" : transport === "wifi" ? "Wi-Fi · ADB TCP" : "连接方式未知";
+const byTransport = (snapshot: Snapshot) => {
+  const deviceTransport = snapshot.connectionTransport === "usb" ? "usb" : snapshot.settings.wirelessProtocol === "adb" ? "wifi" : null;
+  return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];
+};
+const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
+const connectionLabel = (transport: Snapshot["connectionTransport"] | null, protocol: Snapshot["sessionWirelessProtocol"] | null) =>
+  transport === "usb" ? "USB" : transport === "wireless" ? protocol === "udp" ? "无线 · UDP" : "无线 · ADB" : "连接方式未知";
+const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
+  snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
+const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);
 const bindingLabel = (reference: string | null | undefined) => reference ? `已配对接收端 · ${reference.slice(0, 8)}` : "已配对接收端";
+const CAP_PLAYBACK_PROGRESS = 1 << 3;
 const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
   return !!match && match[1].split(".").every(part => Number(part) <= 255) && Number(match[2]) > 0 && Number(match[2]) <= 65535;
@@ -83,17 +113,25 @@ const endpointFitsInterface = (endpoint: string, local: PrivateIpv4Interface | u
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "help" | "diagnostics" | null>(null);
-  const [confirm, setConfirm] = useState<{ kind: "transport" | "playback" | "device" | "network"; value: string } | null>(null);
+  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "receiver" | "help" | "diagnostics" | null>(null);
+  const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "device" | "network" | "receiverUsb"; value: string } | null>(null);
   const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
+  const [pendingReceiverOperation, setPendingReceiverOperation] = useState<ReceiverUsbOperation | null>(null);
+  const [receiverOperationBusy, setReceiverOperationBusy] = useState(false);
+  const [receiverManagerSerial, setReceiverManagerSerial] = useState("");
+  const [receiverOperationResult, setReceiverOperationResult] = useState<ReceiverUsbOperationResult | null>(null);
   const [networkDialogError, setNetworkDialogError] = useState("");
   const [localSelected, setLocalSelected] = useState<string | null>(null);
-  const [explicitWifiDeviceSerial, setExplicitWifiDeviceSerial] = useState<string | null>(null);
   const [largeText, setLargeText] = useState(false);
   const [notice, setNotice] = useState("");
   const [working, setWorking] = useState(false);
+  const snapshotRefreshGeneration = useRef(0);
 
-  const apply = (value: Snapshot) => { setSnapshot(value); setLocalSelected(value.selectedSerial); };
+  const apply = (value: Snapshot) => {
+    snapshotRefreshGeneration.current++;
+    setSnapshot(value);
+    setLocalSelected(value.selectedSerial);
+  };
   useEffect(() => {
     let disposed = false;
     const cleanups: (() => void)[] = [];
@@ -118,6 +156,23 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (panel !== "network") return;
+    let disposed = false;
+    const refreshOffers = async () => {
+      const generation = ++snapshotRefreshGeneration.current;
+      try {
+        const next = await invokeApp<Snapshot>("get_snapshot");
+        if (!disposed && generation === snapshotRefreshGeneration.current) setSnapshot(next);
+      } catch (error) {
+        if (!disposed && generation === snapshotRefreshGeneration.current) setNetworkDialogError(String(error));
+      }
+    };
+    void refreshOffers();
+    const timer = window.setInterval(() => void refreshOffers(), 1000);
+    return () => { disposed = true; window.clearInterval(timer); snapshotRefreshGeneration.current++; };
+  }, [panel]);
+
+  useEffect(() => {
     if (!snapshot || snapshot.settings.appearanceTheme !== "System") return;
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const update = () => document.documentElement.dataset.theme = media.matches ? "dark" : "light";
@@ -129,9 +184,13 @@ function App() {
   const devices = useMemo(() => snapshot ? byTransport(snapshot) : [], [snapshot]);
   const selected = devices.find(device => device.serial === localSelected) ?? devices.find(device => device.connectable);
   const active = hasActiveSession(snapshot);
-  const lanSession = active && snapshot?.sessionTransport === "lan";
+  const lanSession = active && snapshot?.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp";
+  const wirelessUdpMode = !!snapshot && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp";
+  const udpBackendFixed = !!snapshot && ((snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp")
+    || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp"));
   const canDisconnect = !!snapshot?.canDisconnect;
   const cleanupPending = canDisconnect && !active && snapshot?.state === "error";
+  const controlsDisabled = working || snapshot?.busy === true || cleanupPending || receiverOperationBusy;
   const activeDevice = snapshot?.devices.find(device => device.serial === snapshot.sessionSerial);
   const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
   const deviceChoices = useMemo(() => {
@@ -152,20 +211,79 @@ function App() {
     finally { setWorking(false); }
   };
 
-  const setOption = async (kind: "transport" | "playback", value: string) => {
+  const setOption = async (kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback", value: string) => {
     if (!snapshot) return;
-    if (snapshot.busy || cleanupPending) return;
-    if ((kind === "transport" && value === snapshot.transport)
-      || (kind === "playback" && value === (snapshot.settings.playbackMode === "LowLatency" ? "lowLatency" : "balanced"))) return;
+    if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
+    if (kind === "audioBackend" && ((snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp")
+      || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp"))) return;
+    const current = kind === "transport" ? snapshot.connectionTransport
+      : kind === "wirelessProtocol" ? snapshot.settings.wirelessProtocol
+        : kind === "audioBackend" ? snapshot.settings.audioBackend
+          : snapshot.settings.playbackMode === "LowLatency" ? "lowLatency" : "balanced";
+    if (value === current) return;
     if (active) { setConfirm({ kind, value }); return; }
     setWorking(true);
     try {
-      if (kind === "transport") await invokeApp("update_setting", { key: "preferredTransport", value: value === "wifi" ? "Wifi" : "Usb" });
-      else await invokeApp("update_setting", { key: "playbackMode", value: value === "lowLatency" ? "LowLatency" : "Balanced" });
-      apply(await invokeApp<Snapshot>("refresh_devices"));
-      setNotice("");
+      const key = kind === "playback" ? "playbackMode" : kind;
+      const savedValue = kind === "playback" ? value === "lowLatency" ? "LowLatency" : "Balanced" : value;
+      let next = await invokeApp<Snapshot>("update_setting", { key, value: savedValue });
+      apply(next);
+      let refreshFailure = "";
+      if (kind === "transport" || kind === "wirelessProtocol") {
+        try { next = await invokeApp<Snapshot>("refresh_devices"); apply(next); }
+        catch (error) { refreshFailure = String(error); }
+      }
+      if (refreshFailure) notify(`选择已保存，但设备列表刷新失败：${refreshFailure}`); else setNotice("");
+      const wirelessProtocol = kind === "wirelessProtocol" ? value : next.settings.wirelessProtocol;
+      const connectionTransport = kind === "transport" ? value : next.connectionTransport;
+      if (connectionTransport === "wireless" && wirelessProtocol === "udp" && (kind === "transport" || kind === "wirelessProtocol")) {
+        setNetworkDialogError(""); setPanel("network");
+      }
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
+  };
+
+  const performReceiverUsbOperation = async (operation: ReceiverUsbOperation) => {
+    setWorking(true); setReceiverOperationBusy(true); setNetworkDialogError(""); setReceiverOperationResult(null);
+    try {
+      const command = operation.kind === "upgrade" ? "receiver_upgrade_usb" : "receiver_install";
+      const args = operation.kind === "upgrade"
+        ? { serial: operation.serial, bindingReference: operation.bindingReference }
+        : { serial: operation.serial };
+      await invokeApp<ReceiverStatus>(command, args);
+      const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: operation.serial });
+      if (!status.installed || status.versionCode !== operation.targetVersionCode) {
+        throw new Error(`已执行 USB 操作，但重新检查未确认目标版本码 ${operation.targetVersionCode}；请检查设备状态后重试。`);
+      }
+      setReceiverOperationResult({ serial: operation.serial, kind: operation.kind, targetVersionCode: operation.targetVersionCode, status });
+      setReceiverManagerSerial(operation.serial);
+      setPanel(operation.returnPanel);
+      try { apply(await invokeApp<Snapshot>("refresh_devices")); }
+      catch (error) { setNetworkDialogError(`Receiver 版本码 ${status.versionCode} 已核验；设备列表刷新失败：${String(error)}`); }
+      notify(`Receiver 版本码 ${status.versionCode} 已核验；请重新认证连接。`);
+    } catch (error) {
+      setNetworkDialogError(String(error));
+      setReceiverManagerSerial(operation.serial);
+      setPanel(operation.returnPanel);
+    } finally { setReceiverOperationBusy(false); setWorking(false); }
+  };
+
+  const requestReceiverUsbOperation = (operation: ReceiverUsbOperation) => {
+    setReceiverOperationResult(null); setNetworkDialogError("");
+    if (active && snapshot) {
+      const targetMatches = snapshot.sessionTransport === "lan"
+        ? operation.bindingReference === snapshot.sessionReceiverBinding
+        : operation.serial === snapshot.sessionSerial;
+      if (!targetMatches) {
+        setNetworkDialogError("当前会话使用另一台设备；请先断开或选择当前会话对应的 USB 设备与绑定。");
+        return;
+      }
+      setPendingReceiverOperation(operation);
+      setPanel(null);
+      setConfirm({ kind: "receiverUsb", value: "" });
+      return;
+    }
+    void performReceiverUsbOperation(operation);
   };
 
   const applyConfirmed = async () => {
@@ -179,22 +297,11 @@ function App() {
         if (!stopped.success) throw new Error(stopped.message);
         apply(await invokeApp<Snapshot>("start_network_audio", { ...pendingNetworkStart }));
         setPanel(null);
-      } else if (confirm.kind === "device" && lanSession) {
-        const output = snapshot?.output ?? "computer";
-        const stopped = await invokeApp<OperationResult>("disconnect");
-        apply(stopped.snapshot);
-        if (!stopped.success) throw new Error(stopped.message);
-        const command = connectCommandForOutput(output);
-        const result = await invokeApp<OperationResult>(command, { serial: confirm.value });
-        apply(result.snapshot);
-        if (!result.success) notify(result.message);
-      } else if (confirm.kind === "transport" && lanSession) {
-        const stopped = await invokeApp<OperationResult>("disconnect");
-        apply(stopped.snapshot);
-        if (!stopped.success) throw new Error(stopped.message);
-        await invokeApp("update_setting", { key: "preferredTransport", value: confirm.value === "wifi" ? "Wifi" : "Usb" });
-        apply(await invokeApp<Snapshot>("refresh_devices"));
-        setNotice("直接网络会话已断开；连接方式已更新。需要时请重新选择手机。");
+      } else if (confirm.kind === "receiverUsb") {
+        if (!pendingReceiverOperation) throw new Error("USB 操作信息已失效；请重新检查 Receiver 状态。");
+        const operation = pendingReceiverOperation;
+        setConfirm(null); setPendingReceiverOperation(null);
+        await performReceiverUsbOperation(operation);
       } else if (confirm.kind === "device") {
         const result = await invokeApp<OperationResult>("switch_device", { serial: confirm.value });
         apply(result.snapshot);
@@ -202,13 +309,29 @@ function App() {
       } else {
         const next = await invokeApp<Snapshot>("reconfigure_session", { kind: confirm.kind, value: confirm.value });
         apply(next);
+        if (!hasActiveSession(next) && next.connectionTransport === "wireless" && next.settings.wirelessProtocol === "udp"
+          && (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend")) {
+          setNetworkDialogError(""); setPanel("network");
+        }
       }
       setConfirm(null);
       setPendingNetworkStart(null);
     } catch (error) {
-      if (confirm.kind === "network") setNetworkDialogError(String(error)); else notify(String(error));
+      if (confirm.kind === "network" || confirm.kind === "receiverUsb") {
+        setNetworkDialogError(String(error));
+        if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver");
+      }
+      else {
+        let message = String(error);
+        if (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" || confirm.kind === "playback") {
+          try { apply(await invokeApp<Snapshot>("get_snapshot")); }
+          catch (refreshError) { message += `；状态刷新失败：${String(refreshError)}`; }
+        }
+        notify(message);
+      }
       setConfirm(null);
       setPendingNetworkStart(null);
+      if (confirm.kind === "receiverUsb") setPendingReceiverOperation(null);
     }
     finally { setWorking(false); }
   };
@@ -229,15 +352,55 @@ function App() {
     finally { setWorking(false); }
   };
 
+  const setOfferListener = async (localAddress: string, allowed: boolean, bindingReference?: string) => {
+    if (!snapshot || active || working || snapshot.busy) return;
+    setWorking(true);
+    setNetworkDialogError("");
+    try {
+      let selectedAddress = localAddress;
+      let selectedBinding = bindingReference;
+      if (allowed && (!selectedAddress || !selectedBinding)) {
+        const [availableInterfaces, availableBindings] = await Promise.all([
+          invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
+          invokeApp<string[]>("receiver_binding_references"),
+        ]);
+        if (!selectedAddress && availableInterfaces.length === 1) selectedAddress = availableInterfaces[0].address;
+        if (!selectedBinding && availableBindings.length === 1) selectedBinding = availableBindings[0];
+        if (!selectedAddress || !selectedBinding) { setPanel("network"); return; }
+      }
+      await invokeApp<HostDiscoverySnapshot>("set_wireless_connection_offers", {
+        localAddress: selectedAddress, allowed, bindingReference: selectedBinding,
+      });
+      const generation = ++snapshotRefreshGeneration.current;
+      const next = await invokeApp<Snapshot>("get_snapshot");
+      if (generation === snapshotRefreshGeneration.current) apply(next);
+    } catch (error) {
+      if (panel === "network") setNetworkDialogError(String(error)); else notify(String(error));
+    }
+    finally { setWorking(false); }
+  };
+
+  const acceptOffer = async (offerId: string, bindingReference: string) => {
+    if (!snapshot || active || working || snapshot.busy || !bindingReference) return;
+    setWorking(true);
+    setNetworkDialogError("");
+    try {
+      const next = await invokeApp<Snapshot>("accept_wireless_connection_offer", { offerId, bindingReference });
+      apply(next);
+      setPanel(null);
+    } catch (error) { setNetworkDialogError(String(error)); }
+    finally { setWorking(false); }
+  };
+
   const setOutput = async (output: "computer" | "phone") => {
     if (!snapshot) return;
-    if (snapshot.busy || cleanupPending) return;
-    const selectedWifiAdb = selected?.transport === "wifi" && explicitWifiDeviceSerial === selected.serial;
-    if (output === "phone" && !active && snapshot.transport === "wifi" && !selectedWifiAdb) {
+    if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
+    if (output === "phone" && snapshot.state === "managementOnly") return;
+    if (output === "phone" && !active && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
       setNetworkDialogError(""); setPanel("network"); return;
     }
     if (output === "phone" && !active && !selected) {
-      setPanel("help");
+      setPanel(snapshot.connectionTransport === "wireless" ? "pair" : "help");
       return;
     }
     if (output === "phone" && !active && selected) {
@@ -266,7 +429,28 @@ function App() {
     finally { setWorking(false); }
   };
 
+  const runMainAction = () => {
+    if (!snapshot) return;
+    if (snapshot.wirelessConnectionOffers.active) {
+      void setOfferListener(snapshot.wirelessConnectionOffers.interfaceAddress ?? "", false);
+    } else if (snapshot.state === "connecting" || snapshot.state === "reconnecting") {
+      void invokeApp<Snapshot>("cancel_operation").then(apply).catch(error => notify(String(error)));
+    } else if (canDisconnect) {
+      void disconnect();
+    } else if (wirelessUdpMode) {
+      void setOfferListener("", true);
+    } else if (selected?.connectable) {
+      void connectOnly();
+    } else {
+      setPanel(snapshot.connectionTransport === "usb" ? "help" : "pair");
+    }
+  };
+
   const connectOnly = async () => {
+    if (!snapshot) return;
+    if (snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
+      setNetworkDialogError(""); setPanel("network"); return;
+    }
     if (!selected?.connectable) return;
     setWorking(true);
     try {
@@ -279,7 +463,6 @@ function App() {
 
   const chooseDevice = (device: Device) => {
     setPanel(null);
-    setExplicitWifiDeviceSerial(device.transport === "wifi" ? device.serial : null);
     if (canDisconnect) {
       if (device.serial === snapshot.sessionSerial) return;
       setConfirm({ kind: "device", value: device.serial });
@@ -296,11 +479,13 @@ function App() {
     noDevice: empty ? "尚未连接手机" : "等待手机授权", unauthorized: "等待手机授权",
     ready: "准备就绪", connecting: "正在连接", connected: "已连接 · 电脑播放",
     streaming: "正在手机播放", phoneReady: lanSession ? "已认证 · 等待手机播放确认" : "手机接收已就绪",
-    paused: "手机播放已暂停", reconnecting: "正在重新连接", error: "连接失败",
+    paused: "手机播放已暂停", reconnecting: "正在重新连接", managementOnly: "Receiver 管理连接已认证", error: "连接失败",
   };
-  const currentDeviceLabel = lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName;
+  const cancellingConnection = snapshot.state === "connecting" || snapshot.state === "reconnecting";
+  const statusTitle = snapshot.state === "error" ? stateLabels.error : snapshot.wirelessConnectionOffers.active ? "等待手机连接" : stateLabels[snapshot.state];
   const statusDetail = lanSession
-    ? snapshot.state === "phoneReady" ? snapshot.output === "computer" ? "Receiver 已认证；声音由电脑输出。" : "Receiver 已认证；等待接收端确认手机正在播放。"
+    ? snapshot.state === "managementOnly" ? "Receiver 管理连接已认证，但音频协议不兼容；声音继续由电脑输出。"
+      : snapshot.state === "phoneReady" ? snapshot.output === "computer" ? "Receiver 已认证；声音由电脑输出。" : "Receiver 已认证；等待接收端确认手机正在播放。"
       : snapshot.state === "streaming" ? "Receiver 已确认音频正在手机端播放。"
         : snapshot.state === "paused" ? "Receiver 会话已暂停；手机当前没有播放声音。"
         : snapshot.state === "reconnecting" ? "直接网络连接正在恢复；请保持两端位于可互访网络。"
@@ -317,59 +502,60 @@ function App() {
     <main className="main-scroll">
       <div className={`status-line state-${snapshot.state}`}>
         <span className="status-dot" aria-hidden="true" />
-        <span role="status" aria-live="polite">{stateLabels[snapshot.state]}</span>
-        {currentDeviceLabel && <span className="status-device">{currentDeviceLabel}</span>}
-        <span className="audio-bitrate" title={bitrateHelp}>
-          <span>音频码率</span><span className="audio-bitrate-value">{formatBitrate(snapshot.audioBitrateBps)}</span>
-        </span>
-        <span className="transport-tag">{snapshot.sessionTransport === "lan" ? "UDP" : (snapshot.sessionTransport ?? snapshot.transport).toUpperCase()}</span>
+        <span role="status" aria-live="polite">{statusTitle}</span>
       </div>
+      <button className="primary-button main-action" type="button" disabled={receiverOperationBusy || (!cancellingConnection && (working || snapshot.busy)) || !(snapshot.wirelessConnectionOffers.active || canDisconnect || wirelessUdpMode || selected?.connectable)} onClick={runMainAction}>
+        {cancellingConnection ? "取消连接" : working || snapshot.busy ? "正在处理…" : snapshot.wirelessConnectionOffers.active ? "停止接收"
+            : canDisconnect ? cleanupPending ? "重试断开" : "断开连接"
+              : wirelessUdpMode ? "开始接收" : selected?.connectable ? "连接手机"
+                : snapshot.connectionTransport === "usb" ? "连接 USB 手机" : "添加无线手机"}
+      </button>
 
       <section className="playback-section" aria-label="声音输出">
-        <div className="section-title"><h1>声音输出</h1><button className="text-button" onClick={() => void refresh()} disabled={working || snapshot.busy} aria-label="刷新设备"><LoaderCircle className={working || snapshot.busy ? "spin" : ""} size={15} />刷新</button></div>
+        <div className="section-title"><h1>声音输出</h1></div>
         <div className="output-grid" role="group" aria-label="选择声音输出">
-          <button className={`output-card ${snapshot.output === "computer" ? "selected" : ""}`} aria-pressed={snapshot.output === "computer"} onClick={() => void setOutput("computer")} disabled={working || snapshot.busy || cleanupPending || (!active && snapshot.output === "computer")}>
+          <button className={`output-card ${snapshot.output === "computer" ? "selected" : ""}`} aria-pressed={snapshot.output === "computer"} onClick={() => void setOutput("computer")} disabled={controlsDisabled || (!active && snapshot.output === "computer")}>
             <span className="output-heading"><Computer size={18} aria-hidden="true" /><span className="output-name">电脑</span></span>
           </button>
-          <button className={`output-card ${snapshot.output === "phone" ? "selected" : ""}`} aria-pressed={snapshot.output === "phone"} onClick={() => void setOutput("phone")} disabled={working || snapshot.busy || cleanupPending}>
+          <button className={`output-card ${snapshot.output === "phone" ? "selected" : ""}`} aria-pressed={snapshot.output === "phone"} onClick={() => void setOutput("phone")} disabled={controlsDisabled || snapshot.state === "managementOnly"}>
             <span className="output-heading"><Smartphone size={18} aria-hidden="true" /><span className="output-name">手机</span></span>
           </button>
         </div>
-        <p className="status-description">{statusDetail}</p>
-        <div className="session-row">
-        <span>{snapshot.busy ? "正在处理手机连接" : cleanupPending ? "连接清理待完成" : active ? "手机连接保持中" : empty ? "声音继续从电脑播放" : "连接手机后可从手机输出声音"}</span>
-          {(snapshot.state === "connecting" || snapshot.state === "reconnecting") && <button className="text-button cancel-button" onClick={() => void invokeApp<Snapshot>("cancel_operation").then(apply).catch(error => notify(String(error)))}>取消连接</button>}
-        </div>
+        {snapshot.state === "error" && <p className="status-description" role="alert">{snapshot.statusDetail || snapshot.message || statusDetail}</p>}
       </section>
 
       <section className="connection-section" aria-label="连接手机">
+        <div className="section-title"><h2>连接方式</h2></div>
         <div className="transport-switch" role="group" aria-label="连接方式">
-          <button aria-pressed={snapshot.transport === "usb"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("transport", "usb")}><Usb size={16} />USB</button>
-          <button aria-pressed={snapshot.transport === "wifi"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("transport", "wifi")}><Wifi size={16} />Wi-Fi</button>
+          <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} />USB</button>
+          <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} />无线</button>
         </div>
-        <div className="section-title device-heading"><h2>连接手机</h2><button className="text-button" disabled={working || snapshot.busy} onClick={() => { setNetworkDialogError(""); setPanel(snapshot.transport === "wifi" ? "network" : "help"); }}>{snapshot.transport === "wifi" ? "添加手机" : "连接帮助"}</button></div>
+        {snapshot.connectionTransport === "wireless" && <>
+          <div className="protocol-switch" role="group" aria-label="无线协议">
+            <button aria-pressed={snapshot.settings.wirelessProtocol === "udp"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("wirelessProtocol", "udp")}>UDP <small>推荐</small></button>
+            <button aria-pressed={snapshot.settings.wirelessProtocol === "adb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("wirelessProtocol", "adb")}>ADB <small>兼容</small></button>
+          </div>
+          {snapshot.settings.wirelessProtocol === "adb" && <p className="connection-hint">手机需开启无线调试并完成配对。</p>}
+        </>}
+        <div className="section-title device-heading"><h2>目标</h2>{snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" && <button className="text-button" disabled={working || snapshot.busy || cleanupPending} onClick={() => setPanel("pair")}>添加手机</button>}</div>
         <div className="device-card">
-          <button className="device-select" onClick={() => setPanel("device")} disabled={working || snapshot.busy} aria-haspopup="dialog" aria-expanded={panel === "device"} aria-label={`选择手机，${active ? `当前连接${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "手机"}` : cardDevice ? `当前选择${cardDevice.displayName}` : "打开设备列表"}`}>
+          <button className="device-select" onClick={() => setPanel(wirelessUdpMode && !active ? "network" : "device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network"} aria-label={`选择目标，${active ? `当前连接${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "手机"}` : cleanupPending ? "连接清理待完成" : wirelessUdpMode ? "选择已配对接收端" : cardDevice ? `当前选择${cardDevice.displayName}` : "打开设备列表"}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
-              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "已连接手机" : cleanupPending ? snapshot.deviceName ?? "连接清理待完成" : selected?.displayName ?? (empty ? "未检测到手机" : "选择手机")}</strong>
-              <span>{active ? `${transportLabel(snapshot.sessionTransport)}${snapshot.sessionAndroidVersion ? ` · Android ${snapshot.sessionAndroidVersion}` : ""}` : cleanupPending ? "当前连接信息不可用" : cardDevice ? `${transportLabel(cardDevice.transport)}${cardDevice.androidVersion ? ` · Android ${cardDevice.androidVersion}` : ""}` : snapshot.transport === "wifi" ? "直接网络接收；ADB 无线调试为过渡/诊断方式" : "连接 USB 手机后刷新设备列表"}</span>
-              {(active || cleanupPending) && <span className="device-live-state" role="status">{cleanupPending ? "连接清理待重试" : stateLabels[snapshot.state]}</span>}
+              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? "已连接手机" : cleanupPending ? snapshot.deviceName ?? "连接清理待完成" : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : "选择接收手机" : selected?.displayName ?? (empty ? "未检测到手机" : "选择手机")}</strong>
+              <span>{active ? `${actualConnectionLabel(snapshot)}${snapshot.sessionAndroidVersion ? ` · Android ${snapshot.sessionAndroidVersion}` : ""}` : cleanupPending ? "当前连接信息不可用" : wirelessUdpMode ? "无线 · UDP" : cardDevice ? `${cardDevice.transport === "wifi" ? "无线 · ADB" : "USB"}${cardDevice.androidVersion ? ` · Android ${cardDevice.androidVersion}` : ""}` : snapshot.connectionTransport === "wireless" ? "无线调试设备" : "USB 设备"}</span>
+              {cleanupPending && <span className="device-live-state" role="status">连接清理待重试</span>}
             </span>
             <ChevronDown size={18} aria-hidden="true" />
-          </button>
-          <button className="primary-button device-action" disabled={working || snapshot.busy || (!canDisconnect && !selected?.connectable)} onClick={() => canDisconnect ? void disconnect() : void connectOnly()}>
-            {working || snapshot.busy ? <><LoaderCircle className="spin" size={15} />处理中</> : canDisconnect ? "断开连接" : snapshot.transport === "wifi" ? "ADB 诊断连接" : "连接"}
           </button>
         </div>
       </section>
 
       <section className="mode-section" aria-label="播放模式">
         <div className="mode-row"><h2>播放模式</h2><div className="mode-switch" role="group" aria-label="播放模式">
-          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("playback", "balanced")}>均衡</button>
-          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={working || snapshot.busy || cleanupPending} onClick={() => void setOption("playback", "lowLatency")}>低延迟</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled} onClick={() => void setOption("playback", "balanced")}>均衡</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled} onClick={() => void setOption("playback", "lowLatency")}>低延迟</button>
         </div></div>
-        <p>{snapshot.settings.playbackMode === "Balanced" ? "优先播放稳定，适合长时间收听。" : "缩短缓冲，适合互动和游戏声音。"}</p>
       </section>
     </main>
 
@@ -377,22 +563,24 @@ function App() {
     {notice && <div className="toast" role="status">{notice}</div>}
 
     {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onClose={() => setPanel(null)} />}
-    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} onSave={async (key, value) => {
+    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} busy={controlsDisabled} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onSave={async (key, value) => {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {panel === "network" && <NetworkReceiverDialog usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} disabled={working || snapshot.busy} audioSessionActive={active} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onDisconnect={() => void disconnect()} onLegacy={() => setPanel("pair")} onClose={() => setPanel(null)} />}
-    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={snapshot.busy} onClose={() => setPanel("network")} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
-    {panel === "help" && <HelpDialog transport={snapshot.transport} onClose={() => setPanel(null)} />}
+    {(panel === "network" || panel === "receiver") && <NetworkReceiverDialog key={panel} snapshot={snapshot} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => setPanel(null)} />}
+    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
+    {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {confirm && <ConfirmDialog
-      title={confirm.kind === "network" ? "断开当前会话并连接？" : confirm.kind === "device" ? "切换连接手机？" : confirm.kind === "transport" ? "切换连接方式？" : "切换播放模式？"}
-      body={confirm.kind === "network" ? "将先断开当前会话，再启动所选网络接收。声音会中断；只有 Receiver 完成双向认证后才会显示连接就绪。"
+      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? "停止播放并升级 Receiver？" : "停止播放并安装 Receiver？" : confirm.kind === "network" ? "断开当前会话并连接？" : confirm.kind === "device" ? "切换连接手机？" : confirm.kind === "transport" ? "切换连接方式？" : confirm.kind === "wirelessProtocol" ? "切换无线协议？" : confirm.kind === "audioBackend" ? "切换接收后端？" : "切换播放模式？"}
+      body={confirm.kind === "receiverUsb" ? `将停止当前播放并通过所选 USB 设备${pendingReceiverOperation ? `安装或核验目标版本码 ${pendingReceiverOperation.targetVersionCode}` : "执行 Receiver 操作"}。仅在设备身份、绑定、签名和版本预检通过后才会继续；完成后需要重新认证连接。`
+        : confirm.kind === "network" ? "将先断开当前会话，再启动所选网络接收。声音会中断；只有 Receiver 完成双向认证后才会显示连接就绪。"
         : confirm.kind === "device" && lanSession ? `先断开当前直接网络会话，再连接 ${snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? "所选手机"}。声音会中断，原网络会话不会自动恢复。`
-          : confirm.kind === "transport" && lanSession ? "先断开当前直接网络会话，再切换连接方式。不会自动重连同一部手机。"
+          : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? "将短暂中断声音，再按所选连接方式重新配置；缺少接口、绑定或设备时会回到电脑输出并提示下一步。"
+            : confirm.kind === "audioBackend" ? "将短暂中断声音并重新配置接收后端；未能重新连接时会回到电脑输出。"
             : confirm.kind === "device" ? `切换到 ${snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? "所选手机"} 会短暂中断当前连接；${snapshot.output === "phone" ? "完成后会继续从手机输出。" : "完成后声音仍从电脑输出。"}`
               : "切换播放模式时会短暂中断声音，AnPod 会重新配置当前连接。"}
-      confirmLabel={confirm.kind === "network" ? "断开并启动" : confirm.kind === "device" ? "中断并切换" : confirm.kind === "transport" && lanSession ? "断开并切换" : confirm.kind === "transport" ? "断开并重新连接" : "重新配置"} busy={working} onCancel={() => { setConfirm(null); setPendingNetworkStart(null); }} onConfirm={() => void applyConfirmed()} />}
+      confirmLabel={confirm.kind === "receiverUsb" ? "停止播放并继续" : confirm.kind === "network" ? "断开并启动" : confirm.kind === "device" ? "中断并切换" : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? "确认切换" : "重新配置"} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 
@@ -413,12 +601,17 @@ function Modal({ title, children, onClose, className = "" }: { title: string; ch
   </dialog>;
 }
 
-function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error, onError, onStart, onDisconnect, onLegacy, onClose }: {
-  usbDevices: Device[]; disabled: boolean; audioSessionActive: boolean; error: string; onError: (error: string) => void;
-  onStart: (request: NetworkStartRequest) => void; onDisconnect: () => void; onLegacy: () => void; onClose: () => void;
+function NetworkReceiverDialog({ snapshot, usbDevices, receiverManagerOnly, initialReceiverSerial, disabled, receiverOperationBusy, receiverOperationResult, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onOpenReceiverManager, onClose }: {
+  snapshot: Snapshot;
+  receiverManagerOnly: boolean;
+  initialReceiverSerial: string;
+  usbDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; audioSessionActive: boolean; udpMode: boolean; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
+  onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string) => void;
+  onAcceptOffer: (offerId: string, bindingReference: string) => void; onReceiverSerialChange: (serial: string) => void;
+  onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onOpenReceiverManager: () => void; onClose: () => void;
 }) {
   const [method, setMethod] = useState<"bootstrap" | "paired">("bootstrap");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(receiverManagerOnly);
   const [interfaces, setInterfaces] = useState<PrivateIpv4Interface[]>([]);
   const [receiverInterfaces, setReceiverInterfaces] = useState<ReceiverIpv4Interface[]>([]);
   const [bindings, setBindings] = useState<string[]>([]);
@@ -427,23 +620,26 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   const [serial, setSerial] = useState("");
   const [receiverAddress, setReceiverAddress] = useState("");
   const [bindingReference, setBindingReference] = useState("");
+  const [selectedOfferId, setSelectedOfferId] = useState("");
   const [peer, setPeer] = useState("");
   const [loading, setLoading] = useState(false);
-  const [receiverAction, setReceiverAction] = useState<"checking" | "installing" | null>(null);
+  const [receiverAction, setReceiverAction] = useState<"checking" | null>(null);
   const [receiverStatus, setReceiverStatus] = useState<ReceiverStatus | null>(null);
   const [receiverError, setReceiverError] = useState("");
-  const [receiverInstallFailed, setReceiverInstallFailed] = useState(false);
+  const [updateCandidate, setUpdateCandidate] = useState<ReceiverPackageCandidate | null>(null);
+  const [updateCandidateError, setUpdateCandidateError] = useState("");
+  const [candidateLoading, setCandidateLoading] = useState(false);
   const [localError, setLocalError] = useState("");
   const [addressNotice, setAddressNotice] = useState("");
   const alertRef = useRef<HTMLParagraphElement>(null);
   const receiverGeneration = useRef(0);
   const discoveryGeneration = useRef(0);
   const networkInfoGeneration = useRef(0);
-  const methodManuallySelected = useRef(false);
+  const methodManuallySelected = useRef(receiverManagerOnly);
   const peerManuallyEdited = useRef(false);
-  const busy = disabled || loading || receiverAction !== null;
-  const usbDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
-  const selectedUsbDevice = usbDevices.find(device => device.serial === serial);
+  const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading;
+  const receiverDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
+  const selectedReceiverDevice = usbDevices.find(device => device.serial === serial);
   const validBootstrapPairs = useMemo(() => bootstrapNetworkPairs(interfaces, receiverInterfaces), [interfaces, receiverInterfaces]);
   const compatibleReceiverInterfaces = useMemo(() => localAddress
     ? receiverInterfaces.filter(receiver => {
@@ -456,24 +652,36 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
     if (error || localError || receiverError) alertRef.current?.focus();
   }, [error, localError, receiverError]);
 
+  useEffect(() => {
+    setSelectedOfferId(current => offers.offers.some(offer => offer.id === current)
+      ? current : offers.offers.length === 1 ? offers.offers[0].id : "");
+  }, [offers.offers]);
+
   const loadNetworkInfo = async () => {
     const generation = ++networkInfoGeneration.current;
     setLoading(true); setLocalError("");
     const [interfacesResult, bindingsResult] = await Promise.allSettled([
-      invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
+      receiverManagerOnly ? Promise.resolve([] as PrivateIpv4Interface[]) : invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
       invokeApp<string[]>("receiver_binding_references"),
     ]);
     if (networkInfoGeneration.current !== generation) return;
     const errors: string[] = [];
-    if (interfacesResult.status === "fulfilled") {
+    if (receiverManagerOnly) {
+      setInterfaces([]); setLocalAddress("");
+    } else if (interfacesResult.status === "fulfilled") {
       setInterfaces(interfacesResult.value);
-      setLocalAddress(current => interfacesResult.value.some(value => value.address === current) ? current : "");
+      setLocalAddress(current => interfacesResult.value.some(value => value.address === current) ? current
+        : interfacesResult.value.some(value => value.address === offers.interfaceAddress) ? offers.interfaceAddress ?? ""
+          : interfacesResult.value.length === 1 ? interfacesResult.value[0].address : "");
       if (interfacesResult.value.length === 0) errors.push("没有可用的电脑 IPv4 网络接口。请启用 Wi-Fi 或有线网络后刷新。");
     } else errors.push(String(interfacesResult.reason));
     if (bindingsResult.status === "fulfilled") {
       const values = bindingsResult.value;
       setBindings(values);
-      setBindingReference(current => values.includes(current) ? current : values.length === 1 ? values[0] : "");
+      setBindingReference(current => values.includes(current) ? current
+        : receiverManagerOnly && snapshot.sessionTransport === "lan" && snapshot.sessionReceiverBinding && values.includes(snapshot.sessionReceiverBinding)
+          ? snapshot.sessionReceiverBinding
+          : !receiverManagerOnly && values.length === 1 ? values[0] : "");
       if (!methodManuallySelected.current) setMethod(values.length > 0 ? "paired" : "bootstrap");
     } else errors.push(String(bindingsResult.reason));
     setLocalError(errors.join("；"));
@@ -482,15 +690,39 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   useEffect(() => {
     void loadNetworkInfo();
     return () => { networkInfoGeneration.current++; };
-  }, []);
+  }, [receiverManagerOnly]);
   useEffect(() => {
-    setSerial(current => usbDevices.some(device => device.serial === current) ? current : usbDevices.length === 1 ? usbDevices[0].serial : "");
-  }, [usbDeviceKey]);
+    let disposed = false;
+    setUpdateCandidate(null); setUpdateCandidateError("");
+    setCandidateLoading(true);
+    void invokeApp<ReceiverPackageCandidate | null>("receiver_update_candidate")
+      .then(value => {
+        if (disposed) return;
+        setUpdateCandidate(value);
+        if (value?.bindingReference && value.bindingReference === snapshot.sessionReceiverBinding && bindings.includes(value.bindingReference))
+          setBindingReference(value.bindingReference);
+      })
+      .catch(reason => { if (!disposed) setUpdateCandidateError(String(reason)); })
+      .finally(() => { if (!disposed) setCandidateLoading(false); });
+    return () => { disposed = true; };
+  }, [receiverManagerOnly, snapshot.sessionReceiverBinding, snapshot.sessionCapabilities?.managementCompatible, snapshot.sessionCapabilities?.versionCode, snapshot.sessionCapabilities?.capabilityBits]);
+  useEffect(() => {
+    const next = usbDevices.some(device => device.serial === serial) ? serial
+      : receiverManagerOnly && usbDevices.some(device => device.serial === initialReceiverSerial) ? initialReceiverSerial
+        : receiverManagerOnly && usbDevices.length === 1 ? usbDevices[0].serial
+        : !receiverManagerOnly && usbDevices.length === 1 ? usbDevices[0].serial : "";
+    setSerial(next);
+    onReceiverSerialChange(next);
+  }, [receiverDeviceKey, receiverManagerOnly, initialReceiverSerial]);
   const readReceiverStatusAndInterfaces = async (deviceSerial: string, generation: number) => {
     const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: deviceSerial });
     if (receiverGeneration.current !== generation) return;
     setReceiverStatus(status);
     setReceiverError("");
+    if (receiverManagerOnly) {
+      setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+      return;
+    }
     if (!status.installed) {
       setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
       return;
@@ -503,37 +735,25 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   };
   const checkReceiver = async (deviceSerial: string) => {
     const generation = ++receiverGeneration.current;
-    setReceiverStatus(null); setReceiverError(""); setReceiverInstallFailed(false); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
+    setReceiverStatus(null); setReceiverError(""); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
     setReceiverAction("checking");
     try { await readReceiverStatusAndInterfaces(deviceSerial, generation); }
     catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
     finally { if (receiverGeneration.current === generation) setReceiverAction(null); }
   };
-  const installReceiver = async () => {
-    if (!serial || busy) return;
-    if (audioSessionActive) { setReceiverError("请先断开音频会话，再安装或更新 Receiver。"); return; }
-    const deviceSerial = serial;
-    const generation = ++receiverGeneration.current;
-    setReceiverAction("installing"); setReceiverError(""); setReceiverInstallFailed(false); setReceiverStatus(null); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
-    try {
-      try { await invokeApp<ReceiverStatus>("receiver_install", { serial: deviceSerial }); }
-      catch (reason) {
-        if (receiverGeneration.current === generation) { setReceiverError(String(reason)); setReceiverInstallFailed(true); }
-        return;
-      }
-      if (receiverGeneration.current === generation) await readReceiverStatusAndInterfaces(deviceSerial, generation);
-    } catch (reason) { if (receiverGeneration.current === generation) setReceiverError(String(reason)); }
-    finally { if (receiverGeneration.current === generation) setReceiverAction(null); }
-  };
   useEffect(() => {
     setReceiverInterfaces([]); setReceiverAddress("");
-    setReceiverStatus(null); setReceiverError(""); setReceiverInstallFailed(false); setLocalError("");
+    setReceiverStatus(null); setReceiverError(""); setLocalError("");
     if (serial) void checkReceiver(serial);
     else setReceiverAction(null);
     return () => { receiverGeneration.current++; };
   }, [serial]);
+  useEffect(() => {
+    if (receiverOperationResult?.serial === serial) setReceiverStatus(receiverOperationResult.status);
+  }, [receiverOperationResult, serial]);
 
   useEffect(() => {
+    if (receiverManagerOnly) return;
     if (method === "paired") {
       if (!interfaces.some(value => value.address === localAddress)) setLocalAddress(interfaces.length === 1 ? interfaces[0].address : "");
       return;
@@ -585,6 +805,7 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   }, [interfaces, localAddress, method]);
   const submit = (event: React.FormEvent) => {
     event.preventDefault(); setLocalError(""); onError("");
+    if (receiverManagerOnly) return;
     if (!localAddress) { setLocalError("请明确选择电脑使用的网络接口。"); return; }
     if (method === "bootstrap") {
       if (!receiverStatus?.installed) { setLocalError("请先检查并安装/更新已核验的 Receiver，再选择手机网络接口。"); return; }
@@ -602,79 +823,156 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
   const shownError = error || localError;
   const selectedLocalInterface = interfaces.find(value => value.address === localAddress);
   const peerOutsideSubnet = method === "paired" && isIpv4Endpoint(peer) && !endpointFitsInterface(peer, selectedLocalInterface);
+  const currentVersionCode = receiverStatus
+    ? receiverStatus.installed
+      ? receiverStatus.versionCode ?? (bindingReference && bindingReference === updateCandidate?.bindingReference ? updateCandidate.currentVersionCode : null)
+      : null
+    : bindingReference && bindingReference === updateCandidate?.bindingReference ? updateCandidate.currentVersionCode : null;
+  const currentVersionLabel = receiverStatus?.installed === false ? "未安装"
+    : currentVersionCode === null ? "待 USB 核验" : String(currentVersionCode);
+  const packageVersion = updateCandidate?.versionCode ?? null;
+  const receiverNeedsUpgrade = !!receiverStatus?.installed && currentVersionCode !== null && packageVersion !== null && currentVersionCode < packageVersion;
+  const receiverAlreadyCurrent = currentVersionCode !== null && packageVersion !== null && currentVersionCode >= packageVersion;
+  const receiverNeedsInstall = !!serial && receiverStatus?.installed === false;
+  const canRequestUsbInstall = receiverNeedsInstall && !!updateCandidate && !receiverError;
+  const canRequestUsbMaintenance = receiverNeedsUpgrade && snapshot.sessionTransport !== "lan" && !bindingReference && !!updateCandidate && !receiverError;
+  const canRequestUsbUpgrade = receiverNeedsUpgrade && bindings.length > 0 && !!updateCandidate && !!bindingReference && !receiverError;
   const canStart = method === "bootstrap"
     ? !!serial && receiverStatus?.installed === true && !!selectedBootstrapPair
     : !!bindingReference && endpointFitsInterface(peer, selectedLocalInterface);
-  const receiverCompatibilityError = /(签名|核验|版本|协议|不兼容|不匹配|signature|version)/i.test(receiverError);
-  const receiverNeedsInstall = !!serial && (receiverStatus?.installed === false || receiverInstallFailed || receiverCompatibilityError);
+  const requestUsbOperation = (kind: ReceiverUsbOperation["kind"]) => {
+    if (!serial || !updateCandidate) return;
+    onReceiverOperation({
+      kind, serial, ...(kind === "upgrade" ? { bindingReference } : {}),
+      targetVersionCode: updateCandidate.versionCode, returnPanel: receiverManagerOnly ? "receiver" : "network",
+    });
+  };
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
-  const mainSummary = method === "paired"
+  const mainSummary = receiverManagerOnly ? selectedReceiverDevice?.displayName ?? "选择已授权且在线的 USB 手机" : method === "paired"
     ? bindingReference ? bindingLabel(bindingReference) : "选择已配对接收端"
-    : selectedUsbDevice?.displayName ?? "选择 USB 手机";
-  const addressSummary = localAddress
+    : selectedReceiverDevice?.displayName ?? "选择 USB 手机";
+  const addressSummary = receiverManagerOnly ? "仅查看 Receiver 状态，不要求电脑网络接口"
+    : localAddress
     ? `${interfaces.find(value => value.address === localAddress)?.name ?? "电脑接口"} · ${localAddress}${method === "paired" && peer ? ` → ${peer}` : method === "bootstrap" && receiverAddress ? ` ↔ ${receiverAddress}` : ""}`
     : "网络接口待选择";
   const advancedRequired = method === "paired"
-    ? bindings.length !== 1 || !bindingReference || interfaces.length !== 1 && !localAddress || !isIpv4Endpoint(peer) || !endpointFitsInterface(peer, selectedLocalInterface)
+    ? bindings.length !== 1 || !bindingReference || interfaces.length !== 1 && !localAddress
     : usbDevices.length !== 1 || !serial || receiverStatus?.installed !== true || !selectedBootstrapPair;
 
-  return <Modal title="直接连接 Receiver" onClose={onClose} className="network-dialog">
+  return <Modal title={receiverManagerOnly ? "检查或安装 Receiver" : "无线 Receiver"} onClose={onClose} className="network-dialog">
     <form className="network-pane" onSubmit={submit}>
       <div className="network-primary">
         <div className="network-summary"><strong>{mainSummary}</strong><span>{addressSummary}</span></div>
+        {receiverManagerOnly && <section className="receiver-manager receiver-usb-card" aria-label="USB 检查或升级 Receiver">
+          <div className="receiver-status-row">
+            <div className="receiver-status-copy" role="status" aria-live="polite">
+              <strong>{candidateLoading ? "正在检查本机 Receiver 安装包…" : updateCandidate ? "通过 USB 检查并升级 Receiver" : "本机 Receiver 安装包不可用"}</strong>
+              {updateCandidate && <small>{updateCandidate.versionName} · 当前版本码 {currentVersionLabel} → 目标版本码 {updateCandidate.versionCode} · {(updateCandidate.sizeBytes / (1024 * 1024)).toFixed(1)} MiB</small>}
+              {!updateCandidate && <small>{updateCandidateError || "连接已授权的 USB 手机后可检查版本。"}</small>}
+              {receiverAlreadyCurrent && <small>当前版本已达到目标版本，无需升级。</small>}
+              {receiverNeedsUpgrade && <small>{snapshot.sessionTransport === "lan"
+                ? bindingReference ? "当前网络会话已选定绑定；升级还会核验 USB 设备身份。" : "当前存在网络会话，请选择与该会话对应的保存绑定后再升级。"
+                : "Receiver 版本较旧；可用 USB 维护安装，或指定保存的绑定来验证升级目标。"}</small>}
+              {receiverOperationResult && <small>USB 操作后已重新读取并核验 {receiverOperationResult.serial} 的版本码 {receiverOperationResult.status.versionCode}。</small>}
+              {usbDevices.length === 0 && <small>连接 USB 手机、允许 USB 调试后刷新设备列表。</small>}
+              {updateCandidateError && updateCandidate && <small className="inline-error">{updateCandidateError}</small>}
+            </div>
+            <div className="receiver-status-actions">
+              {canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>安装 Receiver · {updateCandidate.versionCode}</button>}
+              {canRequestUsbMaintenance && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>USB 维护安装 · {updateCandidate.versionCode}</button>}
+              {canRequestUsbUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("upgrade")}>升级 Receiver · {updateCandidate.versionCode}</button>}
+              <button className="dialog-secondary" type="button" disabled={busy} onClick={onRefreshDevices}>刷新 USB 设备</button>
+            </div>
+          </div>
+          {receiverNeedsUpgrade && bindings.length > 0 && <label className="network-field">可选：使用已保存绑定验证升级目标
+            <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }}>
+              <option value="">不指定绑定（USB 维护安装）</option>
+              {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
+            </select>
+          </label>}
+          {receiverNeedsUpgrade && !bindingReference && <small>未指定绑定；后台会先核验设备身份和版本，再执行 USB 维护安装。</small>}
+        </section>}
         {pairedServiceStopped && <div className="network-recovery" role="status">
           <span>当前 USB 手机的 Receiver 服务未启动；可通过 USB 启动所选手机。</span>
           <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); setAdvancedOpen(true); }}>USB 启动所选手机</button>
         </div>}
         {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{shownError}</p>}
-        {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装 Receiver…" : "正在读取网络信息…"}</p>}
-        <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "首次绑定并连接" : "连接已配对手机"}</button>
+        {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverOperationBusy ? "正在执行 USB 操作并核验结果…" : receiverAction === "checking" ? "正在检查 Receiver…" : candidateLoading ? "正在检查随包版本…" : "正在读取网络信息…"}</p>}
+        {!receiverManagerOnly && udpMode && <section className="receiver-manager offer-manager" aria-label="允许手机搜索电脑">
+          <div className="receiver-status-row">
+            <div className="receiver-status-copy" role="status" aria-live="polite">
+              <strong>{offers.active ? `手机连接监听中 · ${offers.interfaceAddress ?? "网络接口"}` : "允许已绑定手机连接"}</strong>
+              <small>{offers.active
+                ? offers.offers.length > 1 ? "收到多个请求，请选择目标后连接。" : offers.automaticBinding ? `手机点击“开始接收”后自动认证 · ${bindingLabel(offers.automaticBinding)}` : "自动认证绑定未启用；收到请求后仍需手动选择并接受。"
+                : bindings.length === 0 ? "首次使用请通过 USB 完成绑定。" : "电脑监听后，手机可一键开始接收。"}</small>
+            </div>
+            {!offers.active && <button className="dialog-secondary" type="button" disabled={busy || audioSessionActive || !localAddress || !bindingReference} onClick={() => void onSetOfferListener(localAddress, true, bindingReference || undefined)}>开始监听</button>}
+          </div>
+          {offers.active && (!offers.automaticBinding || offers.offers.length > 1) && <>
+            {offers.offers.length > 0
+              ? <div className="candidate-list" aria-label="未认证的手机连接请求">
+                  {offers.offers.map(offer => <button type="button" key={offer.id} disabled={busy || audioSessionActive} aria-pressed={selectedOfferId === offer.id} onClick={() => setSelectedOfferId(offer.id)}>
+                    <span>{offer.endpoint}</span><small>{selectedOfferId === offer.id ? "已选择 · " : ""}未认证请求 · 收到后 30 秒内有效</small>
+                  </button>)}
+                </div>
+              : <p className="network-hint">等待手机开始接收。</p>}
+            <p className="network-hint">{bindings.length === 0 ? "尚无已保存绑定；请先完成手机配对。"
+              : bindingReference ? `接受时将使用：${bindingLabel(bindingReference)}`
+                : "有多个已保存绑定；请在高级选项中明确选择一个。"}</p>
+            {offers.offers.length > 1 && !selectedOfferId && <p className="network-hint">请选择要接受的手机请求。</p>}
+            <button className="primary-button" type="button" disabled={busy || audioSessionActive || !selectedOfferId || !bindingReference || !offers.offers.some(offer => offer.id === selectedOfferId)} onClick={() => onAcceptOffer(selectedOfferId, bindingReference)}>接受并连接所选手机</button>
+            {audioSessionActive && <p className="network-hint">音频会话运行时，无法接受连接请求。</p>}
+          </>}
+        </section>}
       </div>
-      <details className="network-advanced" open={advancedOpen || advancedRequired} onToggle={event => { if (!advancedRequired) setAdvancedOpen(event.currentTarget.open); }}>
-        <summary>高级选项与诊断</summary>
+      <details className="network-advanced" open={receiverManagerOnly ? advancedOpen : advancedOpen || advancedRequired} onToggle={event => { if (receiverManagerOnly || !advancedRequired) setAdvancedOpen(event.currentTarget.open); }}>
+        <summary>{receiverManagerOnly ? "Receiver 状态与安装" : "连接选项"}</summary>
         <div className="network-advanced-body">
-          <p className="network-intro">候选地址仅作提示；连接仍使用已保存的绑定进行双向认证。</p>
-          <div className="network-methods" role="group" aria-label="Receiver 连接方式">
+          {!receiverManagerOnly && <p className="network-intro">候选地址仅作提示；连接仍使用已保存的绑定进行双向认证。</p>}
+          {!receiverManagerOnly && <div className="network-methods" role="group" aria-label="Receiver 连接方式">
             <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>USB 首次绑定</button>
             <button type="button" aria-pressed={method === "paired"} disabled={busy || bindings.length === 0} onClick={() => { methodManuallySelected.current = true; setMethod("paired"); onError(""); setLocalError(""); }}>连接已配对手机</button>
-          </div>
-          <label className="network-field">电脑网络接口
-            <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (!peerManuallyEdited.current) setPeer(""); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+          </div>}
+          {!receiverManagerOnly && <label className="network-field">电脑网络接口
+            <select required value={localAddress} disabled={busy || offers.active} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (!peerManuallyEdited.current) setPeer(""); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
               <option value="">请选择 IPv4 接口</option>
               {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
             </select>
-          </label>
+          </label>}
           {method === "bootstrap" ? <>
-            <label className="network-field">已授权的 USB 手机
-              <select required value={serial} disabled={busy} onChange={event => { setSerial(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-                <option value="">请选择 USB 设备</option>
+            <label className="network-field">已授权且在线的 USB 手机
+              <select required value={serial} disabled={busy} onChange={event => { setSerial(event.target.value); onReceiverSerialChange(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+                <option value="">请选择 USB 手机</option>
                 {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
               </select>
             </label>
+            {receiverManagerOnly && usbDevices.length === 0 && <div className="network-recovery" role="status"><span>连接 USB 手机并允许 USB 调试后，才能检查或升级。</span><button type="button" className="text-button" disabled={busy} onClick={onRefreshDevices}>刷新设备</button></div>}
             {serial && <section className="receiver-manager" aria-label="Receiver 安装管理">
               <div className="receiver-status-row">
                 <div className="receiver-status-copy" role="status" aria-live="polite">
-                  <strong>{receiverAction === "checking" ? "正在检查 Receiver…" : receiverAction === "installing" ? "正在安装/更新 Receiver…" : receiverError ? "Receiver 检查失败" : !receiverStatus ? "等待 Receiver 检查" : !receiverStatus.installed ? "Receiver 未安装" : receiverStatus.serviceActive ? receiverStatus.healthy ? "Receiver 已安装 · 服务正常" : "Receiver 已安装 · 服务异常" : "Receiver 已安装 · 服务未启动"}</strong>
+                  <strong>{receiverOperationBusy ? "正在安装并核验 Receiver…" : receiverAction === "checking" ? "正在检查 Receiver…" : receiverError ? "Receiver 检查失败" : !receiverStatus ? "等待 Receiver 检查" : !receiverStatus.installed ? "Receiver 未安装" : receiverStatus.serviceActive ? receiverStatus.healthy ? "Receiver 已安装 · 服务正常" : "Receiver 已安装 · 服务异常" : "Receiver 已安装 · 服务未启动"}</strong>
                   {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : `版本码 ${receiverStatus.versionCode}`, receiverStatus.foreground ? "前台服务" : ""].filter(Boolean).join(" · ")}</small>}
                   {receiverStatus?.audioActive && <small>Receiver 报告音频活动；这不代表手机正在播放。</small>}
-                  {receiverStatus && <small>{receiverStatus.message}</small>}
+                  {receiverStatus && !receiverStatus.healthy && <small>{receiverStatus.error || receiverStatus.message}</small>}
+                  {!receiverManagerOnly && receiverNeedsUpgrade && <small>此版本较旧；兼容的 Receiver 仍可连接，也可选用 USB 管理升级。</small>}
                 </div>
                 <div className="receiver-status-actions">
                   <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? "检查中…" : "检查状态"}</button>
-                  {receiverNeedsInstall && <button className="primary-button" type="button" disabled={busy || audioSessionActive} onClick={() => void installReceiver()}>{receiverAction === "installing" ? "安装中…" : "安装/更新 Receiver"}</button>}
+                  {!receiverManagerOnly && canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>安装 Receiver · {updateCandidate.versionCode}</button>}
+                  {!receiverManagerOnly && receiverNeedsUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>USB 升级选项</button>}
                 </div>
               </div>
               {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverError}</p>}
-              {audioSessionActive && receiverNeedsInstall && <div className="receiver-session-warning"><span>当前有音频会话；请先断开后才能安装/更新 Receiver。</span><button type="button" className="text-button" disabled={busy} onClick={onDisconnect}>断开音频会话</button></div>}
-              {receiverNeedsInstall && <p className="network-note">将使用本便携包附带的 Receiver APK。手机系统可能要求确认安装或通知权限；签名不匹配时 Android 会拒绝覆盖并保留现有应用数据。</p>}
+              {!receiverManagerOnly && receiverNeedsInstall && <p className="network-note">使用 AnPod 随包 Receiver；设备身份、签名和版本会先核验。</p>}
+              {!receiverManagerOnly && receiverNeedsUpgrade && <button type="button" className="text-button" disabled={busy} onClick={onOpenReceiverManager}>打开 USB 升级管理</button>}
             </section>}
-            <label className="network-field">手机当前 IPv4 地址
+            {!receiverManagerOnly && <label className="network-field">手机当前 IPv4 地址
               <select required value={receiverAddress} disabled={busy || !serial || receiverStatus?.installed !== true} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
                 <option value="">请选择手机网络接口</option>
                 {compatibleReceiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
               </select>
-            </label>
-            <p className="network-note">只显示与所选电脑接口处于同一网段的手机地址。</p>
+            </label>}
+            {!receiverManagerOnly && <p className="network-note">只显示与所选电脑接口处于同一网段的手机地址。</p>}
           </> : <>
             <label className="network-field">已配对接收端
               <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
@@ -691,8 +989,8 @@ function NetworkReceiverDialog({ usbDevices, disabled, audioSessionActive, error
             <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />重新搜索地址</button>
             {candidates.length > 0 && <div className="candidate-list" aria-label="未验证的发现候选">{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>未经验证 · 仅填入地址</small></button>)}</div>}
           </>}
-          <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />刷新接口和配对信息</button>
-          <button type="button" className="dialog-secondary" onClick={onLegacy} disabled={busy}>无线调试（过渡/诊断）</button>
+          {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />刷新接口和配对信息</button>}
+          {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? "正在处理…" : method === "bootstrap" ? "首次绑定并连接" : "直接连接 Receiver"}</button>}
         </div>
       </details>
     </form>
@@ -711,13 +1009,17 @@ function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, on
   </Modal>;
 }
 
-function SettingsDialog({ snapshot, largeText, onLargeText, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
+function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, busy, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; busy: boolean; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
   const settings = snapshot.settings;
   const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
   return <Modal title="设置" onClose={onClose} className="settings-dialog">
     <h3>连接</h3>
     <SettingToggle disabled={snapshot.busy} title="自动连接上次使用的手机" description="设备重新出现时尝试连接" checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
     <SettingToggle disabled={snapshot.busy} title="无线连接恢复" description="无线掉线后进行有限次数的重连" checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />
+    <h3>接收端</h3>
+    <label className="select-setting"><span>接收后端</span><select aria-label="接收后端" disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => update("audioBackend", event.target.value)}><option value="legacy">Legacy（兼容）</option><option value="receiver">Receiver</option></select></label>
+    {udpBackendFixed && <p className="dialog-footnote">无线 UDP 使用 Receiver。</p>}
+    <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>检查或安装 Receiver</button>
     <h3>窗口和外观</h3>
     <SettingToggle disabled={snapshot.busy} title="关闭时最小化到托盘" description="从托盘菜单可以重新打开 AnPod" checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
     <SettingToggle title="放大文字" description="增加界面文字尺寸" checked={largeText} onChange={onLargeText} />
@@ -777,7 +1079,7 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
     } catch (reason) { if (generation === taskGeneration.current) setError(String(reason)); }
     finally { if (generation === taskGeneration.current) setBusy(false); }
   };
-  return <Modal title={transport === "wifi" ? "无线调试（过渡/诊断）" : "连接 USB 手机"} onClose={onClose} className="pair-dialog">
+  return <Modal title={transport === "wifi" ? "无线 ADB 兼容连接" : "连接 USB 手机"} onClose={onClose} className="pair-dialog">
     {transport === "wifi" ? <>
       <div className="tabs" role="tablist" aria-label="添加方式"><button role="tab" aria-selected={tab === "qr"} disabled={disabled || busy} onClick={() => setTab("qr")}>扫码配对</button><button role="tab" aria-selected={tab === "code"} disabled={disabled || busy} onClick={() => setTab("code")}>配对码</button><button role="tab" aria-selected={tab === "address"} disabled={disabled || busy} onClick={() => setTab("address")}>手动地址</button></div>
       {tab === "qr" && <div className="qr-pane">
@@ -812,22 +1114,94 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
   </Modal>;
 }
 
-function HelpDialog({ transport, onClose }: { transport: "usb" | "wifi"; onClose: () => void }) {
+function HelpDialog({ transport, wirelessProtocol, onClose }: { transport: Snapshot["connectionTransport"]; wirelessProtocol: Snapshot["sessionWirelessProtocol"]; onClose: () => void }) {
   return <Modal title="连接帮助" onClose={onClose} className="help-dialog">
-    {transport === "usb" ? <><h3>USB 与 Receiver</h3><ol><li>在手机开发者选项中开启 USB 调试，用支持数据的线连接，并允许此电脑进行 USB 调试。</li><li>在直接连接弹窗中选中 USB 手机后，可检查 Receiver 状态，并由你明确点击“安装/更新 Receiver”；系统可能要求确认安装或通知权限。</li><li>连接时明确选择电脑与手机正在使用的网络接口，两端需要位于可互访网络。</li></ol></> : <><h3>直接网络连接</h3><ol><li>主入口使用已安装并通过版本、签名核验的 Receiver，在可互访网络上进行加密认证。</li><li>首次绑定或 Receiver 需重新启动时，需要已授权 USB 连接；可在弹窗检查状态并明确点击“安装/更新 Receiver”。系统可能要求安装或通知权限确认。</li><li>无线调试扫码、配对码和地址连接保留为过渡/诊断方式。</li></ol></>}
-    <p>请在手机上允许所需的 USB 调试和 Receiver 通知权限。如果 Receiver 被强行停止或手机重启，需要重新通过 USB 启动。连接就绪不代表手机已开始播放；播放状态会在 Receiver 确认后显示。</p><button className="dialog-secondary" onClick={onClose}>完成</button>
+    {transport === "usb" ? <><h3>USB 连接</h3><ol><li>在手机开发者选项中开启 USB 调试，用支持数据的线连接，并允许此电脑进行 USB 调试。</li><li>接收后端可在主界面的二级菜单中选择 Legacy 或已安装 Receiver。</li></ol></>
+      : wirelessProtocol === "udp" ? <><h3>无线 UDP 直连</h3><ol><li>使用已配对接收端；首次绑定时需通过已授权 USB 手机检查 Receiver。</li><li>明确选择电脑网络接口和接收端地址后，再点击连接。发现结果只是地址建议，不代表认证连接。</li><li>仅在你明确点击“安装/更新 Receiver”后，程序才会请求安装。</li></ol></>
+        : <><h3>无线 ADB 兼容连接</h3><ol><li>先在手机的无线调试页面启用并配对设备，再从添加手机入口选择扫码、配对码或手动连接地址。</li><li>配对/连接成功后，再从设备卡片明确连接；不会因搜索到设备就开始播放。</li></ol></>}
+    <p>{transport === "usb" ? "USB 操作需要在手机上允许此电脑进行调试。使用 Receiver 时，连接就绪不代表手机已开始播放；播放状态会在 Receiver 确认后显示。"
+      : wirelessProtocol === "udp" ? "Receiver 安装或通知权限可能需要 Android 系统确认。若 Receiver 被强行停止或手机重启，需要通过 USB 重新启动；连接就绪不代表手机已开始播放。"
+        : "无线调试配对需要在手机系统中明确授权。连接就绪不代表手机已开始播放；播放状态由当前音频后端报告。"}</p><button className="dialog-secondary" onClick={onClose}>完成</button>
   </Modal>;
 }
 
 function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose: () => void }) {
-  const text = [`状态：${snapshot.message}`, `连接方式：${transportLabel(snapshot.sessionTransport ?? snapshot.transport)}`, `设备：${snapshot.sessionReceiverBinding ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName ?? "无"}`, `输出：${snapshot.output === "phone" ? "手机" : "电脑"}`, `可见设备：${snapshot.devices.length}`, `详细状态：${snapshot.statusDetail}`, `版本：${snapshot.version}`].join("\n");
+  const capabilities = snapshot.sessionCapabilities;
+  const diagnostic = snapshot.playbackDiagnostics;
+  const active = hasActiveSession(snapshot);
+  const udpSession = active && snapshot.sessionTransport === "lan"
+    && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp";
+  const unsupportedUdpDiagnostics = udpSession
+    && (capabilities === null || (capabilities.capabilityBits & CAP_PLAYBACK_PROGRESS) === 0);
+  const playbackContext = !active ? "当前无手机会话。"
+    : snapshot.output === "computer" ? "声音当前输出到电脑；以下仅为最近快照，不代表手机此刻正在播放。"
+      : snapshot.state === "paused" ? "手机播放已暂停；以下仅为最近快照。"
+        : snapshot.state === "streaming" && diagnostic?.playbackAdvancing === true ? "最近快照报告手机播放正在推进。"
+          : "以下为最近取得的诊断快照，不代表手机此刻正在播放。";
+  const unavailable = !active ? "当前没有手机会话，尚无播放诊断快照。"
+    : unsupportedUdpDiagnostics ? "此 Receiver 未提供播放诊断能力（可能为旧版本或尚未协商）；连接与播放不受影响。"
+      : "当前没有可用的播放诊断快照；数据尚未取得或 Receiver 未提供。";
+  const number = (value: number | null) => value === null ? "未提供" : value.toLocaleString("zh-CN");
+  const frames = (value: number | null, meaning: string) => value === null ? "未提供" : `${number(value)} 帧 · ${meaning}`;
+  const groups: { title: string; note?: string; metrics: [string, string][] }[] = diagnostic ? [
+    { title: "实际音频格式", metrics: [
+      ["PC 采样率", diagnostic.sampleRate === null ? "未提供" : `${number(diagnostic.sampleRate)} Hz`],
+      ["PC 声道数", number(diagnostic.channels)],
+      ["Receiver 采样率", diagnostic.receiverSampleRate === null ? "未提供" : `${number(diagnostic.receiverSampleRate)} Hz`],
+      ["Receiver 声道数", number(diagnostic.receiverChannels)],
+    ] },
+    { title: "发送与接收队列", note: "队列和目标以当前帧数显示；丢弃、过期与积压为本次会话累计。", metrics: [
+      ["PC 当前队列", frames(diagnostic.pcQueuedFrames, "当前队列")],
+      ["PC 丢弃", frames(diagnostic.pcDroppedFrames, "会话累计")],
+      ["UDP 抖动目标", frames(diagnostic.udpJitterTargetFrames, "目标队列")],
+      ["UDP 当前队列", frames(diagnostic.udpQueuedFrames, "当前队列")],
+      ["UDP 过期", frames(diagnostic.udpExpiredFrames, "会话累计")],
+      ["TCP 丢弃积压", frames(diagnostic.tcpDroppedBacklogFrames, "会话累计")],
+    ] },
+    { title: "Receiver 播放状态", note: "待播帧为本次查询；欠载增量是与上次查询的差值，首次查询或计数重置时未提供。", metrics: [
+      ["AudioTrack 待播", frames(diagnostic.trackPendingFrames, "本次查询")],
+      ["欠载总数", diagnostic.underrunCount === null ? "未提供" : `${number(diagnostic.underrunCount)} · AudioTrack 累计`],
+      ["欠载增量", diagnostic.underrunIncrement === null ? "未提供" : `${number(diagnostic.underrunIncrement)} · 自上次查询`],
+      ["播放推进", diagnostic.playbackAdvancing === null ? "未提供" : diagnostic.playbackAdvancing ? "是" : "否"],
+    ] },
+    { title: "AudioTrack 缓冲", note: "均为 AudioTrack 报告的帧数；不等同端到端延迟。", metrics: [
+      ["请求", frames(diagnostic.requestedBufferFrames, "AudioTrack")],
+      ["系统接受", frames(diagnostic.acceptedBufferFrames, "AudioTrack")],
+      ["当前有效", frames(diagnostic.effectiveBufferFrames, "AudioTrack")],
+      ["容量", frames(diagnostic.capacityFrames, "AudioTrack")],
+      ["启动阈值", frames(diagnostic.startThresholdFrames, "AudioTrack")],
+      ["预填充", frames(diagnostic.preRollFrames, "AudioTrack")],
+    ] },
+  ] : [];
+  const statusText = [
+    `状态：${snapshot.message}`, `本次连接：${active ? actualConnectionLabel(snapshot) : "未连接"}`,
+    `当前选择：${intendedConnectionLabel(snapshot)}`, `接收后端选择：${snapshot.settings.audioBackend}`,
+    `设备：${snapshot.sessionReceiverBinding ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName ?? "无"}`,
+    `输出：${snapshot.output === "phone" ? "手机" : "电脑"}`, `可见设备：${snapshot.devices.length}`,
+    `详细状态：${snapshot.statusDetail}`,
+    `认证能力：${capabilities ? `管理 ${capabilities.controlMajor}（兼容 ${capabilities.managementCompatible}），音频 ${capabilities.audioMajor}（兼容 ${capabilities.audioCompatible}），位标志 0x${capabilities.capabilityBits.toString(16)}，版本码 ${capabilities.versionCode}` : "无"}`,
+    `版本：${snapshot.version}`,
+  ].join("\n");
+  const text = [statusText, `播放诊断：${playbackContext}`,
+    ...groups.flatMap(group => [group.title, ...group.metrics.map(([label, value]) => `${label}：${value}`), ...(group.note ? [group.note] : [])]),
+  ].join("\n");
+  const metricGroup = (group: typeof groups[number]) => <section className="diagnostic-group" key={group.title}>
+    <h3>{group.title}</h3>
+    <dl>{group.metrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+    {group.note && <p>{group.note}</p>}
+  </section>;
   return <Modal title="诊断" onClose={onClose} className="diagnostics-dialog">
-    <p>本次运行状态</p><pre>{text}</pre><div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(text)}><Copy size={15} />复制诊断</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>查看日志文件夹<ExternalLink size={14} /></button></div>
+    <p>本次运行状态</p><pre>{statusText}</pre>
+    <section className="diagnostic-playback" aria-label="播放诊断">
+      <h3>播放诊断</h3><p className="diagnostic-context" role="status">{playbackContext}</p>
+      {diagnostic ? groups.map(metricGroup) : <p className="diagnostic-empty">{unavailable}</p>}
+    </section>
+    <div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(text)}><Copy size={15} />复制诊断</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>查看日志文件夹<ExternalLink size={14} /></button></div>
   </Modal>;
 }
 
 function ConfirmDialog({ title, body, confirmLabel, busy, onConfirm, onCancel }: { title: string; body: string; confirmLabel: string; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
-  return <Modal title={title} onClose={onCancel} className="confirm-dialog"><p>{body}</p><div className="dialog-actions"><button className="dialog-secondary" onClick={onCancel} disabled={busy}>取消</button><button className="primary-button" onClick={onConfirm} disabled={busy}>{busy ? "正在切换…" : confirmLabel}</button></div></Modal>;
+  return <Modal title={title} onClose={() => { if (!busy) onCancel(); }} className="confirm-dialog"><p>{body}</p><div className="dialog-actions"><button className="dialog-secondary" onClick={onCancel} disabled={busy}>取消</button><button className="primary-button" onClick={onConfirm} disabled={busy}>{busy ? "正在切换…" : confirmLabel}</button></div></Modal>;
 }
 
 export default App;

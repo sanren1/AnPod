@@ -11,6 +11,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'source-snapshot.ps1')
+$inputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
+$sourceInputsSha256 = Get-AnPodSourceSnapshot $root $inputPaths
 $project = Join-Path $root 'src\AnPod.Receiver'
 
 if (-not $JavaHome) { $JavaHome = $env:JAVA_HOME }
@@ -40,8 +43,8 @@ $applicationId = [regex]::Match($appGradle, "(?m)^\s*applicationId\s+'([^']+)'\s
 $configuredVersionCode = [int][regex]::Match($appGradle, '(?m)^\s*versionCode\s+(\d+)\s*$').Groups[1].Value
 $configuredVersionName = [regex]::Match($appGradle, "(?m)^\s*versionName\s+'([^']+)'\s*$").Groups[1].Value
 $configuredTargetSdk = [int][regex]::Match($appGradle, '(?m)^\s*targetSdk\s+(\d+)\s*$').Groups[1].Value
-if ($applicationId -ne 'app.anpod.receiver' -or $configuredVersionCode -ne 3 -or $configuredVersionName -ne '0.3.0-v2-candidate' -or $configuredTargetSdk -ne 35) {
-    throw 'Receiver Gradle configuration must identify the v2 candidate as app.anpod.receiver / 0.3.0-v2-candidate / code 3 / targetSdk 35.'
+if ($applicationId -ne 'app.anpod.receiver' -or $configuredVersionCode -ne 9 -or $configuredVersionName -ne '0.7.0-v3-flow-candidate' -or $configuredTargetSdk -ne 35) {
+    throw 'Receiver Gradle configuration must identify the current v3 flow candidate as app.anpod.receiver / 0.7.0-v3-flow-candidate / code 9 / targetSdk 35.'
 }
 $sourceCommit = (& git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the Receiver source commit.' }
@@ -115,19 +118,27 @@ $application = $manifest.SelectSingleNode('/manifest/application', $ns)
 if (-not $application) { throw 'Merged manifest is missing application.' }
 $components = @($application.ChildNodes | Where-Object { $_.LocalName -in @('activity', 'service', 'provider', 'receiver') })
 $exports = @($components | Where-Object { $_.GetAttribute('exported', $androidNs) -eq 'true' })
+$mainActivity = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.MainActivity' }
 $bootstrap = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.BootstrapActivity' }
 $service = $components | Where-Object { $_.LocalName -eq 'service' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.ReceiverService' }
 $provider = $components | Where-Object { $_.LocalName -eq 'provider' -and $_.GetAttribute('authorities', $androidNs) -eq 'app.anpod.receiver.state' }
+$profileInstaller = $components | Where-Object { $_.LocalName -eq 'receiver' -and $_.GetAttribute('name', $androidNs) -eq 'androidx.profileinstaller.ProfileInstallReceiver' }
 if (-not $bootstrap -or $bootstrap.GetAttribute('exported', $androidNs) -ne 'true' -or $bootstrap.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'Bootstrap must be explicitly exported and protected by android.permission.DUMP.' }
-if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or $service.GetAttribute('foregroundServiceType', $androidNs) -ne 'shortService|mediaPlayback') { throw 'P2 Receiver service must be private and declare shortService plus mediaPlayback foreground types.' }
+if (-not $mainActivity -or $mainActivity.GetAttribute('exported', $androidNs) -ne 'true' -or $mainActivity.GetAttribute('permission', $androidNs)) { throw 'MainActivity must be the unpermissioned exported Launcher entry.' }
+if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or $service.GetAttribute('foregroundServiceType', $androidNs) -ne 'shortService|mediaPlayback') { throw 'Receiver service must remain private and declare only shortService and mediaPlayback foreground types.' }
 if (-not $provider -or $provider.GetAttribute('exported', $androidNs) -ne 'true' -or $provider.GetAttribute('readPermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('writePermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('grantUriPermissions', $androidNs) -ne 'false') { throw 'Health provider must be read-only to ordinary callers and protected by android.permission.DUMP.' }
-if (@($exports | Where-Object { $_ -ne $bootstrap -and $_ -ne $provider }).Count) { throw 'Merged manifest contains an unexpected exported component.' }
-if ($components | Where-Object { $_.SelectNodes('intent-filter/category[@android:name="android.intent.category.LAUNCHER"]', $ns).Count -gt 0 }) { throw 'Receiver APK must not contain a Launcher entry.' }
+if (-not $profileInstaller -or $profileInstaller.GetAttribute('exported', $androidNs) -ne 'true' -or $profileInstaller.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'AndroidX ProfileInstallReceiver must remain protected by android.permission.DUMP.' }
+if (@($exports | Where-Object { $_ -ne $bootstrap -and $_ -ne $provider -and $_ -ne $mainActivity -and $_ -ne $profileInstaller }).Count) { throw 'Merged manifest contains an unexpected exported component.' }
+$launcherComponents = @($components | Where-Object { $_.SelectNodes('intent-filter[action[@android:name="android.intent.action.MAIN"] and category[@android:name="android.intent.category.LAUNCHER"]]', $ns).Count -gt 0 })
+if ($launcherComponents.Count -ne 1 -or $launcherComponents[0] -ne $mainActivity) { throw 'MainActivity must be the only MAIN/LAUNCHER component.' }
 $permissions = @($manifest.SelectNodes('/manifest/uses-permission', $ns) | ForEach-Object { $_.GetAttribute('name', $androidNs) })
 foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.POST_NOTIFICATIONS')) {
     if ($required -notin $permissions) { throw "Merged manifest is missing $required." }
 }
-if ('android.permission.ACCESS_LOCAL_NETWORK' -in $permissions) { throw 'Do not request Android 17 local-network permission while targeting SDK 34.' }
+foreach ($retired in @('android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.REQUEST_INSTALL_PACKAGES')) {
+    if ($retired -in $permissions) { throw "Retired network APK installation permission remains: $retired" }
+}
+if ('android.permission.ACCESS_LOCAL_NETWORK' -in $permissions) { throw 'Do not add a new local-network permission while targeting SDK 35.' }
 
 $badging = & (Join-Path $buildTools.FullName 'aapt.exe') dump badging $apk
 if ($LASTEXITCODE -ne 0) { throw 'aapt could not inspect the Receiver APK.' }
@@ -144,7 +155,12 @@ try {
 }
 finally { $archive.Dispose() }
 
-$signatureOutput = & (Join-Path $buildTools.FullName 'apksigner.bat') verify --print-certs $apk 2>&1
+$signingJavaHome = $env:JAVA_HOME
+$signingPath = $env:PATH
+$env:JAVA_HOME = [IO.Path]::GetFullPath($JavaHome)
+$env:PATH = (Join-Path $env:JAVA_HOME 'bin') + [IO.Path]::PathSeparator + $signingPath
+try { $signatureOutput = & (Join-Path $buildTools.FullName 'apksigner.bat') verify --print-certs $apk 2>&1 }
+finally { $env:JAVA_HOME = $signingJavaHome; $env:PATH = $signingPath }
 $signatureText = $signatureOutput -join "`n"
 $signerMatch = [regex]::Match($signatureText, 'Signer #1 certificate SHA-256 digest: (?<sha>[0-9a-fA-F]{64})')
 if ($LASTEXITCODE -ne 0 -or -not $signerMatch.Success) {
@@ -153,7 +169,7 @@ if ($LASTEXITCODE -ne 0 -or -not $signerMatch.Success) {
 $signerSha256 = $signerMatch.Groups['sha'].Value.ToLowerInvariant()
 $apkSha256 = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($versionName -ne $configuredVersionName -or $versionCode -ne $configuredVersionCode) {
-    throw 'Receiver APK version does not match the v2 candidate Gradle configuration.'
+    throw 'Receiver APK version does not match the current v3 candidate Gradle configuration.'
 }
 
 $outputPath = $OutputDirectory
@@ -172,7 +188,10 @@ $metadata = [ordered]@{
     sha256 = $apkSha256
     signerSha256 = $signerSha256
     sourceCommit = $sourceCommit
+    sourceInputsSha256 = $sourceInputsSha256
+    sourceModified = @(& git -C $root status --porcelain=v1 -- @inputPaths).Count -gt 0
 }
+if ((Get-AnPodSourceSnapshot $root $inputPaths) -ne $sourceInputsSha256) { throw 'Receiver source inputs changed during the build.' }
 $metadataJson = $metadata | ConvertTo-Json
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($temporaryMetadata, $metadataJson, $utf8WithoutBom)

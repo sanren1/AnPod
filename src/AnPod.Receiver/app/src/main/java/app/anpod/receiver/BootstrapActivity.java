@@ -30,8 +30,12 @@ public final class BootstrapActivity extends Activity {
 
         String action = getIntent().getAction();
         if (ACTION_STOP.equals(action)) {
-            stopService(new Intent(this, ReceiverService.class));
-            status.setText("AnPod Receiver 已停止。");
+            try {
+                startService(new Intent(this, ReceiverService.class).setAction(ACTION_STOP));
+                status.setText("AnPod Receiver 正在停止并清理当前音频会话…");
+            } catch (RuntimeException error) {
+                status.setText("AnPod Receiver 停止请求失败，请重试。");
+            }
             status.postDelayed(this::finish, 250);
         } else if (ACTION_START.equals(action) || ACTION_START_AUDIO.equals(action)
                 || ACTION_START_NETWORK_AUDIO.equals(action)) {

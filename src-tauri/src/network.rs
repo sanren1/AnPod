@@ -62,6 +62,10 @@ impl PcmQueue {
 
     pub fn dropped_frames(&self) -> u64 { self.dropped_frames.load(Ordering::Relaxed) }
 
+    pub(crate) fn queued_frames(&self) -> u64 {
+        self.state.lock().expect("PCM queue lock poisoned").queued_frames
+    }
+
     pub(crate) fn for_session(format: PcmFormat, low_latency: bool) -> Self {
         let mut queue = Self::new();
         queue.target_format = Some(format);

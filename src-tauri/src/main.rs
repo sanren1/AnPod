@@ -108,6 +108,11 @@ async fn receiver_install(state: State<'_, AppState>, serial: String) -> Result<
 }
 
 #[tauri::command]
+async fn receiver_upgrade_usb(state: State<'_, AppState>, serial: String, binding_reference: String) -> Result<receiver::ReceiverStatus, String> {
+    state.receiver_upgrade_usb(&serial, &binding_reference).await
+}
+
+#[tauri::command]
 async fn receiver_start(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
     state.receiver_start(&serial).await
 }
@@ -120,6 +125,11 @@ async fn receiver_health(state: State<'_, AppState>, serial: String) -> Result<r
 #[tauri::command]
 async fn receiver_stop(state: State<'_, AppState>, serial: String) -> Result<receiver::ReceiverStatus, String> {
     state.receiver_stop(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_update_candidate(state: State<'_, AppState>) -> Result<Option<state::ReceiverUpdateCandidate>, String> {
+    state.receiver_update_candidate().await
 }
 
 #[tauri::command]
@@ -148,6 +158,18 @@ async fn start_network_audio(app: tauri::AppHandle, state: State<'_, AppState>, 
     receiver_prefix_length: Option<u8>, binding_reference: Option<String>) -> Result<AppSnapshot, String> {
     state.start_network_audio(&app, &local_address, &peer, bootstrap_serial.as_deref(),
         receiver_address.as_deref(), receiver_prefix_length, binding_reference.as_deref()).await
+}
+
+#[tauri::command]
+fn set_wireless_connection_offers(state: State<'_, AppState>, local_address: String, allowed: bool, binding_reference: Option<String>)
+    -> Result<discovery::HostDiscoverySnapshot, String> {
+    state.set_wireless_connection_offers(&local_address, allowed, binding_reference.as_deref())
+}
+
+#[tauri::command]
+async fn accept_wireless_connection_offer(app: tauri::AppHandle, state: State<'_, AppState>,
+    offer_id: String, binding_reference: String) -> Result<AppSnapshot, String> {
+    state.accept_wireless_connection_offer(&app, &offer_id, &binding_reference).await
 }
 
 #[tauri::command]
@@ -241,14 +263,18 @@ fn main() {
             pair_qr,
             receiver_status,
             receiver_install,
+            receiver_upgrade_usb,
             receiver_start,
             receiver_health,
             receiver_stop,
+            receiver_update_candidate,
             network_interfaces,
             receiver_network_interfaces,
             receiver_binding_references,
             discover_network_receivers,
             start_network_audio,
+            set_wireless_connection_offers,
+            accept_wireless_connection_offer,
             cancel_qr_pairing,
             reconfigure_session,
             show_main_window,

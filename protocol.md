@@ -216,6 +216,75 @@ OK (0), rejected (1), or failed (2). States are authenticated (0),
 TransportConnected (1), ReceiverRunning (2), Streaming (3), paused (4), and
 stopped (5). ACK has its own receiver-to-host sequence and HMAC.
 
+## Receiver management negotiation (V3)
+
+The P5-C authenticated outer frame remains version 1: a two-byte length prefix,
+the fixed 30-byte header, payload, and 32-byte HMAC. Existing ACK type 127 keeps
+its exact 13-byte payload. The V3 capability response is a separate fixed
+frame; no implementation may append fields to an old ACK.
+
+After the P5-A binding handshake has authenticated the session, but before
+BIND/START, PCM, or any new management action, the host may send
+`CAPABILITIES_QUERY` (type 8) with this fixed 8-byte payload:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 2 | requested management control major, unsigned big-endian (`3` for V3) |
+| 2 | 1 | requested audio protocol major (`1` for PCM16 v1) |
+| 3 | 1 | reserved, must be zero |
+| 4 | 4 | required capability bit mask, unsigned big-endian |
+
+A V3 receiver replies to an authenticated query with `CAPABILITIES_INFO`
+(type 9), whose fixed 20-byte payload reports whether the requested versions
+and capabilities are compatible:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 8 | echoed host query sequence, unsigned big-endian |
+| 8 | 2 | supported management control major, unsigned big-endian |
+| 10 | 1 | supported audio protocol major |
+| 11 | 1 | result: `0` compatible, `1` incompatible |
+| 12 | 4 | implemented capability bit mask, unsigned big-endian |
+| 16 | 4 | `versionCode`, unsigned big-endian; informational only |
+
+Both frames use the existing direction, session ID, sequence, and HMAC checks.
+Capability bits are:
+
+| Bit mask | Capability |
+|---:|---|
+| `0x00000001` | `receiver-ui` |
+| `0x00000002` | `authenticated-status` |
+| `0x00000008` | `playback-progress` |
+
+The former capability bit `0x00000004` and command types 10–15 for network APK
+updates are retired. They are not advertised, accepted, or sent, and these
+numeric identifiers remain reserved rather than being reassigned to other
+features.
+
+A receiver reports only implemented bits; unknown bits do not satisfy a
+required bit. `versionCode` and the capability response are not
+APK identity evidence. The host must separately establish identity from its
+existing binding authentication or an exact locally audited APK digest. It
+must not trust a remote package name, certificate string, or version claim as
+identity.
+
+The host proceeds with audio only after an authenticated response with result
+`0`, matching required control/audio majors, and every required capability bit.
+Network APK upload and self-update are not part of P5-C. The host keeps APK identity and installation on the explicitly selected USB/ADB path; network sessions are limited to authenticated management and audio operations.
+
+An old receiver that does not recognize type 8 may reject or close the session.
+The V3 host ends that session and does not reinterpret an old ACK or issue V3
+commands. A documented legacy path is allowed only when the installed APK has
+already been proven against the exact local target or an explicit audited
+historical digest/version/source record. Otherwise the user must use the
+existing authorized ADB or manual same-signature installation path. The first
+v2-to-v3 installation is not a network update.
+
+The current V3 source configuration uses Android `versionCode` 9 and the
+existing `0.7.0-v3-flow-candidate` version name; no final APK 9 artifact has
+been generated. APK identity still comes from locally verified artifact
+metadata, not the capability response.
+
 Audio remains the existing ANPD v1 UDP datagram: 34-byte authenticated header,
 PCM16LE payload, AES-GCM tag, and the negotiated P5-A session ID. The sender
 uses the P5-A host-to-receiver audio key. The receiver uses that same derived
@@ -368,6 +437,78 @@ the wire exchange and full authenticated PCM handoff only on loopback with a
 fake sink; real LAN/hotspot broadcast, Android runtime, ADB, WASAPI, AudioTrack,
 and audible output remain NOT_TESTED.
 
+## P5-C V3 bidirectional discovery and host offers
+
+Discovery v1 remains unchanged for host-initiated discovery. V3 adds three
+unauthenticated records on the same UDP port (`49772`), sent only over the
+currently selected private IPv4 interface:
+
+| Record | Version/type | Bytes | Payload |
+| --- | --- | ---: | --- |
+| `HOST_PROBE` | 2 / 3 | 24 | zero flags, fresh 16-byte nonce |
+| `HOST_CANDIDATE` | 2 / 4 | 26 | zero flags, echoed nonce, PC UDP offer port (`49772`) |
+| `CONNECT_OFFER` | 2 / 5 | 26 | zero flags, echoed nonce, Receiver TCP control port |
+
+All integers are big-endian; the 2-byte flags field is zero. A Receiver search
+is user-started, expires after ten seconds, and can be cancelled. Its discovery
+socket binds port 49772 on the selected Android `Network` and receives on the
+wildcard address so directed broadcasts reach it; the advertised TCP control
+listener remains bound to the selected local address. The Receiver only sends
+`HOST_PROBE` and accepts PC `HOST_CANDIDATE` replies; it does not answer
+`HOST_PROBE` as though it were a PC. The Receiver accepts at
+most 16 unique candidates whose source is in its selected interface prefix,
+whose record advertises UDP offer port 49772, and whose nonce matches the active
+search. The PC's explicit wireless-UDP offer listener binds port 49772 on the
+wildcard address to receive LAN broadcasts, filters packets to the selected
+private IPv4 prefix and source port, and sends candidate replies from a socket
+bound to the selected local address. A selected candidate can send one
+`CONNECT_OFFER` to the PC's fixed discovery port. The PC accepts an offer only
+from that interface prefix and source port 49772, correlated to a fresh probe
+and unexpired nonce. Offers expire thirty seconds after receipt of their
+`CONNECT_OFFER`; expiry is enforced when snapshots are read and when an offer is
+accepted. The automatic phone intent still expires ten seconds after search
+starts, so a later offer cannot start automatic playback. Loss of the selected Android interface closes its discovery socket
+and clears actionable candidates.
+
+An offer is only a pending, unauthenticated endpoint hint. It cannot change
+the current binding or establish identity. An explicitly enabled PC listener
+may use the sole saved binding, or a binding explicitly selected when enabling
+the listener, to authenticate one unambiguous pending target automatically.
+Several pending targets or unresolved binding choices retain explicit selection.
+An automatic caller requires the connection-intent capability described below;
+an explicit accept can still connect to older Receivers. Both perform P5-A plus
+the authenticated capability query before BIND/START. A spoofed, replayed, expired, or otherwise
+uncorrelated offer is ignored. The offer listener requires saved transport
+`Wifi` and wireless protocol `udp`; changing either setting or the selected
+interface closes it. Activity rebinds reuse the existing Receiver service and
+discovery socket. V3 search uses that same socket and creates no pairing or
+audio endpoint.
+
+### One-click reception intent (U5)
+
+The phone's explicit start action uses the same ten-second search and sends
+one CONNECT_OFFER automatically to each bounded valid PC candidate. None of
+those candidates is trusted until the saved P5-A binding authenticates it.
+Automatic mode advertises capability `connection-intent` (`0x00000010`).
+After CAPABILITIES_INFO and before BIND, the host sends HMAC-protected
+CONNECTION_INTENT (type 17) containing exactly the 16 discovery-token bytes.
+An OK ACK retains Authenticated state. Wrong, absent, expired or cancelled
+intents reject BIND/START. Types 10–15 and the retired network-update bit stay
+reserved; P5-A and encrypted audio layouts are unchanged.
+
+Cancellation clears the pending intent and closes any pending TCP connection.
+START rechecks the intent in the service's actual main-thread handoff as well
+as the coordinator. Interface loss invalidates it. Once playback is established,
+the same intent identifier can identify that operation during the existing
+bounded recovery window; it is not a cryptographic nonce. Every recovery still
+performs a new P5-A handshake with fresh cryptographic nonces, session and keys.
+Explicit stop closes the operation; Activity rebind never starts a new search.
+PC listener stop, replacement, mode change or interface loss cancels its
+pending operation; automatic attempts never preempt an active session or a
+foreground operation. The listener remains alive through failed authentication
+so consumed discovery tokens stay single-use. Failed initial automatic attempts
+do not enter indefinite reconnect loops. No binding is created or changed.
+
 ## P5-F explicit product backend
 
 The desktop backend exposes explicit Tauri commands and routes their work
@@ -473,3 +614,92 @@ must produce this complete packet:
 ```
 
 The vector is test data only and must not be used as a session key.
+
+## Desktop transport selection (V2 backend contract)
+
+The canonical selection is `transport = usb | wireless`. For a wireless
+selection, persist `wirelessProtocol = udp | adb`; a new setting defaults to
+`udp`. A saved `preferredTransport = Wifi` with no protocol field migrates to
+`adb`, preserving the former Wi-Fi ADB behavior; explicit `udp` and `adb`
+values are retained. A missing audio-backend setting also preserves the old
+`ANPOD_AUDIO_BACKEND=installed-receiver` opt-in. The stored
+`preferredTransport = Usb | Wifi` remains as a compatibility representation
+for the current frontend; snapshots expose the canonical value as
+`connectionTransport` and continue returning the old `transport = usb | wifi`
+alias until the UI migration.
+
+Use `update_setting` for an idle preference. For an active session, call
+`reconfigure_session` with `kind = transport`, `wirelessProtocol`,
+`audioBackend`, or `playback`; the backend validates the requested value before starting an
+operation or cleaning up the current owner. It stops the old route, restores
+computer output, removes owned resources, then reconnects only when the same
+device and selected route are known. Missing wireless ADB devices or UDP
+interface/binding/peer data produce a ready state with computer output and a
+selection prompt. UDP never guesses a peer and never falls back to ADB. Device
+monitoring and auto-reconnect follow the saved wireless protocol, while the
+explicit `connect_device*` commands remain explicit ADB operations.
+
+`connect_device`, `connect_device_only`, and `switch_device` are explicit
+ADB-device operations. A wireless ADB serial always stays on ADB even when the
+stored wireless protocol is UDP; UDP is selected explicitly through the
+existing `start_network_audio` command. Its active session reports
+`sessionConnectionTransport = wireless` and
+`sessionWirelessProtocol = udp`; a Wi-Fi ADB session reports
+`wireless` / `adb`. USB reports `usb` with no wireless protocol.
+
+The Receiver audio backend is selected separately with
+`audioBackend = receiver | legacy`; Legacy is not a wireless protocol.
+Existing USB default routing remains Legacy until a real-device Receiver
+smoke test passes. Selecting Receiver routes both USB and wireless ADB through
+the installed APK's existing ADB reverse and LocalSocket scheduling path.
+Failures stop and clean that route; the host does not retry by silently
+starting Legacy.
+
+The protected `BootstrapActivity` STOP action sends an explicit STOP command
+to the private `ReceiverService`. The service routes it through the current
+owner/generation termination path, which releases AudioTrack, network
+coordinator, and foreground state even while one or more UI clients remain
+bound. A duplicate STOP waits for the existing cleanup. Device-side Binder and
+foreground-service runtime behavior remains unverified.
+
+## P5-C authenticated playback progress (V5)
+
+After capability negotiation, a host that received `playback-progress`
+(`0x00000008`) may send `PLAYBACK_PROGRESS_QUERY` (type 16) with an empty
+payload. It is sent alongside the existing authenticated heartbeat, at the
+host's one-second status-query cadence. The Receiver replies using ACK type
+127 and the existing 13-byte ACK payload followed by exactly 70 bytes of
+playback diagnostics (83 bytes total). The 13-byte ACK itself is unchanged.
+An older Receiver that does not advertise the capability receives no type 16
+query.
+
+The 70-byte extension uses unsigned big-endian integers. `0xff`, `0xffffffff`,
+and `0xffffffffffffffff` mean unknown for 1-, 4-, and 8-byte fields
+respectively. Queue, pending, buffer, and drop values are PCM frames; sample
+rate is Hz, channels are a count, and underruns are a cumulative AudioTrack
+counter. The host computes `underrunIncrement` from successive cumulative
+counts within the same authenticated session; the first sample or a counter
+reset has an unknown increment.
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 0 | 4 | Receiver sample rate, Hz |
+| 4 | 1 | Receiver channel count |
+| 5 | 4 | UDP jitter target, frames |
+| 9 | 8 | Expired UDP frames, cumulative |
+| 17 | 8 | UDP queue depth, frames |
+| 25 | 8 | AudioTrack pending frames |
+| 33 | 4 | AudioTrack underrun count, cumulative |
+| 37 | 8 | Receiver TCP backlog frames dropped, cumulative |
+| 45 | 1 | Playback head advanced recently: `0` no, `1` yes |
+| 46 | 4 | Requested AudioTrack buffer, frames |
+| 50 | 4 | Accepted AudioTrack buffer, frames |
+| 54 | 4 | Effective AudioTrack buffer, frames |
+| 58 | 4 | AudioTrack capacity, frames |
+| 62 | 4 | AudioTrack start threshold, frames |
+| 66 | 4 | Startup pre-roll, frames |
+
+The PC supplies its own capture sample rate/channels, PCM queue depth, and
+dropped frames from its local session state. Neither frame counts nor recent
+playback-head advancement are an acoustic-latency measurement, and this query
+does not compare remote and local clocks.

@@ -1,5 +1,7 @@
 plugins {
     id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
 }
 
 if (project.hasProperty('receiverBuildDir')) {
@@ -24,14 +26,15 @@ android {
 
     buildFeatures {
         buildConfig true
+        compose true
     }
 
     defaultConfig {
         applicationId 'app.anpod.receiver'
         minSdk 23
         targetSdk 35
-        versionCode 3
-        versionName '0.3.0-v2-candidate'
+        versionCode 9
+        versionName '0.7.0-v3-flow-candidate'
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'
     }
 
@@ -60,6 +63,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
 }
 
 if (candidateDebugStoreFile) {
@@ -69,6 +76,10 @@ if (candidateDebugStoreFile) {
 android.sourceSets.main.java.srcDir('../../AnPod.AndroidProtocol/src/main/java')
 
 dependencies {
+    implementation platform('androidx.compose:compose-bom:2025.06.00')
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.compose.material3:material3'
+
     androidTestImplementation files(
         "${android.sdkDirectory}/platforms/android-35/optional/android.test.base.jar",
         "${android.sdkDirectory}/platforms/android-35/optional/android.test.runner.jar"

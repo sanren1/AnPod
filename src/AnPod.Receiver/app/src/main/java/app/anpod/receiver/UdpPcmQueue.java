@@ -522,6 +522,7 @@ final class UdpPcmQueue {
     synchronized long droppedFrames() { return droppedFrames; }
     synchronized long expiredFrames() { return expiredFrames; }
     synchronized int targetFrames() { return targetFrames; }
+    synchronized long queuedFrames() { return queuedFrames; }
     synchronized UdpPacketDecoder.Format format() { return format; }
     boolean hasAuthenticatedAudio() { return hasAuthenticatedAudio; }
     long lastAuthenticatedAudioAtNanos() { return lastAuthenticatedAudioAtNanos; }
@@ -665,6 +666,11 @@ final class UdpPlaybackActivity {
                 && isRecent(nowNanos, lastReceivedAudioAtNanos)
                 && isRecent(nowNanos, lastSuccessfulWriteAtNanos)
                 && isRecent(nowNanos, lastHeadAdvanceAtNanos);
+    }
+
+    synchronized boolean recentlyAdvanced(long nowNanos, int playbackHeadPosition) {
+        updatePlaybackHead(playbackHeadPosition, nowNanos);
+        return hasHeadAdvance && isRecent(nowNanos, lastHeadAdvanceAtNanos);
     }
 
     private long updatePlaybackHead(int position, long nowNanos) {

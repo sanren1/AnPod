@@ -1,7 +1,7 @@
 use crate::state::{adb_run, adb_run_with_stdin, parse_devices, AdbResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{future::Future, fs, path::Path, time::{Duration, Instant}};
+use std::{future::Future, fs::{self, File}, io::Read, path::Path, time::{Duration, Instant}};
 use tokio_util::sync::CancellationToken;
 
 const PACKAGE: &str = "app.anpod.receiver";
@@ -40,8 +40,34 @@ pub struct ReceiverStatus {
     pub foreground: bool,
     pub healthy: bool,
     pub audio_active: bool,
+    pub playback_diagnostics: Option<PlaybackDiagnostics>,
     pub error: Option<String>,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackDiagnostics {
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u8>,
+    pub receiver_sample_rate: Option<u32>,
+    pub receiver_channels: Option<u8>,
+    pub pc_dropped_frames: Option<u64>,
+    pub pc_queued_frames: Option<u64>,
+    pub udp_jitter_target_frames: Option<u32>,
+    pub udp_queued_frames: Option<u64>,
+    pub udp_expired_frames: Option<u64>,
+    pub tcp_dropped_backlog_frames: Option<u64>,
+    pub track_pending_frames: Option<u64>,
+    pub underrun_count: Option<u32>,
+    pub underrun_increment: Option<u64>,
+    pub playback_advancing: Option<bool>,
+    pub requested_buffer_frames: Option<u32>,
+    pub accepted_buffer_frames: Option<u32>,
+    pub effective_buffer_frames: Option<u32>,
+    pub capacity_frames: Option<u32>,
+    pub start_threshold_frames: Option<u32>,
+    pub pre_roll_frames: Option<u32>,
 }
 
 impl ReceiverStatus {
@@ -51,7 +77,7 @@ impl ReceiverStatus {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactMetadata {
     application_id: String,
@@ -59,6 +85,164 @@ struct ArtifactMetadata {
     version_name: String,
     sha256: String,
     signer_sha256: String,
+    #[serde(default)]
+    source_commit: Option<String>,
+}
+
+const V3_CONTROL_MAJOR: u16 = 3;
+const PCM_AUDIO_MAJOR: u8 = 1;
+const CAP_RECEIVER_UI: u32 = 1 << 0;
+const CAP_AUTHENTICATED_STATUS: u32 = 1 << 1;
+const CAP_PLAYBACK_PROGRESS: u32 = 1 << 3;
+
+#[derive(Clone, Copy)]
+struct AuditedReceiverArtifact {
+    sha256: &'static str,
+    version_code: u32,
+    version_name: &'static str,
+    source_commit: &'static str,
+    signer_sha256: &'static str,
+}
+
+// Only same-signer APKs with an exact audited digest and recorded source are admitted.
+const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77",
+        version_code: 3,
+        version_name: "0.3.0-v2-candidate",
+        source_commit: "20e42fac0274252dccb8ccc8b7d5e416ab8e958b",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050",
+        version_code: 3,
+        version_name: "0.3.0-v2-candidate",
+        source_commit: "81dda7630e2728881d4aa556698ba8f6bb36c453",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "22af84b1989011d3cd214ff321ccd37bc4fe4de03546850f65d5db778f49d8c9",
+        version_code: 3,
+        version_name: "0.3.0-v2-candidate",
+        source_commit: "608c98c75ec04e11555e9e547caa516c96d4e0dd",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "b52a326f234ab84d6aba9b5ffbb840e75f90a101cb5479461da7a53d184a4abb",
+        version_code: 4,
+        version_name: "0.4.0-v3-candidate",
+        source_commit: "8f868708a83a32973be902fabf7dc8357f3c55a6",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "c514dfd555aa2734178131db47037875cf1086d934b45639b799471297668be3",
+        version_code: 6,
+        version_name: "0.5.0-v4-candidate",
+        source_commit: "20f2389af0526ebdbc20924cad42570ce51110ce",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedReceiverArtifact {
+    version_code: u32,
+    version_name: String,
+    sha256: String,
+    signer_sha256: String,
+    source_commit: Option<String>,
+}
+
+fn verified_installed_artifact(digest: &str, current: &ArtifactMetadata) -> Option<VerifiedReceiverArtifact> {
+    if digest.eq_ignore_ascii_case(&current.sha256) {
+        return Some(VerifiedReceiverArtifact {
+            version_code: current.version_code,
+            version_name: current.version_name.clone(),
+            sha256: current.sha256.to_ascii_lowercase(),
+            signer_sha256: current.signer_sha256.to_ascii_lowercase(),
+            source_commit: current.source_commit.clone(),
+        });
+    }
+    AUDITED_RECEIVER_ARTIFACTS.iter().find(|artifact| {
+        digest.eq_ignore_ascii_case(artifact.sha256)
+            && current.application_id == PACKAGE
+            && current.signer_sha256.eq_ignore_ascii_case(artifact.signer_sha256)
+    })
+        .map(|artifact| VerifiedReceiverArtifact {
+            version_code: artifact.version_code,
+            version_name: artifact.version_name.into(),
+            sha256: artifact.sha256.into(),
+            signer_sha256: artifact.signer_sha256.into(),
+            source_commit: Some(artifact.source_commit.into()),
+        })
+}
+
+#[derive(Clone, Copy)]
+struct ReceiverCapabilities {
+    control_major: u16,
+    audio_major: u8,
+    bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeatureCompatibility { NotNegotiated, Compatible, Incompatible }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateAvailability { Unavailable, CandidateAvailable, BlockedBySignature }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagementAccess { Denied, PreflightOnly, PreflightAndUpdateOnly, CompatibleSession }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReceiverCompatibilityDecision {
+    identity_trusted: bool,
+    features: FeatureCompatibility,
+    update: UpdateAvailability,
+    usb_upgrade_available: bool,
+    management: ManagementAccess,
+}
+
+fn decide_receiver_compatibility(
+    identity: Option<&VerifiedReceiverArtifact>,
+    authenticated: bool,
+    capabilities: Option<ReceiverCapabilities>,
+    required_capabilities: u32,
+    update: Option<&ArtifactMetadata>,
+) -> ReceiverCompatibilityDecision {
+    let identity_trusted = identity.is_some();
+    let features = if !authenticated {
+        FeatureCompatibility::NotNegotiated
+    } else {
+        match capabilities {
+            None => FeatureCompatibility::NotNegotiated,
+            Some(peer) if peer.control_major == V3_CONTROL_MAJOR
+                && peer.audio_major == PCM_AUDIO_MAJOR
+                && peer.bits & required_capabilities == required_capabilities => FeatureCompatibility::Compatible,
+            Some(_) => FeatureCompatibility::Incompatible,
+        }
+    };
+    let update = match (identity, update) {
+        (Some(installed), Some(candidate)) if candidate.application_id == PACKAGE
+            && candidate.version_code > installed.version_code
+            && valid_digest(&candidate.sha256) => {
+                if candidate.signer_sha256.eq_ignore_ascii_case(&installed.signer_sha256) {
+                    UpdateAvailability::CandidateAvailable
+                } else {
+                    UpdateAvailability::BlockedBySignature
+                }
+            }
+        _ => UpdateAvailability::Unavailable,
+    };
+    let usb_upgrade_available = identity_trusted && update == UpdateAvailability::CandidateAvailable;
+    let management = if !authenticated || !identity_trusted {
+        ManagementAccess::Denied
+    } else if features == FeatureCompatibility::Compatible {
+        ManagementAccess::CompatibleSession
+    } else if usb_upgrade_available {
+        ManagementAccess::PreflightAndUpdateOnly
+    } else {
+        ManagementAccess::PreflightOnly
+    };
+    ReceiverCompatibilityDecision { identity_trusted, features, update, usb_upgrade_available, management }
 }
 
 #[derive(Default)]
@@ -70,6 +254,7 @@ struct Health {
     foreground: bool,
     healthy: bool,
     audio_active: bool,
+    playback_diagnostics: PlaybackDiagnostics,
     error: String,
 }
 
@@ -122,6 +307,10 @@ fn binding_reference_for(serial: &str, android_user: &str) -> String {
     digest.update(android_user.as_bytes());
     let result: [u8; 32] = digest.finalize().into();
     hex_digest(&result)
+}
+
+fn valid_binding_reference(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(windows)]
@@ -349,39 +538,92 @@ fn parse_content_row(line: &str) -> Option<std::collections::HashMap<String, Str
 }
 
 async fn status_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
-    ensure_usb_device(adb, serial, cancel).await?;
+    ensure_adb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
     if !is_installed(adb, serial, &user, cancel).await? {
         return Ok(ReceiverStatus {
             installed: false, version_name: None, version_code: None,
             service_active: false, foreground: false, healthy: false,
-            audio_active: false, error: None,
+            audio_active: false, playback_diagnostics: None, error: None,
             message: "Receiver 尚未安装。".into(),
         });
     }
     let metadata = read_artifact(apk, metadata_path)?;
-    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let health = read_health(adb, serial, &user, cancel).await?;
-    ensure_version(&health, &metadata)?;
+    ensure_version(&health, &installed)?;
     Ok(status_from_health(health))
 }
 
 pub async fn install(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
-    install_with(&SystemAdb(adb), serial, apk, metadata_path, cancel).await
+    install_usb_with(&SystemAdb(adb), serial, apk, metadata_path, None, cancel).await
 }
 
-async fn install_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
-    ensure_usb_device(adb, serial, cancel).await?;
-    let user = current_android_user(adb, serial, cancel).await?;
-    let metadata = read_artifact(apk, metadata_path)?;
+pub async fn upgrade_usb(adb: &Path, serial: &str, binding_reference: &str, binding_path: &Path, apk: &Path,
+    metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    install_usb_with(&SystemAdb(adb), serial, apk, metadata_path, Some((binding_reference, binding_path)), cancel).await
+}
 
+async fn install_usb_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    binding: Option<(&str, &Path)>, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    let (user, metadata, _) = prepare_usb_install(adb, serial, apk, metadata_path, binding, cancel).await?;
     let apk_text = apk.to_string_lossy().into_owned();
     let result = adb.run(Some(serial), &["install", "-r", "--user", &user, &apk_text], Duration::from_secs(90), Some(cancel)).await?;
     ensure_adb_success(&result)?;
-    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    if !installed.sha256.eq_ignore_ascii_case(&metadata.sha256) {
+        return Err("安装命令成功，但设备上的 Receiver APK 摘要与本次目标包不一致；未报告安装完成。".into());
+    }
     let health = read_health(adb, serial, &user, cancel).await?;
-    ensure_version(&health, &metadata)?;
+    ensure_version(&health, &installed)?;
+    if let Some((_, binding_path)) = binding {
+        verify_saved_binding(adb, serial, &user, &metadata, binding_path, cancel).await?;
+    }
     Ok(status_from_health(health))
+}
+
+async fn prepare_usb_install(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    binding: Option<(&str, &Path)>, cancel: &CancellationToken) -> Result<(String, ArtifactMetadata, Option<VerifiedReceiverArtifact>), String> {
+    ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
+    if let Some((expected, _)) = binding {
+        if !valid_binding_reference(expected) || binding_reference_for(serial, &user) != expected {
+            return Err("所选 USB 设备或 Android 用户与已保存 Receiver 绑定不匹配。".into());
+        }
+    }
+    let metadata = read_artifact(apk, metadata_path)?;
+    let installed_on_user = is_installed(adb, serial, &user, cancel).await?;
+    if binding.is_some() && !installed_on_user {
+        return Err("所选绑定对应的 Receiver 尚未安装；未创建新绑定或继续升级。".into());
+    }
+    let installed = if installed_on_user {
+        let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+        if metadata.version_code <= installed.version_code {
+            return Err("已阻止降级或同版本重装：本机 Receiver APK 必须高于设备受信版本；未执行安装。".into());
+        }
+        if !metadata.signer_sha256.eq_ignore_ascii_case(&installed.signer_sha256) {
+            return Err("Receiver 签名与设备上的受信版本不一致；未执行安装。".into());
+        }
+        Some(installed)
+    } else { None };
+    if let Some((expected, binding_path)) = binding {
+        if binding_path.file_stem().and_then(|value| value.to_str()) != Some(expected) {
+            return Err("所选 Receiver 本机绑定材料与 USB 目标不匹配；未执行升级。".into());
+        }
+        verify_saved_binding(adb, serial, &user, &metadata, binding_path, cancel).await?;
+    }
+    Ok((user, metadata, installed))
+}
+
+pub async fn validate_usb_install(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken) -> Result<(), String> {
+    prepare_usb_install(&SystemAdb(adb), serial, apk, metadata_path, None, cancel).await.map(|_| ())
+}
+
+#[cfg(test)]
+async fn install_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
+    cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
+    install_usb_with(adb, serial, apk, metadata_path, None, cancel).await
 }
 
 pub async fn start(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
@@ -400,13 +642,13 @@ async fn start_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_pat
 
 async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path,
     cancel: &CancellationToken, audio: Option<(&str, &str, &str)>) -> Result<ReceiverStatus, String> {
-    ensure_usb_device(adb, serial, cancel).await?;
+    ensure_adb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
     if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let before = read_health(adb, serial, &user, cancel).await?;
-    ensure_version(&before, &metadata)?;
+    ensure_version(&before, &installed)?;
     if before.service_active && !before.error.is_empty() { return Err(format!("Receiver 启动失败：{}。", before.error)); }
     if before.healthy && audio.is_none() { return Ok(status_from_health(before)); }
 
@@ -427,9 +669,9 @@ async fn start_with_action(adb: &impl AdbRunner, serial: &str, apk: &Path, metad
     let deadline = Instant::now() + Duration::from_secs(35);
     loop {
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
-        verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+        let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
         let health = read_health(adb, serial, &user, cancel).await?;
-        ensure_version(&health, &metadata)?;
+        ensure_version(&health, &installed)?;
         if !health.error.is_empty() { return Err(format!("Receiver 启动失败：{}。", health.error)); }
         if health.healthy { return Ok(status_from_health(health)); }
         if Instant::now() >= deadline {
@@ -447,13 +689,13 @@ pub async fn health(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, 
 }
 
 async fn health_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
-    ensure_usb_device(adb, serial, cancel).await?;
+    ensure_adb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
     if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let health = read_health(adb, serial, &user, cancel).await?;
-    ensure_version(&health, &metadata)?;
+    ensure_version(&health, &installed)?;
     Ok(status_from_health(health))
 }
 
@@ -462,13 +704,13 @@ pub async fn stop(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, ca
 }
 
 async fn stop_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
-    ensure_usb_device(adb, serial, cancel).await?;
+    ensure_adb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
     if !is_installed(adb, serial, &user, cancel).await? { return Err("Receiver 尚未安装。".into()); }
-    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     let before = read_health(adb, serial, &user, cancel).await?;
-    ensure_version(&before, &metadata)?;
+    ensure_version(&before, &installed)?;
     if before.application_id != PACKAGE { return Err("已安装包名冲突，未执行停止操作。".into()); }
 
     let result = adb.run(Some(serial), &[
@@ -480,9 +722,9 @@ async fn stop_with(adb: &impl AdbRunner, serial: &str, apk: &Path, metadata_path
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
-        verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+        let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
         let health = read_health(adb, serial, &user, cancel).await?;
-        ensure_version(&health, &metadata)?;
+        ensure_version(&health, &installed)?;
         if !health.service_active { return Ok(status_from_health(health)); }
         if Instant::now() >= deadline { return Err("Receiver 服务在停止请求后仍处于活动状态。".into()); }
         tokio::select! {
@@ -496,19 +738,39 @@ async fn ensure_usb_device(adb: &impl AdbRunner, serial: &str, cancel: &Cancella
     if serial.is_empty() || serial.contains('\r') || serial.contains('\n') || serial.contains(':') || serial.contains("_adb-tls-") {
         return Err("Receiver P1 只允许选择已授权的 USB ADB 设备。".into());
     }
+    let transport = confirmed_adb_device(adb, serial, cancel).await?;
+    if transport != "usb" {
+        return Err("所选设备不是已授权的在线 USB 设备。".into());
+    }
+    Ok(())
+}
+
+async fn ensure_adb_device(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<(), String> {
+    let transport = confirmed_adb_device(adb, serial, cancel).await?;
+    if !matches!(transport.as_str(), "usb" | "wifi") {
+        return Err("所选设备不是已授权的在线 USB 或无线 ADB 设备。".into());
+    }
+    Ok(())
+}
+
+async fn confirmed_adb_device(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<String, String> {
+    if serial.is_empty() || serial.contains('\r') || serial.contains('\n') {
+        return Err("Receiver 只允许选择明确的已授权 ADB 设备。".into());
+    }
     let result = adb.run(None, &["devices", "-l"], Duration::from_secs(8), Some(cancel)).await?;
     ensure_adb_success(&result)?;
     let device = parse_devices(&result.stdout).into_iter().find(|device| device.serial == serial)
         .ok_or_else(|| "所选 ADB 设备当前不可用。".to_string())?;
-    if device.state != "device" || device.transport == "wifi" {
-        return Err("所选设备不是已授权的在线 USB 设备。".into());
+    if device.state != "device" {
+        return Err("所选设备不是已授权的在线 ADB 设备。".into());
     }
-    if device.transport != "usb" {
+    let transport = if device.transport == "unknown" {
         let usb = adb.run(None, &["-d", "get-serialno"], Duration::from_secs(6), Some(cancel)).await?;
         ensure_adb_success(&usb)?;
-        if usb.stdout.trim() != serial { return Err("ADB 未能把所选设备确认为 USB 连接。".into()); }
-    }
-    Ok(())
+        if usb.stdout.trim() == serial { "usb".to_owned() }
+        else { return Err("无法确认所选设备使用已授权的 USB 或无线 ADB 传输。".into()); }
+    } else { device.transport };
+    Ok(transport)
 }
 
 async fn is_installed(adb: &impl AdbRunner, serial: &str, user: &str, cancel: &CancellationToken) -> Result<bool, String> {
@@ -517,7 +779,7 @@ async fn is_installed(adb: &impl AdbRunner, serial: &str, user: &str, cancel: &C
     Ok(has_listed_package(&result.stdout))
 }
 
-async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &str, metadata: &ArtifactMetadata, cancel: &CancellationToken) -> Result<(), String> {
+async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &str, metadata: &ArtifactMetadata, cancel: &CancellationToken) -> Result<VerifiedReceiverArtifact, String> {
     let listed = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     ensure_adb_success(&listed)?;
     if !has_listed_package(&listed.stdout) { return Err("当前 Android 用户未安装 AnPod Receiver，已拒绝管理操作。".into()); }
@@ -528,10 +790,11 @@ async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &st
     let hash_result = adb.run(Some(serial), &["shell", "toybox", "sha256sum", path], Duration::from_secs(8), Some(cancel)).await?;
     ensure_adb_success(&hash_result)?;
     let installed_digest = hash_result.stdout.split_whitespace().next().unwrap_or("");
-    if !valid_digest(installed_digest) || !installed_digest.eq_ignore_ascii_case(&metadata.sha256) {
-        return Err("设备上的 Receiver APK 字节与本机受信任产物不一致；未读取其状态或执行管理动作。".into());
+    if !valid_digest(installed_digest) {
+        return Err("设备没有返回有效的 Receiver APK 摘要；未读取其状态或执行管理动作。".into());
     }
-    Ok(())
+    verified_installed_artifact(installed_digest, metadata)
+        .ok_or_else(|| "设备上的 Receiver APK 字节既不匹配当前本机产物，也不在已审计历史摘要清单中；未读取其状态或执行管理动作。".into())
 }
 
 async fn current_android_user(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<String, String> {
@@ -562,11 +825,53 @@ fn read_artifact(apk: &Path, metadata_path: &Path) -> Result<ArtifactMetadata, S
         || !valid_digest(&metadata.sha256) || !valid_digest(&metadata.signer_sha256) {
         return Err("Receiver APK 校验清单的包名、版本或摘要格式无效。".into());
     }
-    let bytes = fs::read(apk).map_err(|_| "找不到 Receiver APK。".to_string())?;
-    if bytes.is_empty() { return Err("Receiver APK 是空文件。".into()); }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let file_metadata = fs::metadata(apk).map_err(|_| "找不到 Receiver APK。".to_string())?;
+    if file_metadata.len() == 0 { return Err("Receiver APK 是空文件。".into()); }
+    let mut file = File::open(apk).map_err(|_| "无法读取 Receiver APK。".to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| "无法读取 Receiver APK。".to_string())?;
+        if count == 0 { break; }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
     if digest != metadata.sha256.to_ascii_lowercase() { return Err("Receiver APK SHA-256 与校验清单不一致。".into()); }
     Ok(metadata)
+}
+
+pub(crate) fn local_upgrade_candidate(apk: &Path, metadata_path: &Path) -> Result<(u32, String, u64), String> {
+    let metadata = read_artifact(apk, metadata_path)?;
+    let size = fs::metadata(apk).map_err(|_| "找不到 Receiver APK。".to_string())?.len();
+    Ok((metadata.version_code, metadata.version_name, size))
+}
+
+pub async fn validate_usb_upgrade(adb: &Path, serial: &str, binding_reference: &str, apk: &Path,
+    binding_path: &Path, metadata_path: &Path, cancel: &CancellationToken) -> Result<(), String> {
+    prepare_usb_install(&SystemAdb(adb), serial, apk, metadata_path, Some((binding_reference, binding_path)), cancel)
+        .await.map(|_| ())
+}
+
+#[cfg(windows)]
+async fn verify_saved_binding(adb: &impl AdbRunner, serial: &str, user: &str, metadata: &ArtifactMetadata,
+    binding_path: &Path, cancel: &CancellationToken) -> Result<(), String> {
+    use crate::security::BindingStore;
+    let material = BindingStore::load(binding_path)
+        .map_err(|_| "所选 Receiver 的本机绑定材料不可用；未执行升级。".to_string())?;
+    let commitment = hex_digest(&material.commitment());
+    verify_installed_identity(adb, serial, user, metadata, cancel).await?;
+    match read_binding_state(adb, serial, user, cancel).await? {
+        BindingStatus::Saved(saved) if saved == commitment => Ok(()),
+        BindingStatus::Saved(_) => Err("手机保存的绑定与所选本机材料不一致；没有改写绑定或执行升级。".into()),
+        BindingStatus::Empty | BindingStatus::Pending => Err("手机没有保存所选绑定；没有创建绑定或执行升级。".into()),
+        BindingStatus::Failed(message) => Err(message.into()),
+    }
+}
+
+#[cfg(not(windows))]
+async fn verify_saved_binding(_adb: &impl AdbRunner, _serial: &str, _user: &str, _metadata: &ArtifactMetadata,
+    _binding_path: &Path, _cancel: &CancellationToken) -> Result<(), String> {
+    Err("USB Receiver 升级只在 Windows 上可用。".into())
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -583,10 +888,10 @@ fn parse_installed_apk_path(output: &str) -> Option<&str> {
     Some(path)
 }
 
-fn ensure_version(health: &Health, metadata: &ArtifactMetadata) -> Result<(), String> {
+fn ensure_version(health: &Health, installed: &VerifiedReceiverArtifact) -> Result<(), String> {
     if health.application_id != PACKAGE { return Err("Receiver 包名不匹配。".into()); }
-    if health.version_code != metadata.version_code || health.version_name != metadata.version_name {
-        return Err("设备上的 Receiver 版本与本机 APK 不一致。".into());
+    if health.version_code != installed.version_code || health.version_name != installed.version_name {
+        return Err("Receiver 健康记录版本与已核验 APK 不一致。".into());
     }
     Ok(())
 }
@@ -610,6 +915,7 @@ fn status_from_health(health: Health) -> ReceiverStatus {
         foreground: health.foreground,
         healthy: health.healthy,
         audio_active: health.audio_active,
+        playback_diagnostics: Some(health.playback_diagnostics),
         error: (!health.error.is_empty()).then_some(health.error),
         message,
     }
@@ -628,12 +934,37 @@ fn parse_health(output: &str) -> Option<Health> {
         foreground: parse_bool(fields.get("foreground")?)?,
         healthy: parse_bool(fields.get("healthy")?)?,
         audio_active: fields.get("audioActive").and_then(|value| parse_bool(value)).unwrap_or(false),
+        playback_diagnostics: PlaybackDiagnostics {
+            receiver_sample_rate: parse_optional_metric(fields.get("actualSampleRate")),
+            receiver_channels: parse_optional_metric(fields.get("actualChannels")),
+            udp_jitter_target_frames: parse_optional_metric(fields.get("udpJitterTargetFrames")),
+            udp_queued_frames: parse_optional_metric(fields.get("udpQueuedFrames")),
+            udp_expired_frames: parse_optional_metric(fields.get("udpExpiredFrames")),
+            tcp_dropped_backlog_frames: parse_optional_metric(fields.get("tcpDroppedBacklogFrames")),
+            track_pending_frames: parse_optional_metric(fields.get("trackPendingFrames")),
+            underrun_count: parse_optional_metric(fields.get("underrunCount")),
+            // USB uses the cumulative count above; the Provider's historical write-loop delta
+            // is not the same interval as the desktop health-query cadence.
+            underrun_increment: None,
+            playback_advancing: fields.get("playbackAdvancing").and_then(|value| parse_bool(value)),
+            requested_buffer_frames: parse_optional_metric(fields.get("requestedBufferFrames")),
+            accepted_buffer_frames: parse_optional_metric(fields.get("acceptedBufferFrames")),
+            effective_buffer_frames: parse_optional_metric(fields.get("effectiveBufferFrames")),
+            capacity_frames: parse_optional_metric(fields.get("bufferCapacityFrames")),
+            start_threshold_frames: parse_optional_metric(fields.get("startThresholdFrames")),
+            pre_roll_frames: parse_optional_metric(fields.get("preRollFrames")),
+            ..PlaybackDiagnostics::default()
+        },
         error: fields.get("error").copied().unwrap_or("").to_string(),
     })
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
     match value { "true" => Some(true), "false" => Some(false), _ => None }
+}
+
+fn parse_optional_metric<T: std::str::FromStr>(value: Option<&&str>) -> Option<T> {
+    value.filter(|value| **value != "unknown").and_then(|value| value.parse().ok())
 }
 
 fn ensure_adb_success(result: &AdbResult) -> Result<(), String> {
@@ -687,16 +1018,23 @@ mod tests {
     struct FakeState {
         installed: bool,
         installed_hash: String,
+        device_serial: String,
         user: &'static str,
         device_state: &'static str,
         usb: bool,
         install_fails: bool,
+        install_digest: Option<String>,
+        install_version_code: Option<u32>,
+        install_version_name: Option<String>,
+        health_version_code: u32,
+        health_version_name: String,
         active: bool,
         foreground: bool,
         healthy: bool,
         audio_active: bool,
         error: String,
         calls: Vec<Vec<String>>,
+        serial_calls: Vec<Option<String>>,
         binding_commitment: Option<String>,
         binding_write_mode: FakeBindingWrite,
         binding_input_commitments: Vec<String>,
@@ -716,17 +1054,25 @@ mod tests {
 
     impl FakeAdb {
         fn new(installed: bool, installed_hash: String) -> Self {
+            Self::with_serial(installed, installed_hash, SERIAL)
+        }
+
+        fn with_serial(installed: bool, installed_hash: String, device_serial: &str) -> Self {
             Self(Mutex::new(FakeState {
                 installed,
                 installed_hash,
+                device_serial: device_serial.into(),
                 user: TEST_USER,
                 device_state: "device",
                 usb: true,
+                health_version_code: 1,
+                health_version_name: "0.1.0-p1".into(),
                 ..FakeState::default()
             }))
         }
 
         fn calls(&self) -> Vec<Vec<String>> { self.0.lock().unwrap().calls.clone() }
+        fn serial_calls(&self) -> Vec<Option<String>> { self.0.lock().unwrap().serial_calls.clone() }
 
         fn call_index(&self, prefix: &[&str]) -> Option<usize> {
             self.0.lock().unwrap().calls.iter().position(|call|
@@ -735,19 +1081,20 @@ mod tests {
     }
 
     impl AdbRunner for FakeAdb {
-        fn run<'a>(&'a self, _serial: Option<&'a str>, args: &'a [&'a str], _limit: Duration,
+        fn run<'a>(&'a self, serial: Option<&'a str>, args: &'a [&'a str], _limit: Duration,
             _cancel: Option<&'a CancellationToken>) -> impl Future<Output = Result<AdbResult, String>> + Send + 'a {
             async move {
                 let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
                 let mut state = self.0.lock().unwrap();
                 state.calls.push(args.clone());
+                state.serial_calls.push(serial.map(str::to_owned));
                 let result = match args.as_slice() {
                     [command, _] if command == "devices" => {
                         let transport = "product:test";
-                        AdbResult { success: true, stdout: format!("List of devices attached\n{SERIAL} {} {transport}\n", state.device_state), stderr: String::new() }
+                        AdbResult { success: true, stdout: format!("List of devices attached\n{} {} {transport}\n", state.device_serial, state.device_state), stderr: String::new() }
                     }
                     [selector, command] if selector == "-d" && command == "get-serialno" => {
-                        AdbResult { success: state.usb, stdout: if state.usb { format!("{SERIAL}\n") } else { String::new() }, stderr: String::new() }
+                        AdbResult { success: state.usb, stdout: if state.usb { format!("{}\n", state.device_serial) } else { String::new() }, stderr: String::new() }
                     }
                     [shell, am, command] if shell == "shell" && am == "am" && command == "get-current-user" => {
                         AdbResult { success: true, stdout: format!("{}\n", state.user), stderr: String::new() }
@@ -764,7 +1111,7 @@ mod tests {
                         AdbResult { success: state.installed, stdout: format!("{}  {INSTALLED_PATH}\n", state.installed_hash), stderr: String::new() }
                     }
                     [shell, content, query, user_option, user, flag, uri] if shell == "shell" && content == "content" && query == "query" && user_option == "--user" && user == state.user && flag == "--uri" && uri == HEALTH_URI => {
-                            let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName=0.1.0-p1, versionCode=1, serviceActive={}, foreground={}, healthy={}, audioActive={}, startedAtElapsedMs=1, error={}\n", state.active, state.foreground, state.healthy, state.audio_active, state.error);
+                            let stdout = format!("Row: 0 applicationId={PACKAGE}, versionName={}, versionCode={}, serviceActive={}, foreground={}, healthy={}, audioActive={}, startedAtElapsedMs=1, error={}\n", state.health_version_name, state.health_version_code, state.active, state.foreground, state.healthy, state.audio_active, state.error);
                             AdbResult { success: true, stdout, stderr: String::new() }
                         }
                     [shell, content, query, user_option, user, flag, uri, projection_flag, projection]
@@ -785,6 +1132,9 @@ mod tests {
                             AdbResult { success: false, stdout: String::new(), stderr: "INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match".into() }
                         } else {
                             state.installed = true;
+                            if let Some(digest) = state.install_digest.take() { state.installed_hash = digest; }
+                            if let Some(version_code) = state.install_version_code.take() { state.health_version_code = version_code; }
+                            if let Some(version_name) = state.install_version_name.take() { state.health_version_name = version_name; }
                             AdbResult { success: true, stdout: "Success".into(), stderr: String::new() }
                         }
                     }
@@ -818,6 +1168,7 @@ mod tests {
                 let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
                 let mut state = self.0.lock().unwrap();
                 state.calls.push(args.clone());
+                state.serial_calls.push(serial.map(str::to_owned));
                 let target_matches = args.len() == 8 && args[0] == "shell" && args[1] == "-T"
                     && args[2] == "content" && args[3] == "write" && args[4] == "--user"
                     && args[5] == state.user && args[6] == "--uri" && args[7] == BINDING_URI;
@@ -899,6 +1250,157 @@ mod tests {
     }
 
     #[test]
+    fn receiver_identity_compatibility_and_update_decisions_are_independent() {
+        let current = ArtifactMetadata {
+            application_id: PACKAGE.into(),
+            version_code: 3,
+            version_name: "0.3.0-v2-candidate".into(),
+            sha256: "22af84b1989011d3cd214ff321ccd37bc4fe4de03546850f65d5db778f49d8c9".into(),
+            signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439".into(),
+            source_commit: Some("608c98c75ec04e11555e9e547caa516c96d4e0dd".into()),
+        };
+        let old = verified_installed_artifact(
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050", &current,
+        ).unwrap();
+        assert_eq!(old.version_code, 3);
+        assert_eq!(old.source_commit.as_deref(), Some("81dda7630e2728881d4aa556698ba8f6bb36c453"));
+        let installed_v3 = verified_installed_artifact(
+            "b52a326f234ab84d6aba9b5ffbb840e75f90a101cb5479461da7a53d184a4abb", &current,
+        ).unwrap();
+        assert_eq!(installed_v3.version_code, 4);
+        assert_eq!(installed_v3.source_commit.as_deref(), Some("8f868708a83a32973be902fabf7dc8357f3c55a6"));
+        let installed_v4_seed = verified_installed_artifact(
+            "c514dfd555aa2734178131db47037875cf1086d934b45639b799471297668be3", &current,
+        ).unwrap();
+        assert_eq!(installed_v4_seed.version_code, 6);
+        assert_eq!(installed_v4_seed.version_name, "0.5.0-v4-candidate");
+        assert_eq!(installed_v4_seed.source_commit.as_deref(), Some("20f2389af0526ebdbc20924cad42570ce51110ce"));
+        assert!(verified_installed_artifact(&"e".repeat(64), &current).is_none(),
+            "a claimed package/version/certificate cannot replace an audited installed APK digest");
+        let p1_target = ArtifactMetadata {
+            application_id: PACKAGE.into(),
+            version_code: 1,
+            version_name: "0.1.0-p1".into(),
+            sha256: "b32eeaf06d40372c4a243eadf3b1c48067875af44f9e3a7b1d23d67628004f62".into(),
+            signer_sha256: "d".repeat(64),
+            source_commit: None,
+        };
+        assert!(verified_installed_artifact(&old.sha256, &p1_target).is_none(),
+            "a different signer cannot authorize a historical v2 identity");
+
+        let older_target = ArtifactMetadata {
+            application_id: PACKAGE.into(),
+            version_code: 2,
+            version_name: "0.2.0-p2".into(),
+            sha256: "b".repeat(64),
+            signer_sha256: old.signer_sha256.clone(),
+            source_commit: None,
+        };
+        let trusted_newer_receiver = verified_installed_artifact(&old.sha256, &older_target).unwrap();
+        let no_downgrade = decide_receiver_compatibility(
+            Some(&trusted_newer_receiver), true, None, CAP_AUTHENTICATED_STATUS, Some(&older_target),
+        );
+        assert!(no_downgrade.identity_trusted);
+        assert_eq!(no_downgrade.update, UpdateAvailability::Unavailable);
+
+        let target = ArtifactMetadata {
+            application_id: PACKAGE.into(),
+            version_code: 5,
+            version_name: "0.4.1-v3-candidate".into(),
+            sha256: "a".repeat(64),
+            signer_sha256: old.signer_sha256.clone(),
+            source_commit: Some("b".repeat(40)),
+        };
+        let capabilities = ReceiverCapabilities {
+            control_major: V3_CONTROL_MAJOR,
+            audio_major: PCM_AUDIO_MAJOR,
+            bits: CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS,
+        };
+        let no_same_version_update = decide_receiver_compatibility(
+            Some(&installed_v3), true, Some(capabilities), CAP_AUTHENTICATED_STATUS,
+            Some(&ArtifactMetadata { version_code: 4, version_name: "0.4.0-v3-candidate".into(), ..target.clone() }),
+        );
+        assert_eq!(no_same_version_update.update, UpdateAvailability::Unavailable);
+        let compatible = decide_receiver_compatibility(
+            Some(&old), true, Some(capabilities), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert_eq!(compatible, ReceiverCompatibilityDecision {
+            identity_trusted: true,
+            features: FeatureCompatibility::Compatible,
+            update: UpdateAvailability::CandidateAvailable,
+            usb_upgrade_available: true,
+            management: ManagementAccess::CompatibleSession,
+        });
+
+        let incompatible = decide_receiver_compatibility(
+            Some(&old), true, Some(ReceiverCapabilities { bits: 0, ..capabilities }),
+            CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert_eq!(incompatible.features, FeatureCompatibility::Incompatible);
+        assert_eq!(incompatible.update, UpdateAvailability::CandidateAvailable);
+        assert!(incompatible.usb_upgrade_available);
+        assert_eq!(incompatible.management, ManagementAccess::PreflightAndUpdateOnly);
+
+        let unnegotiated = decide_receiver_compatibility(
+            Some(&old), true, None, CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert_eq!(unnegotiated.update, UpdateAvailability::CandidateAvailable);
+        assert!(unnegotiated.usb_upgrade_available);
+        assert_eq!(unnegotiated.management, ManagementAccess::PreflightAndUpdateOnly);
+
+        let old_management = decide_receiver_compatibility(
+            Some(&old), true, Some(ReceiverCapabilities {
+                control_major: V3_CONTROL_MAJOR - 1,
+                audio_major: PCM_AUDIO_MAJOR,
+                bits: 0,
+            }), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert!(old_management.usb_upgrade_available);
+        assert_eq!(old_management.management, ManagementAccess::PreflightAndUpdateOnly);
+
+        let no_update_bit = decide_receiver_compatibility(
+            Some(&old), true, Some(ReceiverCapabilities {
+                bits: CAP_AUTHENTICATED_STATUS, ..capabilities
+            }), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert!(no_update_bit.usb_upgrade_available);
+        assert_eq!(no_update_bit.management, ManagementAccess::CompatibleSession);
+
+        let audio_incompatible = decide_receiver_compatibility(
+            Some(&old), true, Some(ReceiverCapabilities {
+                audio_major: PCM_AUDIO_MAJOR + 1, ..capabilities
+            }), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert_eq!(audio_incompatible.features, FeatureCompatibility::Incompatible);
+        assert!(audio_incompatible.usb_upgrade_available);
+        assert_eq!(audio_incompatible.update, UpdateAvailability::CandidateAvailable);
+        assert_eq!(audio_incompatible.management, ManagementAccess::PreflightAndUpdateOnly);
+
+        let unauthenticated = decide_receiver_compatibility(
+            Some(&old), false, Some(capabilities), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert_eq!(unauthenticated.features, FeatureCompatibility::NotNegotiated);
+        assert!(unauthenticated.usb_upgrade_available);
+        assert_eq!(unauthenticated.management, ManagementAccess::Denied);
+
+        let wrong_signer = ArtifactMetadata { signer_sha256: "c".repeat(64), ..target.clone() };
+        let blocked_update = decide_receiver_compatibility(
+            Some(&old), true, Some(capabilities), CAP_AUTHENTICATED_STATUS, Some(&wrong_signer),
+        );
+        assert_eq!(blocked_update.features, FeatureCompatibility::Compatible);
+        assert_eq!(blocked_update.update, UpdateAvailability::BlockedBySignature);
+        assert!(!blocked_update.usb_upgrade_available);
+
+        let unknown_identity = decide_receiver_compatibility(
+            None, true, Some(capabilities), CAP_AUTHENTICATED_STATUS, Some(&target),
+        );
+        assert!(!unknown_identity.identity_trusted);
+        assert!(!unknown_identity.usb_upgrade_available);
+        assert_eq!(unknown_identity.management, ManagementAccess::Denied);
+        assert_eq!(unknown_identity.update, UpdateAvailability::Unavailable);
+    }
+
+    #[test]
     fn signature_mismatch_is_reported_without_an_uninstall_fallback() {
         let result = AdbResult { success: false, stdout: "Performing Streamed Install".into(), stderr: "INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match".into() };
         let error = adb_error(&result);
@@ -910,6 +1412,18 @@ mod tests {
     fn health_parser_rejects_incomplete_or_non_health_rows() {
         assert!(parse_health("No result found.").is_none());
         assert!(parse_health("Row: 0 applicationId=app.anpod.receiver, healthy=true").is_none());
+    }
+
+    #[test]
+    fn health_parser_keeps_unknown_playback_metrics_null() {
+        let health = parse_health("Row: 0 applicationId=app.anpod.receiver, versionName=0.1.0-p1, versionCode=1, serviceActive=true, foreground=true, healthy=true, audioActive=true, actualSampleRate=48000, actualChannels=2, udpQueuedFrames=unknown, udpExpiredFrames=17, underrunCount=10, underrunIncrement=2, playbackAdvancing=true, error=").unwrap();
+        assert_eq!(health.playback_diagnostics.receiver_sample_rate, Some(48_000));
+        assert_eq!(health.playback_diagnostics.receiver_channels, Some(2));
+        assert_eq!(health.playback_diagnostics.udp_queued_frames, None);
+        assert_eq!(health.playback_diagnostics.udp_expired_frames, Some(17));
+        assert_eq!(health.playback_diagnostics.underrun_count, Some(10));
+        assert_eq!(health.playback_diagnostics.underrun_increment, None);
+        assert_eq!(health.playback_diagnostics.playback_advancing, Some(true));
     }
 
     #[test]
@@ -947,6 +1461,150 @@ mod tests {
             }
         }
         assert!(calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into(), "query".into(), "--user".into(), TEST_USER.into()])));
+    }
+
+    #[tokio::test]
+    async fn fake_adb_wireless_receiver_start_accepts_audited_newer_install() {
+        let files = ArtifactFiles::new();
+        fs::write(&files.metadata, serde_json::json!({
+            "applicationId": PACKAGE,
+            "versionCode": 2,
+            "versionName": "0.2.0-p2-candidate",
+            "sha256": files.digest,
+            "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439"
+        }).to_string()).unwrap();
+        let serial = "192.0.2.20:5555";
+        let adb = FakeAdb::with_serial(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into(), serial);
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.health_version_code = 3;
+            state.health_version_name = "0.3.0-v2-candidate".into();
+        }
+        let status = start_with_action(&adb, serial, &files.apk, &files.metadata,
+            &CancellationToken::new(), Some(("wireless-session", "test-code", "balanced"))).await.unwrap();
+        assert_eq!(status.version_code, Some(3));
+        assert!(adb.calls().iter().any(|call|
+            call.iter().any(|arg| arg == "app.anpod.receiver.action.START_AUDIO")));
+    }
+
+    #[tokio::test]
+    async fn fake_adb_install_refuses_older_local_receiver_before_install() {
+        let files = ArtifactFiles::new();
+        fs::write(&files.metadata, serde_json::json!({
+            "applicationId": PACKAGE,
+            "versionCode": 2,
+            "versionName": "0.2.0-p2-candidate",
+            "sha256": files.digest,
+            "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439"
+        }).to_string()).unwrap();
+        let adb = FakeAdb::new(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        let error = install_with(&adb, SERIAL, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.err().unwrap();
+        assert!(error.contains("已阻止降级"));
+        assert!(adb.call_index(&["shell", "toybox", "sha256sum"]).is_some());
+        assert!(adb.call_index(&["install", "-r"]).is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_adb_installs_a_verified_newer_candidate_over_an_existing_receiver() {
+        let files = ArtifactFiles::new();
+        let version_name = "0.7.0-v3-flow-candidate";
+        fs::write(&files.metadata, serde_json::json!({
+            "applicationId": PACKAGE,
+            "versionCode": 9,
+            "versionName": version_name,
+            "sha256": files.digest,
+            "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439"
+        }).to_string()).unwrap();
+        let adb = FakeAdb::new(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.install_digest = Some(files.digest.clone());
+            state.install_version_code = Some(9);
+            state.install_version_name = Some(version_name.into());
+        }
+
+        let status = install_with(&adb, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.unwrap();
+
+        assert_eq!(status.version_code, Some(9));
+        assert_eq!(status.version_name.as_deref(), Some(version_name));
+        assert!(adb.call_index(&["install", "-r"]).is_some());
+        assert!(!adb.calls().iter().any(|call| call.first().is_some_and(|arg| arg == "uninstall")));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_adb_usb_upgrade_requires_the_saved_binding_and_preserves_it() {
+        use crate::security::{test_binding_material, BindingStore};
+
+        let files = ArtifactFiles::new();
+        let version_name = "0.7.0-v3-flow-candidate";
+        fs::write(&files.metadata, serde_json::json!({
+            "applicationId": PACKAGE,
+            "versionCode": 9,
+            "versionName": version_name,
+            "sha256": files.digest,
+            "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439"
+        }).to_string()).unwrap();
+        let reference = binding_reference_for(SERIAL, TEST_USER);
+        let binding_path = files.dir.join(format!("{reference}.dpapi"));
+        let material = test_binding_material();
+        let commitment = hex_digest(&material.commitment());
+        BindingStore::create_if_absent(&binding_path, &material).unwrap();
+
+        let adb = FakeAdb::new(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.binding_commitment = Some(commitment.clone());
+            state.install_digest = Some(files.digest.clone());
+            state.install_version_code = Some(9);
+            state.install_version_name = Some(version_name.into());
+        }
+        let status = install_usb_with(&adb, SERIAL, &files.apk, &files.metadata,
+            Some((&reference, &binding_path)), &CancellationToken::new()).await.unwrap();
+        assert_eq!(status.version_code, Some(9));
+        assert_eq!(adb.0.lock().unwrap().binding_commitment.as_deref(), Some(commitment.as_str()));
+        assert!(adb.call_index(&["install", "-r"]).is_some());
+        let calls = adb.calls();
+        let binding_queries: Vec<_> = calls.iter().enumerate().filter(|(_, call)|
+            call.windows(2).any(|pair| pair[0] == "--uri" && pair[1] == BINDING_URI)).map(|(index, _)| index).collect();
+        assert!(binding_queries.len() >= 2, "binding must match both before and after package installation");
+        assert!(calls.iter().all(|call| !call.windows(2).any(|pair| pair[0] == "content" && pair[1] == "write")));
+        assert!(adb.serial_calls().iter().any(|serial| serial.as_deref() == Some(SERIAL)));
+        assert!(adb.serial_calls().iter().all(|serial| serial.as_deref().is_none_or(|serial| serial == SERIAL)));
+
+        for remote_commitment in [Some("f".repeat(64)), None] {
+            let blocked = FakeAdb::new(true,
+                "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+            blocked.0.lock().unwrap().binding_commitment = remote_commitment;
+            let error = install_usb_with(&blocked, SERIAL, &files.apk, &files.metadata,
+                Some((&reference, &binding_path)), &CancellationToken::new()).await.err().unwrap();
+            assert!(error.contains("绑定"));
+            let calls = blocked.calls();
+            assert!(!calls.iter().any(|call| call.first().is_some_and(|arg| arg == "install")));
+            assert!(!calls.iter().any(|call| call.windows(2).any(|pair| pair[0] == "content" && pair[1] == "write")));
+        }
+
+        let changed_user = FakeAdb::new(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        changed_user.0.lock().unwrap().user = "11";
+        assert!(install_usb_with(&changed_user, SERIAL, &files.apk, &files.metadata,
+            Some((&reference, &binding_path)), &CancellationToken::new()).await.is_err());
+        assert!(!changed_user.calls().iter().any(|call| call.first().is_some_and(|arg| arg == "install")));
+        assert!(!changed_user.calls().iter().any(|call| call.windows(2).any(|pair| pair[0] == "content" && pair[1] == "write")));
+
+        let wireless_serial = "192.0.2.15:5555";
+        let wireless = FakeAdb::with_serial(true,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into(), wireless_serial);
+        wireless.0.lock().unwrap().usb = false;
+        assert!(install_usb_with(&wireless, wireless_serial, &files.apk, &files.metadata,
+            Some((&reference, &binding_path)), &CancellationToken::new()).await.is_err());
+        assert!(!wireless.calls().iter().any(|call| call.first().is_some_and(|arg| arg == "install")));
+        assert!(!wireless.calls().iter().any(|call| call.windows(2).any(|pair| pair[0] == "content" && pair[1] == "write")));
     }
 
     #[tokio::test]
@@ -1036,7 +1694,7 @@ mod tests {
         let files = ArtifactFiles::new();
         let adb = FakeAdb::new(true, "f".repeat(64));
         let error = start_with(&adb, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap();
-        assert!(error.contains("字节与本机受信任产物不一致"));
+        assert!(error.contains("既不匹配当前本机产物"));
         let calls = adb.calls();
         assert!(!calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into()])));
         assert!(!calls.iter().any(|call| call.iter().any(|arg| arg == "app.anpod.receiver.action.START" || arg == "app.anpod.receiver.action.STOP")));
@@ -1056,16 +1714,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_adb_install_rejects_success_when_historical_same_version_apk_remains() {
+        let files = ArtifactFiles::new();
+        fs::write(&files.metadata, serde_json::json!({
+            "applicationId": PACKAGE,
+            "versionCode": 3,
+            "versionName": "0.3.0-v2-candidate",
+            "sha256": files.digest,
+            "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+            "sourceCommit": "608c98c75ec04e11555e9e547caa516c96d4e0dd"
+        }).to_string()).unwrap();
+        let adb = FakeAdb::new(false,
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.health_version_code = 3;
+            state.health_version_name = "0.3.0-v2-candidate".into();
+        }
+        let error = install_with(&adb, SERIAL, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.err().unwrap();
+        assert!(error.contains("与本次目标包不一致"));
+        let calls = adb.calls();
+        assert!(calls.iter().any(|call| call.starts_with(&["install".into(), "-r".into()])));
+        assert!(calls.iter().any(|call| call.starts_with(&["shell".into(), "toybox".into(), "sha256sum".into()])));
+        assert!(!calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into(), "query".into()])));
+    }
+
+    #[tokio::test]
     async fn fake_adb_rejects_unauthorized_and_wifi_devices_before_package_commands() {
         let files = ArtifactFiles::new();
         let unauthorized = FakeAdb::new(false, files.digest.clone());
         unauthorized.0.lock().unwrap().device_state = "unauthorized";
-        assert!(start_with(&unauthorized, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap().contains("USB 设备"));
+        assert!(start_with(&unauthorized, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap().contains("已授权的在线 ADB 设备"));
         assert_eq!(unauthorized.calls().len(), 1);
 
         let wifi = FakeAdb::new(false, files.digest.clone());
-        assert!(start_with(&wifi, "192.0.2.3:5555", &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap().contains("USB ADB 设备"));
-        assert!(wifi.calls().is_empty());
+        assert!(start_with(&wifi, "192.0.2.3:5555", &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap().contains("当前不可用"));
+        assert_eq!(wifi.calls().len(), 1, "wireless ADB commands must confirm the exact selected serial first");
     }
 
     #[cfg(windows)]
