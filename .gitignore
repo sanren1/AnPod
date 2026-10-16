@@ -63,3 +63,11 @@ src-tauri/icons/ios/
 src-tauri/icons/icon.icns
 src-tauri/icons/Square*.png
 src-tauri/icons/StoreLogo.png
+
+# Local instructions and planning files are not part of public source.
+/AGENTS.md
+/AGENTS.override.md
+/plan.md
+/AnPod_plan_v2.md
+/AnPod 审查与优化报告.md
+/AnPod_handoff_*.md
