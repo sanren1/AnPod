@@ -1,4 +1,8 @@
-# AnPod
+<p align="center">
+  <img src="icon.png" alt="AnPod 图标" width="160">
+</p>
+
+<h1 align="center">AnPod</h1>
 
 把 Windows 当前默认播放设备的声音发送到 Android 手机播放。USB 可使用随包 Legacy 服务；无线 UDP 使用 AnPod Receiver。项目目前仍处于 Preview 阶段。
 
@@ -27,6 +31,22 @@
 
 Receiver APK 随 PC 便携包提供。USB 连接后可从 PC 的 Receiver 升级入口检查并升级；升级后重新连接并核对手机端状态。预览包中的 APK 使用候选 debug 签名，不是正式商店签名。
 
+## 最新延迟测试（2026-10-17）
+
+PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 匹配并经独立复核。
+
+| 连接与档位 | 中位数 | P95 |
+| --- | ---: | ---: |
+| USB · 均衡 | 156.720 ms | 157.111 ms |
+| USB · 低延迟 | 123.269 ms | 125.299 ms |
+| 无线 UDP · 均衡 | 310.645 ms | 314.294 ms |
+| 无线 UDP · 低延迟 | 187.394 ms | 200.240 ms |
+| 电脑本机 · 基准 | 71.699 ms | 71.778 ms |
+
+电脑本机基准是独立路径，仅作参照，不与四档结果相减。测量包含声学与麦克风链路，是端到端时差，并非纯传输延迟。无线 UDP 低延迟组有两次低匹配分，仅供参考；这不代表音乐音质通过。
+
+完整口径见 [测试记录](https://github.com/sanren1/AnPod/blob/preview/tests/manual-checklist-v2.md#2026-10-17-anpod-121-四档延迟与电脑基准短测)。
+
 ## 已知问题
 
 - 无线播放时切换均衡/低延迟可能断连，当前不会自动恢复；请手动重新连接。
@@ -42,3 +62,4 @@ Receiver APK 随 PC 便携包提供。USB 连接后可从 PC 的 Receiver 升级
 源码构建依赖 Rust stable、Node.js/npm、MSVC x64 C++ 工具；重建 Receiver 另需 JDK 17 与 Android SDK。前端使用 `cd frontend; npm ci; npm run build`。便携包入口见 [`packaging/publish-tauri.ps1`](packaging/publish-tauri.ps1)，构建前请阅读其中参数及脚本要求。旧 WPF 实现保留在 `src/AnPod.Desktop/`。
 
 第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码未声明独立许可证。
+
