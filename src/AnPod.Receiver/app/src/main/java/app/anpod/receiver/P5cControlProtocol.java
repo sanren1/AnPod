@@ -30,6 +30,9 @@ final class P5cControlProtocol {
     static final int CAPABILITIES_INFO = 9;
     static final int PLAYBACK_PROGRESS_QUERY = 16;
     static final int CONNECTION_INTENT = 17;
+    static final int BACKGROUND_START_REQUEST = 18;
+    static final int BACKGROUND_START_STATUS = 19;
+    static final int BACKGROUND_START_CANCEL = 20;
     static final int ACK = 127;
     static final int MANAGEMENT_CONTROL_MAJOR = 3;
     static final int AUDIO_PROTOCOL_MAJOR = 1;
@@ -37,7 +40,15 @@ final class P5cControlProtocol {
     static final int CAP_AUTHENTICATED_STATUS = 0x00000002;
     static final int CAP_PLAYBACK_PROGRESS = 0x00000008;
     static final int CAP_CONNECTION_INTENT = 0x00000010;
+    static final int CAP_BACKGROUND_START_AUTH = 0x00000020;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
+    static final int AUTH_PENDING = 0;
+    static final int AUTH_ONCE = 1;
+    static final int AUTH_EIGHT_HOURS = 2;
+    static final int AUTH_UNTIL_REVOKED = 3;
+    static final int AUTH_DENIED = 4;
+    static final int AUTH_EXPIRED = 5;
+    static final int AUTH_CANCELLED = 6;
     private static final long FRAME_READ_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(3);
 
     private P5cControlProtocol() {}
@@ -147,6 +158,14 @@ final class P5cControlProtocol {
         byte[] combined = Arrays.copyOf(payload, payload.length + extra.length);
         System.arraycopy(extra, 0, combined, payload.length, extra.length);
         return combined;
+    }
+
+    static byte[] backgroundAuthorizationAckExtra(byte[] requestId, int status) {
+        if (requestId == null || requestId.length != 16 || status < AUTH_PENDING || status > AUTH_CANCELLED)
+            throw new IllegalArgumentException("invalid background authorization ACK");
+        byte[] extra = Arrays.copyOf(requestId, 17);
+        extra[16] = (byte) status;
+        return extra;
     }
 
     static byte[] playbackProgressPayload(int sampleRate, int channels, int jitterTargetFrames,

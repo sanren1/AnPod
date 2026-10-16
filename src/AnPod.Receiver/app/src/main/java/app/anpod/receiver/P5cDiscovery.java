@@ -125,7 +125,8 @@ final class P5cDiscovery implements AutoCloseable {
     private SearchSnapshot startSearch(boolean automatic) throws IOException {
         if (socket.isClosed() || worker == null) throw new IOException("Receiver discovery is unavailable.");
         requireInterface();
-        if (prefixLength > 30) throw new IOException("所选接口不支持 LAN 广播搜索，请选择带有向广播地址的 IPv4 接口。");
+        if (prefixLength > 30 && !localAddress.isLoopbackAddress())
+            throw new IOException("所选接口不支持 LAN 广播搜索，请选择带有向广播地址的 IPv4 接口。");
         return beginSearch(directedBroadcast(localAddress, prefixLength), automatic);
     }
 

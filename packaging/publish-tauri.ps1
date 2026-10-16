@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = '1.0.4',
+    [string]$Version,
     [switch]$IncludeReceiverCandidate,
     [ValidateSet('p1', 'p2', 'v2', 'v3')]
     [string]$ReceiverCandidate = 'p1',
@@ -16,8 +16,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 $root = Split-Path -Parent $PSScriptRoot
+$config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
+if (-not $Version) { $Version = $config.version }
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 . (Join-Path $PSScriptRoot 'source-snapshot.ps1')
 if ($ReviewWorkingTree -and (-not $ReviewPackage -or $ReceiverCandidate -ne 'v3')) { throw '-ReviewWorkingTree requires a local V3 review candidate.' }
 $desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1')
@@ -98,8 +100,9 @@ if ($IncludeReceiverCandidate) {
         if ($receiverMetadata.versionName -ne '0.2.0-p2-candidate' -or $receiverMetadata.versionCode -ne 2) { throw 'P2 package requires a version 0.2.0-p2-candidate / code 2 Receiver artifact.' }
     }
     if ($ReceiverCandidate -in @('v2', 'v3')) {
-        $versionCode = if ($ReceiverCandidate -eq 'v3') { 9 } else { 3 }
-        $versionName = if ($ReceiverCandidate -eq 'v3') { '0.7.0-v3-flow-candidate' } else { '0.3.0-v2-candidate' }
+        $appGradle = Get-Content -Raw (Join-Path $root 'src/AnPod.Receiver/app/build.gradle')
+        $versionCode = if ($ReceiverCandidate -eq 'v3') { [int][regex]::Match($appGradle, '(?m)^\s*versionCode\s+(\d+)\s*$').Groups[1].Value } else { 3 }
+        $versionName = if ($ReceiverCandidate -eq 'v3') { [regex]::Match($appGradle, "(?m)^\s*versionName\s+'([^']+)'\s*$").Groups[1].Value } else { '0.3.0-v2-candidate' }
         if ($ReceiverCandidate -eq 'v3') {
             foreach ($requiredPath in @($ReceiverArtifactDirectory, $NativeArtifactDirectory, $LegacyPayloadDirectory, $RustTargetDirectory)) {
                 if (-not $requiredPath) { throw 'V3 packaging requires explicit isolated Receiver, Native, Legacy, and Rust target directories.' }
@@ -158,11 +161,11 @@ if ($IncludeReceiverCandidate) {
             $auditedComponentCommit = '608c98c75ec04e11555e9e547caa516c96d4e0dd'
             $expectedNativeSha256 = 'eeda608983ef520f281d72c4f0021634b4e87c251ab83dea7f8dcb413068761e'
             $expectedLegacySha256 = '9552af169e4c2b2ab82c39719d3afd7c2c5dd729551d8d487e836013eeb9cfa3'
-            $receiverMatchesCandidate = $receiverMetadata.versionName -eq '0.7.0-v3-flow-candidate' `
-                -and $receiverMetadata.versionCode -eq 9 `
+            $receiverMatchesCandidate = $receiverMetadata.versionName -eq $versionName `
+                -and $receiverMetadata.versionCode -eq $versionCode `
                 -and $receiverMetadata.signerSha256.ToLowerInvariant() -eq 'f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439'
             if (-not $receiverMatchesCandidate) {
-                throw 'V3 review packaging requires the code-9 Receiver artifact signed by the audited candidate certificate.'
+                throw 'V3 review packaging requires the current Receiver version signed by the audited candidate certificate.'
             }
             foreach ($sourcePath in @($nativeSource, $legacyPayloadSource)) {
                 if (-not $sourcePath.StartsWith($artifactsPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'V3 reused components must come from isolated artifacts/ directories.' }

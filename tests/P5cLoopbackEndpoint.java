@@ -5,6 +5,7 @@ import java.io.InputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -35,40 +36,73 @@ public final class P5cLoopbackEndpoint {
             System.out.println("JAVA_V2_DISCOVERY=PASS");
             return;
         }
+        boolean skipQueueSelfChecks = Arrays.asList(args).contains("--background-auth")
+                || Arrays.asList(args).contains("--skip-queue-self-checks");
         verifyCapabilityPayloadVectors();
         verifyV2DiscoveryVectors();
-        verifyFragmentedControlFrame();
-        verifyHeartbeatDeadline();
-        verifyAuthenticatedParametersQueueWithoutFormat();
-        verifyQueueAgeBurstAndLayeredBudget();
-        verifyPlaybackActivityWindow();
+        if (!skipQueueSelfChecks) {
+            verifyFragmentedControlFrame();
+            verifyHeartbeatDeadline();
+            verifyAuthenticatedParametersQueueWithoutFormat();
+            verifyQueueAgeBurstAndLayeredBudget();
+            verifyPlaybackActivityWindow();
+        }
         if (Arrays.asList(args).contains("--self-check-only")) {
             System.out.println("P5-C queue and playback activity checks passed.");
             return;
         }
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
+        boolean verifyAutoRenewAfterAuth = Arrays.asList(args).contains("--verify-auto-renew-after-auth");
         boolean verifyModeSwitch = Arrays.asList(args).contains("--verify-mode-switch");
         boolean verifyAudioWindow = Arrays.asList(args).contains("--verify-audio-window");
         FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"),
-                verifyModeSwitch, verifyAudioWindow);
+                verifyModeSwitch, verifyAudioWindow, Arrays.asList(args).contains("--fail-start-once"),
+                Arrays.asList(args).contains("--throw-start-once"), Arrays.asList(args).contains("--throw-stop-once"),
+                Arrays.stream(args).filter(value -> value.startsWith("--background-auth-mode="))
+                        .map(value -> value.substring("--background-auth-mode=".length())).findFirst().orElse(""));
         String capabilityMode = Arrays.stream(args).filter(value -> value.startsWith("--capabilities-"))
                 .map(value -> value.substring("--capabilities-".length())).findFirst().orElse("");
-        P5cReceiverCoordinator opened = Arrays.asList(args).contains("--connection-intent")
+        playback.keepReceiveIntent = verifyAutoRenewAfterAuth;
+        P5cReceiverCoordinator opened = verifyAutoRenewAfterAuth
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
+                : Arrays.asList(args).contains("--connection-intent")
                 ? P5cReceiverCoordinator.openLoopbackIntentTest(binding, playback, repeated((byte) 0x5a, 16))
+                : Arrays.asList(args).contains("--background-auth")
+                ? P5cReceiverCoordinator.openLoopbackBackgroundAuthorizationTest(binding, playback,
+                        Arrays.stream(args).filter(value -> value.startsWith("--background-auth-test="))
+                                .map(value -> value.substring("--background-auth-test=".length())).findFirst().orElse(""))
                 : !capabilityMode.isEmpty()
                 ? P5cReceiverCoordinator.openLoopbackCapabilityTest(binding, playback, capabilityMode)
                 : Arrays.asList(args).contains("--stop-ack-drop")
                 ? P5cReceiverCoordinator.openLoopbackDropStopAckForTest(binding, playback)
                 : Arrays.asList(args).contains("--discovery")
                 ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
+                : Arrays.asList(args).contains("--fail-start-once")
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
+                : Arrays.asList(args).contains("--throw-start-once")
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
+                : Arrays.stream(args).anyMatch(value -> value.startsWith("--drop-after-ms="))
+                ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : P5cReceiverCoordinator.openLoopback(binding, playback);
         try (P5cReceiverCoordinator endpoint = opened) {
+            if (verifyAutoRenewAfterAuth) {
+                java.lang.reflect.Method beginIntent = P5cReceiverCoordinator.class
+                        .getDeclaredMethod("beginConnectionIntent", byte[].class);
+                beginIntent.setAccessible(true);
+                beginIntent.invoke(endpoint, repeated((byte) 0x5a, 16));
+            }
             if (Arrays.asList(args).contains("--cancel-before-handoff")) playback.beforeStart = endpoint::cancelPendingConnectionIntent;
             endpoint.start();
-            if (Arrays.asList(args).contains("--discovery")) {
+            P5cDiscovery initialDiscovery = null;
+            if (Arrays.asList(args).contains("--discovery") || verifyAutoRenewAfterAuth) {
                 endpoint.startDiscovery();
-                verifyInvalidDiscoveryDoesNotStartPlayback(playback);
+                if (Arrays.asList(args).contains("--discovery")) verifyInvalidDiscoveryDoesNotStartPlayback(playback);
+                if (verifyAutoRenewAfterAuth) {
+                    java.lang.reflect.Field discoveryField = P5cReceiverCoordinator.class.getDeclaredField("discovery");
+                    discoveryField.setAccessible(true);
+                    initialDiscovery = (P5cDiscovery) discoveryField.get(endpoint);
+                }
             }
             System.out.println("PORT=" + endpoint.port());
             System.out.flush();
@@ -84,18 +118,91 @@ public final class P5cLoopbackEndpoint {
                 cancel.setDaemon(true);
                 cancel.start();
             }
+            if (Arrays.asList(args).contains("--close-on-stdin")) {
+                Thread close = new Thread(() -> {
+                    try { if (System.in.read() < 0) throw new IOException("missing close signal"); endpoint.close(); }
+                    catch (IOException error) { throw new RuntimeException(error); }
+                });
+                close.setDaemon(true);
+                close.start();
+            }
+            Arrays.stream(args).filter(value -> value.startsWith("--drop-after-ms=")).findFirst().ifPresent(value -> {
+                long delay = Long.parseLong(value.substring("--drop-after-ms=".length()));
+                Thread drop = new Thread(() -> dropFirstAuthenticatedConnection(endpoint, delay), "P5-C test disconnect");
+                drop.setDaemon(true);
+                drop.start();
+            });
             if (args.length > 0 && "--drop-on-stdin".equals(args[0])) {
                 if (System.in.read() < 0) throw new IOException("P5-D test disconnect signal was not supplied");
                 endpoint.close();
             }
-            if (!endpoint.await(15, TimeUnit.SECONDS)) throw new IOException("P5-C test endpoint timed out");
+            if (verifyAutoRenewAfterAuth) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+                while (!playback.stopped.get()) {
+                    if (System.nanoTime() >= deadline) throw new IOException("persistent receive test did not receive STOP");
+                    Thread.sleep(5);
+                }
+                if (endpoint.await(0, TimeUnit.MILLISECONDS))
+                    throw new AssertionError("PC STOP terminated the persistent receive listener");
+            } else if (!endpoint.await(15, TimeUnit.SECONDS)) throw new IOException("P5-C test endpoint timed out");
+            String discoveryRecovery = verifyAutoRenewAfterAuth
+                    ? verifyAutomaticSearchAfterAuthenticatedConnection(endpoint, initialDiscovery) + "|" : "";
             endpoint.close();
             if (verifyModeSwitch) playback.verifyModeSwitch();
-            System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
+            if (Arrays.asList(args).contains("--verify-background-auth") && playback.backgroundAuthRequests.get() > 0)
+                playback.verifyBackgroundAuthorization();
+            System.out.println("RESULT=" + discoveryRecovery + endpoint.failure() + "," + playback.starts.get() + ","
                     + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","
                     + playback.pcmBytes.get() + "," + playback.udpClosed.get() + "," + playback.shutdowns.get());
             System.out.flush();
         }
+    }
+
+    private static String verifyAutomaticSearchAfterAuthenticatedConnection(P5cReceiverCoordinator endpoint,
+            P5cDiscovery initialDiscovery) throws Exception {
+        java.lang.reflect.Field authenticatedField = P5cReceiverCoordinator.class.getDeclaredField("authenticatedSocket");
+        authenticatedField.setAccessible(true);
+        java.lang.reflect.Field discoveryField = P5cReceiverCoordinator.class.getDeclaredField("discovery");
+        discoveryField.setAccessible(true);
+        java.lang.reflect.Field establishedField = P5cReceiverCoordinator.class.getDeclaredField("connectionIntentEstablished");
+        establishedField.setAccessible(true);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        P5cDiscovery nextDiscovery = null;
+        while (System.nanoTime() < deadline) {
+            nextDiscovery = (P5cDiscovery) discoveryField.get(endpoint);
+            if (authenticatedField.get(endpoint) == null && nextDiscovery != null && nextDiscovery != initialDiscovery)
+                break;
+            Thread.sleep(5);
+        }
+        if (nextDiscovery == null || nextDiscovery == initialDiscovery || authenticatedField.get(endpoint) != null)
+            throw new AssertionError("authenticated session did not install a fresh idle discovery service after STOP");
+        if (!((Boolean) establishedField.get(endpoint)))
+            throw new AssertionError("fixture did not establish the authenticated connection intent before STOP");
+        P5cDiscovery.SearchSnapshot renewed = endpoint.maintainAutomaticSearch();
+        if (!renewed.active || !"searching".equals(renewed.lastRequestStatus))
+            throw new AssertionError("receive-intent maintenance did not restart the fresh post-auth idle search");
+        P5cDiscovery.SearchSnapshot stopped = endpoint.stopSearch();
+        P5cDiscovery.SearchSnapshot maintained = endpoint.maintainAutomaticSearch();
+        if (!"stopped".equals(stopped.lastRequestStatus) || maintained.active
+                || !"stopped".equals(maintained.lastRequestStatus))
+            throw new AssertionError("post-auth search maintenance ignored explicit STOP");
+        return "AUTO_RENEW_AFTER_AUTH=searching;AUTO_RENEW_AFTER_STOP=stopped";
+    }
+
+    private static void dropFirstAuthenticatedConnection(P5cReceiverCoordinator endpoint, long delayMs) {
+        try {
+            java.lang.reflect.Field owner = P5cReceiverCoordinator.class.getDeclaredField("authenticatedSocket");
+            owner.setAccessible(true);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            Socket first = null;
+            while (System.nanoTime() < deadline && first == null) {
+                first = (Socket) owner.get(endpoint);
+                if (first == null) Thread.sleep(5);
+            }
+            if (first == null) throw new AssertionError("test endpoint did not authenticate a session");
+            Thread.sleep(delayMs);
+            first.close();
+        } catch (Exception error) { throw new RuntimeException(error); }
     }
 
     private static void verifyCapabilityPayloadVectors() {
@@ -157,24 +264,58 @@ public final class P5cLoopbackEndpoint {
         AtomicInteger socketBinds = new AtomicInteger();
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
-        FakePlayback playback = new FakePlayback(false, false, false);
+        FakePlayback playback = new FakePlayback(false, false, false, false, false, false);
         try (P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openOnInterface(
                 binding, playback, loopback, 32)) {
             endpoint.start();
+            endpoint.startDiscovery(socket -> socketBinds.incrementAndGet());
+            awaitDiscoveryBinds(endpoint, socketBinds, 2);
             try (Socket first = new Socket(loopback, endpoint.port())) {
                 awaitActiveSocket(endpoint);
                 endpoint.startDiscovery(socket -> socketBinds.incrementAndGet());
-                if (socketBinds.get() != 0)
-                    throw new AssertionError("discovery started while the accepted session was active");
+                if (socketBinds.get() != 2)
+                    throw new AssertionError("unauthenticated connection replaced active discovery sockets");
             }
-            awaitDiscoveryBinds(endpoint, socketBinds, 2);
+            Thread.sleep(100);
+            if (socketBinds.get() != 2) throw new AssertionError("unauthenticated connection restarted discovery");
 
             try (Socket second = new Socket(loopback, endpoint.port())) {
                 awaitActiveSocket(endpoint);
             }
-            awaitDiscoveryBinds(endpoint, socketBinds, 4);
+            Thread.sleep(100);
+            if (socketBinds.get() != 2) throw new AssertionError("rejected connection damaged live discovery");
             if (endpoint.failure().startsWith("listener_failed"))
                 throw new AssertionError("discovery listener did not recover: " + endpoint.failure());
+        }
+
+        try (P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openOnInterface(
+                binding, playback, loopback, 32)) {
+            endpoint.start();
+            endpoint.startDiscovery();
+            P5cDiscovery.SearchSnapshot initial = endpoint.maintainAutomaticSearch();
+            if (!initial.active || !"searching".equals(initial.lastRequestStatus))
+                throw new AssertionError("idle automatic search did not start its first bounded discovery round");
+            java.lang.reflect.Field discoveryField = P5cReceiverCoordinator.class.getDeclaredField("discovery");
+            discoveryField.setAccessible(true);
+            P5cDiscovery discovery = (P5cDiscovery) discoveryField.get(endpoint);
+            java.lang.reflect.Field deadlineField = P5cDiscovery.class.getDeclaredField("searchDeadline");
+            deadlineField.setAccessible(true);
+            deadlineField.setLong(discovery, System.nanoTime() / 1_000_000L - 1);
+            P5cDiscovery.SearchSnapshot renewed = endpoint.maintainAutomaticSearch();
+            if (!renewed.active || !"searching".equals(renewed.lastRequestStatus))
+                throw new AssertionError("expired automatic search did not renew its bounded discovery round");
+            P5cDiscovery.SearchSnapshot stopped = endpoint.stopSearch();
+            if (!"stopped".equals(stopped.lastRequestStatus))
+                throw new AssertionError("explicit search cancellation was not retained");
+            P5cDiscovery.SearchSnapshot stillStopped = endpoint.maintainAutomaticSearch();
+            if (stillStopped.active || !"stopped".equals(stillStopped.lastRequestStatus))
+                throw new AssertionError("automatic maintenance restarted an explicitly stopped search");
+            java.lang.reflect.Field statusField = P5cDiscovery.class.getDeclaredField("lastRequestStatus");
+            statusField.setAccessible(true);
+            statusField.set(discovery, "interface-lost");
+            P5cDiscovery.SearchSnapshot interfaceLost = endpoint.maintainAutomaticSearch();
+            if (interfaceLost.active || !"interface-lost".equals(interfaceLost.lastRequestStatus))
+                throw new AssertionError("automatic maintenance restarted search after interface loss");
         }
     }
 
@@ -371,27 +512,35 @@ public final class P5cLoopbackEndpoint {
     }
 
     private static void verifyPlaybackActivityWindow() {
-        UdpPlaybackActivity activity = new UdpPlaybackActivity();
         long now = 1_000_000_000L;
+        AtomicLong clock = new AtomicLong(now);
+        UdpPlaybackActivity activity = new UdpPlaybackActivity(clock::get);
         activity.resetPlaybackHead(0);
-        activity.noteSuccessfulWrite(now);
-        if (activity.isActive(now + 10, 0, true, now, false))
+        activity.noteSuccessfulWrite(clock.get());
+        clock.set(now + 10);
+        if (activity.isActive(clock.get(), 0, true, now, false))
             throw new AssertionError("writes without AudioTrack consumption were reported as streaming");
-        if (!activity.isActive(now + 20, 240, true, now, false))
+        clock.set(now + 20);
+        if (!activity.isActive(clock.get(), 240, true, now, false))
             throw new AssertionError("recent packet, successful write, and head advance were not reported active");
-        if (activity.isActive(now + 20, 480, true, now, true))
+        if (activity.isActive(clock.get(), 480, true, now, true))
             throw new AssertionError("paused playback was reported streaming");
-        if (activity.isActive(now + 9_000_000_000L, 480, true, now, false))
+        clock.set(now + 9_000_000_000L);
+        if (activity.isActive(clock.get(), 480, true, now, false))
             throw new AssertionError("stale audio activity remained streaming after the waiting window");
 
-        UdpPlaybackActivity wrapped = new UdpPlaybackActivity();
+        clock.set(now);
+        UdpPlaybackActivity wrapped = new UdpPlaybackActivity(clock::get);
         wrapped.resetPlaybackHead(-2);
-        wrapped.noteSuccessfulWrite(now);
-        if (!wrapped.isActive(now + 20, 2, true, now, false))
+        wrapped.noteSuccessfulWrite(clock.get());
+        clock.set(now + 20);
+        if (!wrapped.isActive(clock.get(), 2, true, now, false))
             throw new AssertionError("unsigned AudioTrack head wrap was treated as a reset");
-        UdpPlaybackActivity freshSession = new UdpPlaybackActivity();
+        clock.set(now);
+        UdpPlaybackActivity freshSession = new UdpPlaybackActivity(clock::get);
         freshSession.resetPlaybackHead(0);
-        if (freshSession.isActive(now + 20, 0, true, now, false))
+        clock.set(now + 20);
+        if (freshSession.isActive(clock.get(), 0, true, now, false))
             throw new AssertionError("playback activity leaked across audio sessions");
     }
 
@@ -399,17 +548,18 @@ public final class P5cLoopbackEndpoint {
         PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
         UdpPcmQueue budget = new UdpPcmQueue(parameters);
         budget.configureAudioTrack(3_840);
-        if (budget.targetFrames() != 720)
-            throw new AssertionError("80 ms AudioTrack pre-roll consumed the 15 ms network jitter target");
+        if (budget.targetFrames() != 1_920)
+            throw new AssertionError("80 ms AudioTrack pre-roll consumed the 40 ms network jitter target");
         budget.reportTrackUnderruns(0);
         budget.reportTrackUnderruns(100);
-        if (budget.targetFrames() != 1_920)
-            throw new AssertionError("balanced network jitter target did not retain its independent 40 ms ceiling");
+        if (budget.targetFrames() != 7_200)
+            throw new AssertionError("balanced network jitter target did not clamp underrun growth at 150 ms");
         budget.stop();
 
         byte[] key = repeated((byte) 0x6a, 32);
         long sessionId = 0x1020304050607080L;
-        UdpPcmQueue queue = new UdpPcmQueue(parameters);
+        AtomicLong queueClock = new AtomicLong(System.nanoTime());
+        UdpPcmQueue queue = new UdpPcmQueue(parameters, "balanced", queueClock::get);
         UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
         try {
             long receivedAt = System.nanoTime();
@@ -422,13 +572,14 @@ public final class P5cLoopbackEndpoint {
             byte[] large = encodeUdp(key, sessionId, 3, 360, UdpPacketDecoder.AUDIO,
                     pcmPayloadValue(240, (short) 0x3333));
             queue.acceptAt(decoder.open(large, large.length), decoder, receivedAt + 2);
-            queue.expireStalePackets(receivedAt + 41_000_003L);
+            queue.expireStalePackets(receivedAt + 161_000_003L);
             if (queue.size() != 0 || queue.droppedFrames() != 600 || queue.expiredFrames() != 600)
                 throw new AssertionError("stalled playback did not expire variable-size old audio by exact frame count");
 
             byte[] fresh = encodeUdp(key, sessionId, 4, 600, UdpPacketDecoder.AUDIO,
                     pcmPayloadValue(240, (short) 0x1234));
             queue.accept(decoder.open(fresh, fresh.length), decoder);
+            queueClock.addAndGet(151_000_000L);
             InputStream pcm = queue.asPcmInputStream();
             DataInputStream pcmInput = new DataInputStream(pcm);
             byte[] header = new byte[8];
@@ -438,11 +589,20 @@ public final class P5cLoopbackEndpoint {
 
             byte[] afterGap = encodeUdp(key, sessionId, 5, 1_080, UdpPacketDecoder.AUDIO,
                     pcmPayloadValue(240, (short) 0x1234));
-            queue.accept(decoder.open(afterGap, afterGap.length), decoder);
-            byte[] recovered = new byte[960];
+            queue.acceptAt(decoder.open(afterGap, afterGap.length), decoder,
+                    queueClock.get() - 151_000_000L);
+            byte[] plc = new byte[240 * 4];
+            pcmInput.readFully(plc);
+            if (littleShort(plc, 0) <= 0 || littleShort(plc, 0) >= 0x1234
+                    || littleShort(plc, (240 - 1) * 4) != 0
+                    || queue.plcEvents() != 1 || queue.plcRepeatedFrames() != 240
+                    || queue.plcSilentFrames() != 0 || queue.plcOversizedGapSkips() != 0)
+                throw new AssertionError("finite PLC gap did not repeat and fade the last real packet exactly once");
+            byte[] recovered = new byte[240 * 4];
             pcmInput.readFully(recovered);
-            if (littleShort(recovered, 0) == 0x1234 || littleShort(recovered, 600) != 0x1234)
-                throw new AssertionError("burst gap was not faded into the newest packet");
+            if (littleShort(recovered, 0) <= 0 || littleShort(recovered, 0) >= 0x1234
+                    || littleShort(recovered, (144 - 1) * 4) != 0x1234)
+                throw new AssertionError("fresh real audio did not fade in after finite PLC recovery");
             pcm.close();
         } finally {
             queue.stop();
@@ -515,6 +675,7 @@ public final class P5cLoopbackEndpoint {
         final AtomicInteger modeSequenceErrors = new AtomicInteger();
         final AtomicReference<String> queueBudgetFailure = new AtomicReference<>();
         final boolean verifyModeSwitch;
+        boolean keepReceiveIntent;
         final boolean verifyAudioWindow;
         final AtomicInteger playbackHead = new AtomicInteger();
         final AtomicBoolean paused = new AtomicBoolean();
@@ -527,18 +688,109 @@ public final class P5cLoopbackEndpoint {
         volatile Thread receiverThread;
         volatile Thread sinkThread;
         Runnable beforeStart = () -> {};
+        final AtomicBoolean failStartOnce;
+        final AtomicBoolean throwStartOnce;
+        final AtomicBoolean throwStopOnce;
+        final String backgroundAuthMode;
+        final AtomicInteger backgroundAuthRequests = new AtomicInteger();
+        final AtomicInteger backgroundAuthQueries = new AtomicInteger();
+        final AtomicInteger backgroundAuthEnds = new AtomicInteger();
+        volatile byte[] backgroundAuthRequestId;
+        volatile byte[] backgroundAuthBinding;
+        volatile long backgroundAuthSession;
+        volatile InetAddress backgroundAuthPeer;
+        volatile int backgroundAuthStatus = P5cControlProtocol.AUTH_PENDING;
+        volatile long backgroundAuthRequestedAt;
+        volatile boolean backgroundAuthKeptForRecovery;
 
-        FakePlayback(boolean failResume, boolean verifyModeSwitch, boolean verifyAudioWindow) {
+        FakePlayback(boolean failResume, boolean verifyModeSwitch, boolean verifyAudioWindow, boolean failStartOnce,
+                boolean throwStartOnce, boolean throwStopOnce) {
+            this(failResume, verifyModeSwitch, verifyAudioWindow, failStartOnce, throwStartOnce, throwStopOnce, "");
+        }
+
+        FakePlayback(boolean failResume, boolean verifyModeSwitch, boolean verifyAudioWindow, boolean failStartOnce,
+                boolean throwStartOnce, boolean throwStopOnce, String backgroundAuthMode) {
             this.failResume = new AtomicBoolean(failResume);
             this.verifyModeSwitch = verifyModeSwitch;
             this.verifyAudioWindow = verifyAudioWindow;
+            this.failStartOnce = new AtomicBoolean(failStartOnce);
+            this.throwStartOnce = new AtomicBoolean(throwStartOnce);
+            this.throwStopOnce = new AtomicBoolean(throwStopOnce);
+            this.backgroundAuthMode = backgroundAuthMode;
         }
 
         @Override public boolean supportsPlaybackProgress() { return true; }
+        @Override public boolean requiresBackgroundStartAuthorization() { return !backgroundAuthMode.isEmpty(); }
+        @Override public int requestBackgroundStartAuthorization(byte[] requestId, long sessionId, InetAddress peer,
+                byte[] bindingCommitment) {
+            if (backgroundAuthRequestId != null && !Arrays.equals(backgroundAuthRequestId, requestId)
+                    && !"persistent-stop".equals(backgroundAuthMode)) return P5cControlProtocol.AUTH_CANCELLED;
+            if (backgroundAuthRequestId != null && Arrays.equals(backgroundAuthRequestId, requestId))
+                return backgroundAuthStatus;
+            backgroundAuthRequests.incrementAndGet();
+            backgroundAuthRequestId = requestId.clone();
+            backgroundAuthRequestedAt = System.nanoTime();
+            backgroundAuthSession = sessionId;
+            backgroundAuthPeer = peer;
+            backgroundAuthBinding = bindingCommitment.clone();
+            if ("denied".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_DENIED;
+            else if ("expired".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_EXPIRED;
+            else if ("persistent-stop".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_UNTIL_REVOKED;
+            else backgroundAuthStatus = P5cControlProtocol.AUTH_PENDING;
+            return backgroundAuthStatus;
+        }
+        @Override public int backgroundStartAuthorizationStatus(byte[] requestId, long sessionId, InetAddress peer,
+                byte[] bindingCommitment) {
+            backgroundAuthQueries.incrementAndGet();
+            if (!Arrays.equals(backgroundAuthRequestId, requestId) || backgroundAuthSession != sessionId
+                    || !backgroundAuthPeer.equals(peer) || !Arrays.equals(backgroundAuthBinding, bindingCommitment))
+                return P5cControlProtocol.AUTH_EXPIRED;
+            if ("pending-slow-status".equals(backgroundAuthMode)) {
+                try { Thread.sleep(5_000); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(interrupted);
+                }
+            }
+            if (P5cControlProtocol.AUTH_PENDING == backgroundAuthStatus) {
+                if ("pending-allow".equals(backgroundAuthMode)
+                        || "pending-allow-after-6s".equals(backgroundAuthMode)
+                                && System.nanoTime() - backgroundAuthRequestedAt >= TimeUnit.SECONDS.toNanos(6))
+                    backgroundAuthStatus = P5cControlProtocol.AUTH_ONCE;
+            }
+            return backgroundAuthStatus;
+        }
+        @Override public void endBackgroundStartAuthorization(byte[] requestId, long sessionId, InetAddress peer,
+                byte[] bindingCommitment, boolean keepForRecovery) {
+            if (Arrays.equals(backgroundAuthRequestId, requestId) && backgroundAuthSession == sessionId
+                    && backgroundAuthPeer.equals(peer) && Arrays.equals(backgroundAuthBinding, bindingCommitment)) {
+                backgroundAuthEnds.incrementAndGet();
+                backgroundAuthKeptForRecovery = keepForRecovery;
+                if (!keepForRecovery && backgroundAuthStatus == P5cControlProtocol.AUTH_PENDING)
+                    backgroundAuthStatus = P5cControlProtocol.AUTH_CANCELLED;
+            }
+        }
+
+        @Override public boolean keepStandbyAfterPlaybackStop() {
+            return keepReceiveIntent || "persistent-stop".equals(backgroundAuthMode);
+        }
+
+        void verifyBackgroundAuthorization() throws IOException {
+            if ("persistent-stop".equals(backgroundAuthMode)) {
+                if (backgroundAuthRequests.get() != 2 || backgroundAuthEnds.get() != 2 || backgroundAuthKeptForRecovery)
+                    throw new IOException("persistent authorization must permit two STOP-and-reconnect sessions");
+                return;
+            }
+            if (backgroundAuthRequests.get() != 1 || backgroundAuthEnds.get() != 1 || backgroundAuthKeptForRecovery)
+                throw new IOException("background request must be single-owner and end without a recovery grant");
+        }
 
         @Override public boolean start(UdpSessionContext context, P5cReceiverCoordinator.StartPermission permission) throws IOException {
             beforeStart.run();
             if (!permission.allowed()) return false;
+            this.context = context;
+            if (throwStartOnce.compareAndSet(true, false)) throw new IOException("injected START throw");
+            if (failStartOnce.compareAndSet(true, false)) return false;
             int startNumber = starts.incrementAndGet();
             if (verifyModeSwitch) {
                 int expectedMode = startNumber == 1 ? 1 : 0;
@@ -582,6 +834,7 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public void pause() {
+            awaitModeSwitchPayload();
             pauses.incrementAndGet(); paused.set(true);
             if (queue != null) queue.setPaused(true);
         }
@@ -611,6 +864,8 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public void stop() {
+            if (throwStopOnce.compareAndSet(true, false)) throw new IllegalStateException("injected STOP throw");
+            awaitModeSwitchPayload();
             stops.incrementAndGet();
             if (!stopped.compareAndSet(false, true)) return;
             UdpReceiver currentReceiver = receiver;
@@ -622,6 +877,23 @@ public final class P5cLoopbackEndpoint {
             join(receiverThread);
             join(sinkThread);
             udpClosed.set(currentReceiver == null || currentReceiver.isClosed());
+        }
+
+        private void awaitModeSwitchPayload() {
+            if (!verifyModeSwitch || queue == null || !queue.hasAuthenticatedAudio() || stopped.get()) return;
+            // The mode-switch fixture sends 960 frames per session. A streaming
+            // observation only proves some consumption; wait before flushing it.
+            int expectedBytes = starts.get() * 960 * 4;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (pcmBytes.get() < expectedBytes) {
+                if (System.nanoTime() >= deadline)
+                    throw new AssertionError("mode-switch synthetic sink did not drain " + expectedBytes + " bytes");
+                try { Thread.sleep(1); }
+                catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("mode-switch sink wait interrupted", error);
+                }
+            }
         }
 
         private static void join(Thread thread) {

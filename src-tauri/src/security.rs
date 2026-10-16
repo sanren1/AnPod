@@ -114,6 +114,9 @@ impl BindingMaterial {
     }
 }
 
+#[cfg(windows)]
+pub(crate) enum BindingRemoval { Removed, AlreadyMissing }
+
 impl Drop for BindingMaterial {
     fn drop(&mut self) {
         self.secret.fill(0);
@@ -190,6 +193,23 @@ impl BindingStore {
         let result = BindingMaterial::decode(&plaintext.0);
         plaintext.0.fill(0);
         result
+    }
+
+    pub(crate) fn remove_if_matches(path: &std::path::Path, expected: Option<&[u8; 32]>) -> Result<BindingRemoval, SecurityError> {
+        use std::fs;
+
+        match Self::load(path) {
+            Ok(material) => {
+                let Some(expected) = expected else { return Err(SecurityError::BindingConflict); };
+                if material.commitment() != *expected { return Err(SecurityError::BindingConflict); }
+                fs::remove_file(path)?;
+                if path.exists() { return Err(SecurityError::Io(std::io::Error::other("binding file remains after removal"))); }
+                Ok(BindingRemoval::Removed)
+            }
+            Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() =>
+                Ok(BindingRemoval::AlreadyMissing),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -495,6 +515,15 @@ pub(crate) fn test_binding_material() -> BindingMaterial {
     BindingMaterial { host_id: [0x11; 16], receiver_id: [0x22; 16], secret: [0x33; 32] }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn write_test_binding_file(path: &std::path::Path, material: &BindingMaterial) -> Result<(), SecurityError> {
+    let mut plaintext = material.encode();
+    let protected = dpapi::protect(&plaintext.0)?;
+    plaintext.0.fill(0);
+    std::fs::write(path, protected)?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn test_binding_material_with_wrong_identity() -> BindingMaterial {
     let mut material = test_binding_material();
@@ -636,6 +665,30 @@ mod storage_tests {
         damaged[0] ^= 0x80;
         fs::write(&path, damaged).unwrap();
         assert!(BindingStore::load(&path).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dpapi_binding_removal_is_targeted_and_compare_and_delete() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::current_dir().unwrap().join("target").join(format!("anpod-binding-reset-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("selected.dpapi");
+        let other = directory.join("other.dpapi");
+        let selected = BindingMaterial::generate().unwrap();
+        let unrelated = BindingMaterial::generate().unwrap();
+        write_test_binding_file(&path, &selected).unwrap();
+        write_test_binding_file(&other, &unrelated).unwrap();
+        let wrong = [0x55; 32];
+        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&wrong)), Err(SecurityError::BindingConflict)));
+        assert!(matches!(BindingStore::remove_if_matches(&path, None), Err(SecurityError::BindingConflict)));
+        assert!(path.exists());
+        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&selected.commitment())), Ok(BindingRemoval::Removed)));
+        assert!(!path.exists());
+        assert!(other.exists(), "a reset must not remove another saved binding");
+        assert!(matches!(BindingStore::remove_if_matches(&path, None), Ok(BindingRemoval::AlreadyMissing)));
+        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&selected.commitment())), Err(SecurityError::Io(_))));
         fs::remove_dir_all(directory).unwrap();
     }
 }

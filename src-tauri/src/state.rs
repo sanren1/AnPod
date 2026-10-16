@@ -104,6 +104,7 @@ pub struct AppSnapshot {
     pub session_wireless_protocol: Option<String>,
     pub session_capabilities: Option<ReceiverCapabilities>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub network_recovery_seconds_remaining: Option<u64>,
     pub wireless_connection_offers: HostDiscoverySnapshot,
     pub session_android_version: Option<String>,
     /// Canonical v2 choice; `transport` remains the `usb`/`wifi` frontend alias.
@@ -179,6 +180,7 @@ struct ViewState {
     audio_bitrate_bps: Option<u64>,
     session_capabilities: Option<ReceiverCapabilities>,
     playback_diagnostics: Option<PlaybackDiagnostics>,
+    network_recovery_seconds_remaining: Option<u64>,
 }
 
 pub struct AppState {
@@ -275,6 +277,7 @@ impl AppState {
                 audio_bitrate_bps: None,
                 session_capabilities: None,
                 playback_diagnostics: None,
+                network_recovery_seconds_remaining: None,
             }),
             host_offer_listener: Mutex::new(None),
             operation: Mutex::new(None),
@@ -362,11 +365,8 @@ impl AppState {
     async fn ensure_receiver_operation_target(&self, serial: &str, binding_reference: Option<&str>) -> Result<(), String> {
         let session = self.session.lock().await;
         let Some(active) = session.as_ref() else { return Ok(()); };
-        let matches = if active.network_owner.is_some() {
-            binding_reference.is_some() && active.network_binding_ref.as_deref() == binding_reference
-        } else {
-            active.serial == serial
-        };
+        let matches = receiver_target_matches(&active.serial, active.network_owner.is_some(),
+            active.network_binding_ref.as_deref(), serial, binding_reference);
         if matches { Ok(()) }
         else { Err("AnPod 正在使用另一台设备；未中断当前会话或执行 Receiver 操作。".into()) }
     }
@@ -422,6 +422,79 @@ impl AppState {
         }
         references.sort();
         Ok(references)
+    }
+
+    pub async fn receiver_binding_reset_preview(&self, serial: &str) -> Result<receiver::BindingResetPreview, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        #[cfg(windows)]
+        let result = receiver::binding_reset_preview(&self.adb_path, serial, &self.data_dir,
+            &self.receiver_apk_path, &self.receiver_metadata_path, &token).await;
+        #[cfg(not(windows))]
+        let result = Err("USB 绑定重置仅在 Windows 上可用。".into());
+        self.finish_operation(generation);
+        result
+    }
+
+    pub async fn receiver_reset_binding(&self, expected: receiver::BindingResetPreview)
+        -> Result<receiver::BindingResetResult, String> {
+        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let result = async {
+            let before = self.receiver_binding_reset_preview_under_gate(&expected.serial, &token).await?;
+            validate_receiver_reset_preview(&before, &expected)?;
+            let has_session = self.session.lock().await.is_some();
+            if has_session {
+                self.ensure_receiver_operation_target(&expected.serial, Some(&expected.binding_reference)).await?;
+            } else if before.receiver_busy {
+                return Err("手机仍有活动的接收或播放会话；请先在手机上停止接收，再重新预览。未删除绑定。".into());
+            }
+            if !self.operation_is_current(generation, &token) {
+                return Err("绑定重置已取消；尚未更改任何绑定。".into());
+            }
+            if has_session {
+                self.teardown(None).await?;
+                if before.receiver_busy {
+                    if !self.operation_is_current(generation, &token) {
+                        return Err("会话已停止，但绑定重置随后取消；绑定仍保留。".into());
+                    }
+                    receiver::stop(&self.adb_path, &expected.serial, &self.receiver_apk_path,
+                        &self.receiver_metadata_path, &token).await?;
+                }
+            }
+            if !self.operation_is_current(generation, &token) {
+                return Err("绑定重置已取消；绑定仍保留。".into());
+            }
+            let after_stop = self.receiver_binding_reset_preview_under_gate(&expected.serial, &token).await?;
+            validate_receiver_reset_preview(&after_stop, &expected)?;
+            if after_stop.receiver_busy {
+                return Err("手机仍报告活动接收或播放状态；请在手机上停止接收后重试。绑定未删除。".into());
+            }
+            let is_current = || self.operation_is_current(generation, &token);
+            receiver::reset_binding(&self.adb_path, &after_stop, &self.data_dir,
+                &self.receiver_apk_path, &self.receiver_metadata_path, &token, &is_current).await
+        }.await;
+        if let Ok(reset) = &result {
+            if !reset_preserves_wireless_listener(reset, &expected) {
+                let dropped = {
+                    let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
+                    if listener.as_ref().is_some_and(|current|
+                        wireless_listener_matches_binding(current.automatic_binding.as_deref(), &expected.binding_reference)) {
+                        listener.take()
+                    } else { None }
+                };
+                drop(dropped);
+            }
+        }
+        self.finish_operation(generation);
+        result
+    }
+
+    async fn receiver_binding_reset_preview_under_gate(&self, serial: &str, token: &CancellationToken)
+        -> Result<receiver::BindingResetPreview, String> {
+        #[cfg(windows)]
+        { receiver::binding_reset_preview(&self.adb_path, serial, &self.data_dir,
+            &self.receiver_apk_path, &self.receiver_metadata_path, token).await }
+        #[cfg(not(windows))]
+        { let _ = (serial, token); Err("USB 绑定重置仅在 Windows 上可用。".into()) }
     }
 
     pub async fn discover_network_receivers(&self, local_address: &str) -> Result<Vec<Candidate>, String> {
@@ -499,20 +572,28 @@ impl AppState {
             if view.session_active { return Err("已有活动会话；请先断开后再接受连接请求。".into()); }
             if view.busy { return Err("AnPod 正在处理连接操作；请稍后再接受连接请求。".into()); }
         }
-        let (offer, address, cancellation) = {
+        let Some(reservation) = self.start_background_operation() else {
+            return Err("AnPod 正在处理连接操作；请稍后再接受连接请求。".into());
+        };
+        let offer_result = (|| {
             let listener = self.host_offer_listener.lock().expect("offer listener lock");
-            let listener = listener.as_ref().ok_or("无线连接请求监听已关闭。")?;
+            let listener = listener.as_ref().ok_or_else(|| "无线连接请求监听已关闭。".to_string())?;
             let snapshot = listener.snapshot();
-            let address = snapshot.interface_address.ok_or("监听接口已不可用；请重新选择网络接口。")?;
+            let address = snapshot.interface_address.ok_or_else(|| "监听接口已不可用；请重新选择网络接口。".to_string())?;
             if !self.network_interfaces()?.iter().any(|item| item.address == address
                 && Some(item.prefix_length) == snapshot.interface_prefix_length) {
                 return Err("监听接口已变化；旧连接请求已失效，请重新选择接口并允许连接。".into());
             }
-            let offer = listener.take_offer(offer_id).ok_or("连接请求已过期或已处理，请让 Receiver 重新搜索。")?;
-            (offer, address, listener.cancellation())
+            let offer = listener.take_offer(offer_id)
+                .ok_or_else(|| "连接请求已过期或已处理，请让 Receiver 重新搜索。".to_string())?;
+            Ok((offer, address, listener.cancellation()))
+        })();
+        let (offer, address, cancellation) = match offer_result {
+            Ok(offer) => offer,
+            Err(error) => { self.finish_operation(reservation.0); return Err(error); }
         };
         self.start_network_audio_inner(app, &address.to_string(), &offer.endpoint.to_string(), None,
-            None, None, Some(binding_ref), Some((offer.nonce, false, cancellation)), None).await
+            None, None, Some(binding_ref), Some((offer.nonce, false, cancellation)), Some(reservation)).await
     }
 
     #[cfg(not(windows))]
@@ -561,10 +642,9 @@ impl AppState {
                     return Err("所选绑定与当前 USB 设备或 Android 用户不匹配。".into());
                 }
                 let version = receiver::network_status(&self.adb_path, serial, &self.receiver_apk_path,
-                    &self.receiver_metadata_path, &token).await
-                    .map_err(|error| format!("无法验证 Receiver 网络版本；请升级 Receiver 后重试（保留应用数据）：{error}"))?;
+                    &self.receiver_metadata_path, &token).await?;
                 if version.network_audio_version != 1 {
-                    return Err("Receiver 网络协议版本不兼容；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+                    return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络协议版本不兼容。".into());
                 }
                 let path = binding_store_path(&self.data_dir, &reference)?;
                 receiver::provision(&self.adb_path, serial, &self.receiver_apk_path,
@@ -669,6 +749,7 @@ impl AppState {
                 view.session_android_version = None;
                 view.session_capabilities = capabilities;
                 view.playback_diagnostics = None;
+                view.network_recovery_seconds_remaining = None;
                 view.output = session_output.into();
                 view.state = if management_only { "managementOnly" } else { "phoneReady" }.into();
                 view.message = if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
@@ -763,6 +844,7 @@ impl AppState {
             session_wireless_protocol: view.session_transport.as_deref().and_then(session_wireless_protocol).map(str::to_owned),
             session_capabilities: view.session_capabilities.clone(),
             playback_diagnostics: view.playback_diagnostics.clone(),
+            network_recovery_seconds_remaining: view.network_recovery_seconds_remaining,
             wireless_connection_offers: self.wireless_connection_offers(),
             session_android_version: view.session_android_version.clone(),
             connection_transport: selected_connection_transport(&view.settings.preferred_transport).into(),
@@ -1148,6 +1230,7 @@ impl AppState {
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
+                view.network_recovery_seconds_remaining = None;
                 view.session_android_version = None;
                 view.output = "computer".into();
                 view.state = "error".into();
@@ -1187,7 +1270,8 @@ impl AppState {
         let changed = {
             let mut view = self.view.lock().expect("app view lock");
             let changed = view.state != state || view.message != message || view.status_detail != detail
-                || view.playback_diagnostics != snapshot.playback_diagnostics;
+                || view.playback_diagnostics != snapshot.playback_diagnostics
+                || view.network_recovery_seconds_remaining != snapshot.recovery_seconds_remaining;
             view.state = state.into();
             view.message = message;
             view.status_detail = detail;
@@ -1195,6 +1279,7 @@ impl AppState {
             view.session_receiver_binding = active.network_binding_ref.clone();
             view.session_capabilities = snapshot.capabilities.clone();
             view.playback_diagnostics = snapshot.playback_diagnostics.clone();
+            view.network_recovery_seconds_remaining = snapshot.recovery_seconds_remaining;
             changed
         };
         drop(session);
@@ -1204,10 +1289,9 @@ impl AppState {
 
     async fn recover_session_locked(&self, app: &AppHandle, serial: String, transport: String, was_playing: bool, session_key: String, reason: String) {
         if self.recovering.swap(true, Ordering::AcqRel) { return; }
-        let suppressed = self.suppressed_auto_connect.lock().expect("auto-connect suppression lock").as_deref() == Some(serial.as_str());
         let same_session = self.session.lock().await.as_ref()
             .is_some_and(|session| session.serial == serial && session.reverse == session_key);
-        if suppressed || !same_session {
+        if !same_session {
             self.recovering.store(false, Ordering::Release);
             return;
         }
@@ -1216,6 +1300,13 @@ impl AppState {
         let device_name = self.snapshot().device_name;
         if let Err(error) = self.teardown(Some(app)).await {
             self.set_state(app, "error", format!("{reason}；清理连接失败：{error}"), device_name);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        let suppressed = self.suppressed_auto_connect.lock().expect("auto-connect suppression lock")
+            .as_deref() == Some(serial.as_str());
+        if suppressed {
+            self.set_state(app, "error", reason, device_name);
             self.recovering.store(false, Ordering::Release);
             return;
         }
@@ -1407,6 +1498,7 @@ impl AppState {
             view.session_transport = Some(device.transport.clone());
             view.session_capabilities = None;
             view.playback_diagnostics = None;
+            view.network_recovery_seconds_remaining = None;
             view.session_android_version = (!device.android_version.is_empty()).then(|| device.android_version.clone());
             view.audio_bitrate_bps = Some(0);
         }
@@ -1689,7 +1781,7 @@ impl AppState {
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
             let network_session = session.network_owner.is_some();
-            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_capabilities = None; view.playback_diagnostics = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_capabilities = None; view.playback_diagnostics = None; view.network_recovery_seconds_remaining = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -1820,6 +1912,7 @@ impl AppState {
                     view.session_transport = None;
                     view.session_capabilities = None;
                     view.playback_diagnostics = None;
+                    view.network_recovery_seconds_remaining = None;
                     view.session_android_version = None;
                     view.output = "computer".into();
                     view.state = "error".into();
@@ -2197,6 +2290,41 @@ fn calculate_pcm_bitrate(previous: Option<(u64, u64, Instant)>, session_id: u64,
 
 fn same_physical_device(left: &Device, right: &Device) -> bool {
     left.physical_id.as_ref().is_some_and(|id| right.physical_id.as_ref() == Some(id))
+}
+
+fn receiver_target_matches(active_serial: &str, active_network: bool, active_binding: Option<&str>,
+    target_serial: &str, target_binding: Option<&str>) -> bool {
+    if active_network {
+        target_binding.is_some() && active_binding == target_binding
+    } else {
+        active_serial == target_serial
+    }
+}
+
+fn wireless_listener_matches_binding(listener_binding: Option<&str>, target_binding: &str) -> bool {
+    listener_binding == Some(target_binding)
+}
+
+fn reset_preserves_wireless_listener(result: &receiver::BindingResetResult,
+    expected: &receiver::BindingResetPreview) -> bool {
+    result.serial == expected.serial && result.android_user == expected.android_user
+        && result.binding_reference == expected.binding_reference
+        && result.phone_state == "saved" && result.phone_commitment == expected.phone_commitment
+        && result.pc_state == "saved" && result.pc_commitment == expected.pc_commitment
+}
+
+fn validate_receiver_reset_preview(actual: &receiver::BindingResetPreview,
+    expected: &receiver::BindingResetPreview) -> Result<(), String> {
+    if actual.serial != expected.serial || actual.android_user != expected.android_user
+        || actual.binding_reference != expected.binding_reference
+        || actual.phone_state != expected.phone_state || actual.phone_commitment != expected.phone_commitment
+        || actual.pc_state != expected.pc_state || actual.pc_commitment != expected.pc_commitment {
+        return Err("重置预览已过期（设备、Android user 或绑定摘要发生变化）；未停止会话或删除绑定，请重新检查。".into());
+    }
+    if actual.phone_state == "pending" || actual.phone_state == "failed" {
+        return Err("手机绑定状态正在写入或不可读取；请完成/检查绑定操作后重新预览。未停止会话或删除绑定。".into());
+    }
+    Ok(())
 }
 
 fn valid_binding_reference(reference: &str) -> bool {
@@ -2829,5 +2957,75 @@ mod tests {
         assert!(same_physical_device(&make("USB-1", Some("SERIAL")), &make("192.0.2.1:5555", Some("SERIAL"))));
         assert!(!same_physical_device(&make("USB-1", None), &make("192.0.2.1:5555", None)));
         assert!(!same_physical_device(&make("USB-1", Some("SERIAL-A")), &make("192.0.2.1:5555", Some("SERIAL-B"))));
+    }
+
+    #[test]
+    fn receiver_reset_cannot_stop_a_session_for_another_target() {
+        assert!(receiver_target_matches("USB-A", false, None, "USB-A", Some("reference-a")));
+        assert!(!receiver_target_matches("USB-B", false, None, "USB-A", Some("reference-a")));
+        assert!(receiver_target_matches("USB-A", true, Some("reference-a"), "USB-Z", Some("reference-a")));
+        assert!(!receiver_target_matches("USB-A", true, Some("reference-b"), "USB-A", Some("reference-a")));
+        assert!(!receiver_target_matches("USB-A", true, Some("reference-a"), "USB-A", None));
+    }
+
+    #[test]
+    fn operation_slot_keeps_reset_and_offer_reservations_exclusive() {
+        let generation = AtomicU64::new(0);
+        let slot = Mutex::new(None);
+        let (reset_generation, reset_token) = begin_operation_slot(&generation, &slot, true).unwrap();
+        assert!(begin_operation_slot(&generation, &slot, true).is_none());
+        assert!(!reset_token.is_cancelled());
+        finish_operation_slot(&slot, reset_generation);
+
+        let (offer_generation, offer_token) = begin_operation_slot(&generation, &slot, true).unwrap();
+        assert!(begin_operation_slot(&generation, &slot, true).is_none());
+        assert!(!offer_token.is_cancelled());
+        finish_operation_slot(&slot, offer_generation);
+    }
+
+    #[test]
+    fn binding_reset_preserves_only_the_matching_listener_and_unchanged_saved_binding() {
+        let expected = receiver::BindingResetPreview {
+            serial: "USB-A".into(), android_user: "10".into(), binding_reference: "reference-a".into(),
+            phone_state: "saved".into(), phone_commitment: Some("a".repeat(64)),
+            pc_state: "saved".into(), pc_commitment: Some("b".repeat(64)), receiver_busy: false,
+        };
+        assert!(wireless_listener_matches_binding(Some("reference-a"), "reference-a"));
+        assert!(!wireless_listener_matches_binding(Some("reference-b"), "reference-a"));
+        assert!(!wireless_listener_matches_binding(None, "reference-a"));
+        let mut result = receiver::BindingResetResult {
+            outcome: "phoneRetained".into(), serial: expected.serial.clone(), android_user: expected.android_user.clone(),
+            binding_reference: expected.binding_reference.clone(), phone_state: "saved".into(),
+            phone_commitment: expected.phone_commitment.clone(), pc_state: "saved".into(),
+            pc_commitment: expected.pc_commitment.clone(), reason: String::new(), next_action: String::new(),
+        };
+        assert!(reset_preserves_wireless_listener(&result, &expected));
+        for (phone_state, pc_state) in [("empty", "missing"), ("unknown", "saved"), ("saved", "missing")] {
+            result.phone_state = phone_state.into();
+            result.pc_state = pc_state.into();
+            assert!(!reset_preserves_wireless_listener(&result, &expected));
+        }
+        result.phone_state = "saved".into();
+        result.pc_state = "saved".into();
+        result.pc_commitment = Some("c".repeat(64));
+        assert!(!reset_preserves_wireless_listener(&result, &expected));
+    }
+
+    #[test]
+    fn receiver_reset_preflight_rejects_pending_or_failed_phone_state_before_stop() {
+        let preview = receiver::BindingResetPreview {
+            serial: "USB-A".into(), android_user: "10".into(), binding_reference: "reference-a".into(),
+            phone_state: "saved".into(), phone_commitment: Some("a".repeat(64)),
+            pc_state: "saved".into(), pc_commitment: Some("b".repeat(64)), receiver_busy: false,
+        };
+        assert!(validate_receiver_reset_preview(&preview, &preview).is_ok());
+        for state in ["pending", "failed"] {
+            let invalid = receiver::BindingResetPreview { phone_state: state.into(), phone_commitment: None,
+                ..preview.clone() };
+            assert!(validate_receiver_reset_preview(&invalid, &invalid).is_err(),
+                "{state} must be rejected before any session teardown");
+        }
+        let changed = receiver::BindingResetPreview { android_user: "11".into(), ..preview.clone() };
+        assert!(validate_receiver_reset_preview(&changed, &preview).is_err());
     }
 }

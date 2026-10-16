@@ -5,20 +5,27 @@ import android.util.AtomicFile;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
 
 /** Create-only binding storage under the Receiver's fixed app-private files directory. */
-final class BindingStore {
+final class BindingStore implements BackgroundStartAuthorization.GrantStore {
     private static final Object FILE_LOCK = new Object();
     private final File bindingFile;
     private final AtomicFile atomicFile;
+    private final AtomicFile grantFile;
+
+    enum ResetResult { REMOVED, ALREADY_EMPTY }
+
+    static Object storageLock() { return FILE_LOCK; }
 
     BindingStore(File applicationPrivateFilesDirectory) {
         if (applicationPrivateFilesDirectory == null || !applicationPrivateFilesDirectory.isDirectory())
             throw new IllegalArgumentException("an existing app-private files directory is required");
         bindingFile = new File(applicationPrivateFilesDirectory, "anpod-binding-v1.bin");
         atomicFile = new AtomicFile(bindingFile);
+        grantFile = new AtomicFile(new File(applicationPrivateFilesDirectory, "anpod-background-grant-v1.bin"));
     }
 
     void createOrConfirm(PairingProtocol.BindingMaterial material) throws IOException, PairingProtocol.Failure {
@@ -76,6 +83,65 @@ final class BindingStore {
             } finally {
                 Arrays.fill(record, (byte) 0);
             }
+        }
+    }
+
+    ResetResult removeIfMatches(String expectedCommitment) throws IOException, PairingProtocol.Failure {
+        synchronized (FILE_LOCK) {
+            File backup = new File(bindingFile.getPath() + ".bak");
+            if (!bindingFile.exists() && !backup.exists()) {
+                if (expectedCommitment == null) return ResetResult.ALREADY_EMPTY;
+                throw new ConflictException();
+            }
+            byte[] record = atomicFile.readFully();
+            try (PairingProtocol.BindingMaterial material = PairingProtocol.BindingMaterial.decode(record)) {
+                if (expectedCommitment == null || !hex(material.commitment()).equals(expectedCommitment))
+                    throw new ConflictException();
+                clearUntilRevoked(expectedCommitment);
+                atomicFile.delete();
+                if (bindingFile.exists() || backup.exists()) throw new IOException("binding remains after reset");
+                return ResetResult.REMOVED;
+            } finally {
+                Arrays.fill(record, (byte) 0);
+            }
+        }
+    }
+
+    @Override public boolean hasUntilRevoked(String expectedCommitment) throws IOException {
+        synchronized (FILE_LOCK) {
+            if (!grantFile.getBaseFile().exists() && !new File(grantFile.getBaseFile().getPath() + ".bak").exists()) return false;
+            byte[] record = grantFile.readFully();
+            try { return ("BSA1\n" + expectedCommitment + "\n").equals(new String(record, StandardCharsets.US_ASCII)); }
+            finally { Arrays.fill(record, (byte) 0); }
+        }
+    }
+
+    @Override public void saveUntilRevoked(String commitment) throws IOException {
+        synchronized (FILE_LOCK) {
+            byte[] record = ("BSA1\n" + commitment + "\n").getBytes(StandardCharsets.US_ASCII);
+            FileOutputStream output = null;
+            try {
+                output = grantFile.startWrite();
+                output.write(record);
+                grantFile.finishWrite(output);
+                output = null;
+            } catch (IOException | RuntimeException error) {
+                if (output != null) grantFile.failWrite(output);
+                throw error;
+            } finally { Arrays.fill(record, (byte) 0); }
+        }
+    }
+
+    @Override public void clearUntilRevoked(String expectedCommitment) throws IOException {
+        synchronized (FILE_LOCK) {
+            File base = grantFile.getBaseFile();
+            File backup = new File(base.getPath() + ".bak");
+            if (!base.exists() && !backup.exists()) return;
+            byte[] record = grantFile.readFully();
+            try {
+                String value = new String(record, StandardCharsets.US_ASCII);
+                if (value.equals("BSA1\n" + expectedCommitment + "\n")) grantFile.delete();
+            } finally { Arrays.fill(record, (byte) 0); }
         }
     }
 

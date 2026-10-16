@@ -16,6 +16,12 @@ const PCM_CHANNELS: u16 = 2;
 const MAX_JITTER_PACKETS: usize = 4;
 const BALANCED_CAPTURE_QUEUE_MS: u64 = 40;
 const LOW_LATENCY_CAPTURE_QUEUE_MS: u64 = 20;
+const UDP_SEND_ATTEMPTS: usize = 3;
+#[cfg(test)]
+static FAIL_NEXT_UDP_SEND: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_udp_send_for_test() { FAIL_NEXT_UDP_SEND.store(true, Ordering::Release); }
 
 #[derive(Clone, Copy, Debug)]
 struct PcmBlockInfo {
@@ -293,6 +299,17 @@ impl UdpSender {
         let Some(worker) = self.worker.take() else { return Ok(NetworkStats::default()); };
         worker.join().map_err(|_| "UDP worker thread panicked.".to_string())?
     }
+
+    pub(crate) fn take_finished_error(&mut self) -> Option<String> {
+        let worker = self.worker.as_ref()?;
+        if !worker.is_finished() { return None; }
+        let worker = self.worker.take().expect("finished UDP worker");
+        match worker.join() {
+            Ok(Ok(_)) => Some("UDP sender stopped unexpectedly.".into()),
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("UDP worker thread panicked.".into()),
+        }
+    }
 }
 
 impl Drop for UdpSender {
@@ -337,10 +354,8 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
             if payload.len() > MAX_PAYLOAD_LEN { return Err("PCM packet exceeds the datagram limit.".into()); }
             let frame_index = info.frame_index.checked_add(offset_frames as u64)
                 .ok_or_else(|| "PCM sample frame index exhausted.".to_string())?;
-            let packet = encoder.encode_next(PacketType::Audio, frame_index, &payload)
-                .map_err(|error| error.to_string())?;
-            let sent = socket.send_to(&packet, remote).map_err(|error| error.to_string())?;
-            if sent != packet.len() { return Err("UDP datagram was not sent atomically.".into()); }
+            send_packet_with(&mut encoder, PacketType::Audio, frame_index, &payload,
+                |packet| send_datagram(&socket, remote, packet))?;
             stats.packets_sent = stats.packets_sent.saturating_add(1);
             stats.pcm_payload_bytes_sent = stats.pcm_payload_bytes_sent.saturating_add(payload.len() as u64);
             pcm_payload_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -352,10 +367,32 @@ fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stoppi
 
 fn send_packet(socket: &UdpSocket, remote: SocketAddr, encoder: &mut PacketEncoder,
     packet_type: PacketType, frame_index: u64, payload: &[u8]) -> Result<(), String> {
-    let packet = encoder.encode_next(packet_type, frame_index, payload).map_err(|error| error.to_string())?;
-    let sent = socket.send_to(&packet, remote).map_err(|error| error.to_string())?;
-    if sent != packet.len() { return Err("UDP datagram was not sent atomically.".into()); }
-    Ok(())
+    send_packet_with(encoder, packet_type, frame_index, payload,
+        |packet| send_datagram(socket, remote, packet))
+}
+
+fn send_datagram(socket: &UdpSocket, remote: SocketAddr, packet: &[u8]) -> std::io::Result<usize> {
+    #[cfg(test)]
+    if FAIL_NEXT_UDP_SEND.swap(false, Ordering::AcqRel) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected UDP sender failure"));
+    }
+    socket.send_to(packet, remote)
+}
+
+fn send_packet_with(encoder: &mut PacketEncoder, packet_type: PacketType, frame_index: u64,
+    payload: &[u8], mut send: impl FnMut(&[u8]) -> std::io::Result<usize>) -> Result<(), String> {
+    for attempt in 0..UDP_SEND_ATTEMPTS {
+        // Re-encode each attempt so an ambiguous send error never replays a GCM nonce/ciphertext.
+        let packet = encoder.encode_next(packet_type, frame_index, payload).map_err(|error| error.to_string())?;
+        match send(&packet) {
+            Ok(sent) if sent == packet.len() => return Ok(()),
+            Ok(_) => return Err("UDP datagram was not sent atomically.".into()),
+            Err(error) if attempt + 1 < UDP_SEND_ATTEMPTS
+                && matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("UDP send retry limit reached.".into())
 }
 
 #[cfg(test)]
@@ -467,6 +504,30 @@ mod tests {
         let samples = vec![0i16; 480 * 2];
         assert!(!queue.push_raw(samples.as_ptr(), 480, 44_100, 2, 0));
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn transient_udp_send_retries_are_bounded_and_never_replay_ciphertext() {
+        let mut encoder = PacketEncoder::new(&[7; 32], 9, HOST_TO_RECEIVER);
+        let mut attempts = 0;
+        let mut packets = Vec::new();
+        send_packet_with(&mut encoder, PacketType::Audio, 0, &[1, 2], |packet| {
+            attempts += 1;
+            packets.push(packet.to_vec());
+            if attempts < 3 { Err(std::io::ErrorKind::WouldBlock.into()) }
+            else { Ok(packet.len()) }
+        }).unwrap();
+        assert_eq!(attempts, 3);
+        assert_ne!(packets[0], packets[1]);
+        assert_ne!(packets[1], packets[2]);
+
+        attempts = 0;
+        let error = send_packet_with(&mut encoder, PacketType::Audio, 240, &[3, 4], |_| {
+            attempts += 1;
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }).unwrap_err();
+        assert_eq!(attempts, UDP_SEND_ATTEMPTS);
+        assert!(!error.is_empty());
     }
 
     #[test]

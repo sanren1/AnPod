@@ -10,6 +10,7 @@ import java.util.Arrays;
 
 /** Explicit per-session UDP socket; it has no discovery, control, or service-start path. */
 final class UdpReceiver implements Runnable, AutoCloseable {
+    private static final int RECEIVE_BUFFER_BYTES = 256 * 1024;
     private final DatagramSocket socket;
     private final InetSocketAddress expectedPeer;
     private final UdpPacketDecoder decoder;
@@ -20,22 +21,24 @@ final class UdpReceiver implements Runnable, AutoCloseable {
         this.queue = queue;
         expectedPeer = context.expectedPeer;
         byte[] key = context.copyKey();
-        try { decoder = new UdpPacketDecoder(context.sessionId, key); }
+        UdpPacketDecoder createdDecoder;
+        try { createdDecoder = new UdpPacketDecoder(context.sessionId, key); }
         finally { Arrays.fill(key, (byte) 0); }
-        DatagramSocket transferred = context.takeSocket();
-        if (transferred != null) {
-            socket = transferred;
-        } else {
-            DatagramSocket bound = new DatagramSocket(null);
-            try {
-                bound.setReuseAddress(false);
-                bound.bind(context.bindAddress);
-            } catch (IOException error) {
-                bound.close();
-                decoder.destroy();
-                throw error;
+        decoder = createdDecoder;
+        DatagramSocket candidate = null;
+        try {
+            candidate = context.takeSocket();
+            if (candidate == null) {
+                candidate = new DatagramSocket(null);
+                candidate.setReuseAddress(false);
+                candidate.bind(context.bindAddress);
             }
-            socket = bound;
+            candidate.setReceiveBufferSize(RECEIVE_BUFFER_BYTES);
+            socket = candidate;
+        } catch (IOException | RuntimeException error) {
+            if (candidate != null) candidate.close();
+            decoder.destroy();
+            throw error;
         }
     }
 

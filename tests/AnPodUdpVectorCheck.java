@@ -25,10 +25,49 @@ public final class AnPodUdpVectorCheck {
         checkJavaVectorThroughReceiverParser();
         checkAuthenticatedQueueAndReplay();
         checkJitterQueueExpiryAndFade();
+        checkAdaptiveJitterTimeline();
+        checkUdpLossConcealment();
+        checkMonoPlcFrameAlignment();
+        checkPlaybackActivityReset();
         checkFormatSequenceRejected();
         checkLoopbackReceiveThread();
         checkPairingSecurity();
         System.out.println("Android UDP parser, pairing, replay and loopback checks passed.");
+    }
+
+    private static void checkPlaybackActivityReset() {
+        SyntheticClock clock = new SyntheticClock();
+        UdpPlaybackActivity activity = new UdpPlaybackActivity(clock);
+        long now = 100;
+        clock.set(now);
+        activity.resetPlaybackHead(100);
+        activity.noteSuccessfulWrite(now + 100);
+        clock.set(now + 100);
+        check(activity.playedFrames(110) == 10,
+                "playback-head observer did not record the new position");
+        check(activity.recentlyAdvanced(now, 110),
+                "recentlyAdvanced rejected another observer's progress using an older caller timestamp");
+        check(activity.isActive(now, 110, true, now + 100, false),
+                "concurrent playback evidence newer than the caller timestamp was rejected");
+        check(activity.playedFrames(110) == 10 && activity.recentlyAdvanced(now, 110),
+                "playback-head observers disagreed about the same position");
+
+        clock.set(now + 2_000_000_101L);
+        check(!activity.isActive(now + 2_000_000_101L, 110, true, now + 100, false),
+                "stale playback evidence remained active after the two-second window");
+        check(!activity.recentlyAdvanced(now, 110),
+                "recentlyAdvanced remained true after two seconds without head progress");
+        activity.noteSuccessfulWrite(now + 2_000_000_102L);
+        clock.set(now + 2_000_000_102L);
+        check(activity.isActive(now + 2_000_000_102L, 111, true, now + 2_000_000_102L, false),
+                "playback activity did not recover after fresh audio and head progress");
+
+        activity.resetPlaybackHead(0);
+        check(activity.playedFrames(0) == 0, "flush retained the previous playback-head count");
+        check(!activity.isActive(now + 2_000_000_103L, 0, true, now + 2_000_000_103L, false),
+                "flush retained stale successful-write or playback-advance evidence");
+        check(!activity.isActive(now + 2_000_000_103L, 0, true, now + 2_000_000_103L, true),
+                "pause did not suppress playback activity");
     }
 
     private static void checkPairingSecurity() throws Exception {
@@ -377,8 +416,9 @@ public final class AnPodUdpVectorCheck {
                     check(accept(receiver, packet, sender) == UdpReceiver.ProcessResult.AUDIO,
                             "in-window bounded-queue packet rejected");
                 }
-                check(queue.size() == UdpPcmQueue.CAPACITY_PACKETS, "audio queue exceeded or missed its fixed bound");
-                check(queue.take().frameIndex == 2160, "bounded queue retained stale history");
+                check(queue.size() == 10 && queue.size() <= UdpPcmQueue.CAPACITY_PACKETS,
+                        "audio queue exceeded its fixed bound or dropped in-budget audio");
+                check(queue.take().frameIndex == 1680, "bounded queue retained stale history");
                 check(queue.droppedFrames() >= 6L * 240, "queue drop accounting missed stale frames");
                 byte[] farAhead = encode(key, sessionId, 100, 4320, UdpPacketDecoder.AUDIO, pcm(240));
                 check(accept(receiver, farAhead, sender) == UdpReceiver.ProcessResult.AUDIO,
@@ -437,14 +477,9 @@ public final class AnPodUdpVectorCheck {
         UdpPcmQueue balanced = new UdpPcmQueue(parameters, "balanced");
         check(lowLatency.targetFrames() < balanced.targetFrames(),
                 "low-latency queue budget must start shorter than balanced");
-        lowLatency.reportTrackUnderruns(0);
-        for (int underrun = 1; underrun <= 10; underrun++) lowLatency.reportTrackUnderruns(underrun);
-        check(lowLatency.targetFrames() == 48_000 * 20 / 1000,
-                "AudioTrack underruns did not raise the jitter target to its bounded cap: "
-                        + lowLatency.targetFrames());
-        lowLatency.decayTarget(System.nanoTime() + 2_000_000_000L);
-        check(lowLatency.targetFrames() == 48_000 * 15 / 1000,
-                "stable playback did not step the target back down gradually");
+        check(lowLatency.targetFrames() == 48_000 * 20 / 1000
+                && balanced.targetFrames() == 48_000 * 40 / 1000,
+                "wireless queue modes did not start at their configured targets");
 
         InetAddress loopback = InetAddress.getByName("127.0.0.1");
         byte[] key = filledKey(0x39);
@@ -523,6 +558,472 @@ public final class AnPodUdpVectorCheck {
         }
     }
 
+    private static void checkAdaptiveJitterTimeline() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
+        byte[] key = filledKey(0x48);
+        long sessionId = 0x3344556677889900L;
+        SyntheticClock clock = new SyntheticClock();
+        UdpPcmQueue lowLatency = new UdpPcmQueue(parameters, "lowlatency", clock);
+        UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
+        try {
+            acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), clock.nowNanos());
+            lowLatency.configureAudioTrack(0);
+            long arrival = clock.nowNanos();
+            for (int packet = 1; packet <= 20; packet++) {
+                arrival += 5_000_000L;
+                acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, packet, packet * 240L,
+                        UdpPacketDecoder.AUDIO, pcm(240, packet), arrival);
+                lowLatency.take();
+            }
+            check(lowLatency.targetFrames() == 48_000 * 20 / 1000,
+                    "steady 5ms arrivals raised the low-latency target");
+
+            arrival += 25_000_000L;
+            acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, 21, 21 * 240L,
+                    UdpPacketDecoder.AUDIO, pcm(240, 21), arrival);
+            lowLatency.take();
+            check(lowLatency.targetFrames() > 48_000 * 20 / 1000,
+                    "a 20ms arrival burst did not grow the target");
+            arrival += 100_000_000L;
+            acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, 22, 22 * 240L,
+                    UdpPacketDecoder.AUDIO, pcm(240, 22), arrival);
+            lowLatency.take();
+            check(lowLatency.targetFrames() > 48_000 * 20 / 1000,
+                    "a 100ms arrival burst did not grow the target");
+            int grownTarget = lowLatency.targetFrames();
+
+            // A higher sequence with an old frame index is a reordered packet and must not
+            // perturb the arrival estimator. A duplicate is rejected by the decoder replay window.
+            arrival += 5_000_000L;
+            acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, 23, 20 * 240L,
+                    UdpPacketDecoder.AUDIO, pcm(240, 23), arrival);
+            check(lowLatency.targetFrames() == grownTarget,
+                    "reordered audio contaminated the jitter estimator");
+            byte[] duplicate = encode(key, sessionId, 22, 22 * 240L,
+                    UdpPacketDecoder.AUDIO, pcm(240, 22));
+            try {
+                lowLatency.acceptAt(decoder.open(duplicate, duplicate.length), decoder, arrival + 1_000_000L);
+                throw new AssertionError("duplicate jitter sample was accepted");
+            } catch (UdpPacketDecoder.ProtocolException expected) {
+                check(expected.reason == UdpPacketDecoder.ProtocolException.REPLAY,
+                        "duplicate packet failed for an unexpected reason");
+            }
+            check(lowLatency.targetFrames() == grownTarget,
+                    "duplicate audio changed the jitter target");
+            byte[] invalid = encode(key, sessionId, 24, 23 * 240L,
+                    UdpPacketDecoder.AUDIO, pcm(240, 24));
+            invalid[invalid.length - 1] ^= 1;
+            try {
+                lowLatency.acceptAt(decoder.open(invalid, invalid.length), decoder, arrival + 5_000_000L);
+                throw new AssertionError("unauthenticated jitter sample was accepted");
+            } catch (UdpPacketDecoder.ProtocolException expected) {
+                check(expected.reason == UdpPacketDecoder.ProtocolException.AUTHENTICATION,
+                        "invalid packet failed for an unexpected reason");
+            }
+            check(lowLatency.targetFrames() == grownTarget,
+                    "unauthenticated audio changed the jitter target");
+
+            clock.set(arrival);
+            lowLatency.reportTrackUnderruns(0);
+            lowLatency.reportTrackUnderruns(1);
+            check(lowLatency.targetFrames() >= grownTarget + 48_000 * 10 / 1000,
+                    "track underrun did not grow the target by at least 10ms");
+            int beforeDecay = lowLatency.targetFrames();
+            long stableArrival = arrival;
+            long stableFrame = 22 * 240L;
+            for (int packet = 25; packet <= 35; packet++) {
+                stableArrival += 1_000_000_000L;
+                stableFrame += 48_000;
+                acceptAuthenticatedAt(lowLatency, decoder, key, sessionId, packet, stableFrame,
+                        UdpPacketDecoder.AUDIO, pcm(240, packet), stableArrival);
+                lowLatency.take();
+            }
+            clock.set(stableArrival);
+            lowLatency.decayTarget(clock.nowNanos());
+            check(lowLatency.targetFrames() == beforeDecay - 48_000 * 5 / 1000,
+                    "stable target decay did not wait 10 seconds or step down by 5ms");
+
+            SyntheticClock balancedClock = new SyntheticClock();
+            UdpPcmQueue balanced = new UdpPcmQueue(parameters, "balanced", balancedClock);
+            UdpPacketDecoder balancedDecoder = new UdpPacketDecoder(sessionId + 1, key);
+            try {
+                acceptAuthenticatedAt(balanced, balancedDecoder, key, sessionId + 1, 0, 0,
+                        UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), 0);
+                balanced.configureAudioTrack(0);
+                long time = 0;
+                for (int packet = 1; packet <= 40; packet++) {
+                    time += 105_000_000L;
+                    acceptAuthenticatedAt(balanced, balancedDecoder, key, sessionId + 1,
+                            packet, packet * 240L, UdpPacketDecoder.AUDIO, pcm(240, packet), time);
+                    balanced.take();
+                }
+                check(balanced.targetFrames() == 48_000 * 150 / 1000,
+                        "balanced queue did not clamp repeated bursts to its 150ms target cap");
+            } finally {
+                balanced.stop();
+                balancedDecoder.destroy();
+            }
+
+            SyntheticClock jumpClock = new SyntheticClock();
+            UdpPcmQueue largeFrameJump = new UdpPcmQueue(parameters, "lowlatency", jumpClock);
+            UdpPacketDecoder jumpDecoder = new UdpPacketDecoder(sessionId + 3, key);
+            try {
+                acceptAuthenticatedAt(largeFrameJump, jumpDecoder, key, sessionId + 3, 0, 0,
+                        UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), 0);
+                acceptAuthenticatedAt(largeFrameJump, jumpDecoder, key, sessionId + 3, 1, 0,
+                        UdpPacketDecoder.AUDIO, pcm(240, 1), 0);
+                largeFrameJump.take();
+                acceptAuthenticatedAt(largeFrameJump, jumpDecoder, key, sessionId + 3, 2, Long.MIN_VALUE,
+                        UdpPacketDecoder.AUDIO, pcm(240, 2), 5_000_000L);
+                check(largeFrameJump.targetFrames() == 48_000 * 60 / 1000,
+                        "large unsigned frame jump overflowed the jitter estimate or exceeded its cap");
+            } finally {
+                largeFrameJump.stop();
+                jumpDecoder.destroy();
+            }
+
+            SyntheticClock capClock = new SyntheticClock();
+            UdpPcmQueue bounded = new UdpPcmQueue(parameters, "balanced", capClock);
+            UdpPacketDecoder boundedDecoder = new UdpPacketDecoder(sessionId + 2, key);
+            try {
+                acceptAuthenticatedAt(bounded, boundedDecoder, key, sessionId + 2, 0, 0,
+                        UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), 0);
+                bounded.configureAudioTrack(0);
+                for (int packet = 1; packet <= 40; packet++)
+                    acceptAuthenticatedAt(bounded, boundedDecoder, key, sessionId + 2,
+                            packet, packet * 240L, UdpPacketDecoder.AUDIO, pcm(240, packet), 0);
+                check(bounded.size() == UdpPcmQueue.CAPACITY_PACKETS
+                        && bounded.queuedFrames() == 48_000 * 160 / 1000,
+                        "queue exceeded its physical packet or frame cap");
+                bounded.expireStalePackets(161_000_000L);
+                check(bounded.size() == 0 && bounded.expiredFrames() > 0,
+                        "aged queued audio survived the 160ms physical age cap");
+                acceptAuthenticatedAt(bounded, boundedDecoder, key, sessionId + 2, 41, 41 * 240L,
+                        UdpPacketDecoder.AUDIO, pcm(240, 41), 161_000_000L);
+                check(bounded.size() == 1, "fresh audio failed to recover after age expiry");
+                bounded.setPaused(true);
+                check(bounded.size() == 0 && bounded.queuedFrames() == 0,
+                        "pause retained queued PCM");
+                bounded.setPaused(false);
+                acceptAuthenticatedAt(bounded, boundedDecoder, key, sessionId + 2, 42, 42 * 240L,
+                        UdpPacketDecoder.AUDIO, pcm(240, 42), 162_000_000L);
+                check(bounded.size() == 1, "fresh PCM did not resume after pause");
+                bounded.stop();
+                check(bounded.size() == 0 && bounded.queuedFrames() == 0,
+                        "stop retained queued PCM");
+            } finally {
+                bounded.stop();
+                boundedDecoder.destroy();
+            }
+        } finally {
+            lowLatency.stop();
+            decoder.destroy();
+            Arrays.fill(key, (byte) 0);
+        }
+    }
+
+    private static final class SyntheticClock implements UdpPcmQueue.NanoClock {
+        private long nowNanos;
+        @Override public long nowNanos() { return nowNanos; }
+        void set(long value) { nowNanos = value; }
+    }
+
+    private static void checkUdpLossConcealment() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 0);
+        byte[] key = filledKey(0x69);
+        long baseSession = 0x4455667788990011L;
+
+        SyntheticClock singleClock = new SyntheticClock();
+        UdpPcmQueue single = new UdpPcmQueue(parameters, "lowlatency", singleClock);
+        UdpPacketDecoder singleDecoder = new UdpPacketDecoder(baseSession, key);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(single, singleDecoder, key,
+                    baseSession, singleClock, 1, 12_000, -12_000);
+            acceptAuthenticatedAt(single, singleDecoder, key, baseSession, 5, 1_440,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 8_000, -8_000), 25_000_000L);
+            setAfterGapDeadline(singleClock, single, 25_000_000L);
+            byte[] output = readInChunks(fixture.input, 480 * 4, 3);
+            check(Math.abs(readSample(output, 0, 0) - 12_000) < 100
+                    && Math.abs(readSample(output, 0, 1) + 12_000) < 100,
+                    "single-loss PLC did not repeat the previous stereo frame");
+            check(Math.abs(readSample(output, 119, 0)) < Math.abs(readSample(output, 0, 0)),
+                    "single-loss PLC energy did not fade toward zero");
+            check(readSample(output, 239, 0) == 0 && readSample(output, 239, 1) == 0,
+                    "single-loss PLC did not fade its last repeated frame to zero");
+            check(readSample(output, 240, 0) != 0 && readSample(output, 240, 1) != 0,
+                    "real audio after PLC did not use the existing fade-in");
+            check(single.plcEvents() == 1 && single.plcRepeatedFrames() == 240
+                    && single.plcSilentFrames() == 0 && single.plcOversizedGapSkips() == 0,
+                    "single-loss PLC counters were incorrect");
+            acceptAuthenticatedAt(single, singleDecoder, key, baseSession, 6, 1_200,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 1, 2), 46_000_000L);
+            check(single.size() == 0, "late packet behind the PLC watermark was retained");
+        } finally {
+            single.stop();
+            singleDecoder.destroy();
+        }
+
+        SyntheticClock burstClock = new SyntheticClock();
+        UdpPcmQueue burst = new UdpPcmQueue(parameters, "lowlatency", burstClock);
+        UdpPacketDecoder burstDecoder = new UdpPacketDecoder(baseSession + 1, key);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(burst, burstDecoder, key,
+                    baseSession + 1, burstClock, 1, 9_000, -9_000);
+            acceptAuthenticatedAt(burst, burstDecoder, key, baseSession + 1, 5, 1_680,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 8_000, -8_000), 25_000_000L);
+            setAfterGapDeadline(burstClock, burst, 25_000_000L);
+            byte[] output = readInChunks(fixture.input, 720 * 4, 5);
+            check(Math.abs(readSample(output, 0, 0) - 9_000) < 100
+                    && Math.abs(readSample(output, 0, 1) + 9_000) < 100,
+                    "consecutive-loss PLC did not repeat one prior payload");
+            check(Math.abs(readSample(output, 119, 0)) < Math.abs(readSample(output, 0, 0)),
+                    "consecutive-loss PLC energy did not fade before silence");
+            check(readSample(output, 239, 0) == 0 && readSample(output, 240, 0) == 0
+                    && readSample(output, 479, 1) == 0,
+                    "consecutive-loss PLC did not fade then silence the remainder");
+            check(burst.plcEvents() == 1 && burst.plcRepeatedFrames() == 240
+                    && burst.plcSilentFrames() == 240,
+                    "consecutive-loss PLC counters were incorrect");
+        } finally {
+            burst.stop();
+            burstDecoder.destroy();
+        }
+
+        SyntheticClock silenceClock = new SyntheticClock();
+        UdpPcmQueue silence = new UdpPcmQueue(parameters, "lowlatency", silenceClock);
+        UdpPacketDecoder silenceDecoder = new UdpPacketDecoder(baseSession + 2, key);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(silence, silenceDecoder, key,
+                    baseSession + 2, silenceClock, 1, 0, 0);
+            acceptAuthenticatedAt(silence, silenceDecoder, key, baseSession + 2, 5, 1_440,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 2_000, -2_000), 25_000_000L);
+            setAfterGapDeadline(silenceClock, silence, 25_000_000L);
+            byte[] output = readInChunks(fixture.input, 480 * 4, 7);
+            check(allZero(output, 0, 240 * 4), "silence input produced nonzero PLC samples");
+            check(silence.plcRepeatedFrames() == 240 && silence.plcSilentFrames() == 0,
+                    "silent real PCM was not retained as the previous genuine payload");
+        } finally {
+            silence.stop();
+            silenceDecoder.destroy();
+        }
+
+        SyntheticClock reorderClock = new SyntheticClock();
+        UdpPcmQueue reorder = new UdpPcmQueue(parameters, "lowlatency", reorderClock);
+        UdpPacketDecoder reorderDecoder = new UdpPacketDecoder(baseSession + 3, key);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(reorder, reorderDecoder, key,
+                    baseSession + 3, reorderClock, 1, 4_000, -4_000);
+            acceptAuthenticatedAt(reorder, reorderDecoder, key, baseSession + 3, 5, 1_440,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 8_000, -8_000), 25_000_000L);
+            acceptAuthenticatedAt(reorder, reorderDecoder, key, baseSession + 3, 6, 1_200,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 6_000, -6_000), 30_000_000L);
+            reorderClock.set(45_000_000L);
+            byte[] output = readInChunks(fixture.input, 480 * 4, 9);
+            check(readSample(output, 0, 0) == 6_000 && readSample(output, 240, 0) == 8_000,
+                    "reordered missing packet was not played before the future packet");
+            check(reorder.plcEvents() == 0 && reorder.plcRepeatedFrames() == 0
+                    && reorder.plcSilentFrames() == 0,
+                    "reordered packet incorrectly triggered PLC");
+        } finally {
+            reorder.stop();
+            reorderDecoder.destroy();
+        }
+
+        SyntheticClock noHistoryClock = new SyntheticClock();
+        UdpPcmQueue noHistory = new UdpPcmQueue(parameters, "lowlatency", noHistoryClock);
+        UdpPacketDecoder noHistoryDecoder = new UdpPacketDecoder(baseSession + 4, key);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(noHistory, noHistoryDecoder, key,
+                    baseSession + 4, noHistoryClock, 1, 5_000, -5_000);
+            noHistory.setPaused(true);
+            noHistory.setPaused(false);
+            acceptAuthenticatedAt(noHistory, noHistoryDecoder, key, baseSession + 4, 5, 1_440,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 8_000, -8_000), 25_000_000L);
+            for (int packet = 6; packet <= 8; packet++)
+                acceptAuthenticatedAt(noHistory, noHistoryDecoder, key, baseSession + 4,
+                        packet, (packet + 1) * 240L, UdpPacketDecoder.AUDIO,
+                        stereoPcm(240, 8_000, -8_000), packet * 5_000_000L);
+            setAfterGapDeadline(noHistoryClock, noHistory, 25_000_000L);
+            byte[] output = readInChunks(fixture.input, 480 * 4, 11);
+            check(allZero(output, 0, 240 * 4), "PLC reused genuine PCM invalidated by pause");
+            check(noHistory.plcRepeatedFrames() == 0 && noHistory.plcSilentFrames() == 240,
+                    "PLC without valid history did not count the whole gap as silence");
+        } finally {
+            noHistory.stop();
+            noHistoryDecoder.destroy();
+            Arrays.fill(key, (byte) 0);
+        }
+
+        SyntheticClock expiredHistoryClock = new SyntheticClock();
+        UdpPcmQueue expiredHistory = new UdpPcmQueue(parameters, "lowlatency", expiredHistoryClock);
+        byte[] expiredHistoryKey = filledKey(0x69);
+        UdpPacketDecoder expiredHistoryDecoder = new UdpPacketDecoder(baseSession + 6, expiredHistoryKey);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(expiredHistory,
+                    expiredHistoryDecoder, expiredHistoryKey, baseSession + 6,
+                    expiredHistoryClock, 1, 7_000, -7_000);
+            acceptAuthenticatedAt(expiredHistory, expiredHistoryDecoder, expiredHistoryKey,
+                    baseSession + 6, 5, 1_200, UdpPacketDecoder.AUDIO,
+                    stereoPcm(240, 6_000, -6_000), 25_000_000L);
+            expiredHistory.expireStalePackets(96_000_000L);
+            check(expiredHistory.size() == 0 && expiredHistory.expiredFrames() == 240,
+                    "queued packet expiry did not create the expected discontinuity");
+            acceptAuthenticatedAt(expiredHistory, expiredHistoryDecoder, expiredHistoryKey,
+                    baseSession + 6, 6, 1_680, UdpPacketDecoder.AUDIO,
+                    stereoPcm(240, 8_000, -8_000), 96_000_000L);
+            setAfterGapDeadline(expiredHistoryClock, expiredHistory, 96_000_000L);
+            byte[] output = readInChunks(fixture.input, 480 * 4, 3);
+            check(allZero(output, 0, 240 * 4),
+                    "PLC reused real audio from before an expired-packet discontinuity");
+            check(expiredHistory.plcRepeatedFrames() == 0
+                    && expiredHistory.plcSilentFrames() == 240,
+                    "expired-packet discontinuity did not clear PLC history");
+        } finally {
+            expiredHistory.stop();
+            expiredHistoryDecoder.destroy();
+            Arrays.fill(expiredHistoryKey, (byte) 0);
+        }
+
+        SyntheticClock jumpClock = new SyntheticClock();
+        UdpPcmQueue jump = new UdpPcmQueue(parameters, "lowlatency", jumpClock);
+        byte[] jumpKey = filledKey(0x69);
+        UdpPacketDecoder jumpDecoder = new UdpPacketDecoder(baseSession + 5, jumpKey);
+        try {
+            QueueInputStreamFixture fixture = startConcealmentQueue(jump, jumpDecoder, jumpKey,
+                    baseSession + 5, jumpClock, 1, 3_000, -3_000);
+            acceptAuthenticatedAt(jump, jumpDecoder, jumpKey, baseSession + 5, 5, Long.MIN_VALUE,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 7_000, -7_000), 25_000_000L);
+            setAfterGapDeadline(jumpClock, jump, 25_000_000L);
+            byte[] output = readInChunks(fixture.input, 240 * 4, 13);
+            check(output.length == 240 * 4 && readSample(output, 0, 0) != 0,
+                    "oversized unsigned gap did not immediately resume with real audio");
+            check(jump.plcEvents() == 0 && jump.plcRepeatedFrames() == 0
+                    && jump.plcSilentFrames() == 0 && jump.plcOversizedGapSkips() == 1,
+                    "oversized unsigned gap was concealed or not counted");
+        } finally {
+            jump.stop();
+            jumpDecoder.destroy();
+            Arrays.fill(jumpKey, (byte) 0);
+        }
+    }
+
+    private static void checkMonoPlcFrameAlignment() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 1, 0);
+        byte[] key = filledKey(0x6a);
+        long sessionId = 0x5566778899001122L;
+        SyntheticClock clock = new SyntheticClock();
+        UdpPcmQueue queue = new UdpPcmQueue(parameters, "lowlatency", clock);
+        UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
+        try {
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, formatPayload(48_000, 1), 0);
+            queue.configureAudioTrack(0);
+            for (int packet = 1; packet <= 4; packet++)
+                acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
+                        UdpPacketDecoder.AUDIO, monoPcm(240, 10_000), packet * 5_000_000L);
+            clock.set(20_000_000L);
+            InputStream input = queue.asPcmInputStream();
+            byte[] header = readInChunks(input, 8, 3);
+            check(littleInt(header, 0) == 48_000 && littleShort(header, 4) == 1,
+                    "mono queue stream header was incorrect");
+            readInChunks(input, 960 * 2, 13);
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 5, 1_440,
+                    UdpPacketDecoder.AUDIO, monoPcm(240, 6_000), 25_000_000L);
+            setAfterGapDeadline(clock, queue, 25_000_000L);
+            byte[] output = readInChunks(input, 480 * 2, 5);
+            check(output.length == 480 * 2 && readMonoSample(output, 0) != 0
+                    && readMonoSample(output, 239) == 0 && readMonoSample(output, 240) != 0,
+                    "mono PLC output lost PCM16 frame alignment");
+            check(queue.plcEvents() == 1 && queue.plcRepeatedFrames() == 240
+                    && queue.plcSilentFrames() == 0,
+                    "mono PLC frame counters were incorrect");
+        } finally {
+            queue.stop();
+            decoder.destroy();
+            Arrays.fill(key, (byte) 0);
+        }
+    }
+
+    private static QueueInputStreamFixture startConcealmentQueue(UdpPcmQueue queue,
+            UdpPacketDecoder decoder, byte[] key, long sessionId, SyntheticClock clock,
+            long firstSequence, int left, int right) throws Exception {
+        acceptAuthenticatedAt(queue, decoder, key, sessionId, 0, 0,
+                UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), 0);
+        queue.configureAudioTrack(0);
+        for (int packet = 1; packet <= 4; packet++)
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, firstSequence + packet - 1,
+                    packet * 240L, UdpPacketDecoder.AUDIO, stereoPcm(240, left, right),
+                    packet * 5_000_000L);
+        clock.set(20_000_000L);
+        InputStream input = queue.asPcmInputStream();
+        byte[] header = readInChunks(input, 8, 3);
+        check(littleInt(header, 0) == 48_000 && littleShort(header, 4) == 2,
+                "queue stream header was incorrect");
+        readInChunks(input, 960 * 4, 17);
+        return new QueueInputStreamFixture(input);
+    }
+
+    private static byte[] readInChunks(InputStream input, int length, int chunkSize) throws Exception {
+        byte[] result = new byte[length];
+        int offset = 0;
+        byte[] chunk = new byte[Math.min(chunkSize, length)];
+        while (offset < length) {
+            int count = input.read(chunk, 0, Math.min(chunk.length, length - offset));
+            if (count < 0) throw new AssertionError("queue stream ended before requested PCM frames");
+            System.arraycopy(chunk, 0, result, offset, count);
+            offset += count;
+        }
+        return result;
+    }
+
+    private static void setAfterGapDeadline(SyntheticClock clock, UdpPcmQueue queue,
+            long packetArrivalNanos) {
+        clock.set(packetArrivalNanos + queue.targetFrames() * 1_000_000_000L / 48_000);
+    }
+
+    private static byte[] stereoPcm(int frames, int left, int right) {
+        byte[] payload = new byte[frames * 4];
+        for (int frame = 0; frame < frames; frame++) {
+            int offset = frame * 4;
+            payload[offset] = (byte) left;
+            payload[offset + 1] = (byte) (left >>> 8);
+            payload[offset + 2] = (byte) right;
+            payload[offset + 3] = (byte) (right >>> 8);
+        }
+        return payload;
+    }
+
+    private static byte[] monoPcm(int frames, int sample) {
+        byte[] payload = new byte[frames * 2];
+        for (int frame = 0; frame < frames; frame++) {
+            payload[frame * 2] = (byte) sample;
+            payload[frame * 2 + 1] = (byte) (sample >>> 8);
+        }
+        return payload;
+    }
+
+    private static int readMonoSample(byte[] pcm, int frame) {
+        int offset = frame * 2;
+        return (short) ((pcm[offset] & 0xff) | (pcm[offset + 1] << 8));
+    }
+
+    private static int readSample(byte[] pcm, int frame, int channel) {
+        int offset = frame * 4 + channel * 2;
+        return (short) ((pcm[offset] & 0xff) | (pcm[offset + 1] << 8));
+    }
+
+    private static boolean allZero(byte[] bytes, int offset, int length) {
+        for (int index = offset; index < offset + length; index++)
+            if (bytes[index] != 0) return false;
+        return true;
+    }
+
+    private static final class QueueInputStreamFixture {
+        final InputStream input;
+        QueueInputStreamFixture(InputStream input) { this.input = input; }
+    }
+
     private static void checkLatePacketDoesNotEvictQueuedAudio(byte[] key,
             PairingProtocol.AudioParameters parameters) throws Exception {
         long sessionId = 0x2233445566778899L;
@@ -533,14 +1034,14 @@ public final class AnPodUdpVectorCheck {
             acceptAuthenticatedAt(queue, decoder, key, sessionId, 0, 0,
                     UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), syntheticNow);
             queue.configureAudioTrack(0);
-            for (int packet = 1; packet <= 4; packet++) {
+            for (int packet = 1; packet <= 14; packet++) {
                 acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
                         UdpPacketDecoder.AUDIO, pcm(240, packet), syntheticNow);
             }
             long droppedBefore = queue.droppedFrames();
-            acceptAuthenticatedAt(queue, decoder, key, sessionId, 5, 0,
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 15, 0,
                     UdpPacketDecoder.AUDIO, pcm(240, 0x55), syntheticNow);
-            check(queue.size() == 4 && queue.droppedFrames() == droppedBefore + 240
+            check(queue.size() == 14 && queue.droppedFrames() == droppedBefore + 240
                     && queue.take().frameIndex == 240,
                     "a late packet at the frame budget evicted newer queued audio");
         } finally {

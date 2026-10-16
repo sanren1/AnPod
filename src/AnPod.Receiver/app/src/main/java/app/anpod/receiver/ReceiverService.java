@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.app.ActivityManager;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
@@ -14,6 +15,7 @@ import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
+import android.net.wifi.WifiManager;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
@@ -56,12 +58,24 @@ import java.util.UUID;
 public final class ReceiverService extends Service {
     public static final String ACTION_UI_START_NETWORK_AUDIO = "app.anpod.receiver.action.UI_START_NETWORK_AUDIO";
     private static final String ACTION_NOTIFICATION_STOP = "app.anpod.receiver.action.NOTIFICATION_STOP";
+    private static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
     private static final String EXTRA_UI_REQUEST_ID = "uiRequestId";
     private static final String CHANNEL_ID = "receiver-management";
     private static final int NOTIFICATION_ID = 1;
+    private static final int AUTH_NOTIFICATION_ID = 2;
     private static final long ADB_NETWORK_BOOTSTRAP_TIMEOUT_MS = 25_000L;
     private static final String EXTRA_UI_OWNER_ID = "uiOwnerId";
     private static final String EXTRA_UI_GENERATION = "uiGeneration";
+    private static final String EXTRA_BACKGROUND_STANDBY = "backgroundStandby";
+    private static final String EXTRA_KEEP_RECEIVE_INTENT = "keepReceiveIntent";
+    private static final String EXTRA_AUTH_OWNER = "authOwner";
+    private static final String EXTRA_AUTH_GENERATION = "authGeneration";
+    private static final String EXTRA_AUTH_SESSION = "authSession";
+    private static final String EXTRA_AUTH_REQUEST = "authRequest";
+    private static final String EXTRA_AUTH_PEER = "authPeer";
+    private static final String EXTRA_AUTH_BINDING = "authBinding";
+    private static final String EXTRA_AUTH_DEADLINE = "authDeadline";
+    private static final String EXTRA_AUTH_DECISION = "authDecision";
     private static final long MAX_RUN_MS = 120_000L;
     private static final Object STATUS_LOCK = new Object();
     private static volatile ReceiverService activeService;
@@ -128,6 +142,8 @@ public final class ReceiverService extends Service {
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
     private final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
     private String pendingUiStartRequestId = "";
+    private boolean pendingUiStandbyStart;
+    private boolean pendingUiReceiveIntent;
     private String networkCoordinatorOwnerId = "";
     private String cleanupOwnerId = "";
     private long cleanupGeneration;
@@ -137,12 +153,28 @@ public final class ReceiverService extends Service {
     private String cleanupError = "";
     private int latestDeliveredStartId;
     private final UiBinder uiBinder = new UiBinder();
+    private volatile boolean backgroundStandbyEnabled;
+    private volatile boolean receiveIntentEnabled;
+    private BackgroundStartAuthorization backgroundAuthorization;
 
     public final class UiBinder extends Binder {
         public UiSnapshot snapshot() { return getUiSnapshot(); }
         public List<UiInterface> interfaces() { return getUiInterfaces(); }
         public String start(String address, int prefixLength, String requestId) { return startFromUi(address, prefixLength, requestId); }
+        public String startReceiving(String address, int prefixLength, String requestId) {
+            return startFromUi(address, prefixLength, requestId, false, true);
+        }
+        public String startBackgroundStandby(String address, int prefixLength, String requestId) {
+            return startFromUi(address, prefixLength, requestId, true, true);
+        }
         public boolean stop(String ownerId) { return stopFromUi(ownerId); }
+        public boolean stop(String ownerId, long generation) { return stopFromUi(ownerId, generation); }
+        public boolean trustBindingUntilRevoked(String ownerId, long generation) {
+            return trustBindingUntilRevokedFromUi(ownerId, generation);
+        }
+        public boolean revokeBackgroundTrust(String ownerId, long generation) {
+            return revokeBackgroundTrustFromUi(ownerId, generation);
+        }
         public P5cDiscovery.SearchSnapshot startSearch(String expectedOwnerId) throws IOException {
             synchronized (networkCoordinatorLock) {
                 return currentUiCoordinator(expectedOwnerId).startSearch();
@@ -168,18 +200,38 @@ public final class ReceiverService extends Service {
     public static final class UiSnapshot {
         public final String serviceState, bindingState, connectionMethod, playbackMode, versionName, networkAddress;
         public final String operationId, operationState, error;
+        public final String bindingFingerprint, backgroundListenerState, backgroundGrantKind, backgroundGrantPersistence;
+        public final String pendingAuthorizationRequestId, backgroundAuthorizationError;
         public final int versionCode, networkPort;
+        public final long operationGeneration, backgroundGrantRemainingMs, pendingAuthorizationDeadlineElapsedMs;
+        public final Boolean playbackAdvancing;
+        public final boolean backgroundStandbyEnabled;
         public final boolean searchActive;
         public final List<P5cDiscovery.SearchCandidate> searchCandidates;
         public final String connectionRequestStatus;
-        UiSnapshot(String serviceState, String bindingState, String connectionMethod, String playbackMode,
+        UiSnapshot(String serviceState, String bindingState, String bindingFingerprint, String connectionMethod, String playbackMode,
                 String versionName, int versionCode, String operationId, String operationState, String error,
-                String networkAddress, int networkPort, P5cDiscovery.SearchSnapshot search) {
+                long operationGeneration, String networkAddress, int networkPort, boolean backgroundStandbyEnabled,
+                Boolean playbackAdvancing,
+                String backgroundListenerState, String backgroundGrantKind, String backgroundGrantPersistence,
+                long backgroundGrantRemainingMs,
+                String pendingAuthorizationRequestId, long pendingAuthorizationDeadlineElapsedMs,
+                String backgroundAuthorizationError, P5cDiscovery.SearchSnapshot search) {
             this.serviceState = serviceState; this.bindingState = bindingState;
+            this.bindingFingerprint = bindingFingerprint;
             this.connectionMethod = connectionMethod; this.playbackMode = playbackMode;
             this.versionName = versionName; this.versionCode = versionCode;
             this.operationId = operationId; this.operationState = operationState; this.error = error;
+            this.operationGeneration = operationGeneration;
             this.networkAddress = networkAddress; this.networkPort = networkPort;
+            this.playbackAdvancing = playbackAdvancing;
+            this.backgroundStandbyEnabled = backgroundStandbyEnabled;
+            this.backgroundListenerState = backgroundListenerState; this.backgroundGrantKind = backgroundGrantKind;
+            this.backgroundGrantPersistence = backgroundGrantPersistence;
+            this.backgroundGrantRemainingMs = backgroundGrantRemainingMs;
+            this.pendingAuthorizationRequestId = pendingAuthorizationRequestId;
+            this.pendingAuthorizationDeadlineElapsedMs = pendingAuthorizationDeadlineElapsedMs;
+            this.backgroundAuthorizationError = backgroundAuthorizationError;
             this.searchActive = search.active; this.searchCandidates = search.candidates;
             this.connectionRequestStatus = search.lastRequestStatus;
         }
@@ -219,6 +271,9 @@ public final class ReceiverService extends Service {
         networkAudioFailure = "";
         networkAudioAddress = "";
         networkAudioPort = 0;
+        backgroundAuthorization = new BackgroundStartAuthorization(
+                android.os.SystemClock::elapsedRealtime, new BindingStore(getFilesDir()),
+                pending -> handler.post(() -> updateAuthorizationNotification(pending)));
         createNotificationChannel();
     }
 
@@ -235,6 +290,10 @@ public final class ReceiverService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         latestDeliveredStartId = Math.max(latestDeliveredStartId, startId);
+        if (intent != null && ACTION_BACKGROUND_AUTH_DECISION.equals(intent.getAction())) {
+            handleBackgroundAuthorizationDecision(intent, startId);
+            return START_NOT_STICKY;
+        }
         if (intent != null && ACTION_NOTIFICATION_STOP.equals(intent.getAction())) {
             String ownerId = intent.getStringExtra(EXTRA_UI_OWNER_ID);
             long generation = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
@@ -252,6 +311,10 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
         boolean uiNetworkAudio = intent != null && ACTION_UI_START_NETWORK_AUDIO.equals(intent.getAction());
+        boolean requestedBackgroundStandby = uiNetworkAudio
+                && intent.getBooleanExtra(EXTRA_BACKGROUND_STANDBY, false);
+        boolean requestedKeepReceiveIntent = uiNetworkAudio
+                && intent.getBooleanExtra(EXTRA_KEEP_RECEIVE_INTENT, false);
         boolean networkAudio = intent != null && (BootstrapActivity.ACTION_START_NETWORK_AUDIO.equals(intent.getAction()) || uiNetworkAudio);
         boolean audio = intent != null && BootstrapActivity.ACTION_START_AUDIO.equals(intent.getAction());
 
@@ -266,7 +329,9 @@ public final class ReceiverService extends Service {
             String requestId = intent.getStringExtra(EXTRA_UI_REQUEST_ID);
             if (!uiOperation.owns(ownerId) || !ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                     || generation != currentOperationGeneration || generation != networkBootstrapGeneration.get()
-                    || !requestIdEqualsPending(requestId)) {
+                    || !requestIdEqualsPending(requestId)
+                    || requestedBackgroundStandby != pendingUiStandbyStart
+                    || requestedKeepReceiveIntent != pendingUiReceiveIntent) {
                 stopRejectedStartIfIdle();
                 return START_NOT_STICKY;
             }
@@ -280,23 +345,30 @@ public final class ReceiverService extends Service {
             if (!uiOperation.begin(ownerId)) return START_NOT_STICKY;
             generation = networkBootstrapGeneration.incrementAndGet();
             currentOperationGeneration = generation;
+            backgroundStandbyEnabled = false;
+            receiveIntentEnabled = false;
             networkAudioState = "stopped";
             networkAudioFailure = "";
             networkAudioAddress = "";
             networkAudioPort = 0;
         }
+        backgroundStandbyEnabled = requestedBackgroundStandby;
+        if (uiNetworkAudio) receiveIntentEnabled = requestedKeepReceiveIntent || requestedBackgroundStandby;
         operationStartId = startId;
 
         // A management retry must not downgrade an active mediaPlayback FGS to
         // shortService or attach a short-service timeout to the audio session.
         try {
             Notification notification = serviceNotification(
-                    audio ? "AnPod 音频连接正在运行。" : networkAudio ? "无线接收正在准备，可随时停止。" : "管理检查进行中；当前不播放音频。",
+                    audio ? "AnPod 音频连接正在运行。" : networkAudio
+                            ? receiveIntentEnabled ? "正在等待电脑连接，可随时停止。" : "无线接收正在准备，可随时停止。"
+                            : "管理检查进行中；当前不播放音频。",
                     ownerId, generation, networkAudio || audio && currentAudio != null);
             if (Build.VERSION.SDK_INT >= 34) {
                 int type = audio
-                        ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                        : ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
+                        ? playbackForegroundServiceType()
+                        : receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                                : ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
                 startForeground(NOTIFICATION_ID, notification, type);
             } else {
                 startForeground(NOTIFICATION_ID, notification);
@@ -320,11 +392,15 @@ public final class ReceiverService extends Service {
         if (networkAudio) {
             if (uiNetworkAudio) {
                 pendingUiStartRequestId = "";
+                pendingUiStandbyStart = false;
+                pendingUiReceiveIntent = false;
             }
             if (timeout != null) handler.removeCallbacks(timeout);
             timeout = () -> requestTermination(ownerId, generation, true, "BootstrapTimeout");
             handler.postDelayed(timeout, networkBootstrapTimeoutMs(uiNetworkAudio));
-            startNetworkBootstrap(intent.getStringExtra("networkAddress"), intent.getIntExtra("networkPrefixLength", 0), generation, ownerId);
+            startNetworkBootstrap(intent.getStringExtra("networkAddress"),
+                    intent.getIntExtra("networkPrefixLength", 0), generation, ownerId,
+                    backgroundStandbyEnabled, receiveIntentEnabled);
             return START_NOT_STICKY;
         }
 
@@ -337,6 +413,148 @@ public final class ReceiverService extends Service {
 
     private boolean requestIdEqualsPending(String requestId) {
         return requestId != null && requestId.equals(pendingUiStartRequestId);
+    }
+
+    private boolean notificationPermissionAvailable() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            return false;
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager == null || Build.VERSION.SDK_INT >= 24 && !manager.areNotificationsEnabled()) return false;
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel channel = manager.getNotificationChannel(CHANNEL_ID);
+            if (channel == null || channel.getImportance() == NotificationManager.IMPORTANCE_NONE) return false;
+        }
+        return true;
+    }
+
+    private boolean applicationIsVisible() {
+        ActivityManager manager = getSystemService(ActivityManager.class);
+        if (manager == null) return false;
+        List<ActivityManager.RunningAppProcessInfo> processes = manager.getRunningAppProcesses();
+        if (processes == null) return false;
+        for (ActivityManager.RunningAppProcessInfo process : processes) {
+            if (process.pid == Process.myPid())
+                return process.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+                        && process.importance != ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE;
+        }
+        return false;
+    }
+
+    private void updateAuthorizationNotification(BackgroundStartAuthorization.Token supplied) {
+        if (destroyed || !backgroundStandbyEnabled || !notificationPermissionAvailable()) {
+            cancelAuthorizationNotification();
+            if (backgroundStandbyEnabled)
+                requestTermination(uiOperation.ownerId(), currentOperationGeneration, true, "BackgroundNotificationsUnavailable");
+            return;
+        }
+        BackgroundStartAuthorization.Token token;
+        synchronized (BindingStore.storageLock()) { token = backgroundAuthorization.pendingToken(); }
+        if (token == null || !token.equals(supplied) || !isCurrentOperation(token.ownerId, token.ownerGeneration)) {
+            cancelAuthorizationNotification();
+            return;
+        }
+        int immutable = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+        builder.setSmallIcon(android.R.drawable.stat_sys_headset)
+                .setContentTitle("AnPod Receiver")
+                .setContentText("已配对电脑请求后台播放，请选择是否允许。")
+                .setContentIntent(mainActivityPendingIntent())
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .addAction(android.R.drawable.ic_media_play, "允许一次", backgroundDecisionPendingIntent(token,
+                        BackgroundStartAuthorization.ONCE, immutable))
+                .addAction(android.R.drawable.ic_lock_lock, "信任 8 小时", backgroundDecisionPendingIntent(token,
+                        BackgroundStartAuthorization.EIGHT_HOURS, immutable))
+                .addAction(android.R.drawable.ic_delete, "拒绝", backgroundDecisionPendingIntent(token,
+                        BackgroundStartAuthorization.DENIED, immutable));
+        builder.setDeleteIntent(backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.DENIED, immutable));
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.notify(AUTH_NOTIFICATION_ID, builder.build());
+    }
+
+    private PendingIntent backgroundDecisionPendingIntent(BackgroundStartAuthorization.Token token,
+            int decision, int immutable) {
+        String key = token.ownerId + "/" + token.ownerGeneration + "/" + token.sessionId + "/"
+                + token.requestId + "/" + token.peer + "/" + token.bindingCommitment + "/"
+                + token.deadlineElapsedMs + "/" + decision;
+        Intent action = new Intent(this, ReceiverService.class).setAction(ACTION_BACKGROUND_AUTH_DECISION)
+                .setData(Uri.parse("anpod://receiver/background-auth/" + Uri.encode(key)))
+                .putExtra(EXTRA_AUTH_OWNER, token.ownerId).putExtra(EXTRA_AUTH_GENERATION, token.ownerGeneration)
+                .putExtra(EXTRA_AUTH_SESSION, token.sessionId).putExtra(EXTRA_AUTH_REQUEST, token.requestId)
+                .putExtra(EXTRA_AUTH_PEER, token.peer).putExtra(EXTRA_AUTH_BINDING, token.bindingCommitment)
+                .putExtra(EXTRA_AUTH_DEADLINE, token.deadlineElapsedMs).putExtra(EXTRA_AUTH_DECISION, decision);
+        return PendingIntent.getService(this, key.hashCode(), action,
+                PendingIntent.FLAG_UPDATE_CURRENT | immutable);
+    }
+
+    private void handleBackgroundAuthorizationDecision(Intent intent, int startId) {
+        String ownerId = intent.getStringExtra(EXTRA_AUTH_OWNER);
+        long generation = intent.getLongExtra(EXTRA_AUTH_GENERATION, -1L);
+        long sessionId = intent.getLongExtra(EXTRA_AUTH_SESSION, -1L);
+        String requestId = intent.getStringExtra(EXTRA_AUTH_REQUEST);
+        String peer = intent.getStringExtra(EXTRA_AUTH_PEER);
+        String commitment = intent.getStringExtra(EXTRA_AUTH_BINDING);
+        long deadline = intent.getLongExtra(EXTRA_AUTH_DEADLINE, 0L);
+        int decision = intent.getIntExtra(EXTRA_AUTH_DECISION, BackgroundStartAuthorization.DENIED);
+        if (!intent.hasExtra(EXTRA_AUTH_OWNER) || !intent.hasExtra(EXTRA_AUTH_GENERATION)
+                || !intent.hasExtra(EXTRA_AUTH_SESSION) || !intent.hasExtra(EXTRA_AUTH_REQUEST)
+                || !intent.hasExtra(EXTRA_AUTH_PEER) || !intent.hasExtra(EXTRA_AUTH_BINDING)
+                || !intent.hasExtra(EXTRA_AUTH_DEADLINE) || !intent.hasExtra(EXTRA_AUTH_DECISION)
+                || ownerId == null || requestId == null || peer == null || commitment == null
+                || requestId.length() != 32 || peer.length() != 8 || commitment.length() != 64
+                || deadline <= 0) {
+            stopStaleAuthorizationAction(startId);
+            return;
+        }
+        BackgroundStartAuthorization.Token token = new BackgroundStartAuthorization.Token(ownerId,
+                generation, sessionId, requestId, peer, commitment, deadline);
+        try {
+            synchronized (BindingStore.storageLock()) {
+                backgroundAuthorization.decide(token, decision);
+            }
+        } catch (IOException error) {
+            setAuthorizationError(ownerId, generation, error.getClass().getSimpleName());
+        }
+        stopStaleAuthorizationAction(startId);
+    }
+
+    private void stopStaleAuthorizationAction(int startId) {
+        if (uiOperation.canBegin() && currentAudio == null && networkCoordinator == null) stopSelf(startId);
+    }
+
+    private void cancelAuthorizationNotification() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.cancel(AUTH_NOTIFICATION_ID);
+    }
+
+    private void setAuthorizationError(String ownerId, long generation, String message) {
+        synchronized (BindingStore.storageLock()) { backgroundAuthorization.reportError(ownerId, generation, message); }
+    }
+
+    private long onceRecoveryDeadline(String ownerId, long generation) {
+        synchronized (BindingStore.storageLock()) {
+            return backgroundAuthorization.onceRecoveryDeadlineElapsedMs(ownerId, generation);
+        }
+    }
+
+    private long newRecoveryDeadline(String ownerId, long generation) {
+        long fixed = onceRecoveryDeadline(ownerId, generation);
+        return fixed == 0 ? android.os.SystemClock.elapsedRealtime() + 30_000L : fixed;
+    }
+
+    private int playbackForegroundServiceType() {
+        return ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                | (receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE : 0);
+    }
+
+    private static byte[] unhex(String value) {
+        byte[] bytes = new byte[value.length() / 2];
+        for (int i = 0; i < bytes.length; i++)
+            bytes[i] = (byte) ((Character.digit(value.charAt(i * 2), 16) << 4)
+                    | Character.digit(value.charAt(i * 2 + 1), 16));
+        return bytes;
     }
 
     private Notification serviceNotification(String text, String ownerId, long generation, boolean canStop) {
@@ -380,6 +598,12 @@ public final class ReceiverService extends Service {
     public void onDestroy() {
         destroyed = true;
         if (activeService == this) activeService = null;
+        if (backgroundStandbyEnabled) {
+            synchronized (BindingStore.storageLock()) { backgroundAuthorization.disable(uiOperation.ownerId(), currentOperationGeneration); }
+        }
+        cancelAuthorizationNotification();
+        backgroundStandbyEnabled = false;
+        receiveIntentEnabled = false;
         foregroundReady = false;
         if (pendingAudio != null) pendingAudio.destroy();
         pendingAudio = null;
@@ -408,15 +632,41 @@ public final class ReceiverService extends Service {
 
     private UiSnapshot getUiSnapshot() {
         String binding = "empty";
-        try { binding = new BindingStore(getFilesDir()).status().state; }
-        catch (Exception error) { binding = "unavailable"; }
+        String fingerprint = "";
+        String listenerState = "disabled", grantKind = "none", pendingRequestId = "", authorizationError = "";
+        long grantRemainingMs = 0, pendingDeadlineElapsedMs = 0;
+        try {
+            BindingStore.Status status = new BindingStore(getFilesDir()).status();
+            binding = status.state;
+            fingerprint = status.commitment;
+            if (!fingerprint.isEmpty()) {
+                synchronized (BindingStore.storageLock()) {
+                    backgroundAuthorization.inspectBinding(unhex(fingerprint));
+                    listenerState = backgroundAuthorization.listenerState();
+                    if (backgroundStandbyEnabled && networkCoordinator == null) listenerState = "starting";
+                    grantKind = backgroundAuthorization.grantKind();
+                    grantRemainingMs = backgroundAuthorization.grantRemainingMs();
+                    pendingRequestId = backgroundAuthorization.pendingRequestId();
+                    pendingDeadlineElapsedMs = backgroundAuthorization.pendingDeadlineElapsedMs();
+                    authorizationError = backgroundAuthorization.error();
+                }
+            }
+        } catch (Exception error) { binding = "unavailable"; authorizationError = error.getClass().getSimpleName(); }
         String method = networkCoordinator != null || !networkAudioAddress.isEmpty() ? "wireless-udp"
                 : currentAudio != null ? "usb-or-local" : "unknown";
         String state = ReceiverUiOperation.displayState(networkAudioState, currentAudio != null, audioActive);
         String mode = currentAudio == null ? "" : actualMode;
-        return new UiSnapshot(state, binding, method, mode, BuildConfig.VERSION_NAME,
-                BuildConfig.VERSION_CODE, uiOperation.ownerId(), uiOperation.phase(), uiOperation.error(),
-                networkAudioAddress, networkAudioPort,
+        Boolean playbackAdvancing = playbackMetricsSnapshot().advancing;
+        String operationError = uiOperation.error();
+        if (operationError.isEmpty()) operationError = networkAudioFailure;
+        String grantPersistence = "untilRevoked".equals(grantKind) ? "binding"
+                : ("once".equals(grantKind) || "eightHours".equals(grantKind)) ? "process" : "none";
+        return new UiSnapshot(state, binding, fingerprint, method, mode, BuildConfig.VERSION_NAME,
+                BuildConfig.VERSION_CODE, uiOperation.ownerId(), uiOperation.phase(), operationError,
+                currentOperationGeneration, networkAudioAddress, networkAudioPort, backgroundStandbyEnabled,
+                playbackAdvancing,
+                listenerState, grantKind, grantPersistence, grantRemainingMs, pendingRequestId,
+                pendingDeadlineElapsedMs, authorizationError,
                 networkCoordinator == null ? new P5cDiscovery.SearchSnapshot(false, Collections.emptyList(), "idle")
                         : networkCoordinator.searchSnapshot());
     }
@@ -450,7 +700,15 @@ public final class ReceiverService extends Service {
     }
 
     private String startFromUi(String address, int prefixLength, String requestId) {
+        return startFromUi(address, prefixLength, requestId, false, false);
+    }
+
+    private String startFromUi(String address, int prefixLength, String requestId,
+            boolean backgroundStandby, boolean keepReceiveIntent) {
         if (requestId == null || requestId.isEmpty()) return "启动请求无效，请重试。";
+        if (keepReceiveIntent && !applicationIsVisible()) return "请在 Receiver 前台界面中开始接收。";
+        if (backgroundStandby && !applicationIsVisible()) return "请在 Receiver 前台界面中启用后台待机。";
+        if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 Receiver 通知，再开始接收。";
         if (!uiOperation.canBegin() || currentAudio != null || networkCoordinator != null) return "已有接收会话正在运行。";
         try {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();
@@ -461,18 +719,28 @@ public final class ReceiverService extends Service {
             if (!uiOperation.begin(ownerId)) return "已有接收会话正在运行。";
             long generation = networkBootstrapGeneration.incrementAndGet();
             currentOperationGeneration = generation;
+            backgroundStandbyEnabled = backgroundStandby;
+            receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
             pendingUiStartRequestId = requestId;
+            pendingUiStandbyStart = backgroundStandby;
+            pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
             networkAudioState = "starting";
             networkAudioFailure = "";
             startFailure = "";
             Intent intent = new Intent(this, ReceiverService.class).setAction(ACTION_UI_START_NETWORK_AUDIO)
                     .putExtra("networkAddress", address).putExtra("networkPrefixLength", prefixLength)
                     .putExtra(EXTRA_UI_REQUEST_ID, requestId).putExtra(EXTRA_UI_OWNER_ID, ownerId)
-                    .putExtra(EXTRA_UI_GENERATION, generation);
+                    .putExtra(EXTRA_UI_GENERATION, generation)
+                    .putExtra(EXTRA_BACKGROUND_STANDBY, backgroundStandby)
+                    .putExtra(EXTRA_KEEP_RECEIVE_INTENT, keepReceiveIntent || backgroundStandby);
             try {
                 if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent); else startService(intent);
             } catch (RuntimeException error) {
                 requestTermination(ownerId, generation, true, error.getClass().getSimpleName());
+                pendingUiStandbyStart = false;
+                pendingUiReceiveIntent = false;
+                backgroundStandbyEnabled = false;
+                receiveIntentEnabled = false;
                 return error.getClass().getSimpleName();
             }
             return "";
@@ -488,6 +756,35 @@ public final class ReceiverService extends Service {
         return true;
     }
 
+    private boolean stopFromUi(String ownerId, long generation) {
+        if (!isCurrentOperation(ownerId, generation)) return false;
+        requestTermination(ownerId, generation, false, "");
+        return true;
+    }
+
+    private boolean trustBindingUntilRevokedFromUi(String ownerId, long generation) {
+        if (!applicationIsVisible() || !isCurrentOperation(ownerId, generation) || !backgroundStandbyEnabled) return false;
+        try {
+            synchronized (BindingStore.storageLock()) { backgroundAuthorization.trustUntilRevoked(ownerId, generation); }
+            return true;
+        } catch (IOException error) {
+            setAuthorizationError(ownerId, generation, error.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private boolean revokeBackgroundTrustFromUi(String ownerId, long generation) {
+        if (!applicationIsVisible() || !isCurrentOperation(ownerId, generation) || !backgroundStandbyEnabled) return false;
+        try {
+            synchronized (BindingStore.storageLock()) { backgroundAuthorization.revoke(ownerId, generation); }
+            requestTermination(ownerId, generation, false, "BackgroundTrustRevoked");
+            return true;
+        } catch (IOException error) {
+            setAuthorizationError(ownerId, generation, error.getClass().getSimpleName());
+            return false;
+        }
+    }
+
     private void requestTermination(String ownerId, long generation, boolean failed, String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() -> beginTermination(ownerId, generation, failed, reason));
@@ -499,6 +796,12 @@ public final class ReceiverService extends Service {
             if (!uiOperation.owns(ownerId) || generation != currentOperationGeneration
                     || generation != networkBootstrapGeneration.get() || !uiOperation.stop(ownerId)) return;
         }
+        if (backgroundStandbyEnabled) {
+            synchronized (BindingStore.storageLock()) { backgroundAuthorization.disable(ownerId, generation); }
+        }
+        backgroundStandbyEnabled = false;
+        receiveIntentEnabled = false;
+        cancelAuthorizationNotification();
         cleanupOwnerId = ownerId;
         cleanupGeneration = networkBootstrapGeneration.incrementAndGet();
         currentOperationGeneration = cleanupGeneration;
@@ -507,6 +810,9 @@ public final class ReceiverService extends Service {
         cleanupCoordinatorClosed = true;
         if (timeout != null) handler.removeCallbacks(timeout);
         timeout = null;
+        pendingUiStartRequestId = "";
+        pendingUiStandbyStart = false;
+        pendingUiReceiveIntent = false;
         networkRecoveryDeadlineElapsedMs = 0;
         if (pendingAudio != null) pendingAudio.destroy();
         pendingAudio = null;
@@ -577,6 +883,15 @@ public final class ReceiverService extends Service {
         foregroundReady = false;
     }
 
+    static void resetAuthorizationForBinding(BindingStore store, String commitment) throws IOException {
+        synchronized (BindingStore.storageLock()) {
+            ReceiverService service = activeService;
+            if (service != null && service.backgroundAuthorization != null)
+                service.backgroundAuthorization.resetBinding(commitment);
+            else store.clearUntilRevoked(commitment);
+        }
+    }
+
     private AudioSession startAudio(AudioRequest request) {
         if (destroyed) return null;
         AudioSession existing = currentAudio;
@@ -622,7 +937,7 @@ public final class ReceiverService extends Service {
                     Notification notification = serviceNotification("正在播放电脑音频。", session.ownerId,
                             session.networkGeneration, true);
                     if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification,
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                            playbackForegroundServiceType());
                     else startForeground(NOTIFICATION_ID, notification);
                 } catch (RuntimeException error) {
                     requestTermination(session.ownerId, session.networkGeneration, true,
@@ -645,21 +960,88 @@ public final class ReceiverService extends Service {
         else if (!handler.post(start)) context.destroy();
     }
 
-    private void startNetworkBootstrap(String address, int prefixLength, long generation, String ownerId) {
+    private void startNetworkBootstrap(String address, int prefixLength, long generation, String ownerId,
+            boolean backgroundStandby, boolean keepReceiveIntent) {
         try {
             if (!isCurrentOperation(ownerId, generation)) return;
-            networkAudioState = "starting";
-            networkAudioFailure = "";
-            startFailure = "";
-            networkRecoveryDeadlineElapsedMs = 0;
             InetAddress local = parseIpv4(address);
             if (!isAssignedPrivateAddress(local, prefixLength)) throw new IOException("InvalidReceiverInterface");
-            PairingProtocol.BindingMaterial binding = new BindingStore(getFilesDir()).load();
+            Network selectedNetwork = findNetworkForInterface(local, prefixLength);
+            PairingProtocol.BindingMaterial binding;
+            synchronized (BindingStore.storageLock()) {
+                if (!isCurrentOperation(ownerId, generation)) return;
+                networkAudioState = "starting";
+                networkAudioFailure = "";
+                startFailure = "";
+                networkRecoveryDeadlineElapsedMs = 0;
+                binding = new BindingStore(getFilesDir()).load();
+                if (backgroundStandby) {
+                    if (!notificationPermissionAvailable()) throw new IOException("Background notifications are unavailable");
+                    byte[] commitment = binding.commitment();
+                    try { backgroundAuthorization.enable(ownerId, generation, commitment); }
+                    finally { java.util.Arrays.fill(commitment, (byte) 0); }
+                }
+            }
             P5cReceiverCoordinator.PlaybackEndpoint playback = new P5cReceiverCoordinator.PlaybackEndpoint() {
                 private AudioSession ownedSession;
                 private boolean current() { return isCurrentOperation(ownerId, generation); }
 
                 @Override public boolean supportsPlaybackProgress() { return true; }
+
+                @Override public boolean requiresBackgroundStartAuthorization() {
+                    return backgroundStandby && current();
+                }
+
+                @Override public int requestBackgroundStartAuthorization(byte[] requestId, long sessionId,
+                        InetAddress peer, byte[] bindingCommitment) throws IOException {
+                    if (!current() || !notificationPermissionAvailable()) {
+                        requestTermination(ownerId, generation, true, "BackgroundNotificationsUnavailable");
+                        return P5cControlProtocol.AUTH_EXPIRED;
+                    }
+                    synchronized (BindingStore.storageLock()) {
+                        return backgroundAuthorization.request(ownerId, generation, requestId, sessionId,
+                                peer, bindingCommitment);
+                    }
+                }
+
+                @Override public int backgroundStartAuthorizationStatus(byte[] requestId, long sessionId,
+                        InetAddress peer, byte[] bindingCommitment) throws IOException {
+                    if (!current() || !notificationPermissionAvailable()) {
+                        requestTermination(ownerId, generation, true, "BackgroundNotificationsUnavailable");
+                        return P5cControlProtocol.AUTH_EXPIRED;
+                    }
+                    synchronized (BindingStore.storageLock()) {
+                        return backgroundAuthorization.status(ownerId, generation, requestId, sessionId,
+                                peer, bindingCommitment);
+                    }
+                }
+
+                @Override public void endBackgroundStartAuthorization(byte[] requestId, long sessionId,
+                        InetAddress peer, byte[] bindingCommitment, boolean playbackHadStarted, boolean keepForRecovery) {
+                    synchronized (BindingStore.storageLock()) {
+                        backgroundAuthorization.end(ownerId, generation, requestId, sessionId, peer,
+                                bindingCommitment, playbackHadStarted, keepForRecovery);
+                    }
+                    if (keepForRecovery) networkRecoveryDeadlineElapsedMs = onceRecoveryDeadline(ownerId, generation);
+                    else if (playbackHadStarted) networkRecoveryDeadlineElapsedMs = 0;
+                }
+
+                @Override public void cancelBackgroundStartAuthorization(byte[] requestId, long sessionId,
+                        InetAddress peer, byte[] bindingCommitment) {
+                    synchronized (BindingStore.storageLock()) {
+                        BackgroundStartAuthorization.Token token = backgroundAuthorization.pendingToken();
+                        if (token != null && token.matches(ownerId, generation, requestId, sessionId, peer, bindingCommitment))
+                            backgroundAuthorization.cancel(token);
+                    }
+                }
+
+                @Override public void backgroundPlaybackStarted(byte[] requestId, long sessionId,
+                        InetAddress peer, byte[] bindingCommitment) {
+                    synchronized (BindingStore.storageLock()) {
+                        backgroundAuthorization.playbackStarted(ownerId, generation, requestId, sessionId,
+                                peer, bindingCommitment);
+                    }
+                }
 
                 @Override public byte[] playbackProgressPayload() {
                     return ReceiverService.playbackProgressPayload();
@@ -683,9 +1065,9 @@ public final class ReceiverService extends Service {
                                         .setContentTitle("AnPod Receiver").setContentText("正在播放电脑音频。")
                                         .setOngoing(true).build();
                                 if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification,
-                                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                                        playbackForegroundServiceType());
                                 else startForeground(NOTIFICATION_ID, notification);
-                                networkRecoveryDeadlineElapsedMs = 0;
+                                networkRecoveryDeadlineElapsedMs = onceRecoveryDeadline(ownerId, generation);
                                 networkAudioFailure = "";
                                 networkAudioState = "receiverRunning";
                                 AudioSession accepted = startAudio(AudioRequest.udp(context));
@@ -740,7 +1122,9 @@ public final class ReceiverService extends Service {
                         runOnMainForOwner(ownerId, generation, () -> {
                             AudioSession session = ownedSession;
                             if (session != null && currentAudio == session) cancelAudio(session, "NetworkSessionStopped");
-                            networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
+                            networkRecoveryDeadlineElapsedMs = receiveIntentEnabled
+                                    ? onceRecoveryDeadline(ownerId, generation)
+                                    : newRecoveryDeadline(ownerId, generation);
                             networkAudioState = "prepared";
                         });
                     } catch (IOException error) {
@@ -762,6 +1146,8 @@ public final class ReceiverService extends Service {
                 @Override public void shutdown() {
                     // The waiter owns coordinator termination and checks this generation on the main thread.
                 }
+
+                @Override public boolean keepStandbyAfterPlaybackStop() { return receiveIntentEnabled; }
             };
             P5cReceiverCoordinator coordinator = P5cReceiverCoordinator.openOnInterface(binding, playback, local,
                     prefixLength, BuildConfig.VERSION_CODE);
@@ -777,10 +1163,17 @@ public final class ReceiverService extends Service {
             networkAudioAddress = coordinator.localAddress().getHostAddress();
             networkAudioPort = coordinator.port();
             coordinator.start();
-            coordinator.startDiscovery(discoverySocketBinder(local, prefixLength));
+            coordinator.startDiscovery(selectedNetwork::bindSocket);
+            if (keepReceiveIntent) coordinator.startAutomaticSearch();
             uiOperation.running(ownerId);
             networkAudioState = "prepared";
+            if (keepReceiveIntent && timeout != null) {
+                handler.removeCallbacks(timeout);
+                timeout = null;
+            }
             Thread waiter = new Thread(() -> {
+                long nextStandbyCheckAt = 0;
+                long nextSearchMaintenanceAt = 0;
                 try {
                     while (true) {
                         boolean completed = coordinator.await(250, TimeUnit.MILLISECONDS);
@@ -789,11 +1182,61 @@ public final class ReceiverService extends Service {
                             handler.post(() -> handleCoordinatorEnded(coordinator, ownerId, generation));
                             return;
                         }
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (keepReceiveIntent && now >= nextSearchMaintenanceAt) {
+                            nextSearchMaintenanceAt = now + 1_000L;
+                            try {
+                                P5cDiscovery.SearchSnapshot search = coordinator.maintainAutomaticSearch();
+                                if ("searching".equals(search.lastRequestStatus)) networkAudioFailure = "";
+                            } catch (IOException searchError) {
+                                networkAudioFailure = searchError.getMessage() == null
+                                        ? searchError.getClass().getSimpleName() : searchError.getMessage();
+                            }
+                        }
+                        if (keepReceiveIntent && now >= nextStandbyCheckAt) {
+                            nextStandbyCheckAt = now + 1_000L;
+                            if (backgroundStandby) {
+                                long trustDeadline;
+                                boolean expiredTrust;
+                                try {
+                                    synchronized (BindingStore.storageLock()) {
+                                        trustDeadline = backgroundAuthorization.eightHourDeadlineElapsedMs(ownerId, generation);
+                                        expiredTrust = trustDeadline != 0 && backgroundAuthorization.expireEightHourGrant(
+                                                ownerId, generation, trustDeadline);
+                                    }
+                                } catch (IOException storageError) {
+                                    requestTermination(ownerId, generation, true, "BackgroundGrantStorageFailed");
+                                    return;
+                                }
+                                if (expiredTrust) {
+                                    requestTermination(ownerId, generation, false, "BackgroundTrustExpired");
+                                    return;
+                                }
+                            }
+                            if (!notificationPermissionAvailable()) {
+                                requestTermination(ownerId, generation, true, "ReceiveNotificationsUnavailable");
+                                return;
+                            }
+                            try {
+                                if (!selectedNetwork.equals(findNetworkForInterface(local, prefixLength))) {
+                                    requestTermination(ownerId, generation, true, "ReceiveInterfaceChanged");
+                                    return;
+                                }
+                            } catch (IOException unavailable) {
+                                requestTermination(ownerId, generation, true, "ReceiveInterfaceUnavailable");
+                                return;
+                            }
+                        }
                         long recoveryDeadline = networkRecoveryDeadlineElapsedMs;
                         if (recoveryDeadline != 0 && currentAudio == null
                                 && android.os.SystemClock.elapsedRealtime() >= recoveryDeadline) {
-                            requestTermination(ownerId, generation, true, "RecoveryTimeout");
-                            return;
+                            if (keepReceiveIntent) {
+                                networkRecoveryDeadlineElapsedMs = 0;
+                                networkAudioState = "prepared";
+                            } else {
+                                requestTermination(ownerId, generation, true, "RecoveryTimeout");
+                                return;
+                            }
                         }
                     }
                 } catch (InterruptedException interrupted) {
@@ -885,19 +1328,20 @@ public final class ReceiverService extends Service {
         return false;
     }
 
-    private P5cDiscovery.SocketBinder discoverySocketBinder(InetAddress address, int prefixLength) throws IOException {
+    private Network findNetworkForInterface(InetAddress address, int prefixLength) throws IOException {
         NetworkInterface selected = NetworkInterface.getByInetAddress(address);
         ConnectivityManager connectivity = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        if (selected == null || connectivity == null) throw new IOException("所选网络接口已不可用，请重新选择。");
+        if (selected == null || !selected.isUp() || connectivity == null)
+            throw new IOException("所选网络接口已不可用，请重新选择。");
         for (Network network : connectivity.getAllNetworks()) {
             LinkProperties properties = connectivity.getLinkProperties(network);
             if (properties == null || !selected.getName().equals(properties.getInterfaceName())) continue;
             for (LinkAddress link : properties.getLinkAddresses()) {
                 if (address.equals(link.getAddress()) && link.getPrefixLength() == prefixLength)
-                    return network::bindSocket;
+                    return network;
             }
         }
-        throw new IOException("无法将发现 socket 绑定到所选 Android 网络。");
+        throw new IOException("所选 Android 网络已不可用或发生变化。");
     }
 
     private static InetAddress parseIpv4(String text) throws IOException {
@@ -925,10 +1369,36 @@ public final class ReceiverService extends Service {
     private void setUdpAudioPaused(AudioSession session, boolean paused) throws IOException {
         if (session == null || currentAudio != session || session.request.udpContext == null)
             throw new IOException("NetworkAudioSessionNotOwned");
+        IOException failure = null;
         synchronized (session) {
             ensureRunning(session);
-            session.udpPaused = paused;
-            if (session.udpQueue != null) session.udpQueue.setPaused(paused);
+            AudioFocusState.Action action = session.focusState.setUserPaused(paused);
+            if (session.udpQueue != null) session.udpQueue.setPaused(!session.focusState.canPlay());
+            if (action == AudioFocusState.Action.PAUSE && session.audioTrack != null
+                    && (session.trackPlaying || !session.trackReady)) {
+                try { pauseAndFlushTrack(session, session.audioTrack); }
+                catch (RuntimeException error) {
+                    session.focusState.cancel();
+                    failure = new IOException("AudioPauseFailed: " + describeFailure(error), error);
+                }
+            } else if (!paused && session.trackReady && !session.trackPlaying
+                    && session.audioTrack != null && session.focusState.canPlay()) {
+                try {
+                    session.audioTrack.play();
+                    session.trackPlaying = true;
+                    session.focusState.markTrackPlaying();
+                    synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) audioActive = true;
+                    }
+                } catch (IllegalStateException error) {
+                    throw new IOException("AudioTrack resume failed", error);
+                }
+            }
+            session.notifyAll();
+        }
+        if (failure != null) {
+            cancelAudio(session, failure.getMessage());
+            throw failure;
         }
     }
 
@@ -941,6 +1411,7 @@ public final class ReceiverService extends Service {
         UdpPcmQueue udpQueue = null;
         UdpReceiver udpReceiver = null;
         Thread networkThread = null;
+        WifiManager.WifiLock wifiLock = null;
         String failure = "";
         try {
             ensureRunning(session);
@@ -948,18 +1419,24 @@ public final class ReceiverService extends Service {
             try (ownedSocket) {
                 InputStream input;
                 if (ownedSocket == null) {
+                    WifiManager wifi = getSystemService(WifiManager.class);
+                    if (wifi == null) throw new IOException("WiFi service unavailable");
+                    int wifiMode = Build.VERSION.SDK_INT >= 29
+                            ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                    wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+                    wifiLock.acquire();
                     udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
                             session.request.udpContext.playbackMode);
                     udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
                     UdpReceiver receiverForThread = udpReceiver;
                     networkThread = new Thread(() -> {
-                        Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
                         receiverForThread.run();
                     }, "AnPod UDP packet receiver");
                     synchronized (session) {
                         ensureRunning(session);
                         session.udpQueue = udpQueue;
-                        udpQueue.setPaused(session.udpPaused);
+                        udpQueue.setPaused(!session.focusState.canPlay());
                         session.udpReceiver = udpReceiver;
                         session.networkThread = networkThread;
                         networkThread.start();
@@ -1064,9 +1541,12 @@ public final class ReceiverService extends Service {
                 if (udpQueue != null) {
                     udpQueue.configureAudioTrack(preRollFrames);
                 } else {
-                    int backlogLimitFrames = Pcm16FrameStream.backlogLimitFrames(
-                            track.getSampleRate(), preRollFrames, currentMode(session).startsWith("low-latency"));
-                    pcm.setBacklogLimit(backlogLimitFrames,
+                    boolean lowLatencyBacklog = currentMode(session).startsWith("low-latency");
+                    int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
+                            track.getSampleRate(), lowLatencyBacklog);
+                    int backlogTriggerFrames = Pcm16FrameStream.backlogTriggerFrames(
+                            track.getSampleRate(), lowLatencyBacklog);
+                    pcm.setBacklogLimit(backlogTargetFrames, backlogTriggerFrames,
                             (track.getSampleRate() * 3 + 999) / 1000);
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) tcpDroppedBacklogFrames = 0;
@@ -1086,15 +1566,16 @@ public final class ReceiverService extends Service {
 
                 manager = getSystemService(AudioManager.class);
                 final AudioSession focusSession = session;
-                focusListener = change -> {
-                    if (change != AudioManager.AUDIOFOCUS_GAIN) cancelAudio(focusSession, "AudioFocusLost");
-                };
+                final AudioTrack focusTrack = track;
+                focusListener = change -> handler.post(() ->
+                        handleAudioFocusChange(focusSession, focusTrack, change));
                 synchronized (session) {
                     ensureRunning(session);
                     if (Build.VERSION.SDK_INT >= 26) {
                         focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
                                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                                .setWillPauseWhenDucked(true)
                                 .setOnAudioFocusChangeListener(focusListener).build();
                         if (manager.requestAudioFocus(focusRequest) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
                             throw new IOException("Audio focus denied");
@@ -1103,15 +1584,21 @@ public final class ReceiverService extends Service {
                         throw new IOException("Audio focus denied");
                     }
                     ensureRunning(session);
-                    track.play();
-                    if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) throw new IOException("AudioTrack did not start");
-                    session.trackPlaying = true;
+                    session.trackReady = true;
+                    if (session.focusState.canPlay()) {
+                        track.play();
+                        if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                            throw new IOException("AudioTrack did not start");
+                        session.trackPlaying = true;
+                        session.focusState.markTrackPlaying();
+                    }
                     synchronized (STATUS_LOCK) {
-                        if (statusAudioId == session.id) audioActive = true;
+                        if (statusAudioId == session.id) audioActive = session.focusState.canPlay();
                     }
                 }
                 while (true) {
                     ensureRunning(session);
+                    awaitFocusResume(session);
                     int count = pcm.readFrames(input, buffer, buffer.length);
                     if (count < 0) {
                         failure = "AudioStreamEnded";
@@ -1136,13 +1623,20 @@ public final class ReceiverService extends Service {
             failure = session.cancelled ? session.stopReason : describeFailure(error);
         } finally {
             session.trackPlaying = false;
-            if (session.audioTrack == track) session.audioTrack = null;
-            String trackReleaseFailure = releaseTrack(track);
+            String trackReleaseFailure;
+            synchronized (session) {
+                if (session.audioTrack == track) session.audioTrack = null;
+                trackReleaseFailure = releaseTrack(track);
+            }
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
             if (!focusReleaseFailure.isEmpty()) failure = appendFailure(failure, focusReleaseFailure);
             if (udpReceiver != null) udpReceiver.close();
             if (udpQueue != null) udpQueue.stop();
+            if (wifiLock != null) {
+                try { if (wifiLock.isHeld()) wifiLock.release(); }
+                catch (RuntimeException error) { failure = appendFailure(failure, "WiFiLockRelease: " + describeFailure(error)); }
+            }
             if (networkThread != null && networkThread != Thread.currentThread()) {
                 boolean interrupted = Thread.interrupted();
                 while (networkThread.isAlive()) {
@@ -1174,9 +1668,13 @@ public final class ReceiverService extends Service {
 
     private void writeFrames(AudioSession session, AudioTrack track, Pcm16FrameStream pcm, byte[] buffer, int count, int frameBytes) throws IOException {
         pcm.writeFramesForChannels((data, offset, length) -> {
+            ensureRunning(session);
+            long writeGeneration = session.focusState.writeGeneration();
+            if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+            int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
             synchronized (session) {
+                if (!session.focusState.acceptsWrite(writeGeneration)) return length;
                 ensureRunning(session);
-                int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
                 if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
                 session.trackWrittenFrames += written / frameBytes;
                 if (session.request.udpContext != null) {
@@ -1187,6 +1685,98 @@ public final class ReceiverService extends Service {
             }
         }, buffer, count);
         if (count % frameBytes != 0) throw new IOException("PCM frame alignment failed");
+    }
+
+    private void handleAudioFocusChange(AudioSession session, AudioTrack track, int change) {
+        String failure = "";
+        synchronized (session) {
+            if (currentAudio != session || session.audioTrack != track
+                    || session.cancelled || !isCurrentOperation(session.ownerId, session.networkGeneration)) return;
+            AudioFocusState.Change focusChange;
+            if (change == AudioManager.AUDIOFOCUS_LOSS) focusChange = AudioFocusState.Change.LOSS;
+            else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) focusChange = AudioFocusState.Change.LOSS_TRANSIENT;
+            else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK)
+                focusChange = AudioFocusState.Change.LOSS_TRANSIENT_CAN_DUCK;
+            else if (change == AudioManager.AUDIOFOCUS_GAIN) focusChange = AudioFocusState.Change.GAIN;
+            else return;
+
+            AudioFocusState.Action action = session.focusState.onFocusChange(focusChange);
+            try {
+                if (action == AudioFocusState.Action.STOP) {
+                    failure = "AudioFocusLost";
+                } else if (action == AudioFocusState.Action.PAUSE) {
+                    if (session.udpQueue != null) session.udpQueue.setPaused(true);
+                    if (session.trackPlaying || !session.trackReady) pauseAndFlushTrack(session, track);
+                    else synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) audioActive = false;
+                    }
+                } else if (action == AudioFocusState.Action.DUCK) {
+                    track.setVolume(0.2f);
+                } else if (action == AudioFocusState.Action.RESTORE_VOLUME
+                        || action == AudioFocusState.Action.RESTORE_AND_HOLD
+                        || action == AudioFocusState.Action.RESTORE_AND_RESUME) {
+                    track.setVolume(1.0f);
+                    if (action == AudioFocusState.Action.RESTORE_AND_RESUME) failure = resumeFocusedTrack(session, track);
+                    else if (action == AudioFocusState.Action.RESTORE_AND_HOLD) session.trackPlaying = false;
+                } else if (action == AudioFocusState.Action.RESUME) {
+                    failure = resumeFocusedTrack(session, track);
+                } else if (action == AudioFocusState.Action.HOLD) {
+                    session.trackPlaying = false;
+                }
+            } catch (RuntimeException error) {
+                failure = "AudioFocusTransitionFailed: " + describeFailure(error);
+            }
+            if (!failure.isEmpty() && !"AudioFocusLost".equals(failure)) {
+                session.focusState.cancel();
+            }
+            session.notifyAll();
+        }
+        if (!failure.isEmpty()) cancelAudio(session, failure);
+    }
+
+    /** Called with the session control monitor held. */
+    private String resumeFocusedTrack(AudioSession session, AudioTrack track) {
+        if (!session.focusState.canPlay()) return "";
+        UdpPcmQueue queue = session.udpQueue;
+        if (queue != null) queue.setPaused(false);
+        try {
+            track.play();
+            session.trackPlaying = true;
+            session.focusState.markTrackPlaying();
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) audioActive = true;
+            }
+            return "";
+        } catch (RuntimeException error) {
+            return "AudioFocusResumeFailed: " + describeFailure(error);
+        }
+    }
+
+    /** Called with the session control monitor held for a user or focus pause. */
+    private void pauseAndFlushTrack(AudioSession session, AudioTrack track) {
+        track.pause();
+        track.flush();
+        session.trackWrittenFrames = 0;
+        session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+        PCM_BYTES_WRITTEN.set(0);
+        session.trackPlaying = false;
+        synchronized (STATUS_LOCK) {
+            if (statusAudioId == session.id) audioActive = false;
+        }
+    }
+
+    private static void awaitFocusResume(AudioSession session) throws IOException {
+        synchronized (session) {
+            while (!session.focusState.canPlay() && !session.cancelled) {
+                try { session.wait(); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Audio focus pause interrupted", interrupted);
+                }
+            }
+            if (session.cancelled) throw new IOException(session.stopReason.isEmpty()
+                    ? "AudioSessionStopped" : session.stopReason);
+        }
     }
 
     private void finishAudio(AudioSession session, String failure) {
@@ -1208,18 +1798,42 @@ public final class ReceiverService extends Service {
         if (!uiOperation.owns(session.ownerId) || session.networkGeneration != currentOperationGeneration) return;
         if (session.request.udpContext != null && "NetworkSessionStopped".equals(failure)) {
             networkAudioState = networkCoordinator != null ? "prepared" : "stopped";
-            if (networkCoordinator != null) networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
+            if (networkCoordinator != null) {
+                networkRecoveryDeadlineElapsedMs = receiveIntentEnabled
+                        ? onceRecoveryDeadline(session.ownerId, session.networkGeneration)
+                        : newRecoveryDeadline(session.ownerId, session.networkGeneration);
+                restoreBackgroundStandbyForeground(session.ownerId, session.networkGeneration);
+            }
             else requestTermination(session.ownerId, currentOperationGeneration, false, "");
             return;
         }
         if (session.request.udpContext != null && networkCoordinator != null) {
             recordNetworkFailure(failure.isEmpty() ? "NetworkAudioSessionEnded" : failure);
             uiOperation.reportError(session.ownerId, networkAudioFailure);
-            networkRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime() + 30_000L;
+            networkRecoveryDeadlineElapsedMs = receiveIntentEnabled
+                    ? onceRecoveryDeadline(session.ownerId, session.networkGeneration)
+                    : newRecoveryDeadline(session.ownerId, session.networkGeneration);
+            restoreBackgroundStandbyForeground(session.ownerId, session.networkGeneration);
             return;
         }
         boolean failed = failure != null && !failure.isEmpty() && !"AudioSessionEnded".equals(failure);
         requestTermination(session.ownerId, currentOperationGeneration, failed, failed ? failure : "");
+    }
+
+    private void restoreBackgroundStandbyForeground(String ownerId, long generation) {
+        if (!receiveIntentEnabled) return;
+        handler.post(() -> {
+            if (!receiveIntentEnabled || !isCurrentOperation(ownerId, generation)) return;
+            try {
+                Notification notification = serviceNotification("正在等待电脑连接，可随时停止。", ownerId, generation, true);
+                if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+                else startForeground(NOTIFICATION_ID, notification);
+                foregroundReady = true;
+            } catch (RuntimeException error) {
+                requestTermination(ownerId, generation, true, error.getClass().getSimpleName());
+            }
+        });
     }
 
     private static void clearAudioMetrics(long audioId) {
@@ -1243,22 +1857,40 @@ public final class ReceiverService extends Service {
     }
 
     private void cancelAudio(AudioSession session, String reason) {
+        String stopFailure = "";
+        LocalSocket socket;
+        UdpReceiver receiver;
+        UdpPcmQueue queue;
+        Thread networkThread;
         synchronized (session) {
             if (!session.cancelled) {
                 session.cancelled = true;
                 session.stopReason = reason;
             }
+            session.focusState.cancel();
+            session.notifyAll();
+            AudioTrack track = session.audioTrack;
+            if (track != null) {
+                try { track.stop(); }
+                catch (RuntimeException error) { stopFailure = "AudioTrackStopFailed: " + describeFailure(error); }
+            }
+            socket = session.socket;
+            receiver = session.udpReceiver;
+            queue = session.udpQueue;
+            networkThread = session.networkThread;
+            if (!stopFailure.isEmpty()) session.stopReason = appendFailure(session.stopReason, stopFailure);
+        }
+        if (!stopFailure.isEmpty()) {
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) startFailure = session.stopReason;
+            }
         }
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) audioActive = false; }
         Thread thread = session.thread;
         if (thread != null) thread.interrupt();
-        LocalSocket socket = session.socket;
         if (socket != null) try { socket.close(); } catch (IOException ignored) {}
-        UdpReceiver receiver = session.udpReceiver;
         if (receiver != null) receiver.close();
-        UdpPcmQueue queue = session.udpQueue;
         if (queue != null) queue.stop();
-        Thread networkThread = session.networkThread;
         if (networkThread != null) networkThread.interrupt();
     }
 
@@ -1451,9 +2083,10 @@ public final class ReceiverService extends Service {
         volatile UdpPcmQueue udpQueue;
         final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
         volatile AudioTrack audioTrack;
+        boolean trackReady;
         volatile long trackWrittenFrames;
         volatile boolean trackPlaying;
-        volatile boolean udpPaused;
+        final AudioFocusState focusState = new AudioFocusState();
         volatile boolean cancelled;
         volatile String stopReason = "";
 
@@ -1465,7 +2098,7 @@ public final class ReceiverService extends Service {
         }
 
         boolean isStreamingAt(long nowNanos) throws IOException {
-            if (cancelled || udpPaused || !trackPlaying) return false;
+            if (cancelled || !focusState.canPlay() || !trackPlaying) return false;
             UdpPcmQueue queue = udpQueue;
             AudioTrack track = audioTrack;
             if (queue == null || track == null) return false;
@@ -1477,7 +2110,7 @@ public final class ReceiverService extends Service {
                 throw new IOException("AudioTrack playback position unavailable", error);
             }
             return playbackActivity.isActive(nowNanos, playbackHead, queue.hasAuthenticatedAudio(),
-                    queue.lastAuthenticatedAudioAtNanos(), udpPaused);
+                    queue.lastAuthenticatedAudioAtNanos(), focusState.isUserPaused());
         }
     }
 }

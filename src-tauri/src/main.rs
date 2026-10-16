@@ -148,6 +148,18 @@ fn receiver_binding_references(state: State<'_, AppState>) -> Result<Vec<String>
 }
 
 #[tauri::command]
+async fn receiver_binding_reset_preview(state: State<'_, AppState>, serial: String)
+    -> Result<receiver::BindingResetPreview, String> {
+    state.receiver_binding_reset_preview(&serial).await
+}
+
+#[tauri::command]
+async fn receiver_reset_binding(state: State<'_, AppState>, preview: receiver::BindingResetPreview)
+    -> Result<receiver::BindingResetResult, String> {
+    state.receiver_reset_binding(preview).await
+}
+
+#[tauri::command]
 async fn discover_network_receivers(state: State<'_, AppState>, local_address: String) -> Result<Vec<discovery::Candidate>, String> {
     state.discover_network_receivers(&local_address).await
 }
@@ -271,6 +283,8 @@ fn main() {
             network_interfaces,
             receiver_network_interfaces,
             receiver_binding_references,
+            receiver_binding_reset_preview,
+            receiver_reset_binding,
             discover_network_receivers,
             start_network_audio,
             set_wireless_connection_offers,

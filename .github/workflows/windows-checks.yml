@@ -1,0 +1,74 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    env:
+      ANDROID_HOME: C:\Android\android-sdk
+      ANDROID_SDK_ROOT: C:\Android\android-sdk
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+          build-warnings: ''
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check Android SDK for AGP 8.7.3
+        shell: pwsh
+        run: |
+          $requiredSdkFiles = @(
+            @{ Path = "$env:ANDROID_HOME\platforms\android-35\android.jar"; Component = 'Android SDK Platform 35' },
+            @{ Path = "$env:ANDROID_HOME\build-tools\34.0.0\aapt.exe"; Component = 'Android SDK Build-Tools 34.0.0' }
+          )
+          foreach ($required in $requiredSdkFiles) {
+            if (-not (Test-Path -LiteralPath $required.Path)) {
+              throw "Missing $($required.Component) at '$($required.Path)'; install it in the Windows runner image."
+            }
+          }
+
+      - name: Compile and lint Android receiver
+        working-directory: src/AnPod.Receiver
+        shell: pwsh
+        run: .\gradlew.bat :app:compileDebugKotlin :app:compileDebugJavaWithJavac :app:lintDebug --no-daemon
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check Java protocol vectors, PCM framing, and audio focus state
+        shell: pwsh
+        run: ./packaging/check-java-offline.ps1
+
+      - name: Test Rust on Windows
+        # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: >-
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --
+          --test-threads=1
+          --skip receiver::tests::p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested
+          --skip receiver::tests::reads_the_artifact_written_by_windows_powershell_when_requested

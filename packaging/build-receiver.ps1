@@ -43,8 +43,8 @@ $applicationId = [regex]::Match($appGradle, "(?m)^\s*applicationId\s+'([^']+)'\s
 $configuredVersionCode = [int][regex]::Match($appGradle, '(?m)^\s*versionCode\s+(\d+)\s*$').Groups[1].Value
 $configuredVersionName = [regex]::Match($appGradle, "(?m)^\s*versionName\s+'([^']+)'\s*$").Groups[1].Value
 $configuredTargetSdk = [int][regex]::Match($appGradle, '(?m)^\s*targetSdk\s+(\d+)\s*$').Groups[1].Value
-if ($applicationId -ne 'app.anpod.receiver' -or $configuredVersionCode -ne 9 -or $configuredVersionName -ne '0.7.0-v3-flow-candidate' -or $configuredTargetSdk -ne 35) {
-    throw 'Receiver Gradle configuration must identify the current v3 flow candidate as app.anpod.receiver / 0.7.0-v3-flow-candidate / code 9 / targetSdk 35.'
+if ($applicationId -ne 'app.anpod.receiver' -or $configuredVersionCode -le 0 -or $configuredVersionName -notmatch '^\d+\.\d+\.\d+-v3-flow-candidate$' -or $configuredTargetSdk -ne 35) {
+    throw 'Receiver Gradle configuration must identify app.anpod.receiver with a positive versionCode, semantic v3 flow candidate versionName and targetSdk 35.'
 }
 $sourceCommit = (& git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the Receiver source commit.' }
@@ -125,14 +125,17 @@ $provider = $components | Where-Object { $_.LocalName -eq 'provider' -and $_.Get
 $profileInstaller = $components | Where-Object { $_.LocalName -eq 'receiver' -and $_.GetAttribute('name', $androidNs) -eq 'androidx.profileinstaller.ProfileInstallReceiver' }
 if (-not $bootstrap -or $bootstrap.GetAttribute('exported', $androidNs) -ne 'true' -or $bootstrap.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'Bootstrap must be explicitly exported and protected by android.permission.DUMP.' }
 if (-not $mainActivity -or $mainActivity.GetAttribute('exported', $androidNs) -ne 'true' -or $mainActivity.GetAttribute('permission', $androidNs)) { throw 'MainActivity must be the unpermissioned exported Launcher entry.' }
-if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or $service.GetAttribute('foregroundServiceType', $androidNs) -ne 'shortService|mediaPlayback') { throw 'Receiver service must remain private and declare only shortService and mediaPlayback foreground types.' }
+if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or
+        ((@($service.GetAttribute('foregroundServiceType', $androidNs).Split('|') | Sort-Object) -join '|') -ne 'connectedDevice|mediaPlayback|shortService')) {
+    throw 'Receiver service must remain private and declare exactly connectedDevice, mediaPlayback and shortService foreground types.'
+}
 if (-not $provider -or $provider.GetAttribute('exported', $androidNs) -ne 'true' -or $provider.GetAttribute('readPermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('writePermission', $androidNs) -ne 'android.permission.DUMP' -or $provider.GetAttribute('grantUriPermissions', $androidNs) -ne 'false') { throw 'Health provider must be read-only to ordinary callers and protected by android.permission.DUMP.' }
 if (-not $profileInstaller -or $profileInstaller.GetAttribute('exported', $androidNs) -ne 'true' -or $profileInstaller.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'AndroidX ProfileInstallReceiver must remain protected by android.permission.DUMP.' }
 if (@($exports | Where-Object { $_ -ne $bootstrap -and $_ -ne $provider -and $_ -ne $mainActivity -and $_ -ne $profileInstaller }).Count) { throw 'Merged manifest contains an unexpected exported component.' }
 $launcherComponents = @($components | Where-Object { $_.SelectNodes('intent-filter[action[@android:name="android.intent.action.MAIN"] and category[@android:name="android.intent.category.LAUNCHER"]]', $ns).Count -gt 0 })
 if ($launcherComponents.Count -ne 1 -or $launcherComponents[0] -ne $mainActivity) { throw 'MainActivity must be the only MAIN/LAUNCHER component.' }
 $permissions = @($manifest.SelectNodes('/manifest/uses-permission', $ns) | ForEach-Object { $_.GetAttribute('name', $androidNs) })
-foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.POST_NOTIFICATIONS')) {
+foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.ACCESS_WIFI_STATE', 'android.permission.WAKE_LOCK', 'android.permission.CHANGE_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE', 'android.permission.POST_NOTIFICATIONS')) {
     if ($required -notin $permissions) { throw "Merged manifest is missing $required." }
 }
 foreach ($retired in @('android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.REQUEST_INSTALL_PACKAGES')) {

@@ -1,11 +1,14 @@
 package app.anpod.receiver;
 
 import android.app.ActivityManager;
+import android.Manifest;
 import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.os.CancellationSignal;
+import android.os.Binder;
 import android.os.ParcelFileDescriptor;
+import android.os.Process;
 import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -33,6 +36,10 @@ public final class ReceiverStateProvider extends ContentProvider {
     private static final String[] INTERFACE_COLUMNS = {"address", "prefixLength", "interfaceIndex", "interfaceName"};
     private static final String[] NETWORK_COLUMNS = {"networkAudioVersion", "networkAudioState", "networkAudioFailure", "pcmBytesWritten", "networkAudioAddress", "networkAudioPort"};
     private static final String[] BINDING_COLUMNS = {"bindingState", "bindingCommitment", "bindingFailure"};
+    private static final String[] BINDING_RESET_CAPABILITY_COLUMNS = {"bindingResetVersion"};
+    private static final int BINDING_RESET_VERSION = 1;
+    private static final String EXPECT_EMPTY = "expectedEmpty";
+    private static final String EXPECT_COMMITMENT_PREFIX = "expectedCommitment=";
     private static final long BINDING_READ_TIMEOUT_MS = 15_000;
     private static final int POLL_SLICE_MS = 100;
     private static final String[] COLUMNS = {
@@ -68,10 +75,15 @@ public final class ReceiverStateProvider extends ContentProvider {
         }
 
         if (BINDING_URI.equals(uri.toString())) {
-            if (projection == null || !sameColumns(projection, BINDING_COLUMNS)
-                    || selection != null || selectionArgs != null || sortOrder != null)
+            if (selection != null || selectionArgs != null || sortOrder != null)
                 throw new IllegalArgumentException("Unsupported receiver binding query");
-            return queryBinding();
+            if (projection != null && sameColumns(projection, BINDING_COLUMNS)) return queryBinding();
+            if (projection != null && sameColumns(projection, BINDING_RESET_CAPABILITY_COLUMNS)) {
+                MatrixCursor result = new MatrixCursor(BINDING_RESET_CAPABILITY_COLUMNS, 1);
+                result.addRow(new Object[] {BINDING_RESET_VERSION});
+                return result;
+            }
+            throw new IllegalArgumentException("Unsupported receiver binding query");
         }
 
         if (interfacesUri) return queryInterfaces(projection, selection, selectionArgs, sortOrder);
@@ -190,10 +202,12 @@ public final class ReceiverStateProvider extends ContentProvider {
             throws FileNotFoundException {
         if (!BINDING_URI.equals(uri.toString()) || !"w".equals(mode))
             throw new FileNotFoundException("Unsupported receiver binding write");
-        synchronized (bindingStateLock) {
-            if (!bindingWriteInProgress.compareAndSet(false, true))
-                throw new FileNotFoundException("A receiver binding write is already in progress");
-            bindingFailure = "";
+        synchronized (BindingStore.storageLock()) {
+            synchronized (bindingStateLock) {
+                if (!bindingWriteInProgress.compareAndSet(false, true))
+                    throw new FileNotFoundException("A receiver binding write is already in progress");
+                bindingFailure = "";
+            }
         }
         if (signal != null && signal.isCanceled()) {
             finishBindingWrite("cancelled");
@@ -268,7 +282,50 @@ public final class ReceiverStateProvider extends ContentProvider {
 
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
-        throw new UnsupportedOperationException("Read-only status provider");
+        if (!BINDING_URI.equals(uri.toString())) throw new IllegalArgumentException("Unsupported receiver binding reset URI");
+        if (selectionArgs != null) throw new IllegalArgumentException("Unsupported receiver binding reset arguments");
+        String expectedCommitment;
+        if (EXPECT_EMPTY.equals(selection)) expectedCommitment = null;
+        else if (selection != null && selection.startsWith(EXPECT_COMMITMENT_PREFIX)) {
+            expectedCommitment = selection.substring(EXPECT_COMMITMENT_PREFIX.length());
+            if (!validCommitment(expectedCommitment)) throw new IllegalArgumentException("Invalid expected receiver commitment");
+        } else throw new IllegalArgumentException("An exact expected commitment or expectedEmpty is required");
+
+        enforceResetCaller();
+        synchronized (BindingStore.storageLock()) {
+            synchronized (bindingStateLock) {
+                if (!bindingWriteInProgress.compareAndSet(false, true))
+                    throw new IllegalStateException("binding_busy");
+            }
+            try {
+                if (ReceiverService.audioActive || !"stopped".equals(ReceiverService.networkAudioState))
+                    throw new IllegalStateException("receiver_busy; stop receiving on the phone before resetting the binding");
+                ReceiverService.resetAuthorizationForBinding(bindingStore, expectedCommitment);
+                return bindingStore.removeIfMatches(expectedCommitment) == BindingStore.ResetResult.REMOVED ? 1 : 0;
+            } catch (BindingStore.ConflictException error) {
+                throw new IllegalStateException("binding_conflict", error);
+            } catch (IOException | PairingProtocol.Failure error) {
+                throw new IllegalStateException("binding_storage_error", error);
+            } finally {
+                bindingWriteInProgress.set(false);
+            }
+        }
+    }
+
+    private void enforceResetCaller() {
+        Context context = getContext();
+        if (context == null || Binder.getCallingUid() != Process.SHELL_UID
+                || context.checkCallingPermission(Manifest.permission.DUMP) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            throw new SecurityException("Receiver binding reset requires the authorized adb shell");
+    }
+
+    private static boolean validCommitment(String value) {
+        if (value.length() != 64) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char digit = value.charAt(i);
+            if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) return false;
+        }
+        return true;
     }
 
     @Override

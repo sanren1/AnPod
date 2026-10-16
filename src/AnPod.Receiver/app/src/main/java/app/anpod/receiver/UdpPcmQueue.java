@@ -9,18 +9,25 @@ import java.util.ArrayList;
 
 /** Short-lock packet queue and byte-stream adapter for the existing AudioTrack worker. */
 final class UdpPcmQueue {
-    static final int CAPACITY_PACKETS = 8;
-    private static final int LOW_LATENCY_INITIAL_MS = 5;
-    private static final int BALANCED_INITIAL_MS = 15;
-    private static final int LOW_LATENCY_MAX_MS = 20;
-    private static final int BALANCED_MAX_MS = 40;
+    static final int CAPACITY_PACKETS = 32;
+    private static final int LOW_LATENCY_INITIAL_MS = 20;
+    private static final int BALANCED_INITIAL_MS = 40;
+    private static final int LOW_LATENCY_MAX_MS = 60;
+    private static final int BALANCED_MAX_MS = 150;
+    private static final int QUEUE_HEADROOM_MS = 10;
     private static final int STEP_MS = 5;
+    private static final int GROWTH_STEP_MS = 10;
     private static final int FADE_MS = 3;
-    private static final long STABLE_DECAY_NS = 1_000_000_000L;
+    private static final long STABLE_DECAY_NS = 10_000_000_000L;
+    private static final long JITTER_HYSTERESIS_NS = 2_000_000L;
+
+    interface NanoClock { long nowNanos(); }
+    private static final NanoClock SYSTEM_CLOCK = System::nanoTime;
 
     private final ArrayList<AudioPacket> packets = new ArrayList<>(CAPACITY_PACKETS);
     private final PairingProtocol.AudioParameters expectedParameters;
     private final boolean lowLatency;
+    private final NanoClock clock;
     private UdpPacketDecoder.Format format;
     private volatile boolean hasAuthenticatedAudio;
     private volatile long lastAuthenticatedAudioAtNanos;
@@ -36,6 +43,11 @@ final class UdpPcmQueue {
     private QueueInputStream activePayloadStream;
     private long trackUnderruns = -1;
     private long stableSinceNanos;
+    private long jitterArrivalNanos;
+    private long jitterSequence;
+    private long jitterFrameIndex;
+    private long jitterEstimateNanos;
+    private boolean hasJitterSample;
     private int initialTargetFrames;
     private int targetFrames;
     private int maxTargetFrames;
@@ -48,6 +60,12 @@ final class UdpPcmQueue {
     private long gapWaitFrame;
     private long gapDeadlineNanos;
     private boolean fadeNext;
+    private byte[] lastRealPayload;
+    private int lastRealFrameCount;
+    private long plcEvents;
+    private long plcRepeatedFrames;
+    private long plcSilentFrames;
+    private long plcOversizedGapSkips;
 
     UdpPcmQueue() { this(null, "balanced"); }
 
@@ -57,8 +75,13 @@ final class UdpPcmQueue {
     }
 
     UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters, String playbackMode) {
+        this(expectedParameters, playbackMode, SYSTEM_CLOCK);
+    }
+
+    UdpPcmQueue(PairingProtocol.AudioParameters expectedParameters, String playbackMode, NanoClock clock) {
         this.expectedParameters = expectedParameters;
         lowLatency = "lowlatency".equalsIgnoreCase(playbackMode);
+        this.clock = clock;
         if (expectedParameters != null) {
             format = new UdpPacketDecoder.Format(expectedParameters.sampleRate, expectedParameters.channels);
             updateBudget(expectedParameters.sampleRate);
@@ -69,16 +92,15 @@ final class UdpPcmQueue {
         if (format == null) return;
         // AudioTrack pre-roll is a separate device buffer, not part of this network jitter budget.
         updateBudget(format.sampleRate);
-        targetFrames = initialTargetFrames;
         updateWaitBudget();
-        stableSinceNanos = System.nanoTime();
+        stableSinceNanos = clock.nowNanos();
         rebufferDeadlineNanos = packets.isEmpty() ? 0 : packets.get(0).enqueuedAtNanos + waitBudgetNanos;
         notifyAll();
     }
 
     synchronized void reportTrackUnderruns(int currentCount) {
         if (currentCount < 0) return;
-        long now = System.nanoTime();
+        long now = clock.nowNanos();
         if (trackUnderruns < 0) {
             trackUnderruns = currentCount;
             stableSinceNanos = now;
@@ -87,7 +109,7 @@ final class UdpPcmQueue {
         long increase = Math.max(0, (long) currentCount - trackUnderruns);
         trackUnderruns = currentCount;
         if (increase > 0) {
-            int stepFrames = framesForMillis(STEP_MS);
+            int stepFrames = framesForMillis(GROWTH_STEP_MS);
             targetFrames = (int) Math.min(maxTargetFrames,
                     targetFrames + Math.min(increase, CAPACITY_PACKETS) * stepFrames);
             updateWaitBudget();
@@ -98,7 +120,7 @@ final class UdpPcmQueue {
 
     synchronized void accept(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder)
             throws UdpPacketDecoder.ProtocolException {
-        acceptAt(packet, decoder, System.nanoTime());
+        acceptAt(packet, decoder, clock.nowNanos());
     }
 
     synchronized void acceptAt(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder, long now)
@@ -118,7 +140,7 @@ final class UdpPcmQueue {
             if (format != null) return;
             format = acceptedFormat;
             updateBudget(format.sampleRate);
-            stableSinceNanos = System.nanoTime();
+            stableSinceNanos = now;
             notifyAll();
             return;
         }
@@ -224,6 +246,7 @@ final class UdpPcmQueue {
         boolean wasEmpty = packets.isEmpty();
         packets.add(insertAt, audio);
         queuedFrames += frameCount;
+        updateJitterTarget(audio, now);
         if (rebuffering && wasEmpty) rebufferDeadlineNanos = now + waitBudgetNanos;
         notifyAll();
     }
@@ -258,6 +281,7 @@ final class UdpPcmQueue {
         rebuffering = true;
         rebufferDeadlineNanos = 0;
         if (paused) {
+            clearPlcHistory();
             for (AudioPacket packet : packets) {
                 droppedFrames += packet.frameCount;
                 advancePlayoutFrame(packet.frameIndex + packet.frameCount);
@@ -270,10 +294,12 @@ final class UdpPcmQueue {
                 activePayloadStream.currentPayload = null;
                 activePayloadStream.payloadOffset = 0;
                 activePayloadStream.enqueuedAtNanos = 0;
+                activePayloadStream.currentPayloadIsReal = false;
             }
             activePayloadStream = null;
         } else {
             fadeNext = true;
+            stableSinceNanos = clock.nowNanos();
         }
         notifyAll();
     }
@@ -285,9 +311,60 @@ final class UdpPcmQueue {
         initialTargetFrames = Math.max(1, sampleRate * initialMs / 1000);
         maxTargetFrames = Math.max(initialTargetFrames, sampleRate * maxMs / 1000);
         targetFrames = Math.min(Math.max(targetFrames, initialTargetFrames), maxTargetFrames);
-        maxQueuedFrames = maxTargetFrames;
-        maxPacketAgeNanos = maxMs * 1_000_000L;
+        maxQueuedFrames = framesForMillis(maxMs + QUEUE_HEADROOM_MS);
+        maxPacketAgeNanos = (maxMs + QUEUE_HEADROOM_MS) * 1_000_000L;
         updateWaitBudget();
+    }
+
+    private void updateJitterTarget(AudioPacket audio, long now) {
+        boolean newerSample = hasJitterSample
+                && Long.compareUnsigned(audio.sequence, jitterSequence) > 0
+                && Long.compareUnsigned(audio.frameIndex, jitterFrameIndex) > 0;
+        long arrivalDelta = now - jitterArrivalNanos;
+        if (newerSample && arrivalDelta >= 0) {
+            long frameDelta = audio.frameIndex - jitterFrameIndex;
+            long expectedDelta = frameDeltaNanos(frameDelta, format.sampleRate);
+            long deviation = Math.abs(arrivalDelta - expectedDelta);
+            jitterEstimateNanos += (deviation - jitterEstimateNanos) / 16;
+            if (deviation > JITTER_HYSTERESIS_NS) stableSinceNanos = now;
+            if (deviation > JITTER_HYSTERESIS_NS) {
+                int jitterFrames = jitterFrames(jitterEstimateNanos, format.sampleRate);
+                int desired = (int) Math.min(maxTargetFrames,
+                        (long) initialTargetFrames + 2L * jitterFrames);
+                if (desired > targetFrames) {
+                    targetFrames = Math.min(maxTargetFrames,
+                            Math.max(desired, targetFrames + framesForMillis(GROWTH_STEP_MS)));
+                    updateWaitBudget();
+                }
+                stableSinceNanos = now;
+            }
+        }
+        if (!hasJitterSample || newerSample) {
+            jitterArrivalNanos = now;
+            jitterSequence = audio.sequence;
+            jitterFrameIndex = audio.frameIndex;
+            hasJitterSample = true;
+        }
+    }
+
+    private static long frameDeltaNanos(long unsignedFrames, int sampleRate) {
+        long wholeSeconds = Long.divideUnsigned(unsignedFrames, sampleRate);
+        long remainderFrames = Long.remainderUnsigned(unsignedFrames, sampleRate);
+        if (Long.compareUnsigned(wholeSeconds, Long.MAX_VALUE / 1_000_000_000L) > 0)
+            return Long.MAX_VALUE;
+        long wholeNanos = wholeSeconds * 1_000_000_000L;
+        long remainderNanos = remainderFrames * 1_000_000_000L / sampleRate;
+        return wholeNanos > Long.MAX_VALUE - remainderNanos
+                ? Long.MAX_VALUE : wholeNanos + remainderNanos;
+    }
+
+    private static int jitterFrames(long jitterNanos, int sampleRate) {
+        long maximumNanos = (long) Integer.MAX_VALUE * 1_000_000_000L / sampleRate;
+        if (jitterNanos >= maximumNanos) return Integer.MAX_VALUE;
+        long wholeSeconds = jitterNanos / 1_000_000_000L;
+        long remainderNanos = jitterNanos % 1_000_000_000L;
+        long frames = wholeSeconds * sampleRate + remainderNanos * sampleRate / 1_000_000_000L;
+        return (int) Math.min(Integer.MAX_VALUE, frames);
     }
 
     private void updateWaitBudget() {
@@ -323,7 +400,7 @@ final class UdpPcmQueue {
         if (changed) {
             discardBehindWatermark();
             rebuffering = true;
-            rebufferDeadlineNanos = packets.isEmpty() ? 0 : System.nanoTime() + waitBudgetNanos;
+            rebufferDeadlineNanos = packets.isEmpty() ? 0 : nowNanos + waitBudgetNanos;
         }
     }
 
@@ -359,6 +436,7 @@ final class UdpPcmQueue {
     }
 
     private void markDiscontinuity() {
+        clearPlcHistory();
         payloadGeneration++;
         fadeNext = true;
         gapWaitActive = false;
@@ -369,11 +447,13 @@ final class UdpPcmQueue {
         while (true) {
             if (stream.payloadGeneration != payloadGeneration) {
                 if (stream.currentPayload != null) {
+                    clearPlcHistory();
                     int frameBytes = format.channels * 2;
                     droppedFrames += (stream.currentPayload.length - stream.payloadOffset) / frameBytes;
                     stream.currentPayload = null;
                     stream.payloadOffset = 0;
                     stream.enqueuedAtNanos = 0;
+                    stream.currentPayloadIsReal = false;
                     if (activePayloadStream == stream) {
                         activePayloadStream = null;
                     }
@@ -387,7 +467,7 @@ final class UdpPcmQueue {
                 continue;
             }
 
-            long now = System.nanoTime();
+            long now = clock.nowNanos();
             decayTarget(now);
             if (stream.currentPayload != null) {
                 if (expireCurrentPayload(stream, now)) {
@@ -398,9 +478,14 @@ final class UdpPcmQueue {
                 System.arraycopy(stream.currentPayload, stream.payloadOffset, target, offset, count);
                 stream.payloadOffset += count;
                 if (stream.payloadOffset == stream.currentPayload.length) {
+                    if (stream.currentPayloadIsReal) {
+                        lastRealPayload = stream.currentPayload.clone();
+                        lastRealFrameCount = lastRealPayload.length / (format.channels * 2);
+                    }
                     stream.currentPayload = null;
                     stream.payloadOffset = 0;
                     stream.enqueuedAtNanos = 0;
+                    stream.currentPayloadIsReal = false;
                     if (activePayloadStream == stream) {
                         activePayloadStream = null;
                     }
@@ -443,6 +528,34 @@ final class UdpPcmQueue {
                     waitForChange(remaining);
                     continue;
                 }
+                long gapFrames = next.frameIndex - playoutFrame;
+                if (Long.compareUnsigned(gapFrames, targetFrames) <= 0) {
+                    int boundedGapFrames = (int) gapFrames;
+                    int repeatedFrames = lastRealPayload == null ? 0
+                            : Math.min(boundedGapFrames, lastRealFrameCount);
+                    int frameBytes = format.channels * 2;
+                    byte[] concealment = new byte[boundedGapFrames * frameBytes];
+                    if (repeatedFrames > 0) {
+                        System.arraycopy(lastRealPayload, 0, concealment, 0, repeatedFrames * frameBytes);
+                        fadeOut(concealment, repeatedFrames, format.channels);
+                    }
+                    plcEvents++;
+                    plcRepeatedFrames += repeatedFrames;
+                    plcSilentFrames += boundedGapFrames - repeatedFrames;
+                    markDiscontinuity();
+                    stream.currentPayload = concealment;
+                    stream.payloadOffset = 0;
+                    stream.enqueuedAtNanos = now;
+                    stream.currentPayloadIsReal = false;
+                    stream.payloadGeneration = payloadGeneration;
+                    activePayloadStream = stream;
+                    playoutFrame = next.frameIndex;
+                    hasPlayoutFrame = true;
+                    gapWaitActive = false;
+                    continue;
+                }
+                plcOversizedGapSkips++;
+                clearPlcHistory();
                 markDiscontinuity();
             }
 
@@ -460,6 +573,7 @@ final class UdpPcmQueue {
             stream.currentPayload = next.payload;
             stream.payloadOffset = 0;
             stream.enqueuedAtNanos = next.enqueuedAtNanos;
+            stream.currentPayloadIsReal = true;
             stream.payloadGeneration = payloadGeneration;
             activePayloadStream = stream;
         }
@@ -474,6 +588,8 @@ final class UdpPcmQueue {
         stream.currentPayload = null;
         stream.payloadOffset = 0;
         stream.enqueuedAtNanos = 0;
+        stream.currentPayloadIsReal = false;
+        clearPlcHistory();
         if (activePayloadStream == stream) {
             activePayloadStream = null;
         }
@@ -497,12 +613,32 @@ final class UdpPcmQueue {
         }
     }
 
+    private static void fadeOut(byte[] payload, int frames, int channels) {
+        int frameBytes = channels * 2;
+        for (int frame = 0; frame < frames; frame++) {
+            int gainNumerator = frames - frame - 1;
+            for (int channel = 0; channel < channels; channel++) {
+                int index = frame * frameBytes + channel * 2;
+                short sample = (short) ((payload[index] & 0xff) | (payload[index + 1] << 8));
+                int faded = sample * gainNumerator / frames;
+                payload[index] = (byte) faded;
+                payload[index + 1] = (byte) (faded >>> 8);
+            }
+        }
+    }
+
+    private void clearPlcHistory() {
+        lastRealPayload = null;
+        lastRealFrameCount = 0;
+    }
+
     synchronized void stop() {
         if (stopped) return;
         stopped = true;
         packets.clear();
         queuedFrames = 0;
         activePayloadStream = null;
+        clearPlcHistory();
         payloadGeneration++;
         notifyAll();
     }
@@ -514,6 +650,7 @@ final class UdpPcmQueue {
         packets.clear();
         queuedFrames = 0;
         activePayloadStream = null;
+        clearPlcHistory();
         payloadGeneration++;
         notifyAll();
     }
@@ -523,6 +660,10 @@ final class UdpPcmQueue {
     synchronized long expiredFrames() { return expiredFrames; }
     synchronized int targetFrames() { return targetFrames; }
     synchronized long queuedFrames() { return queuedFrames; }
+    synchronized long plcEvents() { return plcEvents; }
+    synchronized long plcRepeatedFrames() { return plcRepeatedFrames; }
+    synchronized long plcSilentFrames() { return plcSilentFrames; }
+    synchronized long plcOversizedGapSkips() { return plcOversizedGapSkips; }
     synchronized UdpPacketDecoder.Format format() { return format; }
     boolean hasAuthenticatedAudio() { return hasAuthenticatedAudio; }
     long lastAuthenticatedAudioAtNanos() { return lastAuthenticatedAudioAtNanos; }
@@ -579,6 +720,7 @@ final class UdpPcmQueue {
         private int payloadOffset;
         private long payloadGeneration = -1;
         private long enqueuedAtNanos;
+        private boolean currentPayloadIsReal;
 
         QueueInputStream(UdpPcmQueue queue) { this.queue = queue; }
 
@@ -638,43 +780,57 @@ final class UdpPlaybackActivity {
     private static final long ACTIVE_WINDOW_NANOS = 2_000_000_000L;
 
     private final Pcm16FrameStream.PlaybackHeadTracker playbackHead = new Pcm16FrameStream.PlaybackHeadTracker();
+    private final UdpPcmQueue.NanoClock clock;
     private long lastPlayedFrames;
     private boolean hasHeadAdvance;
     private long lastHeadAdvanceAtNanos;
     private volatile boolean hasSuccessfulWrite;
     private volatile long lastSuccessfulWriteAtNanos;
 
+    UdpPlaybackActivity() { this(System::nanoTime); }
+
+    UdpPlaybackActivity(UdpPcmQueue.NanoClock clock) { this.clock = clock; }
+
     synchronized void resetPlaybackHead(int position) {
-        playbackHead.reset(position);
+        playbackHead.reset(position, clock.nowNanos());
         lastPlayedFrames = 0;
         hasHeadAdvance = false;
+        lastHeadAdvanceAtNanos = 0;
+        lastSuccessfulWriteAtNanos = 0;
+        hasSuccessfulWrite = false;
     }
 
     synchronized long playedFrames(int position) {
-        return updatePlaybackHead(position, System.nanoTime());
+        return updatePlaybackHead(position, clock.nowNanos());
     }
 
-    void noteSuccessfulWrite(long nowNanos) {
+    synchronized void noteSuccessfulWrite(long nowNanos) {
         lastSuccessfulWriteAtNanos = nowNanos;
         hasSuccessfulWrite = true;
     }
 
     synchronized boolean isActive(long nowNanos, int playbackHeadPosition,
             boolean hasReceivedAudio, long lastReceivedAudioAtNanos, boolean paused) {
-        updatePlaybackHead(playbackHeadPosition, nowNanos);
-        return !paused && hasReceivedAudio && hasSuccessfulWrite && hasHeadAdvance
-                && isRecent(nowNanos, lastReceivedAudioAtNanos)
-                && isRecent(nowNanos, lastSuccessfulWriteAtNanos)
-                && isRecent(nowNanos, lastHeadAdvanceAtNanos);
+        boolean receivedAudio = hasReceivedAudio;
+        long receivedAudioAtNanos = lastReceivedAudioAtNanos;
+        boolean successfulWrite = hasSuccessfulWrite;
+        long successfulWriteAtNanos = lastSuccessfulWriteAtNanos;
+        long observedAtNanos = Math.max(nowNanos, clock.nowNanos());
+        updatePlaybackHead(playbackHeadPosition, observedAtNanos);
+        return !paused && receivedAudio && successfulWrite && hasHeadAdvance
+                && isRecent(observedAtNanos, receivedAudioAtNanos)
+                && isRecent(observedAtNanos, successfulWriteAtNanos)
+                && isRecent(observedAtNanos, lastHeadAdvanceAtNanos);
     }
 
     synchronized boolean recentlyAdvanced(long nowNanos, int playbackHeadPosition) {
-        updatePlaybackHead(playbackHeadPosition, nowNanos);
-        return hasHeadAdvance && isRecent(nowNanos, lastHeadAdvanceAtNanos);
+        long observedAtNanos = Math.max(nowNanos, clock.nowNanos());
+        updatePlaybackHead(playbackHeadPosition, observedAtNanos);
+        return hasHeadAdvance && isRecent(observedAtNanos, lastHeadAdvanceAtNanos);
     }
 
     private long updatePlaybackHead(int position, long nowNanos) {
-        long played = playbackHead.update(position);
+        long played = playbackHead.update(position, nowNanos);
         if (played > lastPlayedFrames) {
             lastHeadAdvanceAtNanos = nowNanos;
             hasHeadAdvance = true;

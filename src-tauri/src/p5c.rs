@@ -38,6 +38,9 @@ const CAPABILITIES_QUERY: u8 = 8;
 const CAPABILITIES_INFO: u8 = 9;
 const PLAYBACK_PROGRESS_QUERY: u8 = 16;
 const CONNECTION_INTENT: u8 = 17;
+const BACKGROUND_START_REQUEST: u8 = 18;
+const BACKGROUND_START_STATUS: u8 = 19;
+const BACKGROUND_START_CANCEL: u8 = 20;
 const ACK: u8 = 127;
 const RESULT_OK: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
@@ -48,8 +51,18 @@ const CAP_RECEIVER_UI: u32 = 0x0000_0001;
 const CAP_AUTHENTICATED_STATUS: u32 = 0x0000_0002;
 const CAP_PLAYBACK_PROGRESS: u32 = 0x0000_0008;
 const CAP_CONNECTION_INTENT: u32 = 0x0000_0010;
+const CAP_BACKGROUND_START_AUTH: u32 = 0x0000_0020;
 const IMPLEMENTED_CAPABILITIES: u32 = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
+const AUTH_PENDING: u8 = 0;
+const AUTH_ONCE: u8 = 1;
+const AUTH_EIGHT_HOURS: u8 = 2;
+const AUTH_UNTIL_REVOKED: u8 = 3;
+const AUTH_DENIED: u8 = 4;
+const AUTH_EXPIRED: u8 = 5;
+const AUTH_CANCELLED: u8 = 6;
+const AUTHORIZATION_WAIT: Duration = Duration::from_secs(30);
+const AUTHORIZATION_POLL: Duration = Duration::from_millis(500);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_IO_POLL: Duration = Duration::from_millis(50);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -68,16 +81,20 @@ struct SessionEndpoint {
     prefix_length: u8,
     peer: SocketAddr,
     connection_intent: Option<([u8; 16], bool)>,
+    background_request_id: Option<[u8; 16]>,
+    background_authorization_required: bool,
 }
 
 impl SessionEndpoint {
     fn loopback(peer: SocketAddr) -> Self {
-        Self { interface_index: 0, local_address: Ipv4Addr::LOCALHOST, prefix_length: 32, peer, connection_intent: None }
+        Self { interface_index: 0, local_address: Ipv4Addr::LOCALHOST, prefix_length: 32, peer,
+            connection_intent: None, background_request_id: None, background_authorization_required: false }
     }
 
     fn on_interface(interface: &Ipv4Interface, peer: SocketAddr) -> Self {
         Self { interface_index: interface.index, local_address: interface.address,
-            prefix_length: interface.prefix_length, peer, connection_intent: None }
+            prefix_length: interface.prefix_length, peer, connection_intent: None,
+            background_request_id: None, background_authorization_required: false }
     }
 
     fn validate(self) -> Result<(), String> {
@@ -173,6 +190,9 @@ pub(crate) struct HostSession {
     state: ReceiverState,
     capabilities: Option<ReceiverCapabilities>,
     connection_intent: Option<([u8; 16], bool)>,
+    background_request_id: Option<[u8; 16]>,
+    background_authorization_required: bool,
+    background_authorized: bool,
     cancellation: CancellationToken,
 }
 
@@ -250,6 +270,9 @@ impl HostSession {
             state: ReceiverState::Authenticated,
             capabilities: None,
             connection_intent: endpoint.connection_intent,
+            background_request_id: endpoint.background_request_id,
+            background_authorization_required: endpoint.background_authorization_required,
+            background_authorized: false,
             cancellation,
         })
     }
@@ -272,10 +295,12 @@ impl HostSession {
 
     fn connect_endpoint(endpoint: SessionEndpoint, material: BindingMaterial,
         parameters: AudioParameters, cancellation: CancellationToken) -> Result<Self, String> {
+        let mut endpoint = endpoint;
+        if endpoint.background_request_id.is_none() { endpoint.background_request_id = Some(random_request_id()?); }
         let mut session = Self::authenticate_on_network(endpoint, material, parameters, cancellation)?;
         if let Err(error) = session.negotiate_capabilities()
             .and_then(|_| if session.capabilities().is_some_and(|info| info.compatible) {
-                session.bind_audio().and_then(|_| session.select_mode())
+                session.authorize_background_start().and_then(|_| session.bind_audio()).and_then(|_| session.select_mode())
             } else { Err("Receiver audio or management capabilities are incompatible; update it through authorized ADB or manual installation.".into()) }) {
             session.close_local();
             return Err(error);
@@ -314,10 +339,110 @@ impl HostSession {
                     return Err("Receiver does not support one-click reception; use explicit connection or update through USB.".into());
                 }
             }
+            if self.background_authorization_required
+                && info.capability_bits & CAP_BACKGROUND_START_AUTH == 0 {
+                return Err("Receiver does not support authenticated background-start authorization.".into());
+            }
             Ok(())
         })();
         if result.is_err() { self.close_local(); }
         result
+    }
+
+    fn request_background_authorization(&mut self, request_id: &[u8; 16]) -> Result<u8, String> {
+        let ack = self.command(BACKGROUND_START_REQUEST, request_id)?;
+        self.background_authorization_ack(&ack, request_id)
+    }
+
+    fn query_background_authorization(&mut self, request_id: &[u8; 16]) -> Result<u8, String> {
+        let ack = self.command(BACKGROUND_START_STATUS, request_id)?;
+        self.background_authorization_ack(&ack, request_id)
+    }
+
+    fn request_background_authorization_until(&mut self, request_id: &[u8; 16], deadline: Instant) -> Result<u8, String> {
+        let ack = self.command_until(BACKGROUND_START_REQUEST, request_id, deadline)?;
+        self.background_authorization_ack(&ack, request_id)
+    }
+
+    fn query_background_authorization_until(&mut self, request_id: &[u8; 16], deadline: Instant) -> Result<u8, String> {
+        let ack = self.command_until(BACKGROUND_START_STATUS, request_id, deadline)?;
+        self.background_authorization_ack(&ack, request_id)
+    }
+
+    fn cancel_background_authorization(&mut self, request_id: &[u8; 16]) -> Result<(), String> {
+        let ack = self.command(BACKGROUND_START_CANCEL, request_id)?;
+        let status = self.background_authorization_ack(&ack, request_id)?;
+        if status != AUTH_CANCELLED { return Err("Receiver did not cancel the pending background-start request.".into()); }
+        Ok(())
+    }
+
+    fn background_authorization_ack(&self, ack: &Ack, request_id: &[u8; 16]) -> Result<u8, String> {
+        if ack.result != RESULT_OK || ack.state != ReceiverState::Authenticated || ack.udp_port != 0 {
+            return Err("Receiver rejected background-start authorization.".into());
+        }
+        let (echoed_id, status) = ack.background_authorization
+            .as_ref().ok_or("Receiver background-start ACK was missing its status.")?;
+        if echoed_id != request_id { return Err("Receiver background-start ACK request ID did not match.".into()); }
+        Ok(*status)
+    }
+
+    fn authorize_background_start(&mut self) -> Result<(), String> {
+        let supported = self.capabilities.as_ref().is_some_and(|info|
+            info.capability_bits & CAP_BACKGROUND_START_AUTH != 0);
+        if !supported {
+            return if self.background_authorization_required {
+                Err("Receiver does not support authenticated background-start authorization.".into())
+            } else { Ok(()) };
+        }
+        let request_id = self.background_request_id.ok_or_else(||
+            "P5-C background-start request ID is unavailable.".to_string())?;
+        let deadline = Instant::now() + AUTHORIZATION_WAIT;
+        let mut status = self.request_background_authorization_until(&request_id, deadline)?;
+        let mut next_poll = Instant::now() + AUTHORIZATION_POLL;
+        let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+        loop {
+            if Instant::now() >= deadline {
+                return Err("Receiver user did not approve background playback within 30 seconds.".into());
+            }
+            match status {
+                AUTH_ONCE | AUTH_EIGHT_HOURS | AUTH_UNTIL_REVOKED => {
+                    if Instant::now() >= deadline {
+                        return Err("Receiver user did not approve background playback within 30 seconds.".into());
+                    }
+                    self.background_authorized = true;
+                    return Ok(());
+                }
+                AUTH_DENIED => return Err("Receiver user denied background playback.".into()),
+                AUTH_EXPIRED => return Err("Receiver background-start request expired.".into()),
+                AUTH_CANCELLED => return Err("Receiver background-start request was cancelled.".into()),
+                AUTH_PENDING => {}
+                _ => return Err("Receiver returned an invalid background-start status.".into()),
+            }
+            while Instant::now() < next_poll.min(next_heartbeat).min(deadline) {
+                check_cancelled(&self.cancellation).map_err(|_| "P5-C connection was cancelled.".to_string())?;
+                thread::sleep(SESSION_IO_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            if Instant::now() >= deadline {
+                return Err("Receiver user did not approve background playback within 30 seconds.".into());
+            }
+            if Instant::now() >= next_heartbeat {
+                let heartbeat = self.command_until(HEARTBEAT, &[], deadline)?;
+                if Instant::now() >= deadline || heartbeat.result != RESULT_OK
+                    || heartbeat.state != ReceiverState::Authenticated {
+                    return Err("P5-C authenticated heartbeat failed during background-start approval.".into());
+                }
+                self.last_heartbeat = Instant::now();
+                self.state = heartbeat.state;
+                next_heartbeat += HEARTBEAT_INTERVAL;
+            }
+            if Instant::now() >= next_poll {
+                status = self.query_background_authorization_until(&request_id, deadline)?;
+                if Instant::now() >= deadline {
+                    return Err("Receiver user did not approve background playback within 30 seconds.".into());
+                }
+                next_poll += AUTHORIZATION_POLL;
+            }
+        }
     }
 
     pub(crate) fn state(&self) -> ReceiverState { self.state }
@@ -327,8 +452,19 @@ impl HostSession {
         self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
     }
 
+    fn check_sender(&mut self) -> Result<(), String> {
+        if let Some(sender) = self.sender.as_mut() {
+            if let Some(error) = sender.take_finished_error() { return Err(error); }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_audio(&mut self) -> Result<(), String> {
         if self.state != ReceiverState::Authenticated { return Err("P5-C BIND is out of order.".into()); }
+        if self.capabilities.as_ref().is_some_and(|info|
+            info.capability_bits & CAP_BACKGROUND_START_AUTH != 0) && !self.background_authorized {
+            return Err("P5-C BIND requires an approved background-start request.".into());
+        }
         let port = self.udp_socket.as_ref().ok_or("P5-C UDP socket is closed.")?
             .local_addr().map_err(|_| "Unable to read P5-C UDP source port.".to_string())?.port();
         let ack = self.command(BIND, &port.to_be_bytes())?;
@@ -354,6 +490,10 @@ impl HostSession {
     pub(crate) fn start(&mut self) -> Result<(), String> {
         if self.state != ReceiverState::TransportConnected || self.sender.is_some() {
             return Err("P5-C START is out of order.".into());
+        }
+        if self.capabilities.as_ref().is_some_and(|info|
+            info.capability_bits & CAP_BACKGROUND_START_AUTH != 0) && !self.background_authorized {
+            return Err("P5-C START requires an approved background-start request.".into());
         }
         let ack = self.command(START, &[])?;
         if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
@@ -468,6 +608,12 @@ impl HostSession {
         result
     }
 
+    fn command_until(&mut self, kind: u8, payload: &[u8], deadline: Instant) -> Result<Ack, String> {
+        let result = self.command_inner_until(kind, payload, deadline);
+        if result.is_err() { self.close_local(); }
+        result
+    }
+
     fn command_inner(&mut self, kind: u8, payload: &[u8]) -> Result<Ack, String> {
         let sequence = self.command_sequence;
         let frame = encode_control(&self.keys.control_tx, HOST_TO_RECEIVER_CONTROL,
@@ -476,6 +622,27 @@ impl HostSession {
         write_frame(tcp, &frame, &self.cancellation)?;
         let ack_frame = read_frame(tcp, &self.keys.control_rx, RECEIVER_TO_HOST_CONTROL,
             self.session_id, &self.cancellation)?;
+        let ack = decode_ack(&ack_frame, self.ack_sequence, kind, sequence)?;
+        self.command_sequence = self.command_sequence.checked_add(1)
+            .ok_or_else(|| "P5-C command sequence exhausted.".to_string())?;
+        self.ack_sequence = self.ack_sequence.checked_add(1)
+            .ok_or_else(|| "P5-C ACK sequence exhausted.".to_string())?;
+        self.last_command = Some(frame);
+        self.last_ack = Some(ack_frame);
+        Ok(ack)
+    }
+
+    fn command_inner_until(&mut self, kind: u8, payload: &[u8], deadline: Instant) -> Result<Ack, String> {
+        if Instant::now() >= deadline { return Err("P5-C approval deadline expired.".into()); }
+        let io_deadline = deadline.min(Instant::now() + SESSION_IO_DEADLINE);
+        let sequence = self.command_sequence;
+        let frame = encode_control(&self.keys.control_tx, HOST_TO_RECEIVER_CONTROL,
+            self.session_id, sequence, kind, payload)?;
+        let tcp = self.tcp.as_mut().ok_or("P5-C control channel is closed.")?;
+        write_frame_until(tcp, &frame, &self.cancellation, io_deadline)?;
+        let ack_frame = read_frame_until(tcp, &self.keys.control_rx, RECEIVER_TO_HOST_CONTROL,
+            self.session_id, &self.cancellation, io_deadline)?;
+        if Instant::now() >= deadline { return Err("P5-C approval deadline expired.".into()); }
         let ack = decode_ack(&ack_frame, self.ack_sequence, kind, sequence)?;
         self.command_sequence = self.command_sequence.checked_add(1)
             .ok_or_else(|| "P5-C command sequence exhausted.".to_string())?;
@@ -607,6 +774,9 @@ pub(crate) struct SessionSnapshot {
     pub(crate) paused: bool,
     pub(crate) last_error: Option<String>,
     pub(crate) playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub(crate) recovery_seconds_remaining: Option<u64>,
+    recovery_started_at: Option<Instant>,
+    recovery_window: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -633,6 +803,7 @@ enum OwnerCommand {
 /// Single thread owns every HostSession. It is created only by an explicit caller.
 pub(crate) struct SessionOwner {
     connection_intent: Option<([u8; 16], bool)>,
+    background_authorization_required: bool,
     cancellation: CancellationToken,
     enabled: Arc<AtomicBool>,
     commands: mpsc::Sender<OwnerCommand>,
@@ -662,14 +833,22 @@ impl SessionOwner {
         Self::start_with_endpoint(endpoint, binding, parameters, caller_cancel, DEFAULT_SESSION_TIMING)
     }
 
+    pub(crate) fn start_on_interface_with_background_authorization(interface: &Ipv4Interface, peer: SocketAddr,
+        binding: BindingMaterial, parameters: AudioParameters, caller_cancel: CancellationToken) -> Result<Self, String> {
+        let mut endpoint = SessionEndpoint::on_interface(interface, peer);
+        endpoint.background_authorization_required = true;
+        Self::start_with_endpoint(endpoint, binding, parameters, caller_cancel, DEFAULT_SESSION_TIMING)
+    }
+
     fn start_with_timing(peer: SocketAddr, binding: BindingMaterial, parameters: AudioParameters,
         caller_cancel: CancellationToken, timing: SessionTiming) -> Result<Self, String> {
         Self::start_with_endpoint(SessionEndpoint::loopback(peer), binding, parameters, caller_cancel, timing)
     }
 
-    fn start_with_endpoint(endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
+    fn start_with_endpoint(mut endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
         caller_cancel: CancellationToken, timing: SessionTiming) -> Result<Self, String> {
         endpoint.validate()?;
+        if endpoint.background_request_id.is_none() { endpoint.background_request_id = Some(random_request_id()?); }
         let cancellation = caller_cancel.child_token();
         let enabled = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(SessionSnapshot {
@@ -681,6 +860,9 @@ impl SessionOwner {
             paused: false,
             last_error: None,
             playback_diagnostics: None,
+            recovery_seconds_remaining: None,
+            recovery_started_at: None,
+            recovery_window: timing.recovery_window,
         }));
         let queue = Arc::new(Mutex::new(None));
         let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
@@ -694,11 +876,19 @@ impl SessionOwner {
             .spawn(move || run_session_owner(endpoint, binding, parameters, owner_cancel, owner_enabled,
                 receiver, owner_status, owner_queue, owner_bytes, timing))
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
-        Ok(Self { connection_intent: endpoint.connection_intent, cancellation, enabled, commands, status, queue, pcm_payload_bytes_sent, worker: Some(worker) })
+        Ok(Self { connection_intent: endpoint.connection_intent,
+            background_authorization_required: endpoint.background_authorization_required,
+            cancellation, enabled, commands, status, queue, pcm_payload_bytes_sent, worker: Some(worker) })
     }
 
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
-        self.status.lock().expect("P5-D session status lock poisoned").clone()
+        let mut snapshot = self.status.lock().expect("P5-D session status lock poisoned").clone();
+        snapshot.recovery_seconds_remaining = if snapshot.state == SessionLifecycleState::Reconnecting {
+            snapshot.recovery_started_at.map(|started| {
+                snapshot.recovery_window.saturating_sub(started.elapsed()).as_secs_f64().ceil() as u64
+            })
+        } else { None };
+        snapshot
     }
 
     pub(crate) fn pcm_queue(&self) -> Option<Arc<PcmQueue>> {
@@ -734,6 +924,8 @@ impl SessionOwner {
 
     fn enqueue_endpoint(&self, mut endpoint: SessionEndpoint) -> Result<(), String> {
         endpoint.connection_intent = self.connection_intent;
+        endpoint.background_authorization_required = self.background_authorization_required;
+        endpoint.background_request_id = Some(random_request_id()?);
         endpoint.validate()?;
         self.commands.send(OwnerCommand::UpdateEndpoint(endpoint))
             .map_err(|_| "P5-D session owner has stopped.".to_string())
@@ -785,6 +977,7 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
     let mut retry_index = 0;
     let mut last_error = None;
     let mut last_active_at = None;
+    let mut recovery_started_at = None;
     'owner: loop {
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break; }
         generation = generation.saturating_add(1);
@@ -807,7 +1000,7 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                     RetryWait::ReconnectNow => retry_index = 0,
                     RetryWait::DelayElapsed => {
                         retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
-                        if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                        if recovery_window_expired(recovery_started_at, timing.recovery_window, Instant::now()) { break 'owner; }
                     }
                 }
                 continue 'owner;
@@ -879,6 +1072,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             }
             continue 'owner;
         }
+        if let Err(error) = session.authorize_background_start() {
+            last_error = Some(error);
+            drop(session);
+            publish_session(&status, SessionLifecycleState::Stopped, generation, attempts,
+                None, paused, last_error.clone());
+            break 'owner;
+        }
         if let Err(error) = session.bind_audio().and_then(|_| session.select_mode()) {
             last_error = Some(error);
             drop(session);
@@ -891,7 +1091,7 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => {
                     retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
-                    if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                    if recovery_window_expired(recovery_started_at, timing.recovery_window, Instant::now()) { break 'owner; }
                 }
             }
             continue 'owner;
@@ -930,13 +1130,15 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
                 RetryWait::ReconnectNow => retry_index = 0,
                 RetryWait::DelayElapsed => {
                     retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
-                    if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                    if recovery_window_expired(recovery_started_at, timing.recovery_window, Instant::now()) { break 'owner; }
                 }
             }
             continue 'owner;
         }
         paused = desired_paused;
         last_active_at = Some(Instant::now());
+        recovery_started_at = None;
+        status.lock().expect("P5-D session status lock poisoned").recovery_started_at = None;
         let session_id = session.session_id();
         let mut last_session_bytes = 0;
         let session_queue = session.pcm_queue();
@@ -950,6 +1152,10 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
         loop {
             if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
                 stop_owner = true;
+                break;
+            }
+            if let Err(error) = session.check_sender() {
+                last_error = Some(format!("P5-D UDP sender stopped: {error}"));
                 break;
             }
             let sent = session.pcm_payload_bytes_sent();
@@ -1043,6 +1249,13 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
         *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
         drop(session);
         if stop_owner || !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() { break 'owner; }
+        if endpoint_changed {
+            recovery_started_at = None;
+            status.lock().expect("P5-D session status lock poisoned").recovery_started_at = None;
+        } else if last_active_at.is_some() && recovery_started_at.is_none() {
+            recovery_started_at = Some(Instant::now());
+            status.lock().expect("P5-D session status lock poisoned").recovery_started_at = recovery_started_at;
+        }
         publish_session(&status, SessionLifecycleState::Reconnecting, generation, attempts,
             None, paused, last_error.clone());
         if endpoint_changed { retry_index = 0; continue 'owner; }
@@ -1052,7 +1265,7 @@ fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parame
             RetryWait::ReconnectNow => retry_index = 0,
             RetryWait::DelayElapsed => {
                 retry_index = (retry_index + 1).min(timing.reconnect_delays.len() - 1);
-                if recovery_window_expired(last_active_at, timing.recovery_window, Instant::now()) { break 'owner; }
+                if recovery_window_expired(recovery_started_at, timing.recovery_window, Instant::now()) { break 'owner; }
             }
         }
     }
@@ -1161,11 +1374,20 @@ fn recovery_window_expired(active_since: Option<Instant>, window: Duration, now:
     active_since.is_some_and(|active_since| now.saturating_duration_since(active_since) >= window)
 }
 
+fn random_request_id() -> Result<[u8; 16], String> {
+    loop {
+        let mut request_id = [0; 16];
+        getrandom::fill(&mut request_id).map_err(|_| "Unable to generate a background-start request ID.".to_string())?;
+        if request_id.iter().any(|byte| *byte != 0) { return Ok(request_id); }
+    }
+}
+
 struct Ack {
     result: u8,
     state: ReceiverState,
     udp_port: u16,
     playback_progress: Option<PlaybackDiagnostics>,
+    background_authorization: Option<([u8; 16], u8)>,
 }
 
 fn encode_control(key: &[u8; 32], direction: u32, session_id: u64, sequence: u64,
@@ -1236,6 +1458,18 @@ fn write_frame(tcp: &mut TcpStream, frame: &[u8], cancellation: &CancellationTok
     tcp.flush().map_err(|_| "P5-C control write failed.".into())
 }
 
+fn write_frame_until(tcp: &mut TcpStream, frame: &[u8], cancellation: &CancellationToken,
+    deadline: Instant) -> Result<(), String> {
+    if frame.len() < CONTROL_HEADER_BYTES + CONTROL_TAG_BYTES || frame.len() > MAX_CONTROL_FRAME {
+        return Err("P5-C control frame length is invalid.".into());
+    }
+    write_all_cancellable_until(tcp, &(frame.len() as u16).to_be_bytes(), cancellation, deadline)
+        .map_err(|_| "P5-C control write failed or approval deadline expired.".to_string())?;
+    write_all_cancellable_until(tcp, frame, cancellation, deadline)
+        .map_err(|_| "P5-C control write failed or approval deadline expired.".to_string())?;
+    tcp.flush().map_err(|_| "P5-C control write failed.".into())
+}
+
 fn read_raw_frame(tcp: &mut TcpStream, cancellation: &CancellationToken) -> Result<Vec<u8>, String> {
     let mut prefix = [0; 2];
     read_exact_cancellable(tcp, &mut prefix, cancellation)
@@ -1269,11 +1503,40 @@ fn read_frame(tcp: &mut TcpStream, key: &[u8; 32], direction: u32, session_id: u
     Ok(frame)
 }
 
+fn read_frame_until(tcp: &mut TcpStream, key: &[u8; 32], direction: u32, session_id: u64,
+    cancellation: &CancellationToken, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut prefix = [0; 2];
+    read_exact_cancellable_until(tcp, &mut prefix, cancellation, deadline)
+        .map_err(|_| "P5-C control peer closed or approval deadline expired.".to_string())?;
+    let length = u16::from_be_bytes(prefix) as usize;
+    if !(CONTROL_HEADER_BYTES + CONTROL_TAG_BYTES..=MAX_CONTROL_FRAME).contains(&length) {
+        return Err("P5-C control frame length is invalid.".into());
+    }
+    let mut frame = vec![0; length];
+    read_exact_cancellable_until(tcp, &mut frame, cancellation, deadline)
+        .map_err(|_| "P5-C control peer closed or approval deadline expired.".to_string())?;
+    if &frame[..4] != CONTROL_MAGIC || frame[4] != 1 || frame[6..8] != [0, 0]
+        || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
+        || u64::from_be_bytes(frame[12..20].try_into().unwrap()) != session_id {
+        return Err("P5-C control identity or header was rejected.".into());
+    }
+    let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
+    if frame.len() != CONTROL_HEADER_BYTES + payload_len + CONTROL_TAG_BYTES {
+        return Err("P5-C control length was rejected.".into());
+    }
+    let body_len = CONTROL_HEADER_BYTES + payload_len;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
+    mac.update(&frame[..body_len]);
+    mac.verify_slice(&frame[body_len..]).map_err(|_| "P5-C control authentication failed.")?;
+    Ok(frame)
+}
+
 fn decode_ack(frame: &[u8], expected_sequence: u64, command: u8, command_sequence: u64) -> Result<Ack, String> {
     let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
     if frame[5] != ACK || u64::from_be_bytes(frame[20..28].try_into().unwrap()) != expected_sequence
-        || payload_len < 13 || match command {
+        || match command {
             PLAYBACK_PROGRESS_QUERY => payload_len != 83,
+            BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => payload_len != 30,
             _ => payload_len != 13,
         } {
         return Err("P5-C ACK sequence or type was invalid.".into());
@@ -1286,7 +1549,15 @@ fn decode_ack(frame: &[u8], expected_sequence: u64, command: u8, command_sequenc
     let playback_progress = if command == PLAYBACK_PROGRESS_QUERY {
         Some(decode_playback_progress(&payload[13..])?)
     } else { None };
-    Ok(Ack { result: payload[9], state, udp_port: u16::from_be_bytes([payload[11], payload[12]]), playback_progress })
+    let background_authorization = if matches!(command,
+        BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL) {
+        let request_id: [u8; 16] = payload[13..29].try_into().unwrap();
+        let status = payload[29];
+        if status > AUTH_CANCELLED { return Err("P5-C background authorization status was invalid.".into()); }
+        Some((request_id, status))
+    } else { None };
+    Ok(Ack { result: payload[9], state, udp_port: u16::from_be_bytes([payload[11], payload[12]]),
+        playback_progress, background_authorization })
 }
 
 fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> {
@@ -1368,7 +1639,11 @@ fn is_poll_timeout(error: &std::io::Error) -> bool {
 
 fn read_exact_cancellable(tcp: &mut TcpStream, bytes: &mut [u8],
     cancellation: &CancellationToken) -> std::io::Result<()> {
-    let deadline = Instant::now() + SESSION_IO_DEADLINE;
+    read_exact_cancellable_until(tcp, bytes, cancellation, Instant::now() + SESSION_IO_DEADLINE)
+}
+
+fn read_exact_cancellable_until(tcp: &mut TcpStream, bytes: &mut [u8],
+    cancellation: &CancellationToken, deadline: Instant) -> std::io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
         check_cancelled(cancellation)?;
@@ -1386,7 +1661,11 @@ fn read_exact_cancellable(tcp: &mut TcpStream, bytes: &mut [u8],
 
 fn write_all_cancellable(tcp: &mut TcpStream, bytes: &[u8],
     cancellation: &CancellationToken) -> std::io::Result<()> {
-    let deadline = Instant::now() + SESSION_IO_DEADLINE;
+    write_all_cancellable_until(tcp, bytes, cancellation, Instant::now() + SESSION_IO_DEADLINE)
+}
+
+fn write_all_cancellable_until(tcp: &mut TcpStream, bytes: &[u8],
+    cancellation: &CancellationToken, deadline: Instant) -> std::io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
         check_cancelled(cancellation)?;
@@ -1416,6 +1695,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_authorization_ack_enforces_exact_length_and_status_range() {
+        let request_id = [0x35; 16];
+        let make_ack = |payload_len: u16, status: u8| {
+            let mut frame = vec![0; CONTROL_HEADER_BYTES + payload_len as usize + CONTROL_TAG_BYTES];
+            frame[5] = ACK;
+            frame[20..28].copy_from_slice(&0u64.to_be_bytes());
+            frame[28..30].copy_from_slice(&payload_len.to_be_bytes());
+            frame[30] = BACKGROUND_START_REQUEST;
+            frame[31..39].copy_from_slice(&0u64.to_be_bytes());
+            frame[39] = RESULT_OK;
+            frame[40] = 0;
+            frame[43..59].copy_from_slice(&request_id);
+            if payload_len > 29 { frame[59] = status; }
+            frame
+        };
+        let decoded = decode_ack(&make_ack(30, AUTH_ONCE), 0, BACKGROUND_START_REQUEST, 0).unwrap();
+        assert_eq!(decoded.background_authorization, Some((request_id, AUTH_ONCE)));
+        assert!(decode_ack(&make_ack(29, AUTH_ONCE), 0, BACKGROUND_START_REQUEST, 0).is_err());
+        assert!(decode_ack(&make_ack(30, 7), 0, BACKGROUND_START_REQUEST, 0).is_err());
+    }
+
+    #[test]
     fn playback_progress_wire_metrics_keep_unknown_values_null() {
         let mut payload = vec![0xff; 70];
         payload[..4].copy_from_slice(&48_000u32.to_be_bytes());
@@ -1436,7 +1737,7 @@ mod tests {
     use std::{
         fs,
         io::{BufRead, BufReader},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         thread,
@@ -1456,6 +1757,34 @@ mod tests {
         #[cfg(not(windows))]
         let (javac, java) = (bin.join("javac"), bin.join("java"));
         (javac, java)
+    }
+
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self { Self(Some(child)) }
+        fn child_mut(&mut self) -> &mut Child { self.0.as_mut().expect("guarded child") }
+        fn finish(mut self, stdout: BufReader<std::process::ChildStdout>) -> String {
+            finish_endpoint(self.0.take().expect("guarded child"), stdout)
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    struct DripGuard { socket: TcpStream, worker: Option<thread::JoinHandle<()>> }
+
+    impl Drop for DripGuard {
+        fn drop(&mut self) {
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
+            if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        }
     }
 
     fn compile_java_endpoint() -> PathBuf {
@@ -1478,6 +1807,34 @@ mod tests {
 
     fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         spawn_endpoint_mode(classes, false, false, false, false, false, false)
+    }
+
+    fn spawn_endpoint_without_queue_self_checks(classes: &Path)
+        -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        let (_, java) = java_paths();
+        let mut child = Command::new(java).arg("-cp").arg(classes)
+            .arg("app.anpod.receiver.P5cLoopbackEndpoint").arg("--skip-queue-self-checks")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST,
+            line.trim().strip_prefix("PORT=").unwrap().parse::<u16>().unwrap()));
+        (child, stdout, peer)
+    }
+
+    fn spawn_endpoint_with_auto_recovery_check(classes: &Path)
+        -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        let (_, java) = java_paths();
+        let mut child = Command::new(java).arg("-cp").arg(classes)
+            .arg("app.anpod.receiver.P5cLoopbackEndpoint").arg("--verify-auto-renew-after-auth")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST,
+            line.trim().strip_prefix("PORT=").unwrap().parse::<u16>().unwrap()));
+        (child, stdout, peer)
     }
 
     fn spawn_endpoint_mode(classes: &Path, disconnect_on_stdin: bool, fail_resume: bool,
@@ -1514,6 +1871,32 @@ mod tests {
 
     fn spawn_persistent_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
         spawn_endpoint_mode(classes, true, false, true, false, false, false)
+    }
+
+    fn spawn_fail_start_endpoint(classes: &Path, throw: bool) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        let (_, java) = java_paths();
+        let mut command = Command::new(java);
+        command.arg("-cp").arg(classes).arg("app.anpod.receiver.P5cLoopbackEndpoint");
+        if throw { command.arg("--throw-start-once").arg("--throw-stop-once"); }
+        else { command.arg("--fail-start-once"); }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("PORT=").expect("Java P5-C endpoint port").parse().unwrap();
+        (child, stdout, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    }
+
+    fn spawn_recovery_window_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        let (_, java) = java_paths();
+        let mut child = Command::new(java).arg("-cp").arg(classes)
+            .arg("app.anpod.receiver.P5cLoopbackEndpoint").arg("--drop-after-ms=450").arg("--close-on-stdin")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("PORT=").expect("Java P5-C endpoint port").parse().unwrap();
+        (child, stdout, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
     }
 
     fn spawn_stop_ack_drop_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
@@ -1716,13 +2099,263 @@ mod tests {
 
         verify_capability_negotiation(&classes);
         verify_connection_intent(&classes);
-
         same_coordinator_accepts_a_fresh_authenticated_session(&classes);
         stop_ack_failure_still_shuts_down_listener(&classes);
         mode_change_uses_a_fresh_session_and_preserves_pause(&classes);
         stop_disconnect_clears_active_local_session(&classes);
         start_handoff_failure_closes_session(&classes);
         lifecycle_owner_recovers_fresh_session_and_stops(&classes);
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn authenticated_control_stays_alive_without_pcm() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, peer) = spawn_endpoint_with_auto_recovery_check(&classes);
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.connection_intent = Some(([0x5a; 16], true));
+        let mut host = HostSession::connect_endpoint(endpoint, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }, CancellationToken::new()).unwrap();
+        host.start().unwrap();
+        for _ in 0..7 {
+            thread::sleep(Duration::from_secs(1));
+            assert_eq!(host.heartbeat().unwrap(), ReceiverState::ReceiverRunning,
+                "idle PCM must not end the authenticated control session");
+        }
+        assert_eq!(host.pcm_payload_bytes_sent(), 0, "idle-session check must not synthesize PCM");
+        let samples = vec![0x1234i16; 960 * 2];
+        assert!(host.pcm_queue().push_raw(samples.as_ptr(), 960, 48_000, 2, 0),
+            "fresh synthetic PCM must enter the production sender queue after idle");
+        let mut state = ReceiverState::ReceiverRunning;
+        for _ in 0..10 {
+            state = host.heartbeat().unwrap();
+            if state == ReceiverState::Streaming { break; }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(state, ReceiverState::Streaming,
+            "receiver fixture must consume fresh PCM and report streaming after idle");
+        assert!(host.pcm_payload_bytes_sent() >= 3_840,
+            "idle-to-stream recovery must send the synthetic PCM payload");
+        host.stop().unwrap();
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields.len(), 8, "unexpected idle-to-stream fixture result: {result}");
+        assert!(fields[0].contains("AUTO_RENEW_AFTER_AUTH=searching;AUTO_RENEW_AFTER_STOP=stopped|"),
+            "post-auth receive intent did not renew from idle or preserve explicit STOP: {result}");
+        assert_eq!(fields[1..5], ["1", "0", "0", "1"],
+            "idle-to-stream must start once, then STOP its receiver session: {result}");
+        assert!(fields[5].parse::<usize>().unwrap() >= 3_840,
+            "receiver fixture did not drain synthetic PCM after idle: {result}");
+        assert_eq!(fields[6], "true", "STOP must release the receiver UDP socket: {result}");
+        assert_eq!(fields[7], "0", "PC STOP must preserve the explicit receive listener: {result}");
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn slow_unauthenticated_handshake_has_a_total_deadline() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, endpoint) = spawn_persistent_endpoint(&classes);
+        let mut child = ChildGuard::new(child);
+        let mut silent = TcpStream::connect(endpoint).unwrap();
+        silent.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let mut byte = [0; 1];
+        assert_eq!(silent.read(&mut byte).unwrap(), 0, "no-data peer was not closed at the handshake deadline");
+        assert!(started.elapsed() < Duration::from_secs(3), "no-data peer exceeded the total handshake deadline");
+        let mut host = HostSession::connect_loopback(endpoint, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).expect("production listener must accept a legal client after an unauthenticated timeout");
+        host.start().unwrap();
+        host.stop().unwrap();
+        drop(host);
+        child.child_mut().stdin.as_mut().unwrap().write_all(b"drop").unwrap();
+        let _ = child.finish(stdout);
+
+        let (child, stdout, endpoint) = spawn_persistent_endpoint(&classes);
+        let mut child = ChildGuard::new(child);
+        let first = TcpStream::connect(endpoint).unwrap();
+        let slow = TcpStream::connect(endpoint).unwrap();
+        let mut drip_socket = slow.try_clone().unwrap();
+        let drip = DripGuard { socket: slow, worker: Some(thread::spawn(move || {
+            for _ in 0..85 {
+                if drip_socket.write_all(&[0]).is_err() { break; }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })) };
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let mut host = HostSession::connect_loopback(endpoint, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).expect("a legal host must displace queued unauthenticated peers");
+        assert!(started.elapsed() < Duration::from_secs(3), "slow peers blocked the authenticated host");
+        host.start().unwrap();
+        host.stop().unwrap();
+        drop(host);
+        drop(drip);
+        let _ = first.shutdown(std::net::Shutdown::Both);
+        child.child_mut().stdin.as_mut().unwrap().write_all(b"drop").unwrap();
+        let _ = child.finish(stdout);
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn simultaneous_authenticated_clients_claim_one_playback_owner() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, peer) = spawn_persistent_endpoint(&classes);
+        let mut child = ChildGuard::new(child);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let successful_starts = Arc::new(AtomicU64::new(0));
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let successful_starts = successful_starts.clone();
+            clients.push(thread::spawn(move || {
+                barrier.wait();
+                let Ok(mut host) = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+                    sample_rate: 48_000, channels: 2, mode: 0,
+                }) else { return; };
+                if host.start().is_ok() {
+                    successful_starts.fetch_add(1, Ordering::AcqRel);
+                    thread::sleep(Duration::from_millis(100));
+                    let _ = host.stop();
+                }
+            }));
+        }
+        barrier.wait();
+        for client in clients { client.join().unwrap(); }
+        assert_eq!(successful_starts.load(Ordering::Acquire), 1,
+            "parallel authenticated peers must never both claim playback");
+        child.child_mut().stdin.as_mut().unwrap().write_all(b"drop").unwrap();
+        let result = child.finish(stdout);
+        assert_eq!(result.split(',').nth(1), Some("1"), "exactly one playback START must reach the endpoint");
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn failed_start_releases_context_for_a_fresh_session() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, endpoint) = spawn_fail_start_endpoint(&classes, false);
+        let child = ChildGuard::new(child);
+        let parameters = AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 };
+        let mut first = HostSession::connect_loopback(endpoint, test_binding_material(), parameters).unwrap();
+        assert!(first.start().is_err(), "injected START failure must be reported to the host");
+        drop(first);
+        let mut retry = HostSession::connect_loopback(endpoint, test_binding_material(), parameters)
+            .expect("newly authenticated session must bind and start after failed context cleanup");
+        retry.start().unwrap();
+        retry.stop().unwrap();
+        drop(retry);
+        let result = child.finish(stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields[1], "1", "only the retry may start playback: {result}");
+        assert_eq!(fields[4], "2", "failed and retried START paths must both clean up: {result}");
+        assert_eq!(fields[6], "true", "retry STOP must close the UDP context: {result}");
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn thrown_start_and_stop_still_destroy_context_before_retry() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, endpoint) = spawn_fail_start_endpoint(&classes, true);
+        let child = ChildGuard::new(child);
+        let parameters = AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 };
+        let mut first = HostSession::connect_loopback(endpoint, test_binding_material(), parameters).unwrap();
+        assert!(first.start().is_err(), "injected START and playback cleanup throws must fail the first session");
+        drop(first);
+        let mut retry = HostSession::connect_loopback(endpoint, test_binding_material(), parameters)
+            .expect("finally must destroy the failed context and preserve listener ownership");
+        retry.start().unwrap();
+        retry.stop().unwrap();
+        drop(retry);
+        let result = child.finish(stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields[1], "1");
+        assert_eq!(fields[6], "true", "retry STOP must close its UDP socket: {result}");
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
+        let classes = compile_java_endpoint();
+        let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes);
+        let mut child = ChildGuard::new(child);
+        let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+        let timing = SessionTiming {
+            heartbeat_interval: Duration::from_millis(20),
+            reconnect_delays: [Duration::from_millis(150); 4],
+            recovery_window: Duration::from_millis(200),
+        };
+        let mut owner = SessionOwner::start_with_endpoint(SessionEndpoint::on_interface(&interface, peer),
+            test_binding_material(), AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 },
+            CancellationToken::new(), timing).unwrap();
+        let initial = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+        let original_session = initial.session_id.unwrap();
+        thread::sleep(Duration::from_millis(600));
+        let recovering = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Reconnecting
+            && status.session_id.is_none() && status.recovery_seconds_remaining.is_some());
+        assert_ne!(recovering.session_id, Some(original_session));
+        assert!(recovering.recovery_seconds_remaining.unwrap() > 0,
+            "a session healthy longer than the recovery window must receive a fresh window after disconnect");
+        let recovered = wait_for_owner(&owner, |status| status.generation > initial.generation
+            && status.session_id.is_some() && status.state == SessionLifecycleState::ReceiverRunning);
+        assert_ne!(recovered.session_id, Some(original_session), "recovery must authenticate a fresh session");
+        assert_eq!(recovered.recovery_seconds_remaining, None);
+
+        child.child_mut().stdin.as_mut().unwrap().write_all(b"close").unwrap();
+        let stopped = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Stopped);
+        let attempts = stopped.attempts;
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(owner.snapshot().attempts, attempts, "expired recovery must not restart after stop");
+        owner.stop();
+        let _ = child.finish(stdout);
+        let _ = fs::remove_dir_all(classes);
+    }
+
+    #[test]
+    fn session_owner_recovers_after_udp_sender_failure_while_playing_or_paused() {
+        let classes = compile_java_endpoint();
+        let (mut child, stdout, peer) = spawn_persistent_endpoint(&classes);
+        let timing = SessionTiming {
+            heartbeat_interval: Duration::from_millis(20),
+            reconnect_delays: [Duration::from_millis(20); 4],
+            recovery_window: Duration::from_secs(3),
+        };
+        let mut owner = SessionOwner::start_with_timing(peer, test_binding_material(),
+            AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 },
+            CancellationToken::new(), timing).unwrap();
+        let initial = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
+        let audio = vec![0x3344i16; 960 * 2];
+        let first_queue = owner.pcm_queue().unwrap();
+        assert!(first_queue.push_raw(audio.as_ptr(), 960, 48_000, 2, 0));
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+        crate::network::fail_next_udp_send_for_test();
+        assert!(first_queue.push_raw(audio.as_ptr(), 960, 48_000, 2, 960));
+        let recovered = wait_for_owner(&owner, |status| status.generation > initial.generation
+            && status.session_id.is_some() && status.state == SessionLifecycleState::ReceiverRunning);
+        assert_ne!(recovered.session_id, initial.session_id, "sender failure must create a fresh session");
+        let second_queue = owner.pcm_queue().unwrap();
+        assert!(!Arc::ptr_eq(&first_queue, &second_queue));
+        assert!(second_queue.push_raw(audio.as_ptr(), 960, 48_000, 2, 0));
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Streaming);
+
+        owner.set_paused(true).unwrap();
+        wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Paused);
+        crate::network::fail_next_udp_send_for_test();
+        assert!(second_queue.push_raw(audio.as_ptr(), 960, 48_000, 2, 960));
+        let recovered_paused = wait_for_owner(&owner, |status| status.generation > recovered.generation
+            && status.session_id.is_some() && status.state == SessionLifecycleState::Paused);
+        assert_ne!(recovered_paused.session_id, recovered.session_id,
+            "paused sender failure must also reauthenticate and preserve pause");
+
+        owner.stop();
+        let stopped = owner.snapshot();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(owner.snapshot().attempts, stopped.attempts, "sender stop must not revive a closed owner");
+        child.stdin.as_mut().unwrap().write_all(b"drop").unwrap();
+        let _ = finish_endpoint(child, stdout);
         let _ = fs::remove_dir_all(classes);
     }
 
@@ -1778,6 +2411,193 @@ mod tests {
             sample_rate: 48_000, channels: 2, mode: 0,
         }, CancellationToken::new()).is_err());
         assert!(finish_endpoint(child, stdout).starts_with("session_failed,0,0,0,0,"));
+    }
+
+    fn spawn_background_authorization_endpoint(classes: &Path, mode: &str, test_mode: &str)
+        -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+        let (_, java) = java_paths();
+        let mut command = Command::new(java);
+        command.arg("-cp").arg(classes).arg("app.anpod.receiver.P5cLoopbackEndpoint")
+            .arg("--background-auth").arg("--verify-background-auth")
+            .arg(format!("--background-auth-mode={mode}"));
+        if mode == "persistent-stop" {
+            command.arg("--background-auth-test=persistent-stop").arg("--close-on-stdin");
+        }
+        if !test_mode.is_empty() { command.arg(format!("--background-auth-test={test_mode}")); }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST,
+            line.trim().strip_prefix("PORT=").unwrap().parse::<u16>().unwrap()));
+        (child, stdout, peer)
+    }
+
+    fn verify_background_start_authorization(classes: &Path) {
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending-allow-after-6s", "");
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.background_request_id = Some([0x46; 16]);
+        let mut host = HostSession::authenticate_on_network(endpoint, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }, CancellationToken::new()).unwrap();
+        host.negotiate_capabilities().unwrap();
+        assert_ne!(host.capabilities().unwrap().capability_bits & CAP_BACKGROUND_START_AUTH, 0);
+        let request_id = endpoint.background_request_id.unwrap();
+        assert_eq!(host.request_background_authorization(&request_id).unwrap(), AUTH_PENDING);
+        assert_eq!(host.request_background_authorization(&request_id).unwrap(), AUTH_PENDING,
+            "duplicate request ID must remain idempotent");
+        let approval_wait_started = Instant::now();
+        host.authorize_background_start().unwrap();
+        assert!(approval_wait_started.elapsed() >= Duration::from_secs(6),
+            "Java endpoint did not keep the request pending for six seconds");
+        host.bind_audio().unwrap();
+        host.select_mode().unwrap();
+        host.start().unwrap();
+        host.stop().unwrap();
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.contains(",1,"), "approved background request must reach START: {result}");
+
+        let (mut child, stdout, peer) = spawn_background_authorization_endpoint(classes, "persistent-stop", "");
+        for request_id in [[0x62; 16], [0x63; 16]] {
+            let mut endpoint = SessionEndpoint::loopback(peer);
+            endpoint.background_request_id = Some(request_id);
+            let mut host = HostSession::authenticate_on_network(endpoint, test_binding_material(), AudioParameters {
+                sample_rate: 48_000, channels: 2, mode: 0,
+            }, CancellationToken::new()).unwrap();
+            host.negotiate_capabilities().unwrap();
+            host.authorize_background_start().unwrap();
+            host.bind_audio().unwrap();
+            host.select_mode().unwrap();
+            host.start().unwrap();
+            host.stop().unwrap();
+        }
+        child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+        drop(child.stdin.take());
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(fields[1], "2", "persistent standby must accept a new P5-A session after STOP: {result}");
+        assert_eq!(fields[4], "2", "both authenticated STOPs must clean up playback: {result}");
+
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending", "");
+        let cancellation = CancellationToken::new();
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.background_request_id = Some([0x52; 16]);
+        let mut host = HostSession::authenticate_on_network(endpoint,
+            test_binding_material(), AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 },
+            cancellation.clone()).unwrap();
+        host.negotiate_capabilities().unwrap();
+        let request_id = host.background_request_id.unwrap();
+        assert_eq!(host.request_background_authorization(&request_id).unwrap(), AUTH_PENDING);
+        let cancel_timer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(750));
+            cancellation.cancel();
+        });
+        let started = Instant::now();
+        let error = host.authorize_background_start().expect_err("pending authorization must observe cancellation");
+        cancel_timer.join().unwrap();
+        assert!(error.contains("cancelled"), "unexpected pending cancellation result: {error}");
+        assert!(started.elapsed() < Duration::from_secs(3), "pending cancellation did not exit promptly");
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,0,0,0,0,"), "cancelled wait must not start playback: {result}");
+
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending-slow-status", "");
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.background_request_id = Some([0x53; 16]);
+        let mut host = HostSession::authenticate_on_network(endpoint, test_binding_material(),
+            AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 }, CancellationToken::new()).unwrap();
+        host.negotiate_capabilities().unwrap();
+        let request_id = host.background_request_id.unwrap();
+        assert_eq!(host.request_background_authorization(&request_id).unwrap(), AUTH_PENDING);
+        let started = Instant::now();
+        assert!(host.query_background_authorization_until(&request_id, started + AUTHORIZATION_WAIT).is_err(),
+            "a delayed authorization ACK must not be accepted");
+        assert!(started.elapsed() >= SESSION_IO_DEADLINE - Duration::from_millis(100)
+                && started.elapsed() < SESSION_IO_DEADLINE + Duration::from_secs(2),
+            "single authorization I/O should stop at its three-second deadline: {:?}", started.elapsed());
+        drop(host);
+        let _ = finish_endpoint(child, stdout);
+
+        for mode in ["denied", "expired"] {
+            let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, mode, "");
+            let error = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+                sample_rate: 48_000, channels: 2, mode: 0,
+            }).err().expect("denied or expired approval must stop before BIND");
+            assert!(error.contains(if mode == "denied" { "denied" } else { "expired" }), "{mode}: {error}");
+            let result = finish_endpoint(child, stdout);
+            assert!(result.starts_with("session_failed,0,0,0,0,"), "{mode} must not start playback: {result}");
+        }
+
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending", "");
+        let mut host = HostSession::authenticate_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        host.negotiate_capabilities().unwrap();
+        let request_id = [0x51; 16];
+        assert_eq!(host.request_background_authorization(&request_id).unwrap(), AUTH_PENDING);
+        host.cancel_background_authorization(&request_id).unwrap();
+        assert_eq!(host.query_background_authorization(&request_id).unwrap(), AUTH_CANCELLED);
+        assert!(host.bind_audio().is_err(), "cancelled request must not bind UDP");
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,0,0,0,0,"), "cancelled request must not start playback: {result}");
+
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending", "");
+        let mut host = HostSession::authenticate_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        host.negotiate_capabilities().unwrap();
+        let request_id = [0x61; 16];
+        let status = host.command(BACKGROUND_START_STATUS, &request_id).unwrap();
+        assert_eq!(status.result, RESULT_REJECTED, "status query must not create an authorization request");
+        let malformed = host.command(BACKGROUND_START_REQUEST, &[]).unwrap();
+        assert_eq!(malformed.result, RESULT_FAILED, "malformed request length must be rejected");
+        let udp_port = host.udp_socket.as_ref().unwrap().local_addr().unwrap().port().to_be_bytes();
+        assert_eq!(host.command(BIND, &udp_port).unwrap().result, RESULT_REJECTED,
+            "an older PC that skips authorization cannot bind in standby");
+        assert_eq!(host.command(START, &[]).unwrap().result, RESULT_REJECTED,
+            "an older PC that skips authorization cannot start playback");
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,0,0,0,0,"), "unauthorized START must not start playback: {result}");
+
+        let (child, stdout, peer) = spawn_background_authorization_endpoint(classes, "pending", "wrong-id");
+        let mut host = HostSession::authenticate_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).unwrap();
+        host.negotiate_capabilities().unwrap();
+        assert!(host.request_background_authorization(&[0x71; 16]).is_err(),
+            "the ACK must echo the exact request ID");
+        drop(host);
+        let _ = finish_endpoint(child, stdout);
+
+        let (child, stdout, peer) = spawn_endpoint_without_queue_self_checks(&classes);
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.background_authorization_required = true;
+        let error = HostSession::connect_endpoint(endpoint, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }, CancellationToken::new()).err().expect("explicit background authorization must fail closed on an old endpoint");
+        assert!(error.contains("does not support authenticated background-start authorization"), "unexpected fallback: {error}");
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with("session_failed,0,0,0,0,"), "old manual receiver must not start for background-only mode: {result}");
+
+        let (child, stdout, peer) = spawn_endpoint_without_queue_self_checks(classes);
+        let mut host = HostSession::connect_loopback(peer, test_binding_material(), AudioParameters {
+            sample_rate: 48_000, channels: 2, mode: 0,
+        }).expect("old manually started Receiver flow must remain compatible");
+        host.start().unwrap();
+        host.stop().unwrap();
+        drop(host);
+        let result = finish_endpoint(child, stdout);
+        assert!(result.starts_with(",1,"), "old manual mode should still start normally: {result}");
+    }
+
+    #[test]
+    fn background_start_authorization_java_rust_loopback_contract() {
+        let classes = compile_java_endpoint();
+        verify_background_start_authorization(&classes);
+        let _ = fs::remove_dir_all(classes);
     }
 
     fn verify_capability_negotiation(classes: &Path) {

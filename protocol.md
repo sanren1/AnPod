@@ -130,7 +130,8 @@ checks the ANPB magic/version, and stores only under the Receiver's fixed
 app-private files directory. Short, oversized, malformed, unknown-version,
 other-path, or other-mode writes are rejected before storage. Existing equal
 records are idempotently confirmed; a different saved record is a conflict
-and is never replaced. No clear, unlink, or re-pair operation is defined.
+and is never replaced. Reset is a separate, explicitly confirmed USB operation
+described below; provisioning never silently clears or replaces a record.
 
 The provider's read-only query on that fixed URI returns `empty`, `pending`,
 `saved`, or `failed`, a fixed `bindingFailure` code, and
@@ -160,9 +161,46 @@ diagnostic.
 
 Provisioning itself remains USB-only. The P5-F backend checks the Receiver
 network protocol version before calling it and never copies a global binding
-between devices or Android users. There is no unbind, clear, or silent re-pair
-operation. Real USB, DUMP permission enforcement, and Android private storage
-remain NOT_TESTED.
+between devices or Android users. It does not silently unbind or re-pair.
+Real USB, DUMP permission enforcement, and Android private storage remain
+NOT_TESTED for the new reset path.
+
+### USB conditional binding reset
+
+`receiver_binding_reset_preview` accepts an authorized USB serial and returns
+the current Android user, its derived PC binding reference, each side's binding
+state and commitment, and whether the Receiver is busy. It verifies the installed
+Receiver identity and queries the exact one-column `bindingResetVersion`
+projection on the existing `/binding` URI; version 1 advertises this operation.
+An older Receiver is rejected before session teardown or deletion. The existing
+three-column binding query is unchanged.
+
+Only a separate user confirmation calls `receiver_reset_binding` with that
+preview. The backend rechecks USB identity, Android user, binding states and
+commitments before stopping a matching active session. Pending/failed binding
+writes and a different active target are rejected before teardown. Android
+deletion requires the fixed binding URI, DUMP permission, the adb shell UID,
+null selection arguments, and either `expectedEmpty` or
+`expectedCommitment=<64 lowercase hexadecimal digits>` as its exact selection.
+It rejects active reception/playback and pending writes. The idle check and
+conditional deletion share the binding storage lock with reception startup's
+state change and binding load, so startup cannot retain a record deleted by
+a competing reset.
+
+The phone is conditionally cleared and read back as empty before the PC removes
+only the selected serial/user reference's DPAPI file with the expected
+commitment. The operation does not promise an atomic transaction across USB.
+Its structured result distinguishes complete reset/already-empty from retained,
+changed, or unknown states on either side and includes a reason and next action.
+Unless both sides still report their original saved commitments, the PC closes
+an offer listener whose automatic binding matches this reset reference. Closing
+it cancels its pending connection attempt and invalidates its queued offers;
+listeners for another binding and preflight failures before deletion are retained.
+Cancellation or an uncertain phone result preserves the PC copy where possible;
+a shell process exit code alone never proves deletion. Reset never provisions
+a replacement binding or starts playback, and no LAN reset command is defined.
+Fake ADB and local storage tests cover backend outcomes; Android permission,
+AtomicFile, and real-device reset behavior remain NOT_TESTED.
 
 ## P5-C authenticated session prototype
 
@@ -187,6 +225,14 @@ followed by the existing identity, nonce, session, parameter, and proof bytes.
 The existing transcript authenticates host/receiver IDs, both nonces, session
 ID, and PCM parameters. No binding is created or replaced during a handshake;
 each side must receive an already-loaded binding record.
+
+The Receiver bounds HELLO through READY by one two-second monotonic deadline,
+including blocked reads and writes. Pre-authentication admits at most two
+connections globally and one per source address; admission may close an older
+pending connection to keep these bounds. Discovery remains available during
+unauthenticated attempts. Only a successfully authenticated connection can
+atomically claim the single control/playback owner and stop discovery; another
+pending authentication cannot replace an active owner.
 
 After READY, control is carried on the same TCP connection. Each control frame
 has a two-byte big-endian length prefix, then a 30-byte header, payload, and
@@ -255,6 +301,7 @@ Capability bits are:
 | `0x00000001` | `receiver-ui` |
 | `0x00000002` | `authenticated-status` |
 | `0x00000008` | `playback-progress` |
+| `0x00000020` | `background-start-authorization`, only for explicitly enabled standby endpoints |
 
 The former capability bit `0x00000004` and command types 10–15 for network APK
 updates are retired. They are not advertised, accepted, or sent, and these
@@ -304,6 +351,11 @@ authenticated UDP session for playback; the host starts its sender only after
 the successful START ACK. STOP closes the sender, clears the queue, destroys
 session keys/context, and does not reconnect.
 
+If START fails before playback ownership is established, the Receiver clears
+the pending UDP context and mode selection and returns a failed ACK in
+authenticated state (0). A later attempt must bind and select the mode again;
+the host recovery path creates a fresh authenticated session.
+
 TransportConnected means authentication and BIND completed. ReceiverRunning
 means the controlled playback endpoint reports successful start. Streaming
 means the endpoint recently received valid session audio, successfully wrote
@@ -340,10 +392,17 @@ fresh P5-A handshake. Every recovery derives a new session ID and directional
 keys and creates a new PCM queue; it never provisions, overwrites, or clears
 the caller's binding.
 
-While active, the owner sends authenticated heartbeats every second. A failed
-heartbeat closes the old sender, UDP/TCP sockets, queue, and session keys,
+While active, the owner sends authenticated heartbeats every second and checks
+whether its UDP sender worker has exited unexpectedly, including while paused.
+A failed heartbeat or sender closes the old sender, UDP/TCP sockets, queue, and session keys,
 publishes `Reconnecting`, and waits on the bounded 1/2/5/10 second schedule
 (10 seconds maximum) before trying the currently supplied endpoint again.
+For a previously active session, the 30-second recovery window starts when the
+connection is lost, rather than when playback originally started. The desktop
+snapshot exposes `networkRecoverySecondsRemaining` only while that recovery
+window is active; initial connection attempts and healthy sessions expose null.
+Transient UDP sends allow at most three attempts, each with a fresh packet
+sequence and GCM nonce; a fatal or exhausted send is reported to the owner.
 `update_endpoint` is the loopback test path; `update_network_endpoint` explicitly
 replaces both selected interface and literal receiver endpoint. Either change
 closes the old session and requires a fresh P5-A handshake. Address guessing is
@@ -475,6 +534,9 @@ the current binding or establish identity. An explicitly enabled PC listener
 may use the sole saved binding, or a binding explicitly selected when enabling
 the listener, to authenticate one unambiguous pending target automatically.
 Several pending targets or unresolved binding choices retain explicit selection.
+Manual acceptance reserves the same non-preempting operation slot as automatic
+acceptance before consuming an offer, so neither can replace an in-progress USB
+management operation. A failed preflight releases its reservation.
 An automatic caller requires the connection-intent capability described below;
 an explicit accept can still connect to older Receivers. Both perform P5-A plus
 the authenticated capability query before BIND/START. A spoofed, replayed, expired, or otherwise
@@ -574,7 +636,7 @@ P5 sender binds to the explicitly selected private IPv4 address and literal
 peer. Android uses a separate receive thread to authenticate and enqueue
 packets; a queue-backed `InputStream` supplies the negotiated format header and
 PCM bytes to the existing `Pcm16FrameStream` / single AudioTrack playback
-worker. Its eight-packet queue sorts by unsigned sample frame index and drops
+worker. Its 32-packet queue sorts by unsigned sample frame index and drops
 old history on overflow or pause. The pause watermark advances through every
 discarded packet, and the stream adapter drops any unread bytes from a packet
 it had already taken when the pause boundary changes. No UDP control packet or
@@ -587,9 +649,35 @@ is larger than that frame budget, it keeps the newest tail and advances its
 sample frame index by the discarded prefix. Older queued blocks are evicted
 first, and the sender checks age again before each datagram; discarded frames
 are included in the queue counter. Android's network jitter reserve starts at
-5 ms / 15 ms and may grow on AudioTrack underruns up to 20 ms / 40 ms. That
-reserve is independent of AudioTrack's own buffer and startup pre-roll; these
-values are tuning bounds, not an end-to-end latency budget.
+20 ms / 40 ms and may grow to 60 ms / 150 ms in low-latency / balanced mode.
+Accepted, forward-moving audio packets provide relative arrival/frame-interval
+jitter estimates; significant jitter or AudioTrack underruns can grow the
+target quickly, while ten seconds of stability permits a 5 ms reduction.
+The physical queue and age limits remain separate: 70 ms / 160 ms, with a
+32-packet cap. These wireless tuning proposals are independent of the PC
+capture queue, AudioTrack's own buffer and startup pre-roll; they are not
+measured end-to-end latency or evidence of improved sound quality.
+
+After the existing gap deadline, UDP loss concealment fills a sample-frame
+gap only when it fits within the current jitter target. It repeats at most
+one previously completed real PCM payload with a fade to zero, then fills
+the remaining bounded gap with silence. The next real payload uses the
+existing fade-in. Synthetic PCM never becomes the reference for another
+concealment. A larger unsigned frame gap retains the discontinuity/skip
+path rather than allocating or playing an unbounded silence buffer. With
+no following packet, the queue waits instead of generating endless PCM.
+Pause, discontinuity, expiry, stop, and failure invalidate the old reference.
+Internal counters distinguish concealment events, repeated/silent frames,
+and oversized gaps; these counters do not change the control wire format.
+Synthetic mono/stereo checks do not establish audible quality improvements.
+
+USB TCP backlog trimming uses a separate target and trigger: balanced mode
+retains 10 ms after exceeding 30 ms; low-latency mode retains 5 ms after
+exceeding 15 ms. Both the installed Receiver and Legacy AndroidServer use
+these shared `Pcm16FrameStream` limits. Crossing the trigger causes one
+frame-aligned discard of the oldest available PCM to the target, followed by
+the existing fade-in. Below the trigger, PCM is retained. These network
+backlog limits do not change AudioTrack's application buffer or pre-roll.
 
 AudioTrack is configured independently: the balanced mode requests a 50 ms
 effective application buffer where `setBufferSizeInFrames` is available;
@@ -703,3 +791,60 @@ The PC supplies its own capture sample rate/channels, PCM queue depth, and
 dropped frames from its local session state. Neither frame counts nor recent
 playback-head advancement are an acoustic-latency measurement, and this query
 does not compare remote and local clocks.
+
+## Background-start authorization (backend integration)
+
+An explicitly enabled standby endpoint advertises `background-start-authorization`
+(`0x00000020`). Existing binding authentication alone does not authorize background
+playback. After P5-A and capability negotiation, before BIND/START, the host sends
+BACKGROUND_START_REQUEST (18), polls BACKGROUND_START_STATUS (19), or sends
+BACKGROUND_START_CANCEL (20). Each carries exactly one 16-byte request ID. Their
+authenticated ACK payload is exactly 30 bytes: the existing 13-byte ACK, echoed
+request ID (16), and authorization status (1). Existing ACK formats remain unchanged.
+Status values are pending (0), once (1), eight hours (2), until revoked (3), denied
+(4), expired (5), and cancelled (6). The host verifies the echoed ID and status.
+
+The host waits at most 30 seconds, polls at 500ms intervals, and continues one-second
+heartbeats. Each request/status exchange has a three-second deadline bounded by
+the overall deadline, covering both reads and writes. The Receiver checks authority
+at BIND and START and again at playback handoff. Missing capability or authorization
+fails closed for background-required endpoints; the existing explicit manual path
+keeps its behavior. The P5-A two-second handshake deadline is unchanged.
+
+Once authorization belongs to the current owner generation, request, session, peer,
+and binding. Recovery retains a fixed 30-second episode deadline; STOP clears once
+authorization. Eight-hour trust uses elapsed time and lasts only in the current
+process. Until-revoked trust is stored separately against the binding commitment;
+old bindings do not acquire it automatically. Notification decisions carry the full
+64-bit session ID and generation-bound request token. Permanent trust requires an
+explicit UI action. In background mode PC STOP ends playback and leaves standby
+available for a new authenticated session; phone stop, revocation, expiry, or selected
+interface loss ends standby. Standby uses connectedDevice foreground service type;
+active background playback also uses mediaPlayback.
+
+This is implemented backend behavior with offline state/loopback evidence. Product
+UI entry points and PC-visible remaining lifetime/revocation are not yet integrated;
+the ACK reports the grant kind, not a remaining lifetime. Device notification,
+foreground service, persistence, and playback behavior remain unverified.
+
+## Explicit mobile receive intent
+
+The normal mobile Start Receiving action keeps a service-owned receive intent on
+the explicitly selected interface. It uses the existing manual connection-intent
+authentication; it does not enable background-start authorization or grant lasting
+trust. Discovery rounds remain bounded to ten seconds. A one-second maintenance
+check starts a fresh idle round or renews an expired round while the intent is
+enabled; it does not restart a search explicitly stopped or invalidated by interface
+loss, and it does not replace an authenticated connection.
+
+The UI preparation deadline and the previous session's recovery deadline do not
+end this explicit receive intent. PC STOP ends the audio session and returns the
+phone to waiting. Phone Stop cancels the intent and its owner generation; selected
+interface loss or unavailable notification permission ends it with an error. The
+waiting foreground service uses connectedDevice, and active playback adds
+mediaPlayback. This intent does not survive process termination or imply boot start.
+
+Playback-head advancement is a nullable observation in the local UI snapshot.
+Unknown, waiting for advancement, and recent advancement are distinct; no PCM
+arrival is not itself a control-session disconnect. Advancement is not acoustic
+proof. Long real-device silence and subsequent playback still require acceptance.

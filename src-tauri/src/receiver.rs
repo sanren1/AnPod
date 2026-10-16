@@ -10,6 +10,34 @@ const BINDING_URI: &str = "content://app.anpod.receiver.state/binding";
 const INTERFACES_URI: &str = "content://app.anpod.receiver.state/interfaces";
 const NETWORK_URI: &str = "content://app.anpod.receiver.state/network";
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingResetPreview {
+    pub serial: String,
+    pub android_user: String,
+    pub binding_reference: String,
+    pub phone_state: String,
+    pub phone_commitment: Option<String>,
+    pub pc_state: String,
+    pub pc_commitment: Option<String>,
+    pub receiver_busy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingResetResult {
+    pub outcome: String,
+    pub serial: String,
+    pub android_user: String,
+    pub binding_reference: String,
+    pub phone_state: String,
+    pub phone_commitment: Option<String>,
+    pub pc_state: String,
+    pub pc_commitment: Option<String>,
+    pub reason: String,
+    pub next_action: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiverInterface {
@@ -106,6 +134,20 @@ struct AuditedReceiverArtifact {
 
 // Only same-signer APKs with an exact audited digest and recorded source are admitted.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "344c47ddbd51b991ba4562e09c11c195815f7f363f9d1196146263df929fa1b7",
+        version_code: 10,
+        version_name: "0.8.0-v3-flow-candidate",
+        source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "c66a6a350907ab2581e941665b9984c47632777855717fe414964a2177baee41",
+        version_code: 11,
+        version_name: "0.9.0-v3-flow-candidate",
+        source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
     AuditedReceiverArtifact {
         sha256: "de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77",
         version_code: 3,
@@ -309,6 +351,284 @@ fn binding_reference_for(serial: &str, android_user: &str) -> String {
     hex_digest(&result)
 }
 
+#[cfg(windows)]
+pub async fn binding_reset_preview(adb: &Path, serial: &str, data_dir: &Path, apk: &Path,
+    metadata_path: &Path, cancel: &CancellationToken) -> Result<BindingResetPreview, String> {
+    binding_reset_preview_with(&SystemAdb(adb), serial, data_dir, apk, metadata_path, cancel).await
+}
+
+#[cfg(windows)]
+async fn binding_reset_preview_with(adb: &impl AdbRunner, serial: &str, data_dir: &Path, apk: &Path,
+    metadata_path: &Path, cancel: &CancellationToken) -> Result<BindingResetPreview, String> {
+    use crate::security::{BindingStore, SecurityError};
+
+    ensure_usb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
+    let reference = binding_reference_for(serial, &user);
+    let metadata = read_artifact(apk, metadata_path)?;
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    require_binding_reset_capability(adb, serial, &user, cancel).await?;
+
+    let (phone_state, phone_commitment) = match read_binding_state(adb, serial, &user, cancel).await? {
+        BindingStatus::Empty => ("empty".to_owned(), None),
+        BindingStatus::Pending => ("pending".to_owned(), None),
+        BindingStatus::Saved(commitment) => ("saved".to_owned(), Some(commitment)),
+        BindingStatus::Failed(_) => ("failed".to_owned(), None),
+    };
+    let network = read_reset_network_state(adb, serial, &user, cancel).await?;
+    let health = read_health(adb, serial, &user, cancel).await?;
+    let binding_path = data_dir.join("receiver-bindings").join(format!("{reference}.dat"));
+    let (pc_state, pc_commitment) = match BindingStore::load(&binding_path) {
+        Ok(material) => ("saved".to_owned(), Some(hex_digest(&material.commitment()))),
+        Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => ("missing".to_owned(), None),
+        Err(_) => return Err("所选 PC 绑定文件无法通过 DPAPI 和格式核验；未停止会话或删除数据。".into()),
+    };
+
+    Ok(BindingResetPreview {
+        serial: serial.to_owned(), android_user: user, binding_reference: reference,
+        phone_state, phone_commitment, pc_state, pc_commitment,
+        receiver_busy: health.audio_active || network != "stopped",
+    })
+}
+
+#[cfg(windows)]
+async fn require_binding_reset_capability(adb: &impl AdbRunner, serial: &str, user: &str,
+    cancel: &CancellationToken) -> Result<(), String> {
+    let result = adb.run(Some(serial), &["shell", "content", "query", "--user", user,
+        "--uri", BINDING_URI, "--projection", "bindingResetVersion"], Duration::from_secs(6), Some(cancel)).await?;
+    let supported = result.success && result.stdout.lines().filter_map(parse_content_row)
+        .any(|row| row.get("bindingResetVersion").is_some_and(|value| value == "1"));
+    if supported { Ok(()) }
+    else { Err("RECEIVER_UPDATE_REQUIRED:已安装 Receiver 不支持条件绑定重置。".into()) }
+}
+
+#[cfg(windows)]
+async fn read_reset_network_state(adb: &impl AdbRunner, serial: &str, user: &str,
+    cancel: &CancellationToken) -> Result<String, String> {
+    let result = adb.run(Some(serial), &["shell", "content", "query", "--user", user,
+        "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState"],
+        Duration::from_secs(6), Some(cancel)).await?;
+    if !result.success { return Err("无法确认手机是否仍有网络接收会话；未停止会话或删除绑定。".into()); }
+    let row = result.stdout.lines().find_map(parse_content_row)
+        .ok_or_else(|| "手机网络接收状态格式无效；未停止会话或删除绑定。".to_string())?;
+    if row.get("networkAudioVersion").map(String::as_str) != Some("1") {
+        return Err("手机网络接收状态版本不受支持；未停止会话或删除绑定。".into());
+    }
+    row.get("networkAudioState").cloned()
+        .ok_or_else(|| "手机网络接收状态缺少会话状态；未停止会话或删除绑定。".into())
+}
+
+#[cfg(windows)]
+fn reset_result(preview: &BindingResetPreview, outcome: &str, phone_state: &str,
+    phone_commitment: Option<String>, pc_state: &str, pc_commitment: Option<String>,
+    reason: &str, next_action: &str) -> BindingResetResult {
+    BindingResetResult {
+        outcome: outcome.into(), serial: preview.serial.clone(), android_user: preview.android_user.clone(),
+        binding_reference: preview.binding_reference.clone(), phone_state: phone_state.into(), phone_commitment,
+        pc_state: pc_state.into(), pc_commitment, reason: reason.into(), next_action: next_action.into(),
+    }
+}
+
+#[cfg(windows)]
+pub async fn reset_binding(adb: &Path, preview: &BindingResetPreview, data_dir: &Path, apk: &Path,
+    metadata_path: &Path, cancel: &CancellationToken, is_current: &impl Fn() -> bool)
+    -> Result<BindingResetResult, String> {
+    reset_binding_with(&SystemAdb(adb), preview, data_dir, apk, metadata_path, cancel, is_current).await
+}
+
+#[cfg(windows)]
+async fn reset_binding_with(adb: &impl AdbRunner, expected: &BindingResetPreview, data_dir: &Path,
+    apk: &Path, metadata_path: &Path, cancel: &CancellationToken, is_current: &impl Fn() -> bool)
+    -> Result<BindingResetResult, String> {
+    use crate::security::BindingStore;
+
+    let before = binding_reset_preview_with(adb, &expected.serial, data_dir, apk, metadata_path, cancel).await?;
+    if !same_reset_target(&before, expected) { return Err("重置预览已过期（设备、Android user 或绑定摘要发生变化）；未删除绑定，请重新检查。".into()); }
+    if before.phone_state == "pending" || before.phone_state == "failed" {
+        return Err("手机绑定状态正在写入或不可读取；请完成/检查绑定操作后重新预览。".into());
+    }
+    if before.receiver_busy { return Err("手机仍有活动的接收或播放会话；请先在手机上停止接收，再重新预览。".into()); }
+    if !is_current() || cancel.is_cancelled() { return Err("绑定重置已取消；尚未更改任何绑定。".into()); }
+
+    if before.phone_state == "empty" && before.pc_state == "missing" {
+        return Ok(reset_result(&before, "alreadyEmpty", "empty", None, "missing", None,
+            "两端都没有此目标的绑定。", "如需配对，请单独启动 USB 首次绑定。"));
+    }
+
+    let selection = match before.phone_commitment.as_deref() {
+        Some(commitment) => format!("expectedCommitment={commitment}"),
+        None => "expectedEmpty".to_owned(),
+    };
+    let delete_result = adb.run(Some(&before.serial), &["shell", "content", "delete", "--user",
+        &before.android_user, "--uri", BINDING_URI, "--where", &selection],
+        Duration::from_secs(10), Some(cancel)).await;
+    let binding_path = data_dir.join("receiver-bindings").join(format!("{}.dat", before.binding_reference));
+
+    // The shell exit status is not authoritative; observe the fixed URI after the attempt.
+    let after_phone = match binding_reset_preview_with(adb, &before.serial, data_dir, apk, metadata_path, cancel).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let (phone_state, phone_commitment) = match read_reset_phone_status(adb, &before, apk, metadata_path, cancel).await {
+                Ok(BindingStatus::Empty) => ("empty".to_owned(), None),
+                Ok(BindingStatus::Pending) => ("pending".to_owned(), None),
+                Ok(BindingStatus::Saved(commitment)) => ("saved".to_owned(), Some(commitment)),
+                Ok(BindingStatus::Failed(_)) => ("failed".to_owned(), None),
+                Err(_) => ("unknown".to_owned(), None),
+            };
+            let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
+            let outcome = if phone_state == "unknown" { "phoneStateUnknown" }
+                else if phone_state == "empty" && pc_state == "unknown" { "phoneClearedPcUnknown" }
+                else if phone_state == "empty" { pc_partial_outcome(&before, &pc_state, &pc_commitment) }
+                else { "phoneRetained" };
+            return Ok(reset_result(&before, outcome, &phone_state, phone_commitment,
+                &pc_state, pc_commitment, &format!("手机删除结果无法回读：{error}"),
+                "保持 USB 连接并重新预览手机与 PC 绑定状态。"));
+        }
+    };
+    if after_phone.android_user != before.android_user || after_phone.binding_reference != before.binding_reference {
+        return Ok(reset_result(&before, "targetChanged", "unknown", None, &before.pc_state,
+            before.pc_commitment.clone(), "Android user 或 USB 目标已变化；PC 绑定仍保留。",
+            "重新选择并核验 USB 设备与 Android user。"));
+    }
+    if after_phone.phone_state != "empty" {
+        let exit_detail = match delete_result {
+            Ok(result) if result.success => "删除命令已返回，但手机仍报告原绑定。",
+            Ok(_) => "删除命令失败且手机仍报告绑定。",
+            Err(_) => "删除命令结果不确定且手机仍报告绑定。",
+        };
+        return Ok(reset_result(&before, "phoneRetained", &after_phone.phone_state,
+            after_phone.phone_commitment, &before.pc_state, before.pc_commitment.clone(), exit_detail,
+            "绑定未清除；核对手机端状态后重新预览。PC 绑定未删除。"));
+    }
+    if !is_current() || cancel.is_cancelled() {
+        let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
+        let outcome = pc_partial_outcome(&before, &pc_state, &pc_commitment);
+        return Ok(reset_result(&before, outcome, "empty", None,
+            &pc_state, pc_commitment, "操作在手机绑定清除后取消；PC 记录状态已回读。",
+            "保持 USB 连接并重试重置，以清理这一个 PC 记录。"));
+    }
+
+    let before_pc_remove = match binding_reset_preview_with(adb, &before.serial, data_dir, apk, metadata_path, cancel).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let (phone_state, phone_commitment) = match read_reset_phone_status(adb, &before, apk, metadata_path, cancel).await {
+                Ok(BindingStatus::Empty) => ("empty".to_owned(), None),
+                Ok(BindingStatus::Pending) => ("pending".to_owned(), None),
+                Ok(BindingStatus::Saved(commitment)) => ("saved".to_owned(), Some(commitment)),
+                Ok(BindingStatus::Failed(_)) => ("failed".to_owned(), None),
+                Err(_) => ("unknown".to_owned(), None),
+            };
+            let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
+            let outcome = if phone_state == "unknown" { "phoneStateUnknown" }
+                else if phone_state == "empty" { pc_partial_outcome(&before, &pc_state, &pc_commitment) }
+                else { "phoneRetained" };
+            return Ok(reset_result(&before, outcome, &phone_state, phone_commitment,
+                &pc_state, pc_commitment, &format!("手机已清除；删除 PC 记录前重新核验失败：{error}"),
+                "保持 USB 连接并重试；重新预览手机与 PC 绑定状态。"));
+        }
+    };
+    if before_pc_remove.android_user != before.android_user || before_pc_remove.binding_reference != before.binding_reference
+        || before_pc_remove.phone_state != "empty" || before_pc_remove.pc_state != before.pc_state
+        || before_pc_remove.pc_commitment != before.pc_commitment {
+        return Ok(reset_result(&before, "phoneClearedPcChanged", &before_pc_remove.phone_state,
+            before_pc_remove.phone_commitment, &before_pc_remove.pc_state, before_pc_remove.pc_commitment,
+            "手机已清除，但删除前目标状态发生变化；未删除 PC 记录。",
+            "重新预览并确认此 USB 目标对应的 PC 绑定状态。"));
+    }
+    if before_pc_remove.receiver_busy {
+        return Ok(reset_result(&before, "phoneClearedPcRetained", "empty", None,
+            &before.pc_state, before.pc_commitment.clone(), "手机已清除，但 Receiver 出现活动会话；未删除 PC 记录。",
+            "先停止手机接收，再重新预览并重试。"));
+    }
+    if !is_current() || cancel.is_cancelled() {
+        let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
+        let outcome = pc_partial_outcome(&before, &pc_state, &pc_commitment);
+        return Ok(reset_result(&before, outcome, "empty", None,
+            &pc_state, pc_commitment, "操作在 PC 记录删除前取消；PC 记录状态已回读。",
+            "保持 USB 连接并重试重置。"));
+    }
+
+    let expected_pc = before.pc_commitment.as_deref().map(parse_digest)
+        .transpose().map_err(|_| "PC 绑定摘要格式无效；没有删除 PC 记录。".to_string())?;
+    let binding_path = data_dir.join("receiver-bindings").join(format!("{}.dat", before.binding_reference));
+    if let Err(error) = BindingStore::remove_if_matches(&binding_path, expected_pc.as_ref()) {
+        let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
+        let outcome = pc_partial_outcome(&before, &pc_state, &pc_commitment);
+        return Ok(reset_result(&before, outcome, "empty", None,
+            &pc_state, pc_commitment, &format!("手机已清除；PC 条件删除未完成，回读当前 PC 状态：{error}"),
+            "重新预览并确认此 USB 目标对应的 PC 绑定状态。"));
+    }
+
+    if !is_current() || cancel.is_cancelled() {
+        return Ok(reset_result(&before, "pcClearedPhoneEmpty", "empty", None, "missing", None,
+            "两端绑定已清除；操作在最终核验前取消。", "重新预览确认两端都为空。"));
+    }
+    let final_snapshot = match binding_reset_preview_with(adb, &before.serial, data_dir, apk, metadata_path, cancel).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(reset_result(&before, "pcClearedPhoneUnknown", "unknown", None,
+            "missing", None, &format!("PC 目标记录已删除；手机最终状态无法确认：{error}"),
+            "保持 USB 连接并重新预览；若手机仍有绑定，再执行一次明确确认的重置。")),
+    };
+    if final_snapshot.android_user == before.android_user && final_snapshot.binding_reference == before.binding_reference
+        && final_snapshot.phone_state == "empty" && final_snapshot.pc_state == "missing" {
+        Ok(reset_result(&before, "reset", "empty", None, "missing", None,
+            "所选 USB 设备与 Android user 的两端绑定均已清除。", "如需配对，请单独启动 USB 首次绑定。"))
+    } else {
+        Ok(reset_result(&before, "pcClearedPhoneChanged", &final_snapshot.phone_state,
+            final_snapshot.phone_commitment, "missing", None,
+            "PC 目标记录已删除，但手机状态在最终核验时发生变化。",
+            "重新预览当前手机绑定；不要继续使用旧配对信息。"))
+    }
+}
+
+#[cfg(windows)]
+async fn read_reset_phone_status(adb: &impl AdbRunner, expected: &BindingResetPreview, apk: &Path,
+    metadata_path: &Path, cancel: &CancellationToken) -> Result<BindingStatus, String> {
+    ensure_usb_device(adb, &expected.serial, cancel).await?;
+    let user = current_android_user(adb, &expected.serial, cancel).await?;
+    if user != expected.android_user { return Err("Android user changed".into()); }
+    let metadata = read_artifact(apk, metadata_path)?;
+    verify_installed_identity(adb, &expected.serial, &user, &metadata, cancel).await?;
+    require_binding_reset_capability(adb, &expected.serial, &user, cancel).await?;
+    read_binding_state(adb, &expected.serial, &user, cancel).await
+}
+
+#[cfg(windows)]
+fn local_reset_binding(path: &Path) -> (String, Option<String>) {
+    use crate::security::{BindingStore, SecurityError};
+    match BindingStore::load(path) {
+        Ok(material) => ("saved".into(), Some(hex_digest(&material.commitment()))),
+        Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => ("missing".into(), None),
+        Err(_) => ("unknown".into(), None),
+    }
+}
+
+#[cfg(windows)]
+fn pc_partial_outcome(before: &BindingResetPreview, state: &str, commitment: &Option<String>) -> &'static str {
+    if state == "unknown" { "phoneClearedPcUnknown" }
+    else if state == "missing" { "reset" }
+    else if state == before.pc_state && commitment == &before.pc_commitment { "phoneClearedPcRetained" }
+    else { "phoneClearedPcChanged" }
+}
+
+#[cfg(windows)]
+fn same_reset_target(left: &BindingResetPreview, right: &BindingResetPreview) -> bool {
+    left.serial == right.serial && left.android_user == right.android_user
+        && left.binding_reference == right.binding_reference
+        && left.phone_state == right.phone_state && left.phone_commitment == right.phone_commitment
+        && left.pc_state == right.pc_state && left.pc_commitment == right.pc_commitment
+}
+
+#[cfg(windows)]
+fn parse_digest(value: &str) -> Result<[u8; 32], ()> {
+    if !valid_digest(value) { return Err(()); }
+    let mut result = [0u8; 32];
+    for (index, output) in result.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| ())?;
+    }
+    Ok(result)
+}
+
 fn valid_binding_reference(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -483,7 +803,7 @@ pub async fn start_network(adb: &Path, serial: &str, apk: &Path, metadata_path: 
         if cancel.is_cancelled() { return Err("操作已取消。".into()); }
         let status = network_status(adb, serial, apk, metadata_path, cancel).await?;
         if status.network_audio_version != 1 {
-            return Err("Receiver 网络协议版本不兼容；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+            return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络协议版本不兼容。".into());
         }
         if matches!(status.network_audio_state.as_str(), "authenticated" | "receiverRunning" | "streaming" | "paused") {
             if status.network_audio_address != address || status.network_audio_port == 0 {
@@ -511,7 +831,7 @@ pub async fn network_status(adb: &Path, serial: &str, apk: &Path, metadata_path:
         "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten:networkAudioAddress:networkAudioPort"],
         Duration::from_secs(8), Some(cancel)).await?;
     if !result.success {
-        return Err("Receiver 网络状态不可用；请升级 Receiver 并保留应用数据，不要清除或重新配对。".into());
+        return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络状态版本不可用。".into());
     }
     parse_network_status(&result.stdout)
 }
@@ -794,7 +1114,7 @@ async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &st
         return Err("设备没有返回有效的 Receiver APK 摘要；未读取其状态或执行管理动作。".into());
     }
     verified_installed_artifact(installed_digest, metadata)
-        .ok_or_else(|| "设备上的 Receiver APK 字节既不匹配当前本机产物，也不在已审计历史摘要清单中；未读取其状态或执行管理动作。".into())
+        .ok_or_else(|| "RECEIVER_UPDATE_REQUIRED:设备上的 Receiver APK 不在已核验版本中。".into())
 }
 
 async fn current_android_user(adb: &impl AdbRunner, serial: &str, cancel: &CancellationToken) -> Result<String, String> {
@@ -1032,12 +1352,17 @@ mod tests {
         foreground: bool,
         healthy: bool,
         audio_active: bool,
+        network_audio_state: String,
         error: String,
         calls: Vec<Vec<String>>,
         serial_calls: Vec<Option<String>>,
         binding_commitment: Option<String>,
         binding_write_mode: FakeBindingWrite,
         binding_input_commitments: Vec<String>,
+        binding_reset_supported: bool,
+        binding_reset_noop: bool,
+        binding_query_fail_after_delete: bool,
+        binding_query_failed: bool,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -1119,6 +1444,9 @@ mod tests {
                             && user_option == "--user" && user == state.user && flag == "--uri"
                             && uri == BINDING_URI && projection_flag == "--projection"
                             && projection == "bindingState:bindingCommitment:bindingFailure" => {
+                        if state.binding_query_failed {
+                            return Ok(AdbResult { success: false, stdout: String::new(), stderr: "provider unavailable".into() });
+                        }
                         let (binding_state, commitment) = match &state.binding_commitment {
                             Some(commitment) => ("saved", commitment.as_str()),
                             None => ("empty", ""),
@@ -1126,6 +1454,38 @@ mod tests {
                         AdbResult { success: true,
                             stdout: format!("Row: 0 bindingState={binding_state}, bindingCommitment={commitment}, bindingFailure=\n"),
                             stderr: String::new() }
+                    }
+                    [shell, content, query, user_option, user, flag, uri, projection_flag, projection]
+                        if shell == "shell" && content == "content" && query == "query"
+                            && user_option == "--user" && user == state.user && flag == "--uri"
+                            && uri == BINDING_URI && projection_flag == "--projection"
+                            && projection == "bindingResetVersion" => {
+                        AdbResult { success: state.binding_reset_supported,
+                            stdout: if state.binding_reset_supported { "Row: 0 bindingResetVersion=1\n".into() } else { String::new() },
+                            stderr: String::new() }
+                    }
+                    [shell, content, query, user_option, user, flag, uri, projection_flag, projection]
+                        if shell == "shell" && content == "content" && query == "query"
+                            && user_option == "--user" && user == state.user && flag == "--uri"
+                            && uri == NETWORK_URI && projection_flag == "--projection"
+                            && projection == "networkAudioVersion:networkAudioState" => {
+                        AdbResult { success: true,
+                            stdout: format!("Row: 0 networkAudioVersion=1, networkAudioState={}\n", state.network_audio_state),
+                            stderr: String::new() }
+                    }
+                    [shell, content, delete, user_option, user, uri_option, uri, where_option, selection]
+                        if shell == "shell" && content == "content" && delete == "delete"
+                            && user_option == "--user" && user == state.user && uri_option == "--uri"
+                            && uri == BINDING_URI && where_option == "--where" => {
+                        let matches = match (selection.strip_prefix("expectedCommitment="), selection.as_str()) {
+                            (Some(expected), _) => state.binding_commitment.as_deref() == Some(expected),
+                            (None, "expectedEmpty") => state.binding_commitment.is_none(),
+                            _ => false,
+                        };
+                        if matches && !state.binding_reset_noop { state.binding_commitment = None; }
+                        if matches && state.binding_query_fail_after_delete { state.binding_query_failed = true; }
+                        // content may return success even when the provider did not change the row.
+                        AdbResult { success: true, stdout: "0 rows deleted\n".into(), stderr: String::new() }
                     }
                     [install, replace, user_option, user, _apk] if install == "install" && replace == "-r" && user_option == "--user" && user == state.user => {
                         if state.install_fails {
@@ -1207,7 +1567,7 @@ mod tests {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("anpod-receiver-test-{}-{unique}-{:?}", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+            let dir = std::env::current_dir().unwrap().join("target").join(format!("anpod-receiver-test-{}-{unique}-{:?}", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
             fs::create_dir_all(&dir).unwrap();
             let apk = dir.join("receiver.apk");
             let metadata = dir.join("receiver.json");
@@ -1223,6 +1583,180 @@ mod tests {
     }
 
     impl Drop for ArtifactFiles { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
+
+    #[cfg(windows)]
+    fn binding_reset_fixture(files: &ArtifactFiles, phone: Option<&crate::security::BindingMaterial>,
+        pc: Option<&crate::security::BindingMaterial>) -> (FakeAdb, std::path::PathBuf, String) {
+        use crate::security::write_test_binding_file;
+        let data_dir = files.dir.join("profile");
+        let reference = binding_reference_for(SERIAL, TEST_USER);
+        let binding_dir = data_dir.join("receiver-bindings");
+        fs::create_dir_all(&binding_dir).unwrap();
+        if let Some(material) = pc {
+            write_test_binding_file(&binding_dir.join(format!("{reference}.dat")), material).unwrap();
+        }
+        let adb = FakeAdb::new(true, files.digest.clone());
+        {
+            let mut state = adb.0.lock().unwrap();
+            state.binding_reset_supported = true;
+            state.network_audio_state = "stopped".into();
+            state.binding_commitment = phone.map(|material| hex_digest(&material.commitment()));
+        }
+        (adb, data_dir, reference)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn binding_reset_clears_only_the_confirmed_phone_and_pc_target() {
+        use crate::security::{test_binding_material, test_binding_material_with_wrong_secret, write_test_binding_file};
+
+        for (phone_present, pc_present, conflict) in [(false, false, false), (false, true, false),
+                (true, false, false), (true, true, true)] {
+            let files = ArtifactFiles::new();
+            let phone = test_binding_material();
+            let pc = if conflict { test_binding_material_with_wrong_secret() } else { test_binding_material() };
+            let other = test_binding_material_with_wrong_secret();
+            let (adb, data_dir, reference) = binding_reset_fixture(&files,
+                phone_present.then_some(&phone), pc_present.then_some(&pc));
+            let binding_dir = data_dir.join("receiver-bindings");
+            let other_path = binding_dir.join(format!("{}.dat", "b".repeat(64)));
+            write_test_binding_file(&other_path, &other).unwrap();
+
+            let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+                &CancellationToken::new()).await.unwrap();
+            assert_eq!(preview.binding_reference, reference);
+            let result = reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+                &CancellationToken::new(), &|| true).await.unwrap();
+            assert_eq!(result.outcome, if phone_present || pc_present { "reset" } else { "alreadyEmpty" });
+            assert_eq!(adb.0.lock().unwrap().binding_commitment, None);
+            assert!(other_path.exists(), "an unrelated PC binding must survive reset");
+            assert!(!binding_dir.join(format!("{reference}.dat")).exists());
+            let deletes = adb.calls().iter().filter(|call| call.get(2).map(String::as_str) == Some("delete")).count();
+            assert_eq!(deletes, usize::from(phone_present || pc_present), "both-empty reset is read-only");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn binding_reset_requires_capability_identity_current_commitments_and_idle_receiver() {
+        use crate::security::test_binding_material;
+        let files = ArtifactFiles::new();
+        let material = test_binding_material();
+        let (adb, data_dir, reference) = binding_reset_fixture(&files, Some(&material), Some(&material));
+        let binding_path = data_dir.join("receiver-bindings").join(format!("{reference}.dat"));
+
+        adb.0.lock().unwrap().binding_reset_supported = false;
+        let unsupported = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap_err();
+        assert!(unsupported.contains("不支持条件绑定重置"));
+        assert!(adb.0.lock().unwrap().binding_commitment.is_some());
+        assert!(binding_path.exists());
+
+        adb.0.lock().unwrap().binding_reset_supported = true;
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        adb.0.lock().unwrap().device_state = "unauthorized";
+        assert!(reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.is_err());
+        assert!(!adb.calls().iter().any(|call| call.get(2).map(String::as_str) == Some("delete")));
+        assert!(binding_path.exists());
+
+        adb.0.lock().unwrap().device_state = "device";
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        adb.0.lock().unwrap().user = "11";
+        assert!(reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.is_err());
+        assert!(binding_path.exists());
+        adb.0.lock().unwrap().user = TEST_USER;
+
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        adb.0.lock().unwrap().binding_commitment = Some("f".repeat(64));
+        assert!(reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.is_err());
+        assert!(binding_path.exists());
+
+        adb.0.lock().unwrap().binding_commitment = Some(hex_digest(&material.commitment()));
+        adb.0.lock().unwrap().network_audio_state = "streaming".into();
+        let busy = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        assert!(busy.receiver_busy);
+        assert!(reset_binding_with(&adb, &busy, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.is_err());
+        assert_eq!(adb.calls().iter().filter(|call| call.get(2).map(String::as_str) == Some("delete")).count(), 0);
+        assert!(binding_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn binding_reset_reads_back_exit_zero_and_keeps_a_recoverable_partial_result() {
+        use crate::security::{test_binding_material, test_binding_material_with_wrong_secret, write_test_binding_file};
+        let files = ArtifactFiles::new();
+        let material = test_binding_material();
+        let (adb, data_dir, reference) = binding_reset_fixture(&files, Some(&material), Some(&material));
+        let binding_path = data_dir.join("receiver-bindings").join(format!("{reference}.dat"));
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+
+        adb.0.lock().unwrap().binding_reset_noop = true;
+        let retained = reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.unwrap();
+        assert_eq!(retained.outcome, "phoneRetained");
+        assert_eq!(retained.phone_state, "saved");
+        assert!(binding_path.exists());
+
+        adb.0.lock().unwrap().binding_reset_noop = false;
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0).await.unwrap();
+        assert_eq!(cancelled.outcome, "phoneClearedPcRetained");
+        assert_eq!(cancelled.phone_state, "empty");
+        assert_eq!(cancelled.pc_state, "saved");
+        assert!(binding_path.exists(), "cancellation after phone removal must preserve the DPAPI retry copy");
+        assert_eq!(adb.0.lock().unwrap().binding_commitment, None);
+
+        let files = ArtifactFiles::new();
+        let material = test_binding_material();
+        let (adb, data_dir, reference) = binding_reset_fixture(&files, Some(&material), Some(&material));
+        let binding_path = data_dir.join("receiver-bindings").join(format!("{reference}.dat"));
+        adb.0.lock().unwrap().binding_query_fail_after_delete = true;
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        let unknown = reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| true).await.unwrap();
+        assert_eq!(unknown.outcome, "phoneStateUnknown");
+        assert_eq!(unknown.phone_state, "unknown");
+        assert_eq!(unknown.pc_state, "saved");
+        assert!(binding_path.exists(), "failed phone readback must leave the local retry copy intact");
+        assert_eq!(adb.0.lock().unwrap().binding_commitment, None,
+            "the fake phone did clear the binding although readback became unavailable");
+
+        let files = ArtifactFiles::new();
+        let material = test_binding_material();
+        let changed_material = test_binding_material_with_wrong_secret();
+        let (adb, data_dir, reference) = binding_reset_fixture(&files, Some(&material), Some(&material));
+        let binding_path = data_dir.join("receiver-bindings").join(format!("{reference}.dat"));
+        let preview = binding_reset_preview_with(&adb, SERIAL, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new()).await.unwrap();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let failed = reset_binding_with(&adb, &preview, &data_dir, &files.apk, &files.metadata,
+            &CancellationToken::new(), &|| {
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+                    write_test_binding_file(&binding_path, &changed_material).unwrap();
+                }
+                true
+            }).await.unwrap();
+        assert_eq!(failed.outcome, "phoneClearedPcChanged");
+        assert_eq!(failed.phone_state, "empty");
+        assert_eq!(failed.pc_state, "saved");
+        assert_eq!(failed.pc_commitment, Some(hex_digest(&changed_material.commitment())),
+            "a failed PC CAS must report the current record commitment, not the stale preview");
+        assert!(binding_path.exists());
+        assert_eq!(adb.0.lock().unwrap().binding_commitment, None);
+    }
 
     #[test]
     fn parses_real_service_health_record() {
@@ -1275,6 +1809,14 @@ mod tests {
         assert_eq!(installed_v4_seed.version_code, 6);
         assert_eq!(installed_v4_seed.version_name, "0.5.0-v4-candidate");
         assert_eq!(installed_v4_seed.source_commit.as_deref(), Some("20f2389af0526ebdbc20924cad42570ce51110ce"));
+        for (digest, code, name) in [
+            ("344c47ddbd51b991ba4562e09c11c195815f7f363f9d1196146263df929fa1b7", 10, "0.8.0-v3-flow-candidate"),
+            ("c66a6a350907ab2581e941665b9984c47632777855717fe414964a2177baee41", 11, "0.9.0-v3-flow-candidate"),
+        ] {
+            let installed = verified_installed_artifact(digest, &current).unwrap();
+            assert_eq!((installed.version_code, installed.version_name.as_str()), (code, name));
+            assert_eq!(installed.source_commit.as_deref(), Some("61f32f7798f29bb39cf256997de50992a85ea519"));
+        }
         assert!(verified_installed_artifact(&"e".repeat(64), &current).is_none(),
             "a claimed package/version/certificate cannot replace an audited installed APK digest");
         let p1_target = ArtifactMetadata {
@@ -1509,30 +2051,35 @@ mod tests {
 
     #[tokio::test]
     async fn fake_adb_installs_a_verified_newer_candidate_over_an_existing_receiver() {
+        for old_digest in [
+            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050",
+            "344c47ddbd51b991ba4562e09c11c195815f7f363f9d1196146263df929fa1b7",
+            "c66a6a350907ab2581e941665b9984c47632777855717fe414964a2177baee41",
+        ] {
         let files = ArtifactFiles::new();
-        let version_name = "0.7.0-v3-flow-candidate";
+        let version_name = "0.9.1-v3-flow-candidate";
         fs::write(&files.metadata, serde_json::json!({
             "applicationId": PACKAGE,
-            "versionCode": 9,
+            "versionCode": 12,
             "versionName": version_name,
             "sha256": files.digest,
             "signerSha256": "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439"
         }).to_string()).unwrap();
-        let adb = FakeAdb::new(true,
-            "4d984fa8534a7c65ce0792de217688fad9b536a939cae0e59c58f82afcd46050".into());
+        let adb = FakeAdb::new(true, old_digest.into());
         {
             let mut state = adb.0.lock().unwrap();
             state.install_digest = Some(files.digest.clone());
-            state.install_version_code = Some(9);
+            state.install_version_code = Some(12);
             state.install_version_name = Some(version_name.into());
         }
 
         let status = install_with(&adb, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.unwrap();
 
-        assert_eq!(status.version_code, Some(9));
+        assert_eq!(status.version_code, Some(12));
         assert_eq!(status.version_name.as_deref(), Some(version_name));
         assert!(adb.call_index(&["install", "-r"]).is_some());
         assert!(!adb.calls().iter().any(|call| call.first().is_some_and(|arg| arg == "uninstall")));
+        }
     }
 
     #[cfg(windows)]
@@ -1694,7 +2241,7 @@ mod tests {
         let files = ArtifactFiles::new();
         let adb = FakeAdb::new(true, "f".repeat(64));
         let error = start_with(&adb, SERIAL, &files.apk, &files.metadata, &CancellationToken::new()).await.err().unwrap();
-        assert!(error.contains("既不匹配当前本机产物"));
+        assert!(error.starts_with("RECEIVER_UPDATE_REQUIRED:"));
         let calls = adb.calls();
         assert!(!calls.iter().any(|call| call.starts_with(&["shell".into(), "content".into()])));
         assert!(!calls.iter().any(|call| call.iter().any(|arg| arg == "app.anpod.receiver.action.START" || arg == "app.anpod.receiver.action.STOP")));
