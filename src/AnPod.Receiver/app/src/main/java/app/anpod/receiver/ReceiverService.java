@@ -695,7 +695,13 @@ public final class ReceiverService extends Service {
                 }
             }
         } catch (SocketException ignored) { }
-        Collections.sort(result, Comparator.comparing((UiInterface item) -> item.name).thenComparing(item -> item.address));
+        Collections.sort(result, new Comparator<UiInterface>() {
+            @Override
+            public int compare(UiInterface left, UiInterface right) {
+                int byName = left.name.compareTo(right.name);
+                return byName != 0 ? byName : left.address.compareTo(right.address);
+            }
+        });
         return result;
     }
 
