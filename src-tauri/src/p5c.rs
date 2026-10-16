@@ -2293,7 +2293,6 @@ mod tests {
             CancellationToken::new(), timing).unwrap();
         let initial = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::ReceiverRunning);
         let original_session = initial.session_id.unwrap();
-        thread::sleep(Duration::from_millis(600));
         let recovering = wait_for_owner(&owner, |status| status.state == SessionLifecycleState::Reconnecting
             && status.session_id.is_none() && status.recovery_seconds_remaining.is_some());
         assert_ne!(recovering.session_id, Some(original_session));
