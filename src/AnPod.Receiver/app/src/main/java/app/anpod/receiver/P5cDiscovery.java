@@ -78,6 +78,7 @@ final class P5cDiscovery implements AutoCloseable {
     }
 
     static P5cDiscovery openLoopbackForTest(InetAddress localAddress, int prefixLength, int controlPort) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         return openInternal(localAddress, prefixLength, controlPort, null, false, true, null);
     }
 
@@ -147,6 +148,7 @@ final class P5cDiscovery implements AutoCloseable {
     }
 
     synchronized SearchSnapshot startSearchForTest(InetAddress target, boolean automatic) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         if (!localAddress.isLoopbackAddress() || target == null || !target.isLoopbackAddress()
                 || !isInSelectedPrefix(localAddress, prefixLength, target))
             throw new IOException("Loopback discovery test target is outside the selected interface.");

@@ -135,6 +135,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopbackDropStopAckForTest(PairingProtocol.BindingMaterial binding,
             PlaybackEndpoint playback) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         return open(binding, playback, InetAddress.getByName("127.0.0.1"), false, 32, true, 0);
     }
 
@@ -155,6 +156,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopbackCapabilityTest(PairingProtocol.BindingMaterial binding,
             PlaybackEndpoint playback, String mode) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         P5cReceiverCoordinator coordinator = open(binding, playback, InetAddress.getByName("127.0.0.1"), true, 32, false, 0);
         coordinator.capabilityTestMode = mode;
         return coordinator;
@@ -162,6 +164,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopbackBackgroundAuthorizationTest(PairingProtocol.BindingMaterial binding,
             PlaybackEndpoint playback, String mode) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         P5cReceiverCoordinator coordinator = open(binding, playback, InetAddress.getByName("127.0.0.1"),
                 !"persistent-stop".equals(mode), 32, false, 0);
         coordinator.backgroundAuthorizationTestMode = mode;
@@ -170,6 +173,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     static P5cReceiverCoordinator openLoopbackIntentTest(PairingProtocol.BindingMaterial binding,
             PlaybackEndpoint playback, byte[] nonce) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         P5cReceiverCoordinator coordinator = openLoopback(binding, playback);
         coordinator.beginConnectionIntent(nonce);
         return coordinator;

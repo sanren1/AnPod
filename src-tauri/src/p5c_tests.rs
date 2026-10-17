@@ -222,6 +222,7 @@ fn compile_java_endpoint() -> PathBuf {
         repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java"),
     );
     command.arg(repo.join("tests/P5cLoopbackEndpoint.java"));
+    command.arg(repo.join("tests/BuildConfig.java"));
     let result = command
         .output()
         .expect("run JDK 17 javac for the P5-C Java receiver");
