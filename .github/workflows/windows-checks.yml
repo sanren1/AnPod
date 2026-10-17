@@ -20,7 +20,7 @@ jobs:
       ANDROID_HOME: C:\Android\android-sdk
       ANDROID_SDK_ROOT: C:\Android\android-sdk
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -28,19 +28,19 @@ jobs:
         shell: pwsh
         run: ./tests/AnPod.Version.Check.ps1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
           cache: false
           build-warnings: ''
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           package-manager-cache: false
 
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
         with:
           distribution: temurin
           java-version: '17'
@@ -75,6 +75,9 @@ jobs:
 
       - name: Test pure desktop logic
         run: dotnet run --project tests/AnPod.Core.Tests -c Release
+
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
       - name: Clippy
         # Bin target only: under --tests the harness replaces main(), so every
