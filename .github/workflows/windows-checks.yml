@@ -88,12 +88,6 @@ jobs:
           TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 
-      - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: src-tauri
-
       - name: Test Rust on Windows
         # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
         env:
@@ -103,3 +97,20 @@ jobs:
           --test-threads=1
           --skip receiver::tests::p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested
           --skip receiver::tests::reads_the_artifact_written_by_windows_powershell_when_requested
+
+  audit:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
