@@ -38,7 +38,7 @@ public final class ReceiverServiceRobolectricTest {
         UiSnapshot snapshot = invokeSnapshot(service);
 
         assertNotNull(snapshot.serviceState);
-        assertEquals(15, snapshot.versionCode);
+        assertEquals(BuildConfig.VERSION_CODE, snapshot.versionCode);
         assertNotNull(snapshot.searchCandidates);
         assertEquals(false, snapshot.searchActive);
     }
@@ -58,7 +58,7 @@ public final class ReceiverServiceRobolectricTest {
         ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
 
         UiSnapshot snapshot = binder.snapshot();
-        assertEquals(15, snapshot.versionCode);
+        assertEquals(BuildConfig.VERSION_CODE, snapshot.versionCode);
         assertNotNull(snapshot.serviceState);
         assertNotNull(binder.interfaces());
     }
