@@ -61,6 +61,14 @@ public final class ReceiverServiceRobolectricTest {
         assertNotNull(snapshot.serviceState);
         assertNotNull(binder.interfaces());
     }
+
+    @Test
+    public void malformedAuthorizationDecisionIsIgnored() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+
+        service.authorization.handleDecision(new Intent(), 1);
+        service.authorization.cancel();
+    }
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
     }

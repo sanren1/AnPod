@@ -59,24 +59,24 @@ import java.util.UUID;
 public final class ReceiverService extends Service {
     public static final String ACTION_UI_START_NETWORK_AUDIO = "app.anpod.receiver.action.UI_START_NETWORK_AUDIO";
     private static final String ACTION_NOTIFICATION_STOP = "app.anpod.receiver.action.NOTIFICATION_STOP";
-    private static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
+    static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
     private static final String EXTRA_UI_REQUEST_ID = "uiRequestId";
-    private static final String CHANNEL_ID = "receiver-management";
+    static final String CHANNEL_ID = "receiver-management";
     private static final int NOTIFICATION_ID = 1;
-    private static final int AUTH_NOTIFICATION_ID = 2;
+    static final int AUTH_NOTIFICATION_ID = 2;
     private static final long ADB_NETWORK_BOOTSTRAP_TIMEOUT_MS = 25_000L;
     private static final String EXTRA_UI_OWNER_ID = "uiOwnerId";
     private static final String EXTRA_UI_GENERATION = "uiGeneration";
     private static final String EXTRA_BACKGROUND_STANDBY = "backgroundStandby";
     private static final String EXTRA_KEEP_RECEIVE_INTENT = "keepReceiveIntent";
-    private static final String EXTRA_AUTH_OWNER = "authOwner";
-    private static final String EXTRA_AUTH_GENERATION = "authGeneration";
-    private static final String EXTRA_AUTH_SESSION = "authSession";
-    private static final String EXTRA_AUTH_REQUEST = "authRequest";
-    private static final String EXTRA_AUTH_PEER = "authPeer";
-    private static final String EXTRA_AUTH_BINDING = "authBinding";
-    private static final String EXTRA_AUTH_DEADLINE = "authDeadline";
-    private static final String EXTRA_AUTH_DECISION = "authDecision";
+    static final String EXTRA_AUTH_OWNER = "authOwner";
+    static final String EXTRA_AUTH_GENERATION = "authGeneration";
+    static final String EXTRA_AUTH_SESSION = "authSession";
+    static final String EXTRA_AUTH_REQUEST = "authRequest";
+    static final String EXTRA_AUTH_PEER = "authPeer";
+    static final String EXTRA_AUTH_BINDING = "authBinding";
+    static final String EXTRA_AUTH_DEADLINE = "authDeadline";
+    static final String EXTRA_AUTH_DECISION = "authDecision";
     private static final long MAX_RUN_MS = 120_000L;
     private static final Object STATUS_LOCK = new Object();
     private static volatile ReceiverService activeService;
@@ -111,7 +111,7 @@ public final class ReceiverService extends Service {
     static volatile AudioSession currentAudio;
     private AudioRequest pendingAudio;
     private int operationStartId;
-    private volatile boolean destroyed;
+    volatile boolean destroyed;
     private volatile long networkRecoveryDeadlineElapsedMs;
     volatile P5cReceiverCoordinator networkCoordinator;
     final Object networkCoordinatorLock = new Object();
@@ -128,6 +128,7 @@ public final class ReceiverService extends Service {
     private boolean cleanupFailed;
     private String cleanupError = "";
     private int latestDeliveredStartId;
+    final ReceiverBackgroundAuthorization authorization = new ReceiverBackgroundAuthorization(this);
     private final ReceiverUiBinder uiBinder = new ReceiverUiBinder(this);
     final ReceiverUiState uiState = new ReceiverUiState(this);
     volatile boolean backgroundStandbyEnabled;
@@ -165,7 +166,7 @@ public final class ReceiverService extends Service {
         networkAudioPort = 0;
         backgroundAuthorization = new BackgroundStartAuthorization(
                 android.os.SystemClock::elapsedRealtime, new BindingStore(getFilesDir()),
-                pending -> handler.post(() -> updateAuthorizationNotification(pending)));
+                pending -> handler.post(() -> authorization.update(pending)));
         createNotificationChannel();
     }
 
@@ -183,7 +184,7 @@ public final class ReceiverService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         latestDeliveredStartId = Math.max(latestDeliveredStartId, startId);
         if (intent != null && ACTION_BACKGROUND_AUTH_DECISION.equals(intent.getAction())) {
-            handleBackgroundAuthorizationDecision(intent, startId);
+            authorization.handleDecision(intent, startId);
             return START_NOT_STICKY;
         }
         if (intent != null && ACTION_NOTIFICATION_STOP.equals(intent.getAction())) {
@@ -307,7 +308,7 @@ public final class ReceiverService extends Service {
         return requestId != null && requestId.equals(pendingUiStartRequestId);
     }
 
-    private boolean notificationPermissionAvailable() {
+    boolean notificationPermissionAvailable() {
         return ReceiverNotifications.canPost(this, CHANNEL_ID);
     }
 
@@ -324,99 +325,22 @@ public final class ReceiverService extends Service {
         return false;
     }
 
-    private void updateAuthorizationNotification(BackgroundStartAuthorization.Token supplied) {
-        if (destroyed || !backgroundStandbyEnabled || !notificationPermissionAvailable()) {
-            cancelAuthorizationNotification();
-            if (backgroundStandbyEnabled)
-                requestTermination(uiOperation.ownerId(), currentOperationGeneration, true, "BackgroundNotificationsUnavailable");
-            return;
-        }
-        BackgroundStartAuthorization.Token token;
-        synchronized (BindingStore.storageLock()) { token = backgroundAuthorization.pendingToken(); }
-        if (token == null || !token.equals(supplied) || !isCurrentOperation(token.ownerId, token.ownerGeneration)) {
-            cancelAuthorizationNotification();
-            return;
-        }
-        int immutable = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
-        PendingIntent once = backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.ONCE, immutable);
-        PendingIntent eightHours = backgroundDecisionPendingIntent(token,
-                BackgroundStartAuthorization.EIGHT_HOURS, immutable);
-        PendingIntent deny = backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.DENIED, immutable);
-        Notification notification = ReceiverNotifications.authorization(this, CHANNEL_ID,
-                mainActivityPendingIntent(), once, eightHours, deny);
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) manager.notify(AUTH_NOTIFICATION_ID, notification);
-    }
-
-    private PendingIntent backgroundDecisionPendingIntent(BackgroundStartAuthorization.Token token,
-            int decision, int immutable) {
-        String key = token.ownerId + "/" + token.ownerGeneration + "/" + token.sessionId + "/"
-                + token.requestId + "/" + token.peer + "/" + token.bindingCommitment + "/"
-                + token.deadlineElapsedMs + "/" + decision;
-        Intent action = new Intent(this, ReceiverService.class).setAction(ACTION_BACKGROUND_AUTH_DECISION)
-                .setData(Uri.parse("anpod://receiver/background-auth/" + Uri.encode(key)))
-                .putExtra(EXTRA_AUTH_OWNER, token.ownerId).putExtra(EXTRA_AUTH_GENERATION, token.ownerGeneration)
-                .putExtra(EXTRA_AUTH_SESSION, token.sessionId).putExtra(EXTRA_AUTH_REQUEST, token.requestId)
-                .putExtra(EXTRA_AUTH_PEER, token.peer).putExtra(EXTRA_AUTH_BINDING, token.bindingCommitment)
-                .putExtra(EXTRA_AUTH_DEADLINE, token.deadlineElapsedMs).putExtra(EXTRA_AUTH_DECISION, decision);
-        return PendingIntent.getService(this, key.hashCode(), action,
-                PendingIntent.FLAG_UPDATE_CURRENT | immutable);
-    }
-
-    private void handleBackgroundAuthorizationDecision(Intent intent, int startId) {
-        String ownerId = intent.getStringExtra(EXTRA_AUTH_OWNER);
-        long generation = intent.getLongExtra(EXTRA_AUTH_GENERATION, -1L);
-        long sessionId = intent.getLongExtra(EXTRA_AUTH_SESSION, -1L);
-        String requestId = intent.getStringExtra(EXTRA_AUTH_REQUEST);
-        String peer = intent.getStringExtra(EXTRA_AUTH_PEER);
-        String commitment = intent.getStringExtra(EXTRA_AUTH_BINDING);
-        long deadline = intent.getLongExtra(EXTRA_AUTH_DEADLINE, 0L);
-        int decision = intent.getIntExtra(EXTRA_AUTH_DECISION, BackgroundStartAuthorization.DENIED);
-        if (!intent.hasExtra(EXTRA_AUTH_OWNER) || !intent.hasExtra(EXTRA_AUTH_GENERATION)
-                || !intent.hasExtra(EXTRA_AUTH_SESSION) || !intent.hasExtra(EXTRA_AUTH_REQUEST)
-                || !intent.hasExtra(EXTRA_AUTH_PEER) || !intent.hasExtra(EXTRA_AUTH_BINDING)
-                || !intent.hasExtra(EXTRA_AUTH_DEADLINE) || !intent.hasExtra(EXTRA_AUTH_DECISION)
-                || ownerId == null || requestId == null || peer == null || commitment == null
-                || requestId.length() != 32 || peer.length() != 8 || commitment.length() != 64
-                || deadline <= 0) {
-            stopStaleAuthorizationAction(startId);
-            return;
-        }
-        BackgroundStartAuthorization.Token token = new BackgroundStartAuthorization.Token(ownerId,
-                generation, sessionId, requestId, peer, commitment, deadline);
-        try {
-            synchronized (BindingStore.storageLock()) {
-                backgroundAuthorization.decide(token, decision);
-            }
-        } catch (IOException error) {
-            setAuthorizationError(ownerId, generation, error.getClass().getSimpleName());
-        }
-        stopStaleAuthorizationAction(startId);
-    }
-
-    private void stopStaleAuthorizationAction(int startId) {
-        if (uiOperation.canBegin() && currentAudio == null && networkCoordinator == null) stopSelf(startId);
-    }
-
-    private void cancelAuthorizationNotification() {
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) manager.cancel(AUTH_NOTIFICATION_ID);
-    }
-
-    private void setAuthorizationError(String ownerId, long generation, String message) {
-        synchronized (BindingStore.storageLock()) { backgroundAuthorization.reportError(ownerId, generation, message); }
-    }
-
     private long onceRecoveryDeadline(String ownerId, long generation) {
-        synchronized (BindingStore.storageLock()) {
-            return backgroundAuthorization.onceRecoveryDeadlineElapsedMs(ownerId, generation);
-        }
+        return authorization.onceDeadline(ownerId, generation);
     }
 
     private long newRecoveryDeadline(String ownerId, long generation) {
-        long fixed = onceRecoveryDeadline(ownerId, generation);
-        return fixed == 0 ? android.os.SystemClock.elapsedRealtime() + 30_000L : fixed;
+        return authorization.newDeadline(ownerId, generation);
     }
+
+    private void cancelAuthorizationNotification() {
+        authorization.cancel();
+    }
+
+    private void setAuthorizationError(String ownerId, long generation, String message) {
+        authorization.setError(ownerId, generation, message);
+    }
+
 
     private int playbackForegroundServiceType() {
         return ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
@@ -444,7 +368,7 @@ public final class ReceiverService extends Service {
         return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction);
     }
 
-    private PendingIntent mainActivityPendingIntent() {
+    PendingIntent mainActivityPendingIntent() {
         Intent open = new Intent(this, MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         int immutable = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
@@ -665,7 +589,7 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private void requestTermination(String ownerId, long generation, boolean failed, String reason) {
+    void requestTermination(String ownerId, long generation, boolean failed, String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() -> beginTermination(ownerId, generation, failed, reason));
         } else beginTermination(ownerId, generation, failed, reason);
