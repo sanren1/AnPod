@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
@@ -57,6 +57,10 @@ pub struct AppSettings {
     pub auto_reconnect_wifi: bool,
     #[serde(default)]
     pub last_wireless_endpoint: Option<String>,
+    /// Last Receiver control endpoint that accepted a session; probed first on the
+    /// next wireless search so a known phone answers without a broadcast.
+    #[serde(default)]
+    pub last_receiver_endpoint: Option<String>,
     #[serde(default = "balanced")]
     pub playback_mode: String,
     #[serde(default = "system")]
@@ -84,6 +88,7 @@ impl Default for AppSettings {
             audio_backend: receiver(),
             auto_reconnect_wifi: true,
             last_wireless_endpoint: None,
+            last_receiver_endpoint: None,
             playback_mode: balanced(),
             appearance_theme: system(),
         }
@@ -588,10 +593,33 @@ impl AppState {
     pub async fn discover_network_receivers(&self, local_address: &str) -> Result<Vec<Candidate>, String> {
         let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
             .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
+        let cached = self.last_receiver_address();
         let cancellation = CancellationToken::new();
         let targets = discovery::probe_targets(&interface);
-        tokio::task::spawn_blocking(move || discovery::discover_on_interface(&interface, &targets,
+        tokio::task::spawn_blocking(move || discovery::discover_on_interface(&interface, &targets, cached,
             Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
+    }
+
+    /// Address of the Receiver that last accepted a session, if it is a usable IPv4 literal.
+    fn last_receiver_address(&self) -> Option<Ipv4Addr> {
+        let view = self.view.lock().expect("app view lock");
+        let endpoint = view.settings.last_receiver_endpoint.as_deref()?;
+        match endpoint.parse::<SocketAddr>().ok()?.ip() {
+            IpAddr::V4(address) if !address.is_unspecified() && !address.is_loopback() => Some(address),
+            _ => None,
+        }
+    }
+
+    fn remember_receiver_endpoint(&self, peer: &str) {
+        let Ok(endpoint) = peer.parse::<SocketAddr>() else { return; };
+        if endpoint.port() == 0 { return; }
+        let settings = {
+            let mut view = self.view.lock().expect("app view lock");
+            if view.settings.last_receiver_endpoint.as_deref() == Some(peer) { return; }
+            view.settings.last_receiver_endpoint = Some(peer.to_owned());
+            view.settings.clone()
+        };
+        let _ = self.save_settings(&settings);
     }
 
     #[cfg(windows)]
@@ -878,8 +906,10 @@ impl AppState {
     pub async fn start_network_audio(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
         selected_binding_ref: Option<&str>, background_authorization_required: bool) -> Result<AppSnapshot, String> {
-        self.start_network_audio_inner(app, local_address, peer, bootstrap_serial, receiver_address,
-            receiver_prefix, selected_binding_ref, None, None, background_authorization_required).await
+        let result = self.start_network_audio_inner(app, local_address, peer, bootstrap_serial, receiver_address,
+            receiver_prefix, selected_binding_ref, None, None, background_authorization_required).await;
+        if result.is_ok() { self.remember_receiver_endpoint(peer); }
+        result
     }
 
     #[cfg(windows)]

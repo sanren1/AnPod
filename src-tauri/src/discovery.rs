@@ -254,9 +254,36 @@ pub(crate) fn probe_targets(interface: &Ipv4Interface) -> Vec<Ipv4Addr> {
     targets
 }
 
-/// Sends one correlated probe to only the broadcast and/or explicit gateway targets
-/// of the interface selected by the caller. This function is never called implicitly.
-pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Addr],
+/// One probe in the discovery timeline.
+#[derive(Debug, PartialEq, Eq)]
+struct ProbeStep {
+    target: Ipv4Addr,
+    at: Duration,
+}
+
+/// Unicast to the last known address first, then fall back to the gateway and
+/// directed broadcast. Broadcasts repeat three times because a single datagram
+/// is routinely lost on Wi-Fi; the cached address is retried once before that.
+fn probe_schedule(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Option<Ipv4Addr>) -> Vec<ProbeStep> {
+    let cached = cached.filter(|address|
+        *address != interface.address && interface.contains(*address) && !address.is_broadcast() && !address.is_unspecified());
+    let broadcast_start = if cached.is_some() { Duration::from_millis(250) } else { Duration::ZERO };
+    let mut steps = Vec::new();
+    if let Some(address) = cached {
+        steps.push(ProbeStep { target: address, at: Duration::ZERO });
+        steps.push(ProbeStep { target: address, at: Duration::from_millis(250) });
+    }
+    for offset in [broadcast_start, broadcast_start + Duration::from_millis(350), broadcast_start + Duration::from_millis(700)] {
+        steps.extend(targets.iter().map(|target| ProbeStep { target: *target, at: offset }));
+    }
+    steps.sort_by_key(|step| step.at);
+    steps
+}
+
+/// Sends a correlated probe to the cached address first, then to the broadcast and/or
+/// explicit gateway targets of the interface selected by the caller. This function is
+/// never called implicitly.
+pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Option<Ipv4Addr>,
     timeout: Duration, cancellation: &CancellationToken) -> Result<Vec<Candidate>, String> {
     let local_valid = interface.address.is_loopback()
         || (interface.address.is_private() && !interface.address.is_link_local());
@@ -281,17 +308,20 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
     let mut token = [0u8; 16];
     fill(&mut token).map_err(|_| "Unable to create a fresh discovery probe token.".to_string())?;
     let probe = encode(PROBE, token, 0);
-    for target in targets {
-        if cancellation.is_cancelled() { return Err("Network discovery was cancelled.".into()); }
-        socket.send_to(&probe, SocketAddr::from((*target, DISCOVERY_PORT)))
-            .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
-    }
+    let schedule = probe_schedule(interface, targets, cached);
+    let started = Instant::now();
+    let mut next_step = 0;
 
     let deadline = Instant::now() + timeout;
     let mut candidates = Vec::new();
     let mut bytes = [0u8; 128];
     while Instant::now() < deadline {
         if cancellation.is_cancelled() { return Err("Network discovery was cancelled.".into()); }
+        while next_step < schedule.len() && started.elapsed() >= schedule[next_step].at {
+            socket.send_to(&probe, SocketAddr::from((schedule[next_step].target, DISCOVERY_PORT)))
+                .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
+            next_step += 1;
+        }
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) => {
                 let SocketAddr::V4(source) = source else { continue; };
@@ -401,5 +431,30 @@ mod tests {
         listener.attempt_cancel = Some(attempt.clone());
         drop(listener);
         assert!(attempt.is_cancelled(), "stopping discovery cancels an in-flight authentication attempt");
+    }
+
+    #[test]
+    fn probe_schedule_tries_the_cached_address_before_broadcasting() {
+        let interface = interface_for_test(Ipv4Addr::new(192, 168, 1, 10), 24);
+        let targets = probe_targets(&interface);
+        let cached = Ipv4Addr::new(192, 168, 1, 23);
+        let steps = probe_schedule(&interface, &targets, Some(cached));
+        assert_eq!(steps[0], ProbeStep { target: cached, at: Duration::ZERO }, "the cached address is probed first");
+        assert_eq!(steps.iter().filter(|step| step.target == cached).count(), 2, "the unicast round is retried once");
+        let broadcast: Vec<_> = steps.iter().filter(|step| targets.contains(&step.target)).collect();
+        assert_eq!(broadcast.len(), 3, "broadcasts repeat three times");
+        assert!(broadcast.iter().all(|step| step.at >= Duration::from_millis(250)), "broadcast waits for the unicast round");
+        assert!(broadcast.windows(2).all(|pair| pair[0].at < pair[1].at), "broadcast rounds are spaced out");
+    }
+
+    #[test]
+    fn probe_schedule_ignores_a_cached_address_outside_the_interface() {
+        let interface = interface_for_test(Ipv4Addr::new(192, 168, 1, 10), 24);
+        let targets = probe_targets(&interface);
+        for unusable in [Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::BROADCAST] {
+            let steps = probe_schedule(&interface, &targets, Some(unusable));
+            assert!(steps.iter().all(|step| targets.contains(&step.target)), "{unusable} must not be probed");
+            assert_eq!(steps[0].at, Duration::ZERO, "broadcast starts immediately without a usable cache");
+        }
     }
 }

@@ -20,6 +20,7 @@ type Settings = {
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
   wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
   autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
+  lastReceiverEndpoint: string | null;
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
 type Snapshot = {
@@ -1506,6 +1507,7 @@ function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoice
               <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; peerSelectionSource.current = "manual"; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
             </label>
             <small id="network-peer-hint" className="network-hint">{zhCN.network.addressSuggestionNeedsConnection}</small>
+            {snapshot.settings.lastReceiverEndpoint && <small className="network-hint">{zhCN.network.lastReceiverHint(snapshot.settings.lastReceiverEndpoint)}</small>}
             {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{zhCN.network.invalidSubnetConnectDisabled}</small>}
             <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
             <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{zhCN.network.searchAddressAgain}</button>
