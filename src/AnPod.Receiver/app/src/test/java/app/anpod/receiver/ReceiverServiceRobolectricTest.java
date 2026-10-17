@@ -5,8 +5,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 
+import android.content.Intent;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -50,10 +50,19 @@ public final class ReceiverServiceRobolectricTest {
         assertEquals(-1, metrics.channels);
     }
 
-    private static UiSnapshot invokeSnapshot(ReceiverService service) throws Exception {
-        Method method = ReceiverService.class.getDeclaredMethod("getUiSnapshot");
-        method.setAccessible(true);
-        return (UiSnapshot) method.invoke(service);
+
+    @Test
+    public void binderReturnsTheServiceSnapshot() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
+
+        UiSnapshot snapshot = binder.snapshot();
+        assertEquals(15, snapshot.versionCode);
+        assertNotNull(snapshot.serviceState);
+        assertNotNull(binder.interfaces());
+    }
+    private static UiSnapshot invokeSnapshot(ReceiverService service) {
+        return service.uiState.snapshot();
     }
 
     private static ReceiverService activeService() throws Exception {

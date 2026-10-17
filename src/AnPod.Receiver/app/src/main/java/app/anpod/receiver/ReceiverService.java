@@ -108,72 +108,32 @@ public final class ReceiverService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable timeout;
-    private static volatile AudioSession currentAudio;
+    static volatile AudioSession currentAudio;
     private AudioRequest pendingAudio;
     private int operationStartId;
     private volatile boolean destroyed;
     private volatile long networkRecoveryDeadlineElapsedMs;
-    private volatile P5cReceiverCoordinator networkCoordinator;
-    private final Object networkCoordinatorLock = new Object();
+    volatile P5cReceiverCoordinator networkCoordinator;
+    final Object networkCoordinatorLock = new Object();
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
-    private final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
+    final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
     private String pendingUiStartRequestId = "";
     private boolean pendingUiStandbyStart;
     private boolean pendingUiReceiveIntent;
-    private String networkCoordinatorOwnerId = "";
+    String networkCoordinatorOwnerId = "";
     private String cleanupOwnerId = "";
     private long cleanupGeneration;
-    private long currentOperationGeneration;
+    long currentOperationGeneration;
     private boolean cleanupCoordinatorClosed;
     private boolean cleanupFailed;
     private String cleanupError = "";
     private int latestDeliveredStartId;
-    private final UiBinder uiBinder = new UiBinder();
-    private volatile boolean backgroundStandbyEnabled;
+    private final ReceiverUiBinder uiBinder = new ReceiverUiBinder(this);
+    final ReceiverUiState uiState = new ReceiverUiState(this);
+    volatile boolean backgroundStandbyEnabled;
     private volatile boolean receiveIntentEnabled;
-    private BackgroundStartAuthorization backgroundAuthorization;
+    BackgroundStartAuthorization backgroundAuthorization;
 
-    public final class UiBinder extends Binder {
-        public UiSnapshot snapshot() { return getUiSnapshot(); }
-        public List<UiInterface> interfaces() { return getUiInterfaces(); }
-        public String start(String address, int prefixLength, String requestId) { return startFromUi(address, prefixLength, requestId); }
-        public String startReceiving(String address, int prefixLength, String requestId) {
-            return startFromUi(address, prefixLength, requestId, false, true);
-        }
-        public String startBackgroundStandby(String address, int prefixLength, String requestId) {
-            return startFromUi(address, prefixLength, requestId, true, true);
-        }
-        public boolean stop(String ownerId) { return stopFromUi(ownerId); }
-        public boolean stop(String ownerId, long generation) { return stopFromUi(ownerId, generation); }
-        public boolean trustBindingUntilRevoked(String ownerId, long generation) {
-            return trustBindingUntilRevokedFromUi(ownerId, generation);
-        }
-        public boolean revokeBackgroundTrust(String expectedOwnerId, long expectedGeneration,
-                String expectedBindingFingerprint) {
-            return revokeBackgroundTrustFromUi(expectedOwnerId, expectedGeneration,
-                    expectedBindingFingerprint);
-        }
-        public P5cDiscovery.SearchSnapshot startSearch(String expectedOwnerId) throws IOException {
-            synchronized (networkCoordinatorLock) {
-                return currentUiCoordinator(expectedOwnerId).startSearch();
-            }
-        }
-        public P5cDiscovery.SearchSnapshot startAutomaticSearch(String expectedOwnerId) throws IOException {
-            synchronized (networkCoordinatorLock) {
-                return currentUiCoordinator(expectedOwnerId).startAutomaticSearch();
-            }
-        }
-        public P5cDiscovery.SearchSnapshot stopSearch(String expectedOwnerId) throws IOException {
-            synchronized (networkCoordinatorLock) {
-                return currentUiCoordinator(expectedOwnerId).stopSearch();
-            }
-        }
-        public String requestConnection(String candidateId, String expectedOwnerId) throws IOException {
-            synchronized (networkCoordinatorLock) {
-                return currentUiCoordinator(expectedOwnerId).requestConnection(candidateId);
-            }
-        }
-    }
 
 
 
@@ -463,7 +423,7 @@ public final class ReceiverService extends Service {
                 | (receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE : 0);
     }
 
-    private static byte[] unhex(String value) {
+    static byte[] unhex(String value) {
         byte[] bytes = new byte[value.length() / 2];
         for (int i = 0; i < bytes.length; i++)
             bytes[i] = (byte) ((Character.digit(value.charAt(i * 2), 16) << 4)
@@ -536,102 +496,14 @@ public final class ReceiverService extends Service {
         return uiBinder;
     }
 
-    private UiSnapshot getUiSnapshot() {
-        String binding = "empty";
-        String fingerprint = "";
-        String listenerState = "disabled", grantKind = "none", pendingRequestId = "", authorizationError = "";
-        String grantPersistence = "none";
-        long grantRemainingMs = 0, pendingDeadlineElapsedMs = 0;
-        try {
-            BindingStore.Status status = new BindingStore(getFilesDir()).status();
-            binding = status.state;
-            fingerprint = status.commitment;
-            if (!fingerprint.isEmpty()) {
-                synchronized (BindingStore.storageLock()) {
-                    byte[] commitment = unhex(fingerprint);
-                    try { backgroundAuthorization.inspectBinding(commitment); }
-                    finally { java.util.Arrays.fill(commitment, (byte) 0); }
-                    listenerState = backgroundAuthorization.listenerState();
-                    if (backgroundStandbyEnabled && networkCoordinator == null) listenerState = "starting";
-                    try {
-                        BackgroundStartAuthorization.GrantSnapshot grant = backgroundAuthorization.grantSnapshot();
-                        grantKind = grant.kind;
-                        grantPersistence = grant.persistenceCode == 2 ? "binding"
-                                : grant.persistenceCode == 1 ? "process" : "none";
-                        grantRemainingMs = grant.remainingMs;
-                    } catch (IOException grantError) {
-                        grantKind = "unavailable";
-                        grantPersistence = "unavailable";
-                        authorizationError = describeFailure(grantError);
-                    }
-                    pendingRequestId = backgroundAuthorization.pendingRequestId();
-                    pendingDeadlineElapsedMs = backgroundAuthorization.pendingDeadlineElapsedMs();
-                    if (authorizationError.isEmpty()) authorizationError = backgroundAuthorization.error();
-                }
-            }
-        } catch (Exception error) {
-            binding = "unavailable";
-            grantKind = "unavailable";
-            grantPersistence = "unavailable";
-            authorizationError = describeFailure(error);
-        }
-        String method = networkCoordinator != null || !networkAudioAddress.isEmpty() ? "wireless-udp"
-                : currentAudio != null ? "usb-or-local" : "unknown";
-        String state = ReceiverUiOperation.displayState(networkAudioState, currentAudio != null, audioActive);
-        String mode = currentAudio == null ? "" : actualMode;
-        Boolean playbackAdvancing = playbackMetricsSnapshot().advancing;
-        String operationError = uiOperation.error();
-        if (operationError.isEmpty()) operationError = networkAudioFailure;
-        boolean canRevokeBackgroundTrust = canRevokeBackgroundTrust(binding, fingerprint, grantKind);
-        return new UiSnapshot(state, binding, fingerprint, method, mode, BuildConfig.VERSION_NAME,
-                BuildConfig.VERSION_CODE, uiOperation.ownerId(), uiOperation.phase(), operationError,
-                currentOperationGeneration, networkAudioAddress, networkAudioPort, backgroundStandbyEnabled,
-                canRevokeBackgroundTrust, playbackAdvancing,
-                listenerState, grantKind, grantPersistence, grantRemainingMs, pendingRequestId,
-                pendingDeadlineElapsedMs, authorizationError,
-                networkCoordinator == null ? new P5cDiscovery.SearchSnapshot(false, Collections.emptyList(), "idle")
-                        : networkCoordinator.searchSnapshot());
-    }
 
-    private P5cReceiverCoordinator currentUiCoordinator(String expectedOwnerId) throws IOException {
-        P5cReceiverCoordinator coordinator = networkCoordinator;
-        if (expectedOwnerId == null || expectedOwnerId.isEmpty()
-                || !expectedOwnerId.equals(networkCoordinatorOwnerId)
-                || !isCurrentOperation(expectedOwnerId, currentOperationGeneration))
-            throw new IOException("接收会话已结束，请刷新状态后重试。");
-        if (coordinator == null) throw new IOException("请先启动 Receiver 无线 UDP 接收。");
-        return coordinator;
-    }
 
-    private List<UiInterface> getUiInterfaces() {
-        ArrayList<UiInterface> result = new ArrayList<>();
-        try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                NetworkInterface network = interfaces.nextElement();
-                if (!network.isUp() || network.isLoopback()) continue;
-                for (java.net.InterfaceAddress item : network.getInterfaceAddresses()) {
-                    InetAddress address = item.getAddress();
-                    if (address instanceof Inet4Address && address.isSiteLocalAddress())
-                        result.add(new UiInterface(network.getDisplayName(), address.getHostAddress(), item.getNetworkPrefixLength()));
-                }
-            }
-        } catch (SocketException ignored) { }
-        Collections.sort(result, new Comparator<UiInterface>() {
-            @Override
-            public int compare(UiInterface left, UiInterface right) {
-                int byName = left.name.compareTo(right.name);
-                return byName != 0 ? byName : left.address.compareTo(right.address);
-            }
-        });
-        return result;
-    }
 
-    private String startFromUi(String address, int prefixLength, String requestId) {
+    String startFromUi(String address, int prefixLength, String requestId) {
         return startFromUi(address, prefixLength, requestId, false, false);
     }
 
-    private String startFromUi(String address, int prefixLength, String requestId,
+    String startFromUi(String address, int prefixLength, String requestId,
             boolean backgroundStandby, boolean keepReceiveIntent) {
         if (requestId == null || requestId.isEmpty()) return "启动请求无效，请重试。";
         if (keepReceiveIntent && !applicationIsVisible()) return "请在 Receiver 前台界面中开始接收。";
@@ -682,20 +554,20 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private boolean stopFromUi(String ownerId) {
+    boolean stopFromUi(String ownerId) {
         if (!uiOperation.owns(ownerId) || !(ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                 || ReceiverUiOperation.RUNNING.equals(uiOperation.phase()))) return false;
         requestTermination(ownerId, currentOperationGeneration, false, "");
         return true;
     }
 
-    private boolean stopFromUi(String ownerId, long generation) {
+    boolean stopFromUi(String ownerId, long generation) {
         if (!isCurrentOperation(ownerId, generation)) return false;
         requestTermination(ownerId, generation, false, "");
         return true;
     }
 
-    private boolean trustBindingUntilRevokedFromUi(String ownerId, long generation) {
+    boolean trustBindingUntilRevokedFromUi(String ownerId, long generation) {
         if (!applicationIsVisible() || !isCurrentOperation(ownerId, generation) || !backgroundStandbyEnabled) return false;
         try {
             synchronized (BindingStore.storageLock()) { backgroundAuthorization.trustUntilRevoked(ownerId, generation); }
@@ -706,7 +578,7 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private boolean revokeBackgroundTrustFromUi(String expectedOwnerId, long expectedGeneration,
+    boolean revokeBackgroundTrustFromUi(String expectedOwnerId, long expectedGeneration,
             String expectedBindingFingerprint) {
         if (!applicationIsVisible() || expectedOwnerId == null || expectedBindingFingerprint == null
                 || expectedBindingFingerprint.length() != 64) return false;
@@ -754,7 +626,7 @@ public final class ReceiverService extends Service {
         return true;
     }
 
-    private boolean canRevokeBackgroundTrust(String binding, String fingerprint, String grantKind) {
+    boolean canRevokeBackgroundTrust(String binding, String fingerprint, String grantKind) {
         boolean hasGrant = "untilRevoked".equals(grantKind) || "eightHours".equals(grantKind)
                 || "once".equals(grantKind);
         boolean activeStandby = backgroundStandbyEnabled && backgroundAuthorization.enabled()
@@ -1314,7 +1186,7 @@ public final class ReceiverService extends Service {
 
     private interface MainOwnerCommand { void run() throws IOException; }
 
-    private boolean isCurrentOperation(String ownerId, long generation) {
+    boolean isCurrentOperation(String ownerId, long generation) {
         String phase = uiOperation.phase();
         return !destroyed && uiOperation.owns(ownerId) && currentOperationGeneration == generation
                 && networkBootstrapGeneration.get() == generation
@@ -2189,7 +2061,7 @@ public final class ReceiverService extends Service {
         synchronized (STATUS_LOCK) { return statusAudioId == session.id ? actualMode : ""; }
     }
 
-    private static String describeFailure(Exception error) {
+    static String describeFailure(Exception error) {
         String message = error.getMessage();
         if (message == null || message.isEmpty()) return error.getClass().getSimpleName();
         String description = (error.getClass().getSimpleName() + ": " + message).replace('\r', ' ').replace('\n', ' ');

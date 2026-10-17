@@ -65,7 +65,7 @@ private data class BackgroundTrustTarget(
 
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var receiver by mutableStateOf<ReceiverService.UiBinder?>(null)
+    private var receiver by mutableStateOf<ReceiverUiBinder?>(null)
     private var snapshot by mutableStateOf<UiSnapshot?>(null)
     private val interfaces = mutableStateListOf<UiInterface>()
     private var selectedAddress by mutableStateOf("")
@@ -86,7 +86,7 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             discoveryGeneration.incrementAndGet()
             pendingConnection = null
-            receiver = service as ReceiverService.UiBinder
+            receiver = service as ReceiverUiBinder
             refresh()
         }
         override fun onServiceDisconnected(name: ComponentName?) {
