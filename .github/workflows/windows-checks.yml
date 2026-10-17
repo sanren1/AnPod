@@ -61,7 +61,7 @@ jobs:
       - name: Compile and lint Android receiver
         working-directory: src/AnPod.Receiver
         shell: pwsh
-        run: .\gradlew.bat :app:compileDebugKotlin :app:compileDebugJavaWithJavac :app:lintDebug --no-daemon
+        run: .\gradlew.bat :app:compileDebugKotlin :app:compileDebugJavaWithJavac :app:testDebugUnitTest :app:lintDebug --no-daemon
 
       - name: Build frontend
         working-directory: frontend
@@ -87,6 +87,12 @@ jobs:
         env:
           TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
 
       - name: Test Rust on Windows
         # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
