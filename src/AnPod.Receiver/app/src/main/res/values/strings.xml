@@ -85,4 +85,14 @@
     <string name="operation_error_summary">操作没有完成。请检查连接后重试，或展开详情。</string>
     <string name="show_error_details">查看详情</string>
     <string name="wireless_udp">无线 · UDP</string>
+    <string name="aod_title">手机常显</string>
+    <string name="aod_toggle">常显（AOD）</string>
+    <string name="aod_toggle_description">连接并播放到手机时显示纯黑时钟、波形与接收指标；屏幕会保持点亮。</string>
+    <string name="aod_preview">预览常显</string>
+    <string name="aod_exit">退出</string>
+    <string name="aod_disconnected">未连接</string>
+    <string name="aod_connected">Connected</string>
+    <string name="aod_receiving">Receiving</string>
+    <string name="aod_reconnecting">Reconnecting</string>
+    <string name="aod_not_running">手机端接收服务未运行，先开始接收再进入常显。</string>
 </resources>

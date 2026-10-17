@@ -29,6 +29,14 @@
 
         <!-- No launcher filter. The explicit USB bootstrap is restricted to adb shell. -->
         <activity
+            android:name=".AodActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/AnPodAodTheme" />
+
+
+        <activity
             android:name=".BootstrapActivity"
             android:excludeFromRecents="true"
             android:exported="true"

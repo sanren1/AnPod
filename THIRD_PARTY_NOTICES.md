@@ -126,3 +126,10 @@ Requirements that still apply to every published package:
 2. Keep the source revision reachable from a public location.
 3. Keep `audio_capture.dll` a separately loadable file next to `AnPod.exe` so a
    recipient can replace the LGPL library without rebuilding the covered work.
+
+## 6. AOD 字体
+
+The Receiver AOD screen bundles **Rubik** under the SIL Open Font License 1.1.
+Copyright 2015 The Rubik Project Authors (https://github.com/googlefonts/rubik).
+The license text ships as `LICENSES/Rubik-OFL.txt` and inside the APK at
+`assets/licenses/Rubik-OFL.txt`.
