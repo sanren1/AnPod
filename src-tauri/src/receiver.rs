@@ -173,6 +173,13 @@ const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
         signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
     },
     AuditedReceiverArtifact {
+        sha256: "5a29fc35e9ac065b57744abef13d8d06996a8554a5a0c17277bc425a58fac2e9",
+        version_code: 15,
+        version_name: "0.12.0-v3-flow-candidate",
+        source_commit: "9324d48f6acfd41aff5359b04ab0fde016200671",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
         sha256: "de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77",
         version_code: 3,
         version_name: "0.3.0-v2-candidate",
