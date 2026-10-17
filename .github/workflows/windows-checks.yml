@@ -75,6 +75,13 @@ jobs:
       - name: Test pure desktop logic
         run: dotnet run --project tests/AnPod.Core.Tests -c Release
 
+      - name: Check Rust warnings
+        # --tests is excluded on purpose: the test harness replaces main(), so
+        # everything reachable only from main() reports as dead code there.
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+
       - name: Test Rust on Windows
         # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
         env:
