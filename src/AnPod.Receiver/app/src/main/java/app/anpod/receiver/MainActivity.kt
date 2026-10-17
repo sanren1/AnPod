@@ -66,8 +66,8 @@ private data class BackgroundTrustTarget(
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var receiver by mutableStateOf<ReceiverService.UiBinder?>(null)
-    private var snapshot by mutableStateOf<ReceiverService.UiSnapshot?>(null)
-    private val interfaces = mutableStateListOf<ReceiverService.UiInterface>()
+    private var snapshot by mutableStateOf<UiSnapshot?>(null)
+    private val interfaces = mutableStateListOf<UiInterface>()
     private var selectedAddress by mutableStateOf("")
     private var selectedPrefix by mutableStateOf(0)
     private var localMessage by mutableStateOf("")
@@ -245,7 +245,7 @@ class MainActivity : ComponentActivity() {
         refresh()
     }
 
-    private fun advancePendingConnection(current: ReceiverService.UiSnapshot?) {
+    private fun advancePendingConnection(current: UiSnapshot?) {
         var pending = pendingConnection ?: return
         if (!activityStarted || pending.generation != discoveryGeneration.get()) { pendingConnection = null; return }
         if (current == null) { pendingConnection = null; return }
@@ -323,13 +323,13 @@ private fun ReceiverTheme(content: @Composable () -> Unit) {
 
 @Composable
 private fun ReceiverScreen(
-    snapshot: ReceiverService.UiSnapshot?,
-    interfaces: List<ReceiverService.UiInterface>,
+    snapshot: UiSnapshot?,
+    interfaces: List<UiInterface>,
     selectedAddress: String,
     selectedPrefix: Int,
     localMessage: String,
     connectionPending: Boolean,
-    onSelect: (ReceiverService.UiInterface) -> Unit,
+    onSelect: (UiInterface) -> Unit,
     onConnectComputer: () -> Unit,
     onStartBackgroundStandby: () -> Unit,
     onStopBackgroundStandby: () -> Unit,
@@ -497,7 +497,7 @@ private fun ReceiverScreen(
 
 @Composable
 private fun backgroundStandbyStatus(
-    snapshot: ReceiverService.UiSnapshot?,
+    snapshot: UiSnapshot?,
     bound: Boolean,
     running: Boolean,
     connectionPending: Boolean
@@ -514,7 +514,7 @@ private fun backgroundStandbyStatus(
 }
 
 @Composable
-private fun backgroundGrantStatus(snapshot: ReceiverService.UiSnapshot?): String = when (snapshot?.backgroundGrantKind) {
+private fun backgroundGrantStatus(snapshot: UiSnapshot?): String = when (snapshot?.backgroundGrantKind) {
     null -> stringResource(R.string.background_grant_status_loading)
     "once" -> stringResource(R.string.background_grant_once)
     "eightHours" -> {
@@ -527,11 +527,11 @@ private fun backgroundGrantStatus(snapshot: ReceiverService.UiSnapshot?): String
 
 @Composable
 private fun InterfacePicker(
-    interfaces: List<ReceiverService.UiInterface>,
+    interfaces: List<UiInterface>,
     selectedAddress: String,
     selectedPrefix: Int,
     disabled: Boolean,
-    onSelect: (ReceiverService.UiInterface) -> Unit
+    onSelect: (UiInterface) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selected = interfaces.firstOrNull { it.address == selectedAddress && it.prefixLength == selectedPrefix }
@@ -555,7 +555,7 @@ private fun InterfacePicker(
 }
 
 @Composable
-private fun stateLabel(snapshot: ReceiverService.UiSnapshot, connectionPending: Boolean): String = when {
+private fun stateLabel(snapshot: UiSnapshot, connectionPending: Boolean): String = when {
     connectionPending || snapshot.serviceState == "starting" || snapshot.operationState == "starting" -> stringResource(R.string.connecting_computer)
     snapshot.operationState == "stopping" -> stringResource(R.string.stopping_receiver)
     snapshot.operationState == "error" -> stringResource(R.string.operation_failed_retry)
@@ -569,7 +569,7 @@ private fun stateLabel(snapshot: ReceiverService.UiSnapshot, connectionPending: 
 }
 
 @Composable
-private fun stateDetail(snapshot: ReceiverService.UiSnapshot?): String = when (snapshot?.serviceState) {
+private fun stateDetail(snapshot: UiSnapshot?): String = when (snapshot?.serviceState) {
     null -> stringResource(R.string.reading_receive_status_period)
     "streaming", "receiverRunning" -> when (snapshot.playbackAdvancing) {
         true -> stringResource(R.string.receiver_playback_progress_advancing_detail)

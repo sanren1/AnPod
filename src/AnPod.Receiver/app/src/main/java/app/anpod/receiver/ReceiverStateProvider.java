@@ -110,7 +110,7 @@ public final class ReceiverStateProvider extends ContentProvider {
                 && ReceiverService.startFailure.isEmpty();
         MatrixCursor result = new MatrixCursor(columns, 1);
         Object[] values = new Object[columns.length];
-        ReceiverService.PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
+        PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
         for (int i = 0; i < columns.length; i++) {
             switch (columns[i]) {
                 case "applicationId": values[i] = BuildConfig.APPLICATION_ID; break;
