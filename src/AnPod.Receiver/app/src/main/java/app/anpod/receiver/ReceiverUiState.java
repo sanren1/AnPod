@@ -14,9 +14,50 @@ import java.util.List;
 /** Read-only views of ReceiverService state used by the UI binder. */
 final class ReceiverUiState {
     private final ReceiverService service;
+    private final AodMetricsSampler aodSampler = new AodMetricsSampler();
+    private long aodSessionId = -1;
 
     ReceiverUiState(ReceiverService service) {
         this.service = service;
+    }
+
+    AodTelemetrySnapshot aodSnapshot() {
+        long now = System.nanoTime();
+        ReceiverService.AudioSession session = ReceiverService.currentAudio;
+        if (session == null) {
+            aodSessionId = -1;
+            aodSampler.reset(now);
+            return new AodTelemetrySnapshot(-1, AodTelemetrySnapshot.DisplayStatus.DISCONNECTED,
+                    AodTelemetrySnapshot.Transport.UNKNOWN, null, null, null, false, now);
+        }
+        if (session.id != aodSessionId) {
+            aodSessionId = session.id;
+            aodSampler.reset(now);
+        }
+        boolean udp = session.udpQueue != null;
+        long totalBytes = udp ? session.udpQueue.audioPayloadBytes() : session.inputPcmBytes;
+        aodSampler.recordCumulativeBytes(totalBytes, now);
+        PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
+        Long bitsPerSecond = aodSampler.bitsPerSecond(now);
+        Float bufferMs = AodMetricsSampler.bufferMs(udp ? metrics.queuedFrames : 0,
+                metrics.pendingFrames, metrics.sampleRate);
+        Float lossPercent = null;
+        if (udp) {
+            aodSampler.updateFrameTotals(session.udpQueue.acceptedAudioFrames(),
+                    session.udpQueue.concealedFrames());
+            lossPercent = aodSampler.lossPercent();
+        }
+        boolean receivedRecently = aodSampler.receivedAudioRecently(now, 2_000_000_000L);
+        AodTelemetrySnapshot.DisplayStatus status = receivedRecently
+                ? AodTelemetrySnapshot.DisplayStatus.RECEIVING
+                : AodTelemetrySnapshot.DisplayStatus.CONNECTED;
+        if (udp && "reconnecting".equals(ReceiverService.networkAudioState))
+            status = AodTelemetrySnapshot.DisplayStatus.RECONNECTING;
+        AodTelemetrySnapshot.Transport transport = udp
+                ? AodTelemetrySnapshot.Transport.WIFI_UDP
+                : AodTelemetrySnapshot.Transport.USB_ADB;
+        return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
+                lossPercent, receivedRecently, now);
     }
 
     UiSnapshot snapshot() {

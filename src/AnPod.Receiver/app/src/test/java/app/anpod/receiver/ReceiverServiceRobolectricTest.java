@@ -79,6 +79,18 @@ public final class ReceiverServiceRobolectricTest {
         assertFalse(binder.stop("unknown-owner"));
         assertFalse(service.stopFromUi("unknown-owner", 1L));
     }
+
+    @Test
+    public void aodSnapshotIsDisconnectedWhenIdle() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+
+        AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
+        assertEquals(AodTelemetrySnapshot.DisplayStatus.DISCONNECTED, snapshot.status);
+        assertNull(snapshot.recvAudioPayloadBps);
+        assertNull(snapshot.receiverBufferMs);
+        assertNull(snapshot.udpLossPercent);
+        assertFalse(snapshot.receivedAudioRecently);
+    }
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
     }

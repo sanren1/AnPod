@@ -1662,7 +1662,8 @@ public final class ReceiverService extends Service {
             ensureRunning(session);
             long writeGeneration = session.focusState.writeGeneration();
             if (!session.focusState.acceptsWrite(writeGeneration)) return length;
-            int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
+            if (session.udpQueue == null) session.inputPcmBytes += length;
+        int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
             synchronized (session) {
                 if (!session.focusState.acceptsWrite(writeGeneration)) return length;
                 ensureRunning(session);
@@ -2068,7 +2069,7 @@ public final class ReceiverService extends Service {
         AudioStartTicket() {}
     }
 
-    private static final class AudioSession {
+    static final class AudioSession {
         final long id;
         final AudioRequest request;
         final String ownerId;
@@ -2086,6 +2087,7 @@ public final class ReceiverService extends Service {
         volatile AudioTrack audioTrack;
         boolean trackReady;
         volatile long trackWrittenFrames;
+        volatile long inputPcmBytes;
         volatile boolean trackPlaying;
         final AudioFocusState focusState = new AudioFocusState();
         volatile boolean cancelled;
