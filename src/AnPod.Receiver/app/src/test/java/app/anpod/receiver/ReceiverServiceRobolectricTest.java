@@ -91,6 +91,18 @@ public final class ReceiverServiceRobolectricTest {
         assertNull(snapshot.udpLossPercent);
         assertFalse(snapshot.receivedAudioRecently);
     }
+
+
+    @Test
+    public void idleWaveformIsFlat() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
+
+        PcmWaveformTap.Waveform waveform = binder.aodWaveform();
+        for (float value : waveform.left) assertEquals(0f, value, 0.0001f);
+        for (float value : waveform.right) assertEquals(0f, value, 0.0001f);
+    }
+
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
     }

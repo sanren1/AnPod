@@ -82,6 +82,7 @@ public final class ReceiverService extends Service {
     private static volatile ReceiverService activeService;
     private static final AtomicLong NEXT_AUDIO_ID = new AtomicLong();
     static final AtomicLong PCM_BYTES_WRITTEN = new AtomicLong();
+    private static final PcmWaveformTap WAVEFORM = new PcmWaveformTap();
 
     static volatile boolean foregroundReady;
     static volatile long startedAtElapsedMs;
@@ -697,6 +698,7 @@ public final class ReceiverService extends Service {
     }
 
     private AudioSession startAudio(AudioRequest request) {
+        WAVEFORM.reset();
         if (destroyed) return null;
         AudioSession existing = currentAudio;
         if (existing != null) {
@@ -754,6 +756,7 @@ public final class ReceiverService extends Service {
 
     /** In-process hook for an authenticated session coordinator; no Intent or exported API calls it. */
     void startUdpAudio(UdpSessionContext context) {
+        WAVEFORM.reset();
         String ownerId = networkCoordinatorOwnerId;
         long generation = currentOperationGeneration;
         Runnable start = () -> {
@@ -1663,7 +1666,8 @@ public final class ReceiverService extends Service {
             long writeGeneration = session.focusState.writeGeneration();
             if (!session.focusState.acceptsWrite(writeGeneration)) return length;
             if (session.udpQueue == null) session.inputPcmBytes += length;
-        int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
+            WAVEFORM.accept(data, offset, length, frameBytes, System.nanoTime());
+            int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
             synchronized (session) {
                 if (!session.focusState.acceptsWrite(writeGeneration)) return length;
                 ensureRunning(session);
@@ -1934,6 +1938,10 @@ public final class ReceiverService extends Service {
 
     private void publishMode(AudioSession session, String mode) {
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) actualMode = mode; }
+    }
+
+    static PcmWaveformTap.Waveform aodWaveform() {
+        return WAVEFORM.waveform(System.nanoTime());
     }
 
     static PlaybackMetrics playbackMetricsSnapshot() {
