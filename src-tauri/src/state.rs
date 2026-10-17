@@ -1,7 +1,8 @@
-use crate::{audio::AudioActor, discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{BackgroundTrustSnapshot, HostSession, ReceiverCapabilities, SessionLifecycleState, SessionOwner}, protocol::PcmFormat};
+use crate::{audio::AudioActor, discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{BackgroundTrustSnapshot, HostSession, ReceiverCapabilities, SessionLifecycleState, SessionOwner}, protocol::PcmFormat, presence::{PresenceTracker, PresenceView}};
 use crate::receiver::{self, PlaybackDiagnostics, ReceiverStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tauri::Manager;
 use std::{
     collections::{HashMap, VecDeque},
     env,
@@ -124,6 +125,7 @@ pub struct AppSnapshot {
     pub can_change_modes: bool,
     pub status_detail: String,
     pub audio_bitrate_bps: Option<u64>,
+    pub presence: Vec<PresenceView>,
     pub version: String,
 }
 
@@ -297,6 +299,7 @@ pub struct AppState {
     server_path: PathBuf,
     receiver_apk_path: PathBuf,
     receiver_metadata_path: PathBuf,
+    presence: Mutex<PresenceTracker>,
 }
 
 impl AppState {
@@ -392,6 +395,7 @@ impl AppState {
             server_path,
             receiver_apk_path,
             receiver_metadata_path,
+            presence: Mutex::new(PresenceTracker::default()),
         }
     }
 
@@ -597,8 +601,75 @@ impl AppState {
         let bindings = self.discovery_bindings();
         let cancellation = CancellationToken::new();
         let targets = discovery::probe_targets(&interface);
-        tokio::task::spawn_blocking(move || discovery::discover_on_interface(&interface, &targets, cached,
-            &bindings, Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
+        let found = tokio::task::spawn_blocking(move || discovery::discover_on_interface(&interface, &targets, cached,
+            &bindings, Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())??;
+        let now = Instant::now();
+        let unix = unix_seconds();
+        let mut presence = self.presence.lock().expect("presence lock");
+        for candidate in &found {
+            if let (Some(binding), SocketAddr::V4(endpoint)) = (&candidate.binding_reference, candidate.endpoint) {
+                presence.observe(binding, *endpoint.ip(), now, unix);
+            }
+        }
+        drop(presence);
+        Ok(found)
+    }
+
+    fn record_presence(&self, peer: &str, binding_reference: Option<&str>) {
+        let (Some(binding), Ok(SocketAddr::V4(endpoint))) = (binding_reference, peer.parse::<SocketAddr>()) else { return; };
+        self.presence.lock().expect("presence lock").observe(binding, *endpoint.ip(), Instant::now(), unix_seconds());
+    }
+
+    /// Probes bindings whose backoff has elapsed. Skipped while a session or an
+    /// operation is active, so presence work can never compete with playback.
+    async fn probe_presence(&self) {
+        if self.session.lock().await.is_some() { return; }
+        {
+            let view = self.view.lock().expect("app view lock");
+            if view.busy || view.session_active
+                || selected_connection_transport(&view.settings.preferred_transport) != "wireless"
+                || view.settings.wireless_protocol != "udp" {
+                return;
+            }
+        }
+        let bindings = self.discovery_bindings();
+        if bindings.is_empty() { return; }
+        let cached_default = self.last_receiver_address();
+        let now = Instant::now();
+        let due: Vec<String> = {
+            let mut presence = self.presence.lock().expect("presence lock");
+            for binding in &bindings { presence.register(&binding.reference, cached_default, now); }
+            presence.due(now).into_iter().map(|(reference, _)| reference).collect()
+        };
+        if due.is_empty() { return; }
+        let Some(interface) = self.preferred_interface() else { return; };
+        let due_bindings: Vec<discovery::DiscoveryBinding> = bindings.into_iter()
+            .filter(|binding| due.iter().any(|reference| reference == &binding.reference)).collect();
+        let targets = discovery::probe_targets(&interface);
+        let cancellation = CancellationToken::new();
+        let outcome = tokio::task::spawn_blocking(move || discovery::discover_on_interface(
+            &interface, &targets, cached_default, &due_bindings, Duration::from_millis(900), &cancellation)).await;
+        let now = Instant::now();
+        let unix = unix_seconds();
+        let mut presence = self.presence.lock().expect("presence lock");
+        let candidates = outcome.ok().and_then(Result::ok).unwrap_or_default();
+        for reference in &due {
+            match candidates.iter().find(|candidate| candidate.binding_reference.as_deref() == Some(reference.as_str())) {
+                Some(candidate) => {
+                    if let SocketAddr::V4(endpoint) = candidate.endpoint {
+                        presence.observe(reference, *endpoint.ip(), now, unix);
+                    }
+                }
+                None => presence.miss(reference, now),
+            }
+        }
+    }
+
+    /// First private interface with a default route; the presence prober needs one
+    /// without asking the user, and a routed interface is the only useful guess.
+    fn preferred_interface(&self) -> Option<Ipv4Interface> {
+        self.network_interfaces().ok()?.into_iter()
+            .find(|item| item.address.is_private() && !item.address.is_link_local() && !item.gateways.is_empty())
     }
 
     /// Binding secrets used to authenticate discovery replies. Unreadable bindings are
@@ -919,7 +990,10 @@ impl AppState {
         selected_binding_ref: Option<&str>, background_authorization_required: bool) -> Result<AppSnapshot, String> {
         let result = self.start_network_audio_inner(app, local_address, peer, bootstrap_serial, receiver_address,
             receiver_prefix, selected_binding_ref, None, None, background_authorization_required).await;
-        if result.is_ok() { self.remember_receiver_endpoint(peer); }
+        if result.is_ok() {
+            self.remember_receiver_endpoint(peer);
+            self.record_presence(peer, selected_binding_ref);
+        }
         result
     }
 
@@ -1149,7 +1223,13 @@ impl AppState {
         self.load_settings();
         self.recover_mute_state();
         self.log("AnPod Tauri starting");
-        let _ = app;
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                handle.state::<AppState>().probe_presence().await;
+            }
+        });
         Ok(())
     }
 
@@ -1184,6 +1264,7 @@ impl AppState {
             can_change_modes,
             status_detail: view.status_detail.clone(),
             audio_bitrate_bps: view.audio_bitrate_bps,
+            presence: self.presence.lock().expect("presence lock").view(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
@@ -3042,6 +3123,7 @@ mod tests {
             can_change_modes: false,
             status_detail: "192.168.50.2 已连接".into(),
             audio_bitrate_bps: Some(1_536_000),
+            presence: Vec::new(),
             version: "1.4.0".into(),
         }
     }

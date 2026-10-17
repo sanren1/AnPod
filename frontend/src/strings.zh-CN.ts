@@ -515,6 +515,11 @@ export const zhCN = {
     receiverIpv4Endpoint: "手机地址",
     addressSuggestionNeedsConnection: "选择找到的地址，连接时手机仍会核对配对信息。",
     lastReceiverHint: (endpoint: string) => `上次连接过 ${endpoint}；重新搜索会先试这个地址，再广播。`,
+    presenceLine: (online: boolean, address: string | null, lastSeenUnix: number | null) => {
+      if (online) return `已配对手机在线${address ? `（${address}）` : ""}`;
+      if (lastSeenUnix === null) return "已配对手机尚未探测到";
+      return `已配对手机离线 · 上次 ${new Date(lastSeenUnix * 1000).toLocaleTimeString("zh-CN")}`;
+    },
     verifiedCandidate: "已配对 · 已验证",
     unverifiedCandidate: "未验证",
     invalidSubnetConnectDisabled: "此地址不在所选电脑接口的网段内，连接按钮不可用。",

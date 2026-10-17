@@ -15,6 +15,7 @@ mod security;
 mod p5c;
 #[allow(dead_code)] // P5-E discovery is opt-in and has no default startup caller.
 mod discovery;
+mod presence;
 
 use state::{AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};

@@ -30,6 +30,7 @@ type Snapshot = {
   sessionGeneration: number | null;
   sessionConnectionTransport: "usb" | "wireless" | null; sessionWirelessProtocol: "udp" | "adb" | null;
   sessionAndroidVersion: string | null; connectionTransport: "usb" | "wireless"; transport: "usb" | "wifi";
+  presence: PresenceEntry[];
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
   playbackDiagnostics: PlaybackDiagnostics | null;
   output: "computer" | "phone"; settings: Settings;
@@ -46,6 +47,7 @@ type ReceiverStatus = {
   foreground: boolean; healthy: boolean; audioActive: boolean; error: string | null; message: string;
 };
 type NetworkCandidate = { endpoint: string; bindingReference: string | null };
+type PresenceEntry = { bindingReference: string; online: boolean; lastSeenUnix: number | null; lastAddress: string | null };
 type ReceiverCapabilities = {
   controlMajor: number; audioMajor: number; managementCompatible: boolean;
   audioCompatible: boolean; compatible: boolean; capabilityBits: number; versionCode: number;
@@ -1508,6 +1510,7 @@ function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoice
             </label>
             <small id="network-peer-hint" className="network-hint">{zhCN.network.addressSuggestionNeedsConnection}</small>
             {snapshot.settings.lastReceiverEndpoint && <small className="network-hint">{zhCN.network.lastReceiverHint(snapshot.settings.lastReceiverEndpoint)}</small>}
+            {snapshot.presence.map(entry => <small className="network-hint" key={entry.bindingReference}>{zhCN.network.presenceLine(entry.online, entry.lastAddress, entry.lastSeenUnix)}</small>)}
             {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{zhCN.network.invalidSubnetConnectDisabled}</small>}
             <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
             <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{zhCN.network.searchAddressAgain}</button>
