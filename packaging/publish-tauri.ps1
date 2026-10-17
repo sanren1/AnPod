@@ -2,6 +2,7 @@
 param(
     [string]$Version,
     [switch]$IncludeReceiverCandidate,
+    [switch]$IncludeReceiverRelease,
     [ValidateSet('p1', 'p2', 'v2', 'v3')]
     [string]$ReceiverCandidate = 'p1',
     [string]$ReceiverArtifactDirectory,
@@ -29,6 +30,19 @@ $artifacts = Join-Path $root 'artifacts'
 if ($ReviewPackage -and (-not $IncludeReceiverCandidate -or $ReceiverCandidate -notin @('v2', 'v3'))) { throw '-ReviewPackage is only valid for the v2 or v3 Receiver candidate.' }
 if ($ReuseExistingBuild -and (-not $IncludeReceiverCandidate -or $ReceiverCandidate -ne 'v2')) { throw '-ReuseExistingBuild is only valid for the v2 Receiver candidate.' }
 if ($ReceiverCandidate -eq 'v3' -and -not $ReviewPackage) { throw 'V3 can only be packaged as a review candidate.' }
+if ($IncludeReceiverRelease) {
+    if ($IncludeReceiverCandidate) { throw 'Choose either -IncludeReceiverCandidate or -IncludeReceiverRelease, not both.' }
+    if ($ReviewPackage -or $ReviewWorkingTree) { throw '-IncludeReceiverRelease cannot be combined with review switches; review packages keep the audited debug candidate.' }
+    if (-not $ReceiverArtifactDirectory) { throw 'Release packaging requires -ReceiverArtifactDirectory built by build-receiver.ps1 -Variant release.' }
+    $releaseReceiverSource = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($ReceiverArtifactDirectory)) { $ReceiverArtifactDirectory } else { Join-Path $root $ReceiverArtifactDirectory }))
+    $releaseArtifactsPrefix = [IO.Path]::GetFullPath($artifacts).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $releaseReceiverSource.StartsWith($releaseArtifactsPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Release Receiver artifacts must live under artifacts/: build them into a fresh isolated output directory.'
+    }
+    foreach ($releaseFile in @('receiver.apk', 'receiver.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $releaseReceiverSource $releaseFile) -PathType Leaf)) { throw "Release Receiver directory is missing $releaseFile." }
+    }
+}
 $reviewSuffix = if ($ReviewPackage) { '-review' } else { '' }
 $packageName = if ($IncludeReceiverCandidate -and $ReceiverCandidate -eq 'v3') {
     "AnPod-$Version-receiver-v3-usb-oneclick-review-tauri-win-x64-portable"
@@ -209,6 +223,58 @@ if ($IncludeReceiverCandidate) {
         }
     }
 }
+if ($IncludeReceiverRelease) {
+    $receiverMetadata = Get-Content -Raw (Join-Path $receiverSource 'receiver.json') | ConvertFrom-Json
+    $appGradle = Get-Content -Raw (Join-Path $root 'src/AnPod.Receiver/app/build.gradle')
+    $releaseVersionCode = [int][regex]::Match($appGradle, '(?m)^\s*versionCode\s+(\d+)\s*$').Groups[1].Value
+    $releaseVersionName = [regex]::Match($appGradle, "(?m)^\s*versionName\s+'([^']+)'\s*$").Groups[1].Value
+    if ($receiverMetadata.applicationId -ne 'app.anpod.receiver' -or $receiverMetadata.variant -ne 'release' -or
+        $receiverMetadata.versionCode -ne $releaseVersionCode -or $receiverMetadata.versionName -ne $releaseVersionName -or
+        $receiverMetadata.targetSdk -ne 35 -or $receiverMetadata.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+        $receiverMetadata.signerSha256 -notmatch '^[0-9a-fA-F]{64}$' -or $receiverMetadata.sourceCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'Release packaging needs a Receiver built with -Variant release for the current gradle version, targetSdk 35, and a signed artifact.'
+    }
+    $candidateDebugSigner = 'f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439'
+    if ($receiverMetadata.signerSha256.ToLowerInvariant() -eq $candidateDebugSigner) {
+        throw 'The audited candidate debug certificate cannot sign a release Receiver.'
+    }
+    $actualReceiverHash = (Get-FileHash -LiteralPath (Join-Path $receiverSource 'receiver.apk') -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($receiverMetadata.sha256.ToLowerInvariant() -ne $actualReceiverHash) { throw 'Release Receiver APK SHA-256 does not match receiver.json.' }
+    $currentSourceCommit = (& git -C $root rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the current source commit.' }
+    & git -C $root merge-base --is-ancestor $receiverMetadata.sourceCommit $currentSourceCommit 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Release Receiver source commit is not an ancestor of the current source.' }
+    $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
+    $releaseCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
+    $releaseWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
+    if ($releaseCommittedChanges.Count -or $releaseWorkingChanges.Count) {
+        throw 'Receiver build inputs changed after the release artifact was built; rebuild it before packaging.'
+    }
+    if (-not $AndroidSdkRoot) { $AndroidSdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME } }
+    $releaseBuildTools = if ($AndroidSdkRoot) {
+        Get-ChildItem -LiteralPath (Join-Path $AndroidSdkRoot 'build-tools') -Directory |
+            Where-Object { (Test-Path -LiteralPath (Join-Path $_.FullName 'aapt.exe')) -and (Test-Path -LiteralPath (Join-Path $_.FullName 'apksigner.bat')) } |
+            Sort-Object { [version]((Get-Content -LiteralPath (Join-Path $_.FullName 'source.properties') | Where-Object { $_ -like 'Pkg.Revision=*' } | Select-Object -First 1) -replace '^Pkg.Revision=', '') } -Descending |
+            Select-Object -First 1
+    }
+    if (-not $releaseBuildTools) { throw 'Release packaging requires Android SDK Build-Tools with aapt.exe and apksigner.bat.' }
+    $releaseApk = Join-Path $receiverSource 'receiver.apk'
+    $releaseBadging = & (Join-Path $releaseBuildTools.FullName 'aapt.exe') dump badging $releaseApk
+    $releaseBadgingText = $releaseBadging -join "`n"
+    if ($LASTEXITCODE -ne 0 -or
+        $releaseBadgingText -notmatch "name='app\.anpod\.receiver' versionCode='$releaseVersionCode' versionName='$([regex]::Escape($releaseVersionName))'" -or
+        $releaseBadgingText -notmatch "targetSdkVersion:'35'") {
+        throw 'aapt could not confirm the release APK identity, version, or targetSdk 35.'
+    }
+    $releaseSignature = & (Join-Path $releaseBuildTools.FullName 'apksigner.bat') verify --print-certs $releaseApk 2>&1
+    $releaseSignerMatch = [regex]::Match(($releaseSignature -join "`n"), 'Signer #1 certificate SHA-256 digest: (?<sha>[0-9a-fA-F]{64})')
+    if ($LASTEXITCODE -ne 0 -or -not $releaseSignerMatch.Success -or $releaseSignerMatch.Groups['sha'].Value.ToLowerInvariant() -ne $receiverMetadata.signerSha256.ToLowerInvariant()) {
+        throw 'Release Receiver APK signer does not match receiver.json.'
+    }
+}
+
 $missing = @($required | Where-Object { $source = if ($_ -eq 'audio_capture.dll') { $nativeSource } elseif ($_ -eq 'server') { $legacyPayloadSource } else { $deps }; -not (Test-Path -LiteralPath (Join-Path $source $_) -PathType Leaf) })
 if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ', ')" }
 
@@ -279,11 +345,12 @@ Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { $source = if ($name -eq 'audio_capture.dll') { $nativeSource } elseif ($name -eq 'server') { $legacyPayloadSource } else { $deps }; Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $packageDir $name) }
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $packageDir
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'frontend\public\icon.png') -Destination (Join-Path $packageDir 'icon.png')
 Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $packageDir -Recurse
 Copy-Item -LiteralPath (Join-Path $deps 'PLATFORM_TOOLS_NOTICE.txt') -Destination (Join-Path $packageDir 'LICENSES\PLATFORM_TOOLS_NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'upstream') -Destination $packageDir -Recurse
-if ($IncludeReceiverCandidate) {
+if ($IncludeReceiverCandidate -or $IncludeReceiverRelease) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }
 if ($ReceiverCandidate -eq 'v3' -and $IncludeReceiverCandidate) {
@@ -297,6 +364,20 @@ if ($ReceiverCandidate -eq 'v3' -and $IncludeReceiverCandidate) {
         receiver = [ordered]@{ sha256 = $receiverMetadata.sha256.ToLowerInvariant(); sourceCommit = $receiverMetadata.sourceCommit; sourceInputsSha256 = $receiverMetadata.sourceInputsSha256; sourceModified = $receiverMetadata.sourceModified; versionCode = $receiverMetadata.versionCode; versionName = $receiverMetadata.versionName; targetSdk = $receiverMetadata.targetSdk; variant = $receiverMetadata.variant; signerSha256 = $receiverMetadata.signerSha256.ToLowerInvariant() }
         native = [ordered]@{ sha256 = $expectedNativeSha256; sourceCommit = $auditedComponentCommit }
         legacyServer = [ordered]@{ sha256 = $expectedLegacySha256; sourceCommit = $auditedComponentCommit }
+    }
+    $buildMetadataPath = Join-Path $packageDir 'build-metadata.json'
+    [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+}
+if ($IncludeReceiverRelease) {
+    $buildMetadata = [ordered]@{
+        schemaVersion = 1
+        candidate = 'receiver-release'
+        productVersion = $Version
+        buildCommit = $currentSourceCommit
+        workingTreeReview = $false
+        workingTreeDirty = [bool](@(& git -C $root status --porcelain=v1).Count)
+        desktop = [ordered]@{ sha256 = (Get-FileHash -LiteralPath (Join-Path $packageDir 'AnPod.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); sourceCommit = $currentSourceCommit; sourceInputsSha256 = $desktopInputsSha256 }
+        receiver = [ordered]@{ sha256 = $receiverMetadata.sha256.ToLowerInvariant(); sourceCommit = $receiverMetadata.sourceCommit; sourceInputsSha256 = $receiverMetadata.sourceInputsSha256; sourceModified = $receiverMetadata.sourceModified; versionCode = $receiverMetadata.versionCode; versionName = $receiverMetadata.versionName; targetSdk = $receiverMetadata.targetSdk; variant = $receiverMetadata.variant; signerSha256 = $receiverMetadata.signerSha256.ToLowerInvariant() }
     }
     $buildMetadataPath = Join-Path $packageDir 'build-metadata.json'
     [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))

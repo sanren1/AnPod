@@ -535,9 +535,10 @@ is asserted by both `src-tauri/src/discovery.rs` and
 
 ## P5-C V3 bidirectional discovery and host offers
 
-Discovery v1 remains unchanged for host-initiated discovery. V3 adds three
-unauthenticated records on the same UDP port (`49772`), sent only over the
-currently selected private IPv4 interface:
+Discovery v1 remains unchanged for host-initiated discovery. A second,
+unauthenticated offer channel adds three records on the same UDP port
+(`49772`, version 2), sent only over the currently selected private IPv4
+interface:
 
 | Record | Version/type | Bytes | Payload |
 | --- | --- | ---: | --- |
@@ -582,6 +583,39 @@ uncorrelated offer is ignored. The offer listener requires saved transport
 interface closes it. Activity rebinds reuse the existing Receiver service and
 discovery socket. V3 search uses that same socket and creates no pairing or
 audio endpoint.
+
+### Authenticated discovery (V3, types 6–7)
+
+Version 3 adds two records on the same UDP port so a host can recognise its own
+bindings without a TCP handshake. Both are 50 bytes: `ANPD` (4), version 3 (1),
+type 6 `AUTH_PROBE` or 7 `AUTH_CANDIDATE` (1), zero flags (2), a fresh 16-byte
+nonce, the Receiver control port (2, big-endian), an 8-byte binding tag, and a
+16-byte MAC.
+
+The tag is `HMAC-SHA256(binding secret, "anpod-discovery-tag-v3")` truncated to
+eight bytes, so it is stable for one binding. The probe MAC covers
+`"anpod-probe-v3" || nonce || tag`; the candidate MAC covers
+`"anpod-candidate-v3" || nonce || tag || port`. Both are truncated to sixteen
+bytes. A Receiver compares the tag and probe MAC in constant time before it
+answers.
+
+The host sends one `AUTH_PROBE` per saved binding alongside the v1 probe on
+every scheduled step. A Receiver answers with `AUTH_CANDIDATE` only when both
+checks pass, at most once per 200 ms, with 0–19 ms of random delay before
+sending. The host accepts a reply only when the nonce matches its current probe
+and the candidate MAC verifies. A verified reply carries the binding reference
+and upgrades an endpoint that was already seen through the unauthenticated v1
+record; it is also the only input to binding presence, so an unauthenticated
+answer can never make a binding look online.
+
+Two consequences are deliberate:
+
+- The v1 and v2 records stay unauthenticated for compatibility. Any device can
+  still answer v1 and appear as an unpaired candidate, but it cannot impersonate
+  a binding because the candidate MAC cannot be produced without the secret.
+- The tag is a stable per-binding identifier on the local link. A passive
+  observer can correlate probes from the same host across sessions; no key
+  material is exposed.
 
 ### One-click reception intent (U5)
 

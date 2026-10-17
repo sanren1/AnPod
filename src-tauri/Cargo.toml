@@ -1,8 +1,9 @@
 [package]
 name = "anpod-tauri"
-version = "1.4.0"
+version = "1.5.0"
 description = "Windows system audio to Android over ADB"
 authors = ["AnPod"]
+license = "GPL-3.0-or-later"
 edition = "2021"
 rust-version = "1.90"
 

@@ -107,5 +107,22 @@ the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
 
 ## 5. Project code
 
-AnPod's own code has no declared project-wide licence. Third-party notices do
-not grant a licence to the rest of the project.
+AnPod's own code is released under the GNU General Public License, version 3 or
+later (GPL-3.0-or-later). The full text is in `LICENSE` at the repository root;
+the SPDX identifier is also recorded in `src-tauri/Cargo.toml`.
+
+The Windows DLL (`src/AnPod.Native/`), the legacy payload
+(`src/AnPod.AndroidServer/`) and the AudioShare-derived playback implementation
+in `src/AnPod.Receiver/` keep their LGPL-3.0-or-later terms from section 1. A
+Receiver APK combines those files with AnPod code, so the APK as a whole is
+conveyed under GPL-3.0-or-later; the Corresponding Source is this repository at
+the commit recorded in the package's `build-metadata.json`, and the LGPL origins
+stay separable and rebuildable through `packaging/build-native.ps1`,
+`packaging/build-android.ps1` and `packaging/build-receiver.ps1`.
+
+Requirements that still apply to every published package:
+
+1. Ship `LICENSE`, this notice and `LICENSES/` beside the binaries.
+2. Keep the source revision reachable from a public location.
+3. Keep `audio_capture.dll` a separately loadable file next to `AnPod.exe` so a
+   recipient can replace the LGPL library without rebuilding the covered work.

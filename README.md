@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。当前预览版：PC 1.5.0 + Receiver 0.12.0（code 15）。
 
 ## 使用要求
 
@@ -30,11 +30,13 @@
 
 ## 升级
 
-手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。预览包使用候选 debug 签名，不是正式商店签名。
+手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。预览包使用候选 debug 签名；正式发布包改用独立的发布密钥签名，切换签名需要先卸载旧 Receiver（配对会一起清掉，需重新走 USB 配对）。密钥与打包流程见 [`packaging/SIGNING.md`](packaging/SIGNING.md)。
 
 ## 最新延迟测试（2026-10-17）
 
 PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 匹配并经独立复核。
+
+下表是 **1.2.1 的历史测量**。1.3.0 与 1.4.0 没有重新测延迟，因此这些数字不能当作当前版本的延迟结论。
 
 | 连接与档位 | 中位数 | P95 |
 | --- | ---: | ---: |
@@ -51,6 +53,8 @@ PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 �
 ## 已知问题
 
 - 1.3.0 用户短测已确认无线切档可自动恢复；低延迟播放超过 5 分钟出现 2 次短时卡顿、约 2 秒恢复，仍需改善，优先使用均衡模式。
+- 1.4.0（默认使用 Receiver 后端、界面简化）尚无用户实机结论；升级与签名连续性、后台授权撤销仍待验收。
+- 1.5.0 起 Receiver 改用正式发布签名，与旧 debug 预览包不能互相覆盖安装；从旧包升级需先卸载一次。
 - 音乐音质与长期稳定性尚未验收通过，离线模型和短时延迟测试不能替代实听。
 
 ## 下载与反馈
@@ -61,4 +65,4 @@ PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 �
 
 源码构建依赖 Rust stable、Node.js/npm、MSVC x64 C++ 工具；重建 Receiver 另需 JDK 17 与 Android SDK。前端使用 `cd frontend; npm ci; npm run build`。便携包入口见 [`packaging/publish-tauri.ps1`](packaging/publish-tauri.ps1)，构建前请阅读其中参数及脚本要求。旧 WPF 实现保留在 `src/AnPod.Desktop/`。
 
-第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码未声明独立许可证。
+第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码以 **GPL-3.0-or-later** 发布，完整文本见 [`LICENSE`](LICENSE)；其中改编自 AudioShare 的部分仍按 LGPL-3.0-or-later 说明处理。

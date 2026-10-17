@@ -127,6 +127,8 @@ struct AuditedReceiverArtifact {
 }
 
 // Only same-signer APKs with an exact audited digest and recorded source are admitted.
+// Every shipped APK must be added here after release, or the next version cannot
+// recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
     AuditedReceiverArtifact {
         sha256: "344c47ddbd51b991ba4562e09c11c195815f7f363f9d1196146263df929fa1b7",
@@ -155,6 +157,20 @@ const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
         version_name: "0.10.0-v3-flow-candidate",
         source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
         signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "4d3b578e004992816cb1443fd26ecded1c8f3b087ffb14d1ab4f0727ee31c464",
+        version_code: 14,
+        version_name: "0.11.0-v3-flow-candidate",
+        source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "9f5234bebd1c9728b24b557d8ed84f7fc82dcf66129d01588e294b22563d2cba",
+        version_code: 14,
+        version_name: "0.11.0-v3-flow-candidate",
+        source_commit: "940b06e5de20310c589cf7b0cc3e1be983a5f45e",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
     },
     AuditedReceiverArtifact {
         sha256: "de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77",
