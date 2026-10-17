@@ -17,6 +17,15 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 证书 SHA-256 就是 `apksigner verify --print-certs` 打印的
 `Signer #1 certificate SHA-256 digest`，也是 `receiver.json` 里的 `signerSha256`。
 
+已用这把密钥签过、并登记进 `src-tauri/src/receiver.rs` 审计表的版本：
+
+| Receiver | APK SHA-256 | 说明 |
+| --- | --- | --- |
+| 0.11.0 / code 14 | `9f5234bebd1c9728b24b557d8ed84f7fc82dcf66129d01588e294b22563d2cba` | 发布流程验证包（PC 1.4.0 从脏树构建，未对外发布） |
+| 0.12.0 / code 15 | `5a29fc35e9ac065b57744abef13d8d06996a8554a5a0c17277bc425a58fac2e9` | 首个对外发布签名版本，随 PC 1.5.0 |
+
+每次发布新 APK 都要追加一行并同步审计表，否则下一版无法识别手机上的旧版本。
+
 ## 密钥放在哪里
 
 密钥和口令**不能进仓库**（`.gitignore` 已排除 `*.p12`、`*.jks`、`*.keystore`）。生成时
