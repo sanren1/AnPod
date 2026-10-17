@@ -94,14 +94,16 @@ class AodActivity : ComponentActivity() {
             }
             LaunchedEffect(binder) {
                 var disconnectedAt = 0L
+                var sawSession = false
                 while (isActive) {
                     val current = binder?.aodSnapshot()
                     telemetry = current
-                    if (current == null || current.status == AodTelemetrySnapshot.DisplayStatus.DISCONNECTED) {
+                    if (current != null && current.status != AodTelemetrySnapshot.DisplayStatus.DISCONNECTED) {
+                        sawSession = true
+                        disconnectedAt = 0L
+                    } else if (sawSession) {
                         if (disconnectedAt == 0L) disconnectedAt = SystemClock.elapsedRealtime()
                         if (SystemClock.elapsedRealtime() - disconnectedAt > 3_000L) finish()
-                    } else {
-                        disconnectedAt = 0L
                     }
                     delay(250)
                 }
