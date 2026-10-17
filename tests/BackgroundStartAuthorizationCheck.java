@@ -10,8 +10,10 @@ public final class BackgroundStartAuthorizationCheck {
         onceRecoveryCannotExtendItsOriginalGrace();
         transientTrustExpiresAndDoesNotSurviveRestart();
         eightHourExpirySurvivesSnapshotReads();
+        failedGrantReadsAreNotReportedAsNone();
         signedSessionIdsRemainValidTokens();
         persistentTrustSurvivesRestartAndResetClearsIt();
+        idleGrantRevocationMatchesBinding();
         staleAndExpiredDecisionsAreIgnored();
     }
 
@@ -25,10 +27,33 @@ public final class BackgroundStartAuthorizationCheck {
         BackgroundStartAuthorization.Token token = auth.pendingToken();
         check(auth.decide(token, BackgroundStartAuthorization.ONCE), "current once decision must apply");
         check(auth.status("owner", 7, request, 10, peer(), binding) == BackgroundStartAuthorization.ONCE, "once must authorize the active session");
+        check(auth.grantSnapshot().kindCode == 1 && auth.grantSnapshot().persistenceCode == 1
+                && auth.grantSnapshot().remainingMs == -1,
+                "once grant without a recovery deadline must have no grant expiry");
+        auth.playbackStarted("owner", 7, request, 10, peer(), binding);
+        check(auth.grantSnapshot().remainingMs == -1,
+                "successful once playback must not retain a recovery timeout");
         auth.end("owner", 7, request, 10, peer(), binding, true, true);
+        check(auth.grantSnapshot().remainingMs == BackgroundStartAuthorization.RECOVERY_WINDOW_MS,
+                "once recovery must expose its bounded recovery window");
         clock.advance(29_000);
         check(auth.request("owner", 7, request, 11, peer(), binding) == BackgroundStartAuthorization.ONCE, "unexpected disconnect may recover within the original 30 seconds");
-        auth.end("owner", 7, request, 11, peer(), binding, true, false);
+        auth.playbackStarted("owner", 7, request, 11, peer(), binding);
+        clock.advance(BackgroundStartAuthorization.RECOVERY_WINDOW_MS + 1);
+        check(auth.status("owner", 7, request, 11, peer(), binding) == BackgroundStartAuthorization.ONCE
+                && auth.grantSnapshot().remainingMs == -1,
+                "successful recovery must keep its active once playback beyond 30 seconds");
+        auth.end("owner", 7, request, 11, peer(), binding, true, true);
+        long nextRecoveryDeadline = auth.onceRecoveryDeadlineElapsedMs("owner", 7);
+        check(nextRecoveryDeadline == clock.elapsedRealtime() + BackgroundStartAuthorization.RECOVERY_WINDOW_MS,
+                "a new disconnect after successful recovery must start a new fixed episode");
+        clock.advance(1_000);
+        check(auth.request("owner", 7, request, 12, peer(), binding) == BackgroundStartAuthorization.ONCE,
+                "new once recovery episode must authorize within its deadline");
+        auth.playbackStarted("owner", 7, request, 12, peer(), binding);
+        auth.end("owner", 7, request, 12, peer(), binding, true, false);
+        check(auth.grantSnapshot().kindCode == 0 && auth.grantSnapshot().remainingMs == 0,
+                "normal STOP after successful once playback must clear the grant");
         check(auth.request("owner", 7, bytes(9), 12, peer(), binding) == BackgroundStartAuthorization.PENDING,
                 "normal STOP must clear once authorization for the next episode");
         check(!auth.decide(token, BackgroundStartAuthorization.EIGHT_HOURS), "old session notification must not affect a new request");
@@ -44,6 +69,9 @@ public final class BackgroundStartAuthorizationCheck {
         check(first.decide(first.pendingToken(), BackgroundStartAuthorization.EIGHT_HOURS), "eight-hour trust must apply");
         check(first.grantKind().equals("eightHours") && first.grantRemainingMs() == BackgroundStartAuthorization.EIGHT_HOURS_MS,
                 "eight-hour trust must expose its elapsed-time remainder");
+        check(first.grantSnapshot().kindCode == 2 && first.grantSnapshot().persistenceCode == 1
+                && first.grantSnapshot().remainingMs <= 28_800_000L,
+                "eight-hour grant must use process persistence and never exceed eight hours");
         clock.advance(BackgroundStartAuthorization.EIGHT_HOURS_MS);
         check(first.request("owner", 1, bytes(18), 23, peer(), binding) == BackgroundStartAuthorization.PENDING,
                 "eight-hour trust must expire on the monotonic clock");
@@ -109,6 +137,19 @@ public final class BackgroundStartAuthorizationCheck {
                 "a changed session ID must not match the token");
     }
 
+    private static void failedGrantReadsAreNotReportedAsNone() throws Exception {
+        TestClock clock = new TestClock();
+        BackgroundStartAuthorization auth = auth(clock, new FailingStore());
+        byte[] binding = bytes(30);
+        auth.enable("owner", 14, binding);
+        try {
+            auth.grantSnapshot();
+            throw new AssertionError("failed grant storage read was reported as a grant snapshot");
+        } catch (java.io.IOException expected) {
+            check(!auth.error().isEmpty(), "failed grant storage read must remain visible as an authorization error");
+        }
+    }
+
     private static void pendingReconnectDoesNotExtendDeadline() throws Exception {
         TestClock clock = new TestClock();
         BackgroundStartAuthorization auth = auth(clock, new MemoryStore());
@@ -153,12 +194,13 @@ public final class BackgroundStartAuthorizationCheck {
         check(auth.request("owner", 10, request, 70, peer(), binding) == BackgroundStartAuthorization.PENDING,
                 "request must pend before once grant");
         check(auth.decide(auth.pendingToken(), BackgroundStartAuthorization.ONCE), "once grant must apply");
+        auth.playbackStarted("owner", 10, request, 70, peer(), binding);
         auth.end("owner", 10, request, 70, peer(), binding, true, true);
         long deadline = auth.onceRecoveryDeadlineElapsedMs("owner", 10);
         clock.advance(20_000);
         check(auth.request("owner", 10, request, 71, peer(), binding) == BackgroundStartAuthorization.ONCE,
                 "once grant may recover before its original deadline");
-        auth.end("owner", 10, request, 71, peer(), binding, true, true);
+        auth.end("owner", 10, request, 71, peer(), binding, false, false);
         check(auth.onceRecoveryDeadlineElapsedMs("owner", 10) == deadline,
                 "a second disconnect must not extend the once recovery lease");
         clock.advance(10_001);
@@ -178,6 +220,9 @@ public final class BackgroundStartAuthorizationCheck {
         restarted.enable("owner", 4, binding);
         check(restarted.request("owner", 4, request, 30, peer(), binding) == BackgroundStartAuthorization.UNTIL_REVOKED,
                 "until-revoked trust must survive process restart");
+        check(restarted.grantSnapshot().kindCode == 3 && restarted.grantSnapshot().persistenceCode == 2
+                && restarted.grantSnapshot().remainingMs == -1,
+                "until-revoked trust must expose binding persistence and no expiry");
         restarted.resetBinding(BackgroundStartAuthorization.hex(binding));
         check(store.value == null && !restarted.enabled(), "binding reset must clear durable and active trust");
         restarted.enable("owner", 5, binding);
@@ -186,6 +231,29 @@ public final class BackgroundStartAuthorizationCheck {
         restarted.trustUntilRevoked("owner", 5);
         restarted.revoke("owner", 5);
         check(store.value == null && !restarted.enabled(), "explicit revocation must clear the durable grant and stop standby");
+        check(restarted.grantSnapshot().kindCode == 0 && restarted.grantSnapshot().persistenceCode == 0,
+                "revoked persistent grant must report none only after storage clear");
+    }
+
+    private static void idleGrantRevocationMatchesBinding() throws Exception {
+        TestClock clock = new TestClock();
+        MemoryStore store = new MemoryStore();
+        byte[] binding = bytes(31);
+        String fingerprint = BackgroundStartAuthorization.hex(binding);
+        BackgroundStartAuthorization auth = auth(clock, store);
+        auth.enable("owner", 15, binding);
+        auth.trustUntilRevoked("owner", 15);
+        auth.disable("owner", 15);
+        try {
+            auth.revokeBindingGrant(BackgroundStartAuthorization.hex(bytes(32)));
+            throw new AssertionError("idle revoke accepted a different binding commitment");
+        } catch (java.io.IOException expected) {
+            check(store.value.equals(fingerprint), "stale idle revoke changed the stored trust grant");
+        }
+        auth.inspectBinding(binding);
+        auth.revokeBindingGrant(fingerprint);
+        check(store.value == null && auth.grantSnapshot().kindCode == 0 && !auth.enabled(),
+                "idle revoke must clear only the matching grant without re-enabling standby");
     }
 
     private static void staleAndExpiredDecisionsAreIgnored() throws Exception {
@@ -204,7 +272,7 @@ public final class BackgroundStartAuthorizationCheck {
         check(!auth.decide(auth.pendingToken(), BackgroundStartAuthorization.ONCE), "old operation generation must be rejected");
     }
 
-    private static BackgroundStartAuthorization auth(TestClock clock, MemoryStore store) {
+    private static BackgroundStartAuthorization auth(TestClock clock, BackgroundStartAuthorization.GrantStore store) {
         return new BackgroundStartAuthorization(clock, store, null);
     }
 
@@ -223,5 +291,17 @@ public final class BackgroundStartAuthorizationCheck {
         @Override public boolean hasUntilRevoked(String commitment) { return commitment.equals(value); }
         @Override public void saveUntilRevoked(String commitment) { value = commitment; }
         @Override public void clearUntilRevoked(String commitment) { if (commitment.equals(value)) value = null; }
+    }
+
+    private static final class FailingStore implements BackgroundStartAuthorization.GrantStore {
+        @Override public boolean hasUntilRevoked(String commitment) throws java.io.IOException {
+            throw new java.io.IOException("grant storage unavailable");
+        }
+        @Override public void saveUntilRevoked(String commitment) throws java.io.IOException {
+            throw new java.io.IOException("grant storage unavailable");
+        }
+        @Override public void clearUntilRevoked(String commitment) throws java.io.IOException {
+            throw new java.io.IOException("grant storage unavailable");
+        }
     }
 }

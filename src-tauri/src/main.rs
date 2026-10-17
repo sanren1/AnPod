@@ -167,9 +167,23 @@ async fn discover_network_receivers(state: State<'_, AppState>, local_address: S
 #[tauri::command]
 async fn start_network_audio(app: tauri::AppHandle, state: State<'_, AppState>, local_address: String,
     peer: String, bootstrap_serial: Option<String>, receiver_address: Option<String>,
-    receiver_prefix_length: Option<u8>, binding_reference: Option<String>) -> Result<AppSnapshot, String> {
+    receiver_prefix_length: Option<u8>, binding_reference: Option<String>,
+    background_authorization_required: Option<bool>) -> Result<AppSnapshot, String> {
     state.start_network_audio(&app, &local_address, &peer, bootstrap_serial.as_deref(),
-        receiver_address.as_deref(), receiver_prefix_length, binding_reference.as_deref()).await
+        receiver_address.as_deref(), receiver_prefix_length, binding_reference.as_deref(),
+        background_authorization_required.unwrap_or(false)).await
+}
+
+#[tauri::command]
+async fn query_background_trust(state: State<'_, AppState>, target: state::BackgroundTrustTarget)
+    -> Result<state::BackgroundTrustStatus, String> {
+    state.query_background_trust(target).await
+}
+
+#[tauri::command]
+async fn revoke_background_trust(app: tauri::AppHandle, state: State<'_, AppState>,
+    target: state::BackgroundTrustTarget) -> Result<state::BackgroundTrustStatus, String> {
+    state.revoke_background_trust(&app, target).await
 }
 
 #[tauri::command]
@@ -287,6 +301,8 @@ fn main() {
             receiver_reset_binding,
             discover_network_receivers,
             start_network_audio,
+            query_background_trust,
+            revoke_background_trust,
             set_wireless_connection_offers,
             accept_wireless_connection_offer,
             cancel_qr_pairing,

@@ -199,11 +199,14 @@ final class BackgroundStartAuthorization {
             InetAddress peer, byte[] commitment, boolean playbackHadStarted, boolean keepForRecovery) {
         if (current == null || !current.token.matches(ownerId, generation, requestId, sessionId, peer, commitment)) return;
         if (keepForRecovery && once != null && once.matches(current.token)) {
+            once.playbackActive = false;
             if (once.recoveryDeadlineElapsedMs == 0)
                 once.recoveryDeadlineElapsedMs = clock.elapsedRealtime() + RECOVERY_WINDOW_MS;
         } else if (playbackHadStarted && once != null && once.matches(current.token)) {
             once = null;
             if (episode != null && episode.matches(current.token)) episode.status = CANCELLED;
+        } else if (once != null && once.matches(current.token)) {
+            once.playbackActive = false;
         }
         current = null;
         changed();
@@ -211,7 +214,13 @@ final class BackgroundStartAuthorization {
 
     synchronized void playbackStarted(String ownerId, long generation, byte[] requestId, long sessionId,
             InetAddress peer, byte[] commitment) {
-        if (current != null && current.token.matches(ownerId, generation, requestId, sessionId, peer, commitment)) changed();
+        if (current != null && current.token.matches(ownerId, generation, requestId, sessionId, peer, commitment)) {
+            if (current.status == ONCE && once != null && once.matches(current.token)) {
+                once.playbackActive = true;
+                once.recoveryDeadlineElapsedMs = 0;
+            }
+            changed();
+        }
     }
 
     synchronized long onceRecoveryDeadlineElapsedMs(String ownerId, long generation) {
@@ -221,6 +230,7 @@ final class BackgroundStartAuthorization {
     synchronized void revoke(String ownerId, long generation) throws IOException {
         if (!owns(ownerId, generation)) return;
         store.clearUntilRevoked(bindingCommitment);
+        if (store.hasUntilRevoked(bindingCommitment)) throw new IOException("Background trust remains after revoke");
         if (bindingCommitment.equals(eightHourBinding)) {
             eightHourBinding = "";
             eightHourExpiresAt = 0;
@@ -229,6 +239,24 @@ final class BackgroundStartAuthorization {
         episode = null;
         once = null;
         standbyEnabled = false;
+        error = "";
+        changed();
+    }
+
+    synchronized void revokeBindingGrant(String expectedBindingCommitment) throws IOException {
+        if (standbyEnabled || expectedBindingCommitment == null
+                || !bindingCommitment.equals(expectedBindingCommitment))
+            throw new IOException("Receiver binding changed");
+        store.clearUntilRevoked(expectedBindingCommitment);
+        if (store.hasUntilRevoked(expectedBindingCommitment))
+            throw new IOException("Background trust remains after revoke");
+        if (expectedBindingCommitment.equals(eightHourBinding)) {
+            eightHourBinding = "";
+            eightHourExpiresAt = 0;
+        }
+        current = null;
+        episode = null;
+        once = null;
         error = "";
         changed();
     }
@@ -275,6 +303,12 @@ final class BackgroundStartAuthorization {
         changed();
     }
 
+    synchronized void reportErrorForBinding(String expectedBindingCommitment, String message) {
+        if (expectedBindingCommitment == null || !bindingCommitment.equals(expectedBindingCommitment)) return;
+        error = message == null ? "Background authorization failed." : message;
+        changed();
+    }
+
     synchronized long eightHourDeadlineElapsedMs(String ownerId, long generation) {
         return owns(ownerId, generation) && eightHourBinding.equals(bindingCommitment) ? eightHourExpiresAt : 0;
     }
@@ -295,24 +329,32 @@ final class BackgroundStartAuthorization {
         return !stillTrusted;
     }
 
-    synchronized String grantKind() {
+    synchronized GrantSnapshot grantSnapshot() throws IOException {
         long now = clock.elapsedRealtime();
         expireOnceGrant(now);
         try {
-            if (!bindingCommitment.isEmpty() && store.hasUntilRevoked(bindingCommitment)) return "untilRevoked";
-        } catch (IOException failure) { error = failure.getClass().getSimpleName(); }
+            expireEightHourGrantStatus(now);
+            if (!bindingCommitment.isEmpty() && store.hasUntilRevoked(bindingCommitment))
+                return new GrantSnapshot("untilRevoked", 3, 2, -1);
+        } catch (IOException failure) {
+            error = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+            changed();
+            throw failure;
+        }
         if (!eightHourBinding.isEmpty() && eightHourBinding.equals(bindingCommitment)
-                && eightHourExpiresAt > now) return "eightHours";
-        if (once != null && once.bindingCommitment.equals(bindingCommitment)) return "once";
-        return "none";
+                && eightHourExpiresAt > now)
+            return new GrantSnapshot("eightHours", 2, 1, Math.max(0, eightHourExpiresAt - now));
+        if (once != null && once.bindingCommitment.equals(bindingCommitment)) {
+            long remaining = once.recoveryDeadlineElapsedMs == 0 ? -1
+                    : Math.max(0, once.recoveryDeadlineElapsedMs - now);
+            return new GrantSnapshot("once", 1, 1, remaining);
+        }
+        return new GrantSnapshot("none", 0, 0, 0);
     }
 
-    synchronized long grantRemainingMs() {
-        if ("eightHours".equals(grantKind())) return Math.max(0, eightHourExpiresAt - clock.elapsedRealtime());
-        if (once != null && once.recoveryDeadlineElapsedMs != 0)
-            return Math.max(0, once.recoveryDeadlineElapsedMs - clock.elapsedRealtime());
-        return 0;
-    }
+    synchronized String grantKind() throws IOException { return grantSnapshot().kind; }
+
+    synchronized long grantRemainingMs() throws IOException { return grantSnapshot().remainingMs; }
 
     synchronized String listenerState() {
         if (!standbyEnabled) return "disabled";
@@ -337,8 +379,9 @@ final class BackgroundStartAuthorization {
             String ownerId, long generation, long now) {
         return once != null && once.requestId.equals(hex(requestId)) && once.peer.equals(hex(peer.getAddress()))
                 && once.bindingCommitment.equals(hex(commitment)) && once.ownerId.equals(ownerId)
-                && once.ownerGeneration == generation && (once.recoveryDeadlineElapsedMs == 0
-                        ? once.requestDeadlineElapsedMs > now : once.recoveryDeadlineElapsedMs > now);
+                && once.ownerGeneration == generation && (once.playbackActive
+                        || (once.recoveryDeadlineElapsedMs == 0
+                                ? once.requestDeadlineElapsedMs > now : once.recoveryDeadlineElapsedMs > now));
     }
 
     private boolean matchesOwner(String ownerId, long generation, byte[] commitment) {
@@ -361,8 +404,15 @@ final class BackgroundStartAuthorization {
     }
 
     private void expireOnceGrant(long now) {
-        if (current == null && once != null && once.recoveryDeadlineElapsedMs != 0
-                && now >= once.recoveryDeadlineElapsedMs) once = null;
+        if (once != null && once.recoveryDeadlineElapsedMs != 0 && now >= once.recoveryDeadlineElapsedMs) {
+            if (current != null && current.status == ONCE && once.matches(current.token)) {
+                current.status = EXPIRED;
+                if (episode != null && episode.matches(current.token)) episode.status = EXPIRED;
+            }
+            once = null;
+            error = "Background-start recovery expired.";
+            changed();
+        }
     }
 
     private void changed() { if (listener != null) listener.changed(pendingToken()); }
@@ -375,6 +425,16 @@ final class BackgroundStartAuthorization {
             result[i * 2 + 1] = digits[bytes[i] & 15];
         }
         return new String(result);
+    }
+
+    static final class GrantSnapshot {
+        final String kind;
+        final int kindCode, persistenceCode;
+        final long remainingMs;
+        GrantSnapshot(String kind, int kindCode, int persistenceCode, long remainingMs) {
+            this.kind = kind; this.kindCode = kindCode; this.persistenceCode = persistenceCode;
+            this.remainingMs = remainingMs;
+        }
     }
 
     static final class Token {
@@ -428,6 +488,7 @@ final class BackgroundStartAuthorization {
         final long ownerGeneration;
         long recoveryDeadlineElapsedMs;
         final long requestDeadlineElapsedMs;
+        boolean playbackActive;
         OnceGrant(Token token) {
             ownerId = token.ownerId; ownerGeneration = token.ownerGeneration; requestId = token.requestId;
             peer = token.peer; bindingCommitment = token.bindingCommitment;

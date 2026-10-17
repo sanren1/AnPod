@@ -38,6 +38,7 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
+import java.security.MessageDigest;
 import java.util.Enumeration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -172,8 +173,10 @@ public final class ReceiverService extends Service {
         public boolean trustBindingUntilRevoked(String ownerId, long generation) {
             return trustBindingUntilRevokedFromUi(ownerId, generation);
         }
-        public boolean revokeBackgroundTrust(String ownerId, long generation) {
-            return revokeBackgroundTrustFromUi(ownerId, generation);
+        public boolean revokeBackgroundTrust(String expectedOwnerId, long expectedGeneration,
+                String expectedBindingFingerprint) {
+            return revokeBackgroundTrustFromUi(expectedOwnerId, expectedGeneration,
+                    expectedBindingFingerprint);
         }
         public P5cDiscovery.SearchSnapshot startSearch(String expectedOwnerId) throws IOException {
             synchronized (networkCoordinatorLock) {
@@ -205,14 +208,14 @@ public final class ReceiverService extends Service {
         public final int versionCode, networkPort;
         public final long operationGeneration, backgroundGrantRemainingMs, pendingAuthorizationDeadlineElapsedMs;
         public final Boolean playbackAdvancing;
-        public final boolean backgroundStandbyEnabled;
+        public final boolean backgroundStandbyEnabled, canRevokeBackgroundTrust;
         public final boolean searchActive;
         public final List<P5cDiscovery.SearchCandidate> searchCandidates;
         public final String connectionRequestStatus;
         UiSnapshot(String serviceState, String bindingState, String bindingFingerprint, String connectionMethod, String playbackMode,
                 String versionName, int versionCode, String operationId, String operationState, String error,
                 long operationGeneration, String networkAddress, int networkPort, boolean backgroundStandbyEnabled,
-                Boolean playbackAdvancing,
+                boolean canRevokeBackgroundTrust, Boolean playbackAdvancing,
                 String backgroundListenerState, String backgroundGrantKind, String backgroundGrantPersistence,
                 long backgroundGrantRemainingMs,
                 String pendingAuthorizationRequestId, long pendingAuthorizationDeadlineElapsedMs,
@@ -226,6 +229,7 @@ public final class ReceiverService extends Service {
             this.networkAddress = networkAddress; this.networkPort = networkPort;
             this.playbackAdvancing = playbackAdvancing;
             this.backgroundStandbyEnabled = backgroundStandbyEnabled;
+            this.canRevokeBackgroundTrust = canRevokeBackgroundTrust;
             this.backgroundListenerState = backgroundListenerState; this.backgroundGrantKind = backgroundGrantKind;
             this.backgroundGrantPersistence = backgroundGrantPersistence;
             this.backgroundGrantRemainingMs = backgroundGrantRemainingMs;
@@ -634,6 +638,7 @@ public final class ReceiverService extends Service {
         String binding = "empty";
         String fingerprint = "";
         String listenerState = "disabled", grantKind = "none", pendingRequestId = "", authorizationError = "";
+        String grantPersistence = "none";
         long grantRemainingMs = 0, pendingDeadlineElapsedMs = 0;
         try {
             BindingStore.Status status = new BindingStore(getFilesDir()).status();
@@ -641,17 +646,33 @@ public final class ReceiverService extends Service {
             fingerprint = status.commitment;
             if (!fingerprint.isEmpty()) {
                 synchronized (BindingStore.storageLock()) {
-                    backgroundAuthorization.inspectBinding(unhex(fingerprint));
+                    byte[] commitment = unhex(fingerprint);
+                    try { backgroundAuthorization.inspectBinding(commitment); }
+                    finally { java.util.Arrays.fill(commitment, (byte) 0); }
                     listenerState = backgroundAuthorization.listenerState();
                     if (backgroundStandbyEnabled && networkCoordinator == null) listenerState = "starting";
-                    grantKind = backgroundAuthorization.grantKind();
-                    grantRemainingMs = backgroundAuthorization.grantRemainingMs();
+                    try {
+                        BackgroundStartAuthorization.GrantSnapshot grant = backgroundAuthorization.grantSnapshot();
+                        grantKind = grant.kind;
+                        grantPersistence = grant.persistenceCode == 2 ? "binding"
+                                : grant.persistenceCode == 1 ? "process" : "none";
+                        grantRemainingMs = grant.remainingMs;
+                    } catch (IOException grantError) {
+                        grantKind = "unavailable";
+                        grantPersistence = "unavailable";
+                        authorizationError = describeFailure(grantError);
+                    }
                     pendingRequestId = backgroundAuthorization.pendingRequestId();
                     pendingDeadlineElapsedMs = backgroundAuthorization.pendingDeadlineElapsedMs();
-                    authorizationError = backgroundAuthorization.error();
+                    if (authorizationError.isEmpty()) authorizationError = backgroundAuthorization.error();
                 }
             }
-        } catch (Exception error) { binding = "unavailable"; authorizationError = error.getClass().getSimpleName(); }
+        } catch (Exception error) {
+            binding = "unavailable";
+            grantKind = "unavailable";
+            grantPersistence = "unavailable";
+            authorizationError = describeFailure(error);
+        }
         String method = networkCoordinator != null || !networkAudioAddress.isEmpty() ? "wireless-udp"
                 : currentAudio != null ? "usb-or-local" : "unknown";
         String state = ReceiverUiOperation.displayState(networkAudioState, currentAudio != null, audioActive);
@@ -659,12 +680,11 @@ public final class ReceiverService extends Service {
         Boolean playbackAdvancing = playbackMetricsSnapshot().advancing;
         String operationError = uiOperation.error();
         if (operationError.isEmpty()) operationError = networkAudioFailure;
-        String grantPersistence = "untilRevoked".equals(grantKind) ? "binding"
-                : ("once".equals(grantKind) || "eightHours".equals(grantKind)) ? "process" : "none";
+        boolean canRevokeBackgroundTrust = canRevokeBackgroundTrust(binding, fingerprint, grantKind);
         return new UiSnapshot(state, binding, fingerprint, method, mode, BuildConfig.VERSION_NAME,
                 BuildConfig.VERSION_CODE, uiOperation.ownerId(), uiOperation.phase(), operationError,
                 currentOperationGeneration, networkAudioAddress, networkAudioPort, backgroundStandbyEnabled,
-                playbackAdvancing,
+                canRevokeBackgroundTrust, playbackAdvancing,
                 listenerState, grantKind, grantPersistence, grantRemainingMs, pendingRequestId,
                 pendingDeadlineElapsedMs, authorizationError,
                 networkCoordinator == null ? new P5cDiscovery.SearchSnapshot(false, Collections.emptyList(), "idle")
@@ -722,17 +742,22 @@ public final class ReceiverService extends Service {
             InetAddress selected = parseIpv4(address);
             if (!isAssignedPrivateAddress(selected, prefixLength)) throw new IOException("所选网络接口已不可用，请重新选择。");
             String ownerId = UUID.randomUUID().toString();
-            if (!uiOperation.begin(ownerId)) return "已有接收会话正在运行。";
-            long generation = networkBootstrapGeneration.incrementAndGet();
-            currentOperationGeneration = generation;
-            backgroundStandbyEnabled = backgroundStandby;
-            receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
-            pendingUiStartRequestId = requestId;
-            pendingUiStandbyStart = backgroundStandby;
-            pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
-            networkAudioState = "starting";
-            networkAudioFailure = "";
-            startFailure = "";
+            long generation;
+            synchronized (networkCoordinatorLock) {
+                if (!uiOperation.canBegin() || currentAudio != null || pendingAudio != null
+                        || networkCoordinator != null || !uiOperation.begin(ownerId))
+                    return "已有接收会话正在运行。";
+                generation = networkBootstrapGeneration.incrementAndGet();
+                currentOperationGeneration = generation;
+                backgroundStandbyEnabled = backgroundStandby;
+                receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
+                pendingUiStartRequestId = requestId;
+                pendingUiStandbyStart = backgroundStandby;
+                pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
+                networkAudioState = "starting";
+                networkAudioFailure = "";
+                startFailure = "";
+            }
             Intent intent = new Intent(this, ReceiverService.class).setAction(ACTION_UI_START_NETWORK_AUDIO)
                     .putExtra("networkAddress", address).putExtra("networkPrefixLength", prefixLength)
                     .putExtra(EXTRA_UI_REQUEST_ID, requestId).putExtra(EXTRA_UI_OWNER_ID, ownerId)
@@ -779,15 +804,90 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private boolean revokeBackgroundTrustFromUi(String ownerId, long generation) {
-        if (!applicationIsVisible() || !isCurrentOperation(ownerId, generation) || !backgroundStandbyEnabled) return false;
-        try {
-            synchronized (BindingStore.storageLock()) { backgroundAuthorization.revoke(ownerId, generation); }
-            requestTermination(ownerId, generation, false, "BackgroundTrustRevoked");
-            return true;
-        } catch (IOException error) {
-            setAuthorizationError(ownerId, generation, error.getClass().getSimpleName());
-            return false;
+    private boolean revokeBackgroundTrustFromUi(String expectedOwnerId, long expectedGeneration,
+            String expectedBindingFingerprint) {
+        if (!applicationIsVisible() || expectedOwnerId == null || expectedBindingFingerprint == null
+                || expectedBindingFingerprint.length() != 64) return false;
+        boolean terminateActiveStandby = false;
+        synchronized (networkCoordinatorLock) {
+            if (!expectedOwnerId.equals(uiOperation.ownerId())
+                    || expectedGeneration != currentOperationGeneration
+                    || expectedGeneration != networkBootstrapGeneration.get()) return false;
+            boolean activeStandby = backgroundStandbyEnabled && backgroundAuthorization.enabled()
+                    && isCurrentOperation(expectedOwnerId, expectedGeneration);
+            boolean idle = uiOperation.canBegin() && currentAudio == null && pendingAudio == null
+                    && networkCoordinator == null && !backgroundStandbyEnabled;
+            if (!activeStandby && !idle) return false;
+            synchronized (BindingStore.storageLock()) {
+                try {
+                    if (activeStandby) {
+                        byte[] requested = unhex(expectedBindingFingerprint);
+                        try {
+                            verifyBackgroundBinding(expectedOwnerId, expectedGeneration, true, requested);
+                            backgroundAuthorization.revoke(expectedOwnerId, expectedGeneration);
+                        } finally { java.util.Arrays.fill(requested, (byte) 0); }
+                        backgroundStandbyEnabled = false;
+                        networkRecoveryDeadlineElapsedMs = 0;
+                        terminateActiveStandby = true;
+                    } else {
+                        BindingStore.Status status = new BindingStore(getFilesDir()).status();
+                        if (!"saved".equals(status.state)
+                                || !sameBindingFingerprint(expectedBindingFingerprint, status.commitment)) return false;
+                        byte[] commitment = unhex(status.commitment);
+                        try {
+                            backgroundAuthorization.inspectBinding(commitment);
+                            backgroundAuthorization.revokeBindingGrant(status.commitment);
+                        } finally { java.util.Arrays.fill(commitment, (byte) 0); }
+                    }
+                    cancelAuthorizationNotification();
+                } catch (IOException | PairingProtocol.Failure error) {
+                    backgroundAuthorization.reportErrorForBinding(expectedBindingFingerprint,
+                            describeFailure(error));
+                    return false;
+                }
+            }
+        }
+        if (terminateActiveStandby)
+            requestTermination(expectedOwnerId, expectedGeneration, false, "BackgroundTrustRevoked");
+        return true;
+    }
+
+    private boolean canRevokeBackgroundTrust(String binding, String fingerprint, String grantKind) {
+        boolean hasGrant = "untilRevoked".equals(grantKind) || "eightHours".equals(grantKind)
+                || "once".equals(grantKind);
+        boolean activeStandby = backgroundStandbyEnabled && backgroundAuthorization.enabled()
+                && (ReceiverUiOperation.STARTING.equals(uiOperation.phase())
+                        || ReceiverUiOperation.RUNNING.equals(uiOperation.phase()));
+        boolean idle = uiOperation.canBegin() && currentAudio == null && pendingAudio == null
+                && networkCoordinator == null && !backgroundStandbyEnabled;
+        return currentOperationGeneration == networkBootstrapGeneration.get()
+                && applicationIsVisible() && "saved".equals(binding) && !fingerprint.isEmpty()
+                && hasGrant && (activeStandby || idle);
+    }
+
+    private String verifyBackgroundBinding(String ownerId, long generation, boolean standbyRequested,
+            byte[] requestedCommitment) throws IOException {
+        if (!standbyRequested || !backgroundStandbyEnabled || !isCurrentOperation(ownerId, generation)
+                || requestedCommitment == null || requestedCommitment.length != 32)
+            throw new IOException("Background authorization session is no longer current");
+        BindingStore.Status status;
+        try { status = new BindingStore(getFilesDir()).status(); }
+        catch (PairingProtocol.Failure error) { throw new IOException("AnPod binding is unavailable", error); }
+        String requested = BackgroundStartAuthorization.hex(requestedCommitment);
+        if (!"saved".equals(status.state) || !sameBindingFingerprint(requested, status.commitment)
+                || !requested.equals(backgroundAuthorization.bindingCommitment()))
+            throw new IOException("AnPod binding changed during background authorization");
+        backgroundAuthorization.inspectBinding(requestedCommitment);
+        return status.commitment;
+    }
+
+    private static boolean sameBindingFingerprint(String left, String right) {
+        if (left == null || right == null || left.length() != 64 || right.length() != 64) return false;
+        byte[] leftBytes = unhex(left), rightBytes = unhex(right);
+        try { return MessageDigest.isEqual(leftBytes, rightBytes); }
+        finally {
+            java.util.Arrays.fill(leftBytes, (byte) 0);
+            java.util.Arrays.fill(rightBytes, (byte) 0);
         }
     }
 
@@ -998,6 +1098,41 @@ public final class ReceiverService extends Service {
                     return backgroundStandby && current();
                 }
 
+                @Override public boolean supportsBackgroundTrustManagement() {
+                    return backgroundStandby && backgroundStandbyEnabled && current();
+                }
+
+                @Override public P5cReceiverCoordinator.BackgroundTrustSnapshot queryBackgroundTrust(
+                        byte[] bindingCommitment) throws IOException {
+                    synchronized (BindingStore.storageLock()) {
+                        try {
+                            verifyBackgroundBinding(ownerId, generation, backgroundStandby, bindingCommitment);
+                            BackgroundStartAuthorization.GrantSnapshot grant = backgroundAuthorization.grantSnapshot();
+                            return new P5cReceiverCoordinator.BackgroundTrustSnapshot(grant.kindCode,
+                                    grant.persistenceCode, grant.remainingMs);
+                        } catch (IOException error) {
+                            backgroundAuthorization.reportError(ownerId, generation, describeFailure(error));
+                            throw error;
+                        }
+                    }
+                }
+
+                @Override public boolean revokeBackgroundTrust(byte[] bindingCommitment) throws IOException {
+                    synchronized (BindingStore.storageLock()) {
+                        try {
+                            verifyBackgroundBinding(ownerId, generation, backgroundStandby, bindingCommitment);
+                            backgroundAuthorization.revoke(ownerId, generation);
+                            backgroundStandbyEnabled = false;
+                            networkRecoveryDeadlineElapsedMs = 0;
+                            cancelAuthorizationNotification();
+                            return true;
+                        } catch (IOException error) {
+                            backgroundAuthorization.reportError(ownerId, generation, describeFailure(error));
+                            throw error;
+                        }
+                    }
+                }
+
                 @Override public int requestBackgroundStartAuthorization(byte[] requestId, long sessionId,
                         InetAddress peer, byte[] bindingCommitment) throws IOException {
                     if (!current() || !notificationPermissionAvailable()) {
@@ -1047,6 +1182,7 @@ public final class ReceiverService extends Service {
                         backgroundAuthorization.playbackStarted(ownerId, generation, requestId, sessionId,
                                 peer, bindingCommitment);
                     }
+                    networkRecoveryDeadlineElapsedMs = 0;
                 }
 
                 @Override public byte[] playbackProgressPayload() {
@@ -1424,6 +1560,7 @@ public final class ReceiverService extends Service {
             LocalSocket ownedSocket = session.request.udpContext == null ? new LocalSocket() : null;
             try (ownedSocket) {
                 InputStream input;
+                UdpPcmQueue.QueueInputStream udpPcmInput = null;
                 if (ownedSocket == null) {
                     WifiManager wifi = getSystemService(WifiManager.class);
                     if (wifi == null) throw new IOException("WiFi service unavailable");
@@ -1447,7 +1584,8 @@ public final class ReceiverService extends Service {
                         session.networkThread = networkThread;
                         networkThread.start();
                     }
-                    input = udpQueue.asPcmInputStream();
+                    udpPcmInput = (UdpPcmQueue.QueueInputStream) udpQueue.asPcmInputStream();
+                    input = udpPcmInput;
                 } else {
                     synchronized (session) {
                         ensureRunning(session);
@@ -1535,8 +1673,21 @@ public final class ReceiverService extends Service {
                     publishMode(session, configuredMode);
                 }
 
-                byte[] buffer = new byte[Math.max(frameBytes, minBuffer + frameBytes - 1)];
+                int driftReserveFrames = Pcm16FrameStream.driftReserveFrames(sampleRate);
+                int driftReserveBytes = driftReserveFrames * frameBytes;
+                int sourceBufferBytes = Math.max(frameBytes, minBuffer + frameBytes - 1);
+                byte[] buffer = new byte[sourceBufferBytes + driftReserveBytes];
+                byte[] adjustedReadScratch = new byte[buffer.length];
                 Pcm16FrameStream pcm = new Pcm16FrameStream(channels);
+                boolean lowLatencyBacklog = currentMode(session).startsWith("low-latency");
+                int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
+                        track.getSampleRate(), lowLatencyBacklog);
+                int driftReadTargetFrames = udpQueue == null ? backlogTargetFrames
+                        : Math.max(1, track.getSampleRate() / 200);
+                int driftReadLimitBytes = Math.min(buffer.length - driftReserveBytes,
+                        driftReadTargetFrames * frameBytes);
+                driftReadLimitBytes -= driftReadLimitBytes % frameBytes;
+                driftReadLimitBytes = Math.max(frameBytes, driftReadLimitBytes);
                 int effectiveFrames = track.getBufferSizeInFrames();
                 int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
                 int preRollFrames = currentMode(session).startsWith("low-latency") && thresholdFrames > 0
@@ -1547,9 +1698,6 @@ public final class ReceiverService extends Service {
                 if (udpQueue != null) {
                     udpQueue.configureAudioTrack(preRollFrames);
                 } else {
-                    boolean lowLatencyBacklog = currentMode(session).startsWith("low-latency");
-                    int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
-                            track.getSampleRate(), lowLatencyBacklog);
                     int backlogTriggerFrames = Pcm16FrameStream.backlogTriggerFrames(
                             track.getSampleRate(), lowLatencyBacklog);
                     pcm.setBacklogLimit(backlogTargetFrames, backlogTriggerFrames,
@@ -1575,6 +1723,7 @@ public final class ReceiverService extends Service {
                 final AudioTrack focusTrack = track;
                 focusListener = change -> handler.post(() ->
                         handleAudioFocusChange(focusSession, focusTrack, change));
+                boolean driftStarted = false;
                 synchronized (session) {
                     ensureRunning(session);
                     if (Build.VERSION.SDK_INT >= 26) {
@@ -1592,34 +1741,166 @@ public final class ReceiverService extends Service {
                     ensureRunning(session);
                     session.trackReady = true;
                     if (session.focusState.canPlay()) {
+                        long driftStartNanos = System.nanoTime();
+                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), driftStartNanos);
                         track.play();
                         if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
                         session.focusState.markTrackPlaying();
                     }
+                    session.driftResetGeneration++;
+                    if (session.trackPlaying) {
+                        long driftStartNanos = System.nanoTime();
+                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
+                                ? track.getUnderrunCount() : -1;
+                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                                ? backlogTargetFrames : udpQueue.targetFrames(), driftStartNanos);
+                        driftStarted = true;
+                    }
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) audioActive = session.focusState.canPlay();
                     }
                 }
+                long observedDriftResetGeneration = session.driftResetGeneration;
+                long observedUdpDropped = udpQueue == null ? 0 : udpQueue.droppedFrames();
+                long observedUdpExpired = udpQueue == null ? 0 : udpQueue.expiredFrames();
+                long observedUdpOversizedGaps = udpQueue == null ? 0 : udpQueue.plcOversizedGapSkips();
+                long observedUdpPayloadGeneration = udpQueue == null ? 0 : udpQueue.payloadGeneration();
+                long driftObservedPlayedFrames = 0;
+                boolean driftNeedsRealAudio = false;
                 while (true) {
                     ensureRunning(session);
                     awaitFocusResume(session);
-                    int count = pcm.readFrames(input, buffer, buffer.length);
+                    long driftResetGeneration = session.driftResetGeneration;
+                    long nowNanos = System.nanoTime();
+                    if (driftResetGeneration != observedDriftResetGeneration) {
+                        driftObservedPlayedFrames = session.driftPlaybackHead.update(
+                                track.getPlaybackHeadPosition(), nowNanos);
+                        int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+                        session.driftLastUnderruns = underruns;
+                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                                ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
+                        observedDriftResetGeneration = driftResetGeneration;
+                        driftNeedsRealAudio = false;
+                        driftStarted = true;
+                    }
+                    if (!driftStarted) {
+                        nowNanos = System.nanoTime();
+                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), nowNanos);
+                        driftObservedPlayedFrames = 0;
+                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
+                                ? track.getUnderrunCount() : -1;
+                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                                ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
+                        driftStarted = true;
+                    }
+
+                    long droppedBacklogBefore = pcm.getDroppedBacklogFrames();
+                    long udpDroppedBefore = udpQueue == null ? 0 : udpQueue.droppedFrames();
+                    long udpExpiredBefore = udpQueue == null ? 0 : udpQueue.expiredFrames();
+                    long udpSourceDeliveredBefore = udpPcmInput == null ? 0
+                            : udpPcmInput.sourceBytesDelivered();
+                    long udpSyntheticDeliveredBefore = udpPcmInput == null ? 0
+                            : udpPcmInput.syntheticBytesDelivered();
+                    long udpOversizedGapBefore = udpQueue == null ? 0 : udpQueue.plcOversizedGapSkips();
+                    long udpPayloadGenerationBefore = udpQueue == null ? 0 : udpQueue.payloadGeneration();
+                    boolean udpDiscontinuityBeforeRead = udpQueue != null
+                            && (udpDroppedBefore != observedUdpDropped
+                                    || udpExpiredBefore != observedUdpExpired
+                                    || udpOversizedGapBefore != observedUdpOversizedGaps
+                                    || udpPayloadGenerationBefore != observedUdpPayloadGeneration);
+                    session.driftPlaybackHead.update(track.getPlaybackHeadPosition(), nowNanos);
+                    int previousUnderruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+                    boolean headAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
+                    boolean underrunBeforeRead = session.driftLastUnderruns >= 0 && previousUnderruns >= 0
+                            && previousUnderruns != session.driftLastUnderruns;
+                    int sourceReadAdjustmentFrames = headAdvancing && !underrunBeforeRead
+                            && !driftNeedsRealAudio
+                                    ? pcm.driftReadFrameAdjustment(nowNanos) : 0;
+                    int sourceReadLimitBytes = driftReadLimitBytes
+                            + sourceReadAdjustmentFrames * frameBytes;
+                    int count = pcm.readFrames(input, buffer, sourceReadLimitBytes);
+                    if ((sourceReadAdjustmentFrames != 0 || udpQueue != null) && count >= 0) {
+                        int totalRead = count;
+                        while (totalRead < sourceReadLimitBytes) {
+                            ensureRunning(session);
+                            int additionalRead = pcm.readFrames(input, adjustedReadScratch,
+                                    sourceReadLimitBytes - totalRead);
+                            if (additionalRead < 0) break;
+                            System.arraycopy(adjustedReadScratch, 0, buffer, totalRead, additionalRead);
+                            totalRead += additionalRead;
+                        }
+                        count = totalRead;
+                    }
                     if (count < 0) {
                         failure = "AudioStreamEnded";
                         break;
                     }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
-                    writeFrames(session, track, pcm, buffer, count, frameBytes);
+                    nowNanos = System.nanoTime();
+                    int playbackPosition = track.getPlaybackHeadPosition();
+                    long playedFrames = session.driftPlaybackHead.update(playbackPosition, nowNanos);
+                    int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+                    boolean playbackAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
+                    boolean headAdvanced = playedFrames > driftObservedPlayedFrames;
+                    if (headAdvanced) driftObservedPlayedFrames = playedFrames;
+                    boolean underrunChanged = previousUnderruns >= 0 && underruns >= 0
+                            && underruns != previousUnderruns;
+                    long udpDroppedAfter = udpQueue == null ? udpDroppedBefore : udpQueue.droppedFrames();
+                    long udpExpiredAfter = udpQueue == null ? udpExpiredBefore : udpQueue.expiredFrames();
+                    long udpOversizedGapAfter = udpQueue == null ? udpOversizedGapBefore
+                            : udpQueue.plcOversizedGapSkips();
+                    long udpPayloadGenerationAfter = udpQueue == null ? udpPayloadGenerationBefore
+                            : udpQueue.payloadGeneration();
+                    long udpSourceDelivered = udpPcmInput == null ? 0
+                            : udpPcmInput.sourceBytesDelivered() - udpSourceDeliveredBefore;
+                    long udpSyntheticDelivered = udpPcmInput == null ? 0
+                            : udpPcmInput.syntheticBytesDelivered() - udpSyntheticDeliveredBefore;
+                    boolean syntheticUdpBlock = udpSyntheticDelivered > 0;
+                    if (syntheticUdpBlock) driftNeedsRealAudio = true;
+                    boolean resumeAfterSynthetic = udpQueue != null && driftNeedsRealAudio
+                            && !syntheticUdpBlock && udpSourceDelivered > 0;
+                    boolean discontinuity = pcm.getDroppedBacklogFrames() != droppedBacklogBefore
+                            || (udpQueue != null && (udpDroppedAfter != udpDroppedBefore
+                                    || udpExpiredAfter != udpExpiredBefore
+                                    || udpOversizedGapAfter != udpOversizedGapBefore
+                                    || udpPayloadGenerationAfter != udpPayloadGenerationBefore
+                                    || udpDiscontinuityBeforeRead))
+                            || underrunChanged
+                            || underrunBeforeRead
+                            || session.driftResetGeneration != observedDriftResetGeneration;
+                    boolean readAdjustmentApplied = sourceReadAdjustmentFrames != 0
+                            && count == sourceReadLimitBytes
+                            && (udpPcmInput == null
+                                    || udpSourceDelivered + udpSyntheticDelivered == count);
+                    int outputBytes = count;
+                    int driftSourceTargetFrames = udpQueue == null
+                            ? backlogTargetFrames : udpQueue.targetFrames();
+                    long sourceBufferedFrames = udpQueue == null
+                            ? Math.max(0, input.available() / frameBytes) : udpQueue.sourceBufferedFrames();
+                    outputBytes = pcm.correctDrift(buffer, count, sourceBufferedFrames,
+                            Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, playedFrames),
+                            driftSourceTargetFrames, nowNanos, playbackAdvancing,
+                            discontinuity || syntheticUdpBlock || driftNeedsRealAudio,
+                            readAdjustmentApplied ? sourceReadAdjustmentFrames : 0, headAdvanced);
+                    if (udpQueue != null) {
+                        observedUdpDropped = udpDroppedAfter;
+                        observedUdpExpired = udpExpiredAfter;
+                        observedUdpOversizedGaps = udpOversizedGapAfter;
+                        observedUdpPayloadGeneration = udpPayloadGenerationAfter;
+                    }
+                    if (resumeAfterSynthetic) driftNeedsRealAudio = false;
+                    session.driftLastUnderruns = underruns;
+                    writeFrames(session, track, pcm, buffer, outputBytes, frameBytes);
                     if (Build.VERSION.SDK_INT >= 24) {
-                        int underruns = track.getUnderrunCount();
-                        if (udpQueue != null) udpQueue.reportTrackUnderruns(underruns);
+                        int reportedUnderruns = track.getUnderrunCount();
+                        if (udpQueue != null) udpQueue.reportTrackUnderruns(reportedUnderruns);
                         synchronized (STATUS_LOCK) {
                             if (statusAudioId == session.id) {
-                                underrunIncrement = underrunCount < 0 || underruns < underrunCount
-                                        ? -1 : underruns - underrunCount;
-                                underrunCount = underruns;
+                                underrunIncrement = underrunCount < 0 || reportedUnderruns < underrunCount
+                                        ? -1 : reportedUnderruns - underrunCount;
+                                underrunCount = reportedUnderruns;
                             }
                         }
                     }
@@ -1746,9 +2027,11 @@ public final class ReceiverService extends Service {
         UdpPcmQueue queue = session.udpQueue;
         if (queue != null) queue.setPaused(false);
         try {
+            session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), System.nanoTime());
             track.play();
             session.trackPlaying = true;
             session.focusState.markTrackPlaying();
+            session.driftResetGeneration++;
             synchronized (STATUS_LOCK) {
                 if (statusAudioId == session.id) audioActive = true;
             }
@@ -1763,7 +2046,11 @@ public final class ReceiverService extends Service {
         track.pause();
         track.flush();
         session.trackWrittenFrames = 0;
-        session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+        int playbackPosition = track.getPlaybackHeadPosition();
+        long resetAtNanos = System.nanoTime();
+        session.playbackActivity.resetPlaybackHead(playbackPosition);
+        session.driftPlaybackHead.reset(playbackPosition, resetAtNanos);
+        session.driftResetGeneration++;
         PCM_BYTES_WRITTEN.set(0);
         session.trackPlaying = false;
         synchronized (STATUS_LOCK) {
@@ -2088,6 +2375,10 @@ public final class ReceiverService extends Service {
         volatile UdpReceiver udpReceiver;
         volatile UdpPcmQueue udpQueue;
         final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
+        final Pcm16FrameStream.PlaybackHeadTracker driftPlaybackHead =
+                new Pcm16FrameStream.PlaybackHeadTracker();
+        volatile long driftResetGeneration;
+        volatile int driftLastUnderruns = -1;
         volatile AudioTrack audioTrack;
         boolean trackReady;
         volatile long trackWrittenFrames;

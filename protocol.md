@@ -737,9 +737,10 @@ existing `start_network_audio` command. Its active session reports
 
 The Receiver audio backend is selected separately with
 `audioBackend = receiver | legacy`; Legacy is not a wireless protocol.
-Existing USB default routing remains Legacy until a real-device Receiver
-smoke test passes. Selecting Receiver routes both USB and wireless ADB through
-the installed APK's existing ADB reverse and LocalSocket scheduling path.
+New settings and settings without an audio backend default to Receiver.
+An explicitly saved Receiver or Legacy choice remains unchanged. Receiver
+routes both USB and wireless ADB through the installed APK's existing ADB
+reverse and LocalSocket scheduling path.
 Failures stop and clean that route; the host does not retry by silently
 starting Legacy.
 
@@ -822,10 +823,48 @@ available for a new authenticated session; phone stop, revocation, expiry, or se
 interface loss ends standby. Standby uses connectedDevice foreground service type;
 active background playback also uses mediaPlayback.
 
-This is implemented backend behavior with offline state/loopback evidence. Product
-UI entry points and PC-visible remaining lifetime/revocation are not yet integrated;
-the ACK reports the grant kind, not a remaining lifetime. Device notification,
-foreground service, persistence, and playback behavior remain unverified.
+Standby must be explicitly enabled from the Receiver's foreground UI. A stored
+until-revoked grant survives restart, but does not itself restart the listener or
+authorize a background-service launch at boot. The current candidate does not
+implement automatic boot/process-restart listener restoration.
+
+The type 18/19/20 ACK reports the request's authorization status, not its remaining
+lifetime. Device notification, foreground service, persistence, and playback
+behavior require device acceptance; offline state/loopback checks do not establish
+that these platform paths work on a phone.
+
+### Background trust management
+
+An endpoint implementing binding-level authorization management advertises
+`background-trust-management` (`0x00000040`). After P5-A and capability negotiation,
+the host may query with `BACKGROUND_TRUST_QUERY` (21), or revoke with
+`BACKGROUND_TRUST_REVOKE` (22). Neither operation starts audio. They are valid in
+Authenticated, TransportConnected, ReceiverRunning, Streaming, and Paused states.
+The request contains exactly the authenticated binding's full 32-byte commitment;
+discovery data or possession of an endpoint address is not authorization.
+
+The ACK contains the usual 13 bytes followed by exactly 42 bytes (55 total):
+
+| Extension offset | Width | Field |
+|---:|---:|---|
+| 0 | 32 | Authenticated binding commitment, echoed and verified |
+| 32 | 1 | Grant kind: none (0), once (1), eight hours (2), until revoked (3) |
+| 33 | 1 | Persistence: none (0), process (1), binding (2) |
+| 34 | 8 | Remaining milliseconds, unsigned big-endian |
+
+Valid combinations are `(0, 0, 0)`, `(1, 1, 0..30000 or MAX)`,
+`(2, 1, 0..28800000)`, and `(3, 2, MAX)`. `MAX` is `0xffffffffffffffff`
+(Java `-1`), meaning no determined expiry, not a numeric duration for the UI.
+For once, a finite duration describes only the fixed recovery window; active
+once authorization has no predetermined expiry. The UI represents MAX as null
+and does not derive an authoritative grant from a cached PC countdown.
+
+A successful query preserves playback state. Successful revocation clears this
+binding's playback authorization without deleting the pairing, stops its audio
+and UDP context, and returns a Stopped ACK with `(0, 0, 0)`. The Receiver writes
+the ACK before closing the control listener. Failed persistence changes must
+not be reported as successful revocation. Type 20 still cancels one playback
+request; it does not revoke binding-level trust.
 
 ## Explicit mobile receive intent
 

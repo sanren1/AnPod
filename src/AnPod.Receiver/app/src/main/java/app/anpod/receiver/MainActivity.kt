@@ -16,7 +16,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,12 +23,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -39,26 +37,31 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
+
+private data class BackgroundTrustTarget(
+    val operationId: String,
+    val operationGeneration: Long,
+    val bindingFingerprint: String
+)
 
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -74,6 +77,7 @@ class MainActivity : ComponentActivity() {
     private data class PendingConnection(
         val generation: Long,
         val previousOperationId: String,
+        val backgroundStandby: Boolean,
         val operationId: String? = null
     )
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
@@ -168,6 +172,11 @@ class MainActivity : ComponentActivity() {
                     connectionPending = pendingConnection != null,
                     onSelect = { selectedAddress = it.address; selectedPrefix = it.prefixLength },
                     onConnectComputer = { connectComputer() },
+                    onStartBackgroundStandby = { startBackgroundStandby() },
+                    onStopBackgroundStandby = { stopBackgroundStandby() },
+                    serviceConnected = receiver != null,
+                    onTrustBinding = { target -> trustBindingUntilRevoked(target) },
+                    onRevokeBackgroundTrust = { target, grantKind -> revokeBackgroundTrust(target, grantKind) },
                     onStop = {
                         val current = snapshot
                         cancelPendingConnection()
@@ -178,19 +187,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun connectComputer() {
+    private fun connectComputer() = beginReceive(backgroundStandby = false)
+
+    private fun startBackgroundStandby() = beginReceive(backgroundStandby = true)
+
+    private fun beginReceive(backgroundStandby: Boolean) {
         val current = snapshot
         val service = receiver
         if (current == null || service == null) { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
-        if (current.serviceState in setOf("prepared", "authenticated", "receiverRunning", "streaming", "paused")
-            || current.operationState in setOf("starting", "stopping")) return
-        if (current.operationState == "running") return
+        if (current.serviceState in setOf("starting", "prepared", "authenticated", "receiverRunning", "streaming", "paused")
+            || current.operationState in setOf("starting", "running", "stopping")) return
+        if (!activityStarted || !bound) { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
         if (selectedAddress.isEmpty() || interfaces.none { it.address == selectedAddress && it.prefixLength == selectedPrefix }) {
             localMessage = getString(R.string.select_available_private_ipv4_interface)
             return
         }
         val generation = discoveryGeneration.incrementAndGet()
-        pendingConnection = PendingConnection(generation, current.operationId)
+        pendingConnection = PendingConnection(generation, current.operationId, backgroundStandby)
         localMessage = ""
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -201,8 +214,9 @@ class MainActivity : ComponentActivity() {
 
     private val requestNotificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startReceiverForPendingConnection() else {
+            val backgroundStandby = pendingConnection?.backgroundStandby == true
             pendingConnection = null
-            localMessage = getString(R.string.notification_permission_required)
+            localMessage = getString(if (backgroundStandby) R.string.background_notification_permission_required else R.string.notification_permission_required)
         }
     }
 
@@ -210,9 +224,23 @@ class MainActivity : ComponentActivity() {
         val pending = pendingConnection ?: return
         val service = receiver ?: run { pendingConnection = null; localMessage = getString(R.string.receiver_service_connecting_retry); return }
         if (!activityStarted || pending.generation != discoveryGeneration.get()) { pendingConnection = null; return }
-        if (selectedAddress.isEmpty()) { pendingConnection = null; localMessage = getString(R.string.no_private_ipv4_interface_available); return }
+        val current = snapshot
+        if (current == null || current.operationId != pending.previousOperationId
+            || current.operationState in setOf("starting", "running", "stopping")
+            || current.serviceState in setOf("starting", "prepared", "authenticated", "receiverRunning", "streaming", "paused")) {
+            pendingConnection = null
+            localMessage = getString(R.string.receiver_operation_changed_retry)
+            return
+        }
+        if (selectedAddress.isEmpty() || interfaces.none { it.address == selectedAddress && it.prefixLength == selectedPrefix }) {
+            pendingConnection = null
+            localMessage = getString(R.string.no_private_ipv4_interface_available)
+            return
+        }
         localMessage = ""
-        localMessage = service.startReceiving(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
+        localMessage = if (pending.backgroundStandby)
+            service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
+        else service.startReceiving(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
         if (localMessage.isNotEmpty()) pendingConnection = null
         refresh()
     }
@@ -227,6 +255,7 @@ class MainActivity : ComponentActivity() {
         }
         val targetOperationId = pending.operationId ?: return
         if (current.operationId != targetOperationId) { pendingConnection = null; return }
+        if (current.backgroundStandbyEnabled != pending.backgroundStandby) { pendingConnection = null; return }
         if (current.serviceState == "prepared" && current.operationState == "running" && current.networkPort > 0) {
             pendingConnection = null
         } else if (current.serviceState in setOf("failed", "stopped", "receiverRunning", "streaming", "paused")
@@ -238,6 +267,43 @@ class MainActivity : ComponentActivity() {
     private fun cancelPendingConnection() {
         pendingConnection = null
         discoveryGeneration.incrementAndGet()
+    }
+
+    private fun stopBackgroundStandby() {
+        val current = snapshot ?: return
+        val service = receiver ?: run { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
+        if (!activityStarted || !bound || !current.backgroundStandbyEnabled || current.operationId.isEmpty()) return
+        cancelPendingConnection()
+        if (!service.stop(current.operationId, current.operationGeneration))
+            localMessage = getString(R.string.background_standby_stop_failed)
+        else localMessage = ""
+        refresh()
+    }
+
+    private fun trustBindingUntilRevoked(target: BackgroundTrustTarget) {
+        if (snapshot == null) return
+        val service = receiver ?: run { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
+        val latest = service.snapshot()
+        if (!activityStarted || !bound || !latest.backgroundStandbyEnabled || latest.operationId.isEmpty()
+            || latest.operationId != target.operationId || latest.operationGeneration != target.operationGeneration
+            || latest.bindingFingerprint != target.bindingFingerprint) { refresh(); return }
+        localMessage = if (service.trustBindingUntilRevoked(target.operationId, target.operationGeneration)) ""
+            else getString(R.string.background_trust_update_failed)
+        refresh()
+    }
+
+    private fun revokeBackgroundTrust(target: BackgroundTrustTarget, expectedGrantKind: String) {
+        snapshot ?: return
+        val service = receiver ?: run { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
+        val current = service.snapshot()
+        if (!activityStarted || !bound || !current.canRevokeBackgroundTrust
+            || current.operationId != target.operationId || current.operationGeneration != target.operationGeneration
+            || current.bindingFingerprint != target.bindingFingerprint || current.backgroundGrantKind != expectedGrantKind
+            || expectedGrantKind !in setOf("once", "eightHours", "untilRevoked")) return
+        localMessage = if (service.revokeBackgroundTrust(target.operationId, target.operationGeneration,
+                target.bindingFingerprint)) ""
+            else getString(R.string.background_trust_update_failed)
+        refresh()
     }
 
 }
@@ -265,8 +331,21 @@ private fun ReceiverScreen(
     connectionPending: Boolean,
     onSelect: (ReceiverService.UiInterface) -> Unit,
     onConnectComputer: () -> Unit,
+    onStartBackgroundStandby: () -> Unit,
+    onStopBackgroundStandby: () -> Unit,
+    serviceConnected: Boolean,
+    onTrustBinding: (BackgroundTrustTarget) -> Unit,
+    onRevokeBackgroundTrust: (BackgroundTrustTarget, String) -> Unit,
     onStop: () -> Unit
 ) {
+    var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
+    val currentTrustTarget = snapshot?.takeIf {
+        serviceConnected && (it.backgroundStandbyEnabled || it.canRevokeBackgroundTrust)
+            && it.bindingFingerprint.isNotEmpty()
+    }?.let { BackgroundTrustTarget(it.operationId, it.operationGeneration, it.bindingFingerprint) }
+    LaunchedEffect(trustConfirmationTarget, currentTrustTarget) {
+        if (trustConfirmationTarget != null && trustConfirmationTarget != currentTrustTarget) trustConfirmationTarget = null
+    }
     val state = snapshot?.let { stateLabel(it, connectionPending) } ?: stringResource(R.string.reading_receive_status)
     val bound = snapshot?.bindingState == "saved"
     val running = snapshot?.operationState in setOf("starting", "running", "stopping") ||
@@ -299,15 +378,19 @@ private fun ReceiverScreen(
             val canStartReceiver = snapshot != null && bound && !running && selectedAddress.isNotEmpty() &&
                     interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix }
             val canStopReceiver = running && snapshot?.operationState != "stopping"
+            val backgroundStandbyEnabled = snapshot?.backgroundStandbyEnabled == true
             Button(
                 onClick = when {
+                    backgroundStandbyEnabled -> onStopBackgroundStandby
                     running -> onStop
                     else -> onConnectComputer
                 },
-                enabled = canStartReceiver || canStopReceiver,
+                enabled = if (backgroundStandbyEnabled) snapshot?.operationState != "stopping"
+                    else canStartReceiver || canStopReceiver,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
             ) {
                 Text(when {
+                    backgroundStandbyEnabled -> stringResource(R.string.background_standby_primary_action)
                     snapshot?.operationState == "stopping" -> stringResource(R.string.stopping)
                     canStopReceiver -> stringResource(R.string.stop_receiving)
                     connectionPending -> stringResource(R.string.processing)
@@ -315,15 +398,56 @@ private fun ReceiverScreen(
                 })
             }
 
-            Text(stringResource(R.string.audio_output), style = MaterialTheme.typography.titleMedium)
-            OutputCard(icon = R.drawable.ic_phone, title = stringResource(R.string.phone), subtitle = when (snapshot?.serviceState) {
-                "streaming", "receiverRunning" -> playbackAdvancingLabel(snapshot.playbackAdvancing)
-                "receiverRunning" -> stringResource(R.string.receiving_ready_waiting_computer_audio)
-                "paused" -> stringResource(R.string.paused)
-                else -> stringResource(R.string.not_playing)
-            })
-            Text(stringResource(R.string.connection_method, methodLabel(snapshot?.connectionMethod)), style = MaterialTheme.typography.bodyMedium)
-            Text(stringResource(R.string.playback_mode, playbackLabel(snapshot?.playbackMode)), style = MaterialTheme.typography.bodyMedium)
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.background_standby_title), style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        backgroundStandbyStatus(snapshot, bound, running, connectionPending),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
+                    if (snapshot?.backgroundAuthorizationError?.isNotEmpty() == true) {
+                        Text(stringResource(R.string.background_authorization_failed), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                    }
+                    when {
+                        snapshot?.backgroundStandbyEnabled == true -> {
+                            if (snapshot.backgroundGrantKind != "untilRevoked") {
+                                TextButton(
+                                    onClick = { trustConfirmationTarget = currentTrustTarget },
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                ) { Text(stringResource(R.string.trust_binding_until_revoked)) }
+                            }
+                            if (snapshot.canRevokeBackgroundTrust
+                                && snapshot.backgroundGrantKind in setOf("once", "eightHours", "untilRevoked")) {
+                                TextButton(
+                                    onClick = {
+                                        currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
+                                    },
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                ) { Text(stringResource(R.string.revoke_background_trust_and_stop)) }
+                            }
+                        }
+                        snapshot != null && bound && !running && !connectionPending -> {
+                            TextButton(
+                                onClick = onStartBackgroundStandby,
+                                enabled = selectedAddress.isNotEmpty() && interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) { Text(stringResource(R.string.start_background_standby)) }
+                            if (snapshot.canRevokeBackgroundTrust
+                                && snapshot.backgroundGrantKind in setOf("eightHours", "untilRevoked")) {
+                                TextButton(
+                                    onClick = {
+                                        currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
+                                    },
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                ) { Text(stringResource(if (snapshot.backgroundGrantKind == "untilRevoked") R.string.revoke_background_trust else R.string.revoke_background_trust_temporary)) }
+                            }
+                        }
+                        else -> Text(stringResource(R.string.background_standby_requires_idle_receiver), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
 
             if (!running && interfaces.size != 1) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -333,33 +457,72 @@ private fun ReceiverScreen(
                 }
             }
 
-            val message = snapshot?.error?.takeIf { it.isNotEmpty() } ?: localMessage
-            if (message.isNotEmpty()) Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+            val message = localMessage.takeIf { it.isNotEmpty() }
+                ?: snapshot?.error?.takeIf { it.isNotEmpty() }
+                ?: snapshot?.backgroundAuthorizationError?.takeIf { it.isNotEmpty() }.orEmpty()
+            var errorDetailsExpanded by remember(message) { mutableStateOf(false) }
+            if (message.isNotEmpty()) {
+                Text(stringResource(R.string.operation_error_summary), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                TextButton(onClick = { errorDetailsExpanded = !errorDetailsExpanded }, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Text(stringResource(R.string.show_error_details))
+                }
+                if (errorDetailsExpanded) Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
 
             Spacer(Modifier.height(8.dp))
         }
     }
+    val confirmedTarget = trustConfirmationTarget
+    if (confirmedTarget != null && confirmedTarget == currentTrustTarget) {
+        AlertDialog(
+            onDismissRequest = { trustConfirmationTarget = null },
+            title = { Text(stringResource(R.string.confirm_background_trust_title)) },
+            text = { Text(stringResource(R.string.confirm_background_trust_message, confirmedTarget.bindingFingerprint.chunked(4).joinToString(" "))) },
+            confirmButton = {
+                TextButton(
+                    onClick = { trustConfirmationTarget = null; onTrustBinding(confirmedTarget) },
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text(stringResource(R.string.trust_binding_until_revoked))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { trustConfirmationTarget = null }, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Text(stringResource(R.string.dialog_cancel))
+                }
+            }
+        )
+    }
 }
 
 @Composable
-private fun OutputCard(icon: Int, title: String, subtitle: String) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
-        Row(
-            modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            androidx.compose.foundation.Image(
-                painter = painterResource(icon), contentDescription = null,
-                colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onSurfaceVariant),
-                modifier = Modifier.size(24.dp)
-            )
-            Spacer(Modifier.width(12.dp))
-            Column {
-                Text(title, style = MaterialTheme.typography.titleSmall)
-                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
+private fun backgroundStandbyStatus(
+    snapshot: ReceiverService.UiSnapshot?,
+    bound: Boolean,
+    running: Boolean,
+    connectionPending: Boolean
+): String = when {
+    snapshot == null -> stringResource(R.string.background_standby_status_loading)
+    snapshot.backgroundStandbyEnabled && snapshot.backgroundListenerState == "starting" -> stringResource(R.string.background_standby_status_starting)
+    snapshot.backgroundStandbyEnabled && snapshot.backgroundListenerState == "pending" -> stringResource(R.string.background_standby_status_pending)
+    snapshot.backgroundStandbyEnabled && snapshot.backgroundListenerState == "listening" -> stringResource(R.string.background_standby_status_listening)
+    snapshot.backgroundStandbyEnabled -> stringResource(R.string.background_standby_status_enabled)
+    connectionPending -> stringResource(R.string.background_standby_status_starting)
+    !bound -> stringResource(R.string.background_standby_requires_binding)
+    running -> stringResource(R.string.background_standby_requires_idle_receiver)
+    else -> stringResource(R.string.background_standby_status_disabled)
+}
+
+@Composable
+private fun backgroundGrantStatus(snapshot: ReceiverService.UiSnapshot?): String = when (snapshot?.backgroundGrantKind) {
+    null -> stringResource(R.string.background_grant_status_loading)
+    "once" -> stringResource(R.string.background_grant_once)
+    "eightHours" -> {
+        val totalMinutes = ((snapshot.backgroundGrantRemainingMs + 59_999L) / 60_000L).coerceAtLeast(1)
+        stringResource(R.string.background_grant_eight_hours, totalMinutes / 60, totalMinutes % 60)
     }
+    "untilRevoked" -> stringResource(R.string.background_grant_until_revoked)
+    else -> stringResource(R.string.background_grant_none)
 }
 
 @Composable
@@ -424,20 +587,4 @@ private fun playbackAdvancingLabel(advancing: Boolean?): String = when (advancin
     true -> stringResource(R.string.audio_playback_progress_advancing)
     false -> stringResource(R.string.audio_received_playback_not_advancing)
     null -> stringResource(R.string.audio_playback_progress_unknown)
-}
-
-@Composable
-private fun methodLabel(method: String?): String = when (method) {
-    "wireless-udp" -> stringResource(R.string.wireless_udp)
-    "usb-or-local" -> stringResource(R.string.usb_or_local_connection)
-    else -> stringResource(R.string.waiting_for_computer)
-}
-
-@Composable
-private fun playbackLabel(mode: String?): String = when (mode) {
-    "low-latency" -> stringResource(R.string.low_latency_reported_by_computer)
-    "low-latency-limited" -> stringResource(R.string.low_latency_limited_by_system)
-    "balanced" -> stringResource(R.string.balanced_reported_by_computer)
-    "balanced-limited", "balanced-system", "balanced-fallback" -> stringResource(R.string.balanced_adjusted_by_system)
-    else -> stringResource(R.string.playback_mode_not_reported)
 }

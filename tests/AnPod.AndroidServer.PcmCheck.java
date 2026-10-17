@@ -243,8 +243,12 @@ final class PcmCheck {
         checkDriftBound(simulateDrift(-100, 48_000, 2L * 60 * 60 * 1000 / 10), -100);
         checkDriftBound(simulateDrift(500, 48_000, 2L * 60 * 60 * 1000 / 10), 500);
         checkDriftBound(simulateDrift(-500, 48_000, 2L * 60 * 60 * 1000 / 10), -500);
+        checkDriftReadAdjustmentPairing(true);
+        checkDriftReadAdjustmentPairing(false);
         long cadenceTicks = 2L * 60 * 60 * 1000 / 5;
         checkHeadCadenceDrift(simulateDriftWithHeadCadence(0, 48_000, cadenceTicks), 0);
+        checkHeadCadenceDrift(simulateDriftWithHeadCadence(100, 48_000, cadenceTicks), 100);
+        checkHeadCadenceDrift(simulateDriftWithHeadCadence(-100, 48_000, cadenceTicks), -100);
         checkHeadCadenceDrift(simulateDriftWithHeadCadence(500, 48_000, cadenceTicks), 500);
         checkHeadCadenceDrift(simulateDriftWithHeadCadence(-500, 48_000, cadenceTicks), -500);
         checkDriftBurstAndTargetShift();
@@ -387,7 +391,7 @@ final class PcmCheck {
         int underflows = 0;
         int playbackPosition = 0;
         int reportedPlaybackPosition = 0;
-        long lastReportedPlayedFrames = 0;
+        long lastObservedPlayedFrames = 0;
         long nextHeadReportNanos = 20_000_000L;
         Pcm16FrameStream stream = new Pcm16FrameStream(2);
         Pcm16FrameStream.PlaybackHeadTracker playbackHead = new Pcm16FrameStream.PlaybackHeadTracker();
@@ -415,17 +419,19 @@ final class PcmCheck {
             queueFrames -= sourceReadFrames;
             maxQueueFrames = Math.max(maxQueueFrames, queueFrames);
 
-            long nowNanos = elapsedFrameNanos + 5_000_000L;
-            long actualPlayedFrames = elapsedFrameNanos / 5_000_000L * blockFrames;
-            if (nowNanos >= nextHeadReportNanos) {
+            long readStartNanos = elapsedFrameNanos;
+            long nowNanos = readStartNanos + 5_000_000L;
+            long actualPlayedFrames = readStartNanos / 5_000_000L * blockFrames;
+            if (readStartNanos >= nextHeadReportNanos) {
                 reportedPlaybackPosition = (int) actualPlayedFrames;
-                nextHeadReportNanos = (nowNanos / 20_000_000L + 1) * 20_000_000L;
+                nextHeadReportNanos = (readStartNanos / 20_000_000L + 1) * 20_000_000L;
             }
             playbackPosition = reportedPlaybackPosition;
-            long reportedPlayedFrames = playbackHead.update(playbackPosition, nowNanos);
-            boolean headAdvanced = reportedPlayedFrames > lastReportedPlayedFrames;
+            long reportedPlayedFrames = playbackHead.update(playbackPosition, readStartNanos);
+            playbackHead.update(playbackPosition, nowNanos);
+            boolean headAdvanced = reportedPlayedFrames > lastObservedPlayedFrames;
+            lastObservedPlayedFrames = reportedPlayedFrames;
             boolean playbackAdvancing = playbackHead.isAdvancing(nowNanos);
-            lastReportedPlayedFrames = reportedPlayedFrames;
             long pendingActualFrames = Pcm16FrameStream.pendingFrames(totalFramesWritten, actualPlayedFrames);
             long pendingReportedFrames = Pcm16FrameStream.pendingFrames(totalFramesWritten,
                     playbackHead.update(playbackPosition, nowNanos));
@@ -434,12 +440,9 @@ final class PcmCheck {
             long deviation = actualWaterline - baselineWaterline;
             maxDeviation = Math.max(maxDeviation, deviation);
             minDeviation = Math.min(minDeviation, deviation);
-            int outputBytes = blockFrames * frameBytes;
-            if (headAdvanced || !playbackAdvancing || sourceReadAdjustmentFrames != 0) {
-                outputBytes = stream.correctDrift(buffer, sourceReadFrames * frameBytes,
-                        queueFrames, pendingReportedFrames, sourceTargetFrames, nowNanos,
-                        playbackAdvancing, false, sourceReadAdjustmentFrames);
-            }
+            int outputBytes = stream.correctDrift(buffer, sourceReadFrames * frameBytes,
+                    queueFrames, pendingReportedFrames, sourceTargetFrames, nowNanos,
+                    playbackAdvancing, false, sourceReadAdjustmentFrames, headAdvanced);
             int outputFrames = outputBytes / frameBytes;
             totalFramesWritten += outputFrames;
             processedBlocks++;
@@ -576,6 +579,55 @@ final class PcmCheck {
         if (steadyStream.getDriftBaselineStartNanos() != resumedAt
                 || steadyStream.getDriftBaselineFrames() != -1)
             throw new AssertionError("playback resume did not start a fresh drift baseline");
+    }
+
+    private static void checkDriftReadAdjustmentPairing(boolean consumeExtraSourceFrame) {
+        int sampleRate = 48_000;
+        int targetFrames = sampleRate / 200;
+        int blockFrames = sampleRate / 200;
+        int frameBytes = 4;
+        byte[] buffer = new byte[(blockFrames + Pcm16FrameStream.driftReserveFrames(sampleRate)) * frameBytes];
+        Pcm16FrameStream stream = new Pcm16FrameStream(2);
+        stream.beginDriftCorrection(sampleRate, targetFrames, 0);
+        long nowNanos = 0;
+        int adjustment = 0;
+        for (int tick = 0; tick < 2_000 && adjustment == 0; tick++) {
+            nowNanos += 10_000_000L;
+            long sourceBufferedFrames = tick < 120
+                    ? (consumeExtraSourceFrame ? 0 : blockFrames)
+                    : (consumeExtraSourceFrame ? blockFrames : 0);
+            int outputBytes = stream.correctDrift(buffer, blockFrames * frameBytes,
+                    sourceBufferedFrames, 0, targetFrames, nowNanos, true, false, 0);
+            if (outputBytes != blockFrames * frameBytes)
+                throw new AssertionError("paired drift credit changed output before a read adjustment");
+            adjustment = stream.driftReadFrameAdjustment(nowNanos + 5_000_000L);
+        }
+        int expectedAdjustment = consumeExtraSourceFrame ? 1 : -1;
+        if (adjustment != expectedAdjustment)
+            throw new AssertionError("drift credit did not reach the expected paired read adjustment"
+                    + " requested=" + expectedAdjustment + " actual=" + adjustment);
+
+        int adjustedSourceBytes = (blockFrames + adjustment) * frameBytes;
+        Arrays.fill(buffer, (byte) 0x2a);
+        int pairedOutputBytes = stream.correctDrift(buffer, adjustedSourceBytes,
+                consumeExtraSourceFrame ? 0 : blockFrames, 0, targetFrames,
+                nowNanos + 10_000_000L, true, true, adjustment, false);
+        if (pairedOutputBytes != blockFrames * frameBytes
+                || stream.getDriftBaselineFrames() != -1
+                || stream.driftReadFrameAdjustment(nowNanos + 15_000_000L) != 0
+                || (consumeExtraSourceFrame
+                        ? stream.getDeletedDriftFrames() != 1 || stream.getInsertedDriftFrames() != 0
+                        : stream.getInsertedDriftFrames() != 1 || stream.getDeletedDriftFrames() != 0)) {
+            throw new AssertionError("PLC/underrun discontinuity did not pair its source read edit"
+                    + " with a nominal output frame count");
+        }
+
+        int resumedBytes = stream.correctDrift(buffer, blockFrames * frameBytes, 0, 0,
+                targetFrames, nowNanos + 20_000_000L, true, false);
+        if (resumedBytes != blockFrames * frameBytes
+                || stream.getInsertedDriftFrames() + stream.getDeletedDriftFrames() != 1) {
+            throw new AssertionError("real audio recovery carried drift debt across the discontinuity");
+        }
     }
 
     private static void checkFrameEdits(int channels, boolean insertion) {

@@ -12,6 +12,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.NetworkInterface;
 import java.net.SocketException;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -42,6 +43,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     // API 23 has no java.util.function.BooleanSupplier.
     interface StartPermission { boolean allowed(); }
+
+    static final class BackgroundTrustSnapshot {
+        final int kind;
+        final int persistence;
+        final long remainingMs;
+        BackgroundTrustSnapshot(int kind, int persistence, long remainingMs) {
+            this.kind = kind; this.persistence = persistence; this.remainingMs = remainingMs;
+        }
+    }
 
     interface PlaybackEndpoint {
         /** Takes ownership of the already authenticated and UDP-peer-bound context on success. */
@@ -76,6 +86,11 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         }
         default void backgroundPlaybackStarted(byte[] requestId, long sessionId, InetAddress peer,
                 byte[] bindingCommitment) {}
+        default boolean supportsBackgroundTrustManagement() { return false; }
+        default BackgroundTrustSnapshot queryBackgroundTrust(byte[] bindingCommitment) throws IOException {
+            throw new IOException("background trust management is unsupported");
+        }
+        default boolean revokeBackgroundTrust(byte[] bindingCommitment) throws IOException { return false; }
     }
 
     private final ServerSocket listener;
@@ -87,6 +102,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private final int receiverVersionCode;
     private volatile String capabilityTestMode = "";
     private volatile String backgroundAuthorizationTestMode = "";
+    volatile String backgroundTrustTestMode = "";
     private final CountDownLatch finished = new CountDownLatch(1);
     private final Map<Socket, Long> preAuthSockets = new LinkedHashMap<>();
     private final ThreadPoolExecutor preAuthWorkers = new ThreadPoolExecutor(MAX_PREAUTH_CONNECTIONS,
@@ -106,6 +122,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private volatile boolean shutdownRequested;
     private boolean loopbackConnectionAccepted;
     private byte[] connectionIntentNonce;
+    private byte[] establishedConnectionIntentNonce;
     private long connectionIntentDeadline;
     private volatile boolean connectionIntentRequired;
     private boolean connectionIntentEstablished;
@@ -254,15 +271,19 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     private synchronized void beginConnectionIntent(byte[] nonce) {
+        boolean retainEstablished = nonce == null && connectionIntentEstablished
+                && establishedConnectionIntentNonce != null;
         connectionIntentRequired = true;
         connectionIntentNonce = nonce == null ? null : nonce.clone();
         connectionIntentDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        connectionIntentEstablished = false;
+        connectionIntentEstablished = retainEstablished;
+        if (!retainEstablished) establishedConnectionIntentNonce = null;
     }
 
     synchronized void cancelPendingConnectionIntent() {
-        if (connectionIntentEstablished) return;
         connectionIntentNonce = null;
+        establishedConnectionIntentNonce = null;
+        connectionIntentEstablished = false;
         if (discovery != null) discovery.stopSearch();
         for (Socket pending : new HashSet<>(preAuthSockets.keySet()))
             try { pending.close(); } catch (IOException ignored) {}
@@ -271,11 +292,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private synchronized boolean acceptsConnectionIntent(byte[] nonce) {
         if (connectionIntentRequired && !interfaceIsAssigned()) {
             connectionIntentNonce = null;
+            establishedConnectionIntentNonce = null;
+            connectionIntentEstablished = false;
             return false;
         }
-        return !connectionIntentRequired || (nonce != null && connectionIntentNonce != null
-                && Arrays.equals(nonce, connectionIntentNonce)
-                && (connectionIntentEstablished || System.nanoTime() < connectionIntentDeadline));
+        return !connectionIntentRequired || (nonce != null && (
+                connectionIntentEstablished && establishedConnectionIntentNonce != null
+                        && Arrays.equals(nonce, establishedConnectionIntentNonce)
+                || connectionIntentNonce != null && Arrays.equals(nonce, connectionIntentNonce)
+                        && System.nanoTime() < connectionIntentDeadline));
     }
 
     private static boolean backgroundAuthorizationGranted(int status) {
@@ -303,10 +328,21 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         catch (IOException | RuntimeException error) { return false; }
     }
 
+    private boolean acceptsConnectionIntentOrBackgroundGrant(byte[] nonce, boolean backgroundAuthorizationRequired,
+            boolean backgroundGranted) {
+        if (acceptsConnectionIntent(nonce)) return true;
+        return backgroundGranted && connectionIntentRequired && backgroundAuthorizationRequired && interfaceIsAssigned();
+    }
+
     private static boolean allZero(byte[] bytes) {
         int value = 0;
         for (byte item : bytes) value |= item;
         return value == 0;
+    }
+
+    private static boolean supportsBackgroundTrustManagementState(int state) {
+        return state == STATE_AUTHENTICATED || state == STATE_TRANSPORT_CONNECTED
+                || state == STATE_RECEIVER_RUNNING || state == STATE_STREAMING || state == STATE_PAUSED;
     }
 
     private boolean interfaceIsAssigned() {
@@ -427,7 +463,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 }
             }
             try { socket.close(); } catch (IOException ignored) { }
-            if (ownedSession && !listener.isClosed()) {
+            if (ownedSession && !listener.isClosed() && !shutdownRequested) {
                 try {
                     startDiscovery();
                     synchronized (this) {
@@ -519,12 +555,12 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     int backgroundAuthorizationStatus = P5cControlProtocol.AUTH_EXPIRED;
                     boolean backgroundAuthorizationStarted = false;
                     boolean backgroundAuthorizationEnded = false;
+                    boolean backgroundTrustRevoked = false;
                     byte[] bindingCommitment = null;
                     final boolean backgroundAuthorizationRequired = playback.requiresBackgroundStartAuthorization();
                     long lastHeartbeatAt = System.nanoTime();
                     try {
-                        if (backgroundAuthorizationRequired)
-                            bindingCommitment = binding.commitment();
+                        bindingCommitment = binding.commitment();
                         // Keep the authenticated session/keys owned even if READY cannot be written.
                         output.write(complete.ready);
                         output.flush();
@@ -550,6 +586,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 int result = RESULT_OK;
                 int responsePort = 0;
                 byte[] responseExtra = new byte[0];
+                boolean stopAfterAck = false;
                 try {
                     switch (command.type) {
                         case P5cControlProtocol.CAPABILITIES_QUERY:
@@ -573,7 +610,9 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             int implemented = P5cControlProtocol.IMPLEMENTED_CAPABILITIES
                                     | (playback.supportsPlaybackProgress() ? P5cControlProtocol.CAP_PLAYBACK_PROGRESS : 0)
                                     | (connectionIntentRequired ? P5cControlProtocol.CAP_CONNECTION_INTENT : 0)
-                                    | (backgroundAuthorizationRequired ? P5cControlProtocol.CAP_BACKGROUND_START_AUTH : 0);
+                                    | (backgroundAuthorizationRequired ? P5cControlProtocol.CAP_BACKGROUND_START_AUTH : 0)
+                                    | (playback.supportsBackgroundTrustManagement()
+                                            ? P5cControlProtocol.CAP_BACKGROUND_TRUST_MANAGEMENT : 0);
                             if ("incompatible".equals(capabilityTestMode)) audioMajor++;
                             if ("missing-capability".equals(capabilityTestMode))
                                 implemented &= ~P5cControlProtocol.CAP_AUTHENTICATED_STATUS;
@@ -598,7 +637,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                         case P5cControlProtocol.BACKGROUND_START_REQUEST:
                             responseExtra = P5cControlProtocol.backgroundAuthorizationAckExtra(command.payload,
                                     P5cControlProtocol.AUTH_EXPIRED);
-                            if (state != STATE_AUTHENTICATED || !backgroundAuthorizationRequired
+                            if (backgroundTrustRevoked || state != STATE_AUTHENTICATED || !backgroundAuthorizationRequired
                                     || command.payload.length != 16 || allZero(command.payload)) {
                                 result = RESULT_REJECTED;
                             } else if (backgroundRequestId != null) {
@@ -648,12 +687,46 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                         backgroundAuthorizationStatus);
                             }
                             break;
+                        case P5cControlProtocol.BACKGROUND_TRUST_QUERY:
+                            if (!supportsBackgroundTrustManagementState(state) || command.payload.length != 32
+                                    || !playback.supportsBackgroundTrustManagement()
+                                    || !MessageDigest.isEqual(command.payload, bindingCommitment)) {
+                                result = RESULT_REJECTED;
+                            } else {
+                                BackgroundTrustSnapshot trust = playback.queryBackgroundTrust(command.payload.clone());
+                                responseExtra = P5cControlProtocol.backgroundTrustAckExtra(command.payload,
+                                        trust.kind, trust.persistence, trust.remainingMs);
+                            }
+                            break;
+                        case P5cControlProtocol.BACKGROUND_TRUST_REVOKE:
+                            if (!supportsBackgroundTrustManagementState(state) || command.payload.length != 32
+                                    || !playback.supportsBackgroundTrustManagement()
+                                    || !MessageDigest.isEqual(command.payload, bindingCommitment)) {
+                                result = RESULT_REJECTED;
+                            } else {
+                                backgroundTrustRevoked = true;
+                                if (!playback.revokeBackgroundTrust(command.payload.clone())) {
+                                    result = RESULT_FAILED;
+                                } else {
+                                    backgroundAuthorizationEnded = true;
+                                    if (playbackStarted) playback.stop();
+                                    if (context != null) { context.destroy(); context = null; }
+                                    if (audioSocket != null) { audioSocket.close(); audioSocket = null; }
+                                    playbackStarted = false;
+                                    state = STATE_STOPPED;
+                                    responseExtra = P5cControlProtocol.backgroundTrustAckExtra(command.payload, 0, 0, 0);
+                                    stopAfterAck = true;
+                                }
+                            }
+                            break;
                         case P5cControlProtocol.BIND:
-                            if (backgroundAuthorizationRequired
-                                    && (backgroundRequestId == null || !backgroundAuthorizationGranted(
+                            boolean bindBackgroundGrant = !backgroundAuthorizationRequired
+                                    || backgroundRequestId != null && backgroundAuthorizationGranted(
                                         backgroundAuthorizationStatus = queryBackgroundStartAuthorization(backgroundRequestId,
-                                            sessionId, socket.getInetAddress(), bindingCommitment)))
-                                    || !acceptsConnectionIntent(claimedConnectionIntent)) {
+                                            sessionId, socket.getInetAddress(), bindingCommitment));
+                            if (backgroundTrustRevoked || !bindBackgroundGrant
+                                    || !acceptsConnectionIntentOrBackgroundGrant(claimedConnectionIntent,
+                                            backgroundAuthorizationRequired, bindBackgroundGrant)) {
                                 result = RESULT_REJECTED;
                                 break;
                             }
@@ -688,16 +761,22 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             final byte[] startRequestId = backgroundRequestId == null ? null : backgroundRequestId.clone();
                             final byte[] startBindingCommitment = bindingCommitment == null ? null : bindingCommitment.clone();
                             final InetAddress startPeer = socket.getInetAddress();
-                            if (backgroundAuthorizationRequired
-                                    && (startRequestId == null || !backgroundAuthorizationGranted(
+                            final boolean startBackgroundGrant = !backgroundAuthorizationRequired
+                                    || startRequestId != null && backgroundAuthorizationGranted(
                                         backgroundAuthorizationStatus = queryBackgroundStartAuthorization(startRequestId,
-                                            sessionId, startPeer, startBindingCommitment)))
+                                            sessionId, startPeer, startBindingCommitment));
+                            if (backgroundTrustRevoked || !startBackgroundGrant
                                     || state != STATE_TRANSPORT_CONNECTED || !modeSelected || command.payload.length != 0 || context == null
-                                    || !acceptsConnectionIntent(claimedConnectionIntent)) {
+                                    || !acceptsConnectionIntentOrBackgroundGrant(claimedConnectionIntent,
+                                            backgroundAuthorizationRequired, startBackgroundGrant)) {
                                 result = RESULT_REJECTED;
-                            } else if (!playback.start(context, () -> acceptsConnectionIntent(startIntent)
-                                    && (!backgroundAuthorizationRequired
-                                        || backgroundStartStillAuthorized(startRequestId, sessionId, startPeer, startBindingCommitment)))) {
+                            } else if (!playback.start(context, () -> {
+                                boolean stillGranted = !backgroundAuthorizationRequired
+                                        || backgroundStartStillAuthorized(startRequestId, sessionId, startPeer,
+                                                startBindingCommitment);
+                                return stillGranted && acceptsConnectionIntentOrBackgroundGrant(startIntent,
+                                        backgroundAuthorizationRequired, stillGranted);
+                            })) {
                                 playback.stop();
                                 result = RESULT_FAILED;
                                 context.destroy();
@@ -712,10 +791,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                 audioSocket = null;
                                 boolean accepted;
                                 synchronized (this) {
-                                    accepted = acceptsConnectionIntent(claimedConnectionIntent)
-                                            && (!backgroundAuthorizationRequired
-                                                || backgroundStartStillAuthorized(startRequestId, sessionId, startPeer, startBindingCommitment));
-                                    if (accepted) connectionIntentEstablished = connectionIntentRequired;
+                                    boolean stillGranted = !backgroundAuthorizationRequired
+                                            || backgroundStartStillAuthorized(startRequestId, sessionId, startPeer,
+                                                    startBindingCommitment);
+                                    accepted = stillGranted && acceptsConnectionIntentOrBackgroundGrant(
+                                            claimedConnectionIntent, backgroundAuthorizationRequired, stillGranted);
+                                    if (accepted && connectionIntentRequired && claimedConnectionIntent != null) {
+                                        connectionIntentEstablished = true;
+                                        establishedConnectionIntentNonce = claimedConnectionIntent.clone();
+                                    }
                                 }
                                 if (!accepted) {
                                     playback.stop();
@@ -778,6 +862,12 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                         if (responseExtra.length != 17) responseExtra = P5cControlProtocol.backgroundAuthorizationAckExtra(
                                 command.payload.length == 16 ? command.payload : new byte[16], P5cControlProtocol.AUTH_EXPIRED);
                     }
+                    if (command.type == P5cControlProtocol.BACKGROUND_TRUST_QUERY
+                            || command.type == P5cControlProtocol.BACKGROUND_TRUST_REVOKE) {
+                        if (responseExtra.length != 42 && command.payload.length == 32)
+                            responseExtra = P5cControlProtocol.backgroundTrustAckExtra(command.payload,
+                                    0, 0, 0);
+                    }
                     if (command.type == P5cControlProtocol.START && !playbackStarted) {
                         playback.stop();
                         if (context != null) context.destroy();
@@ -795,6 +885,9 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 if (backgroundAuthorizationTestMode.equals("wrong-id")
                         && command.type == P5cControlProtocol.BACKGROUND_START_REQUEST && responseExtra.length == 17)
                     ackPayload[13] ^= 1;
+                if (backgroundTrustTestMode.equals("wrong-binding")
+                        && command.type == P5cControlProtocol.BACKGROUND_TRUST_QUERY && responseExtra.length == 42)
+                    ackPayload[13] ^= 1;
                 byte[] ack = P5cControlProtocol.encode(keys.receiverToHostControl,
                         P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                         P5cControlProtocol.ACK, ackPayload);
@@ -804,6 +897,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 lastCommand = command.raw;
                 lastAck = ack;
                 expectedCommandSequence++;
+                if (stopAfterAck) { shutdownRequested = true; return; }
                 if (shutdownRequested) return;
                 if (command.type == P5cControlProtocol.STOP && result == RESULT_OK) return;
             }
@@ -854,6 +948,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     @Override public void close() {
         synchronized (this) {
             connectionIntentNonce = null;
+            establishedConnectionIntentNonce = null;
             connectionIntentEstablished = false;
         }
         stopDiscovery();

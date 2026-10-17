@@ -27,6 +27,7 @@ public final class AnPodUdpVectorCheck {
         checkJitterQueueExpiryAndFade();
         checkAdaptiveJitterTimeline();
         checkUdpLossConcealment();
+        checkUdpGapWaitWithFilledQueue();
         checkMonoPlcFrameAlignment();
         checkPlaybackActivityReset();
         checkFormatSequenceRejected();
@@ -923,11 +924,14 @@ public final class AnPodUdpVectorCheck {
                 acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
                         UdpPacketDecoder.AUDIO, monoPcm(240, 10_000), packet * 5_000_000L);
             clock.set(20_000_000L);
-            InputStream input = queue.asPcmInputStream();
+            UdpPcmQueue.QueueInputStream input = (UdpPcmQueue.QueueInputStream) queue.asPcmInputStream();
             byte[] header = readInChunks(input, 8, 3);
             check(littleInt(header, 0) == 48_000 && littleShort(header, 4) == 1,
                     "mono queue stream header was incorrect");
             readInChunks(input, 960 * 2, 13);
+            check(input.sourceBytesDelivered() == 960 * 2
+                    && input.syntheticBytesDelivered() == 0,
+                    "split queue reads lost the source byte count remainder");
             acceptAuthenticatedAt(queue, decoder, key, sessionId, 5, 1_440,
                     UdpPacketDecoder.AUDIO, monoPcm(240, 6_000), 25_000_000L);
             setAfterGapDeadline(clock, queue, 25_000_000L);
@@ -935,6 +939,9 @@ public final class AnPodUdpVectorCheck {
             check(output.length == 480 * 2 && readMonoSample(output, 0) != 0
                     && readMonoSample(output, 239) == 0 && readMonoSample(output, 240) != 0,
                     "mono PLC output lost PCM16 frame alignment");
+            check(input.sourceBytesDelivered() - 960 * 2 == 240 * 2
+                    && input.syntheticBytesDelivered() == 240 * 2,
+                    "split queue reads miscounted PLC and real bytes");
             check(queue.plcEvents() == 1 && queue.plcRepeatedFrames() == 240
                     && queue.plcSilentFrames() == 0,
                     "mono PLC frame counters were incorrect");
@@ -943,6 +950,133 @@ public final class AnPodUdpVectorCheck {
             decoder.destroy();
             Arrays.fill(key, (byte) 0);
         }
+    }
+
+    private static void checkUdpGapWaitWithFilledQueue() throws Exception {
+        PairingProtocol.AudioParameters parameters = new PairingProtocol.AudioParameters(48_000, 2, 1);
+        byte[] key = filledKey(0x71);
+        long sessionId = 0x5566778899001122L;
+        SyntheticClock clock = new SyntheticClock();
+        UdpPcmQueue queue = new UdpPcmQueue(parameters, "lowlatency", clock);
+        UdpPacketDecoder decoder = new UdpPacketDecoder(sessionId, key);
+        Thread reader = null;
+        try {
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, formatPayload(48_000, 2), 0);
+            queue.configureAudioTrack(240);
+            for (int packet = 1; packet <= 4; packet++)
+                acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
+                        UdpPacketDecoder.AUDIO, stereoPcm(240, packet, -packet), packet * 5_000_000L);
+
+            UdpPcmQueue.QueueInputStream input = (UdpPcmQueue.QueueInputStream) queue.asPcmInputStream();
+            readInChunks(input, 8, 8);
+            Pcm16FrameStream pcm = new Pcm16FrameStream(2);
+            byte[] buffer = new byte[240 * 4];
+            FinitePlaybackSink sink = new FinitePlaybackSink(720, 25_000_000L);
+            clock.set(20_000_000L);
+            for (int packet = 1; packet <= 3; packet++) {
+                int count = pcm.readFrames(input, buffer, buffer.length);
+                check(count == buffer.length, "queue stream failed to supply a 5ms startup packet");
+                sink.write(count / 4);
+            }
+            check(sink.pendingFrames() == 720, "synthetic AudioTrack did not reach its 15ms capacity");
+
+            long packetFourTime = 30_000_000L;
+            clock.set(packetFourTime);
+            sink.advanceTo(packetFourTime);
+            acceptAuthenticatedAt(queue, decoder, key, sessionId, 6, 6 * 240L,
+                    UdpPacketDecoder.AUDIO, stereoPcm(240, 6, -6), packetFourTime);
+            check(pcm.readFrames(input, buffer, buffer.length) == buffer.length,
+                    "queue stream failed to supply the fourth 5ms packet");
+            sink.write(buffer.length / 4);
+            check(sink.pendingFrames() == 720 && sink.underrunFrames() == 0,
+                    "synthetic AudioTrack did not stay full before the packet gap");
+
+            long gapArrival = 30_000_000L;
+            clock.set(gapArrival);
+            long sourceBytesBeforeGap = input.sourceBytesDelivered();
+            long syntheticBytesBeforeGap = input.syntheticBytesDelivered();
+            CountDownLatch gapReadDone = new CountDownLatch(1);
+            AtomicReference<Integer> gapReadBytes = new AtomicReference<>();
+            AtomicReference<Throwable> gapReadFailure = new AtomicReference<>();
+            reader = new Thread(() -> {
+                try { gapReadBytes.set(pcm.readFrames(input, buffer, buffer.length)); }
+                catch (Throwable failure) { gapReadFailure.set(failure); }
+                finally { gapReadDone.countDown(); }
+            }, "synthetic UDP playback reader");
+            reader.start();
+
+            for (int packet = 7; packet <= 9; packet++) {
+                long now = packet * 5_000_000L;
+                clock.set(now);
+                sink.advanceTo(now);
+                acceptAuthenticatedAt(queue, decoder, key, sessionId, packet, packet * 240L,
+                        UdpPacketDecoder.AUDIO, stereoPcm(240, packet, -packet), now);
+            }
+            check(queue.targetFrames() == 48_000 * 20 / 1000
+                    && queue.queuedFrames() >= queue.targetFrames(),
+                    "gap recovery did not reach the configured low-latency target (queued="
+                            + queue.queuedFrames() + ", target=" + queue.targetFrames() + ")");
+            check(gapReadDone.await(2, TimeUnit.SECONDS),
+                    "gap read did not resume when the queue refilled to its target");
+            if (gapReadFailure.get() != null) throw new AssertionError("queue read failed", gapReadFailure.get());
+            check(gapReadBytes.get() != null && gapReadBytes.get() == buffer.length,
+                    "gap recovery did not return one frame-aligned PLC packet");
+            check(queue.plcEvents() == 1 && queue.plcRepeatedFrames() == 240
+                    && queue.plcSilentFrames() == 0,
+                    "gap recovery changed PLC counters");
+            check(input.sourceBytesDelivered() == sourceBytesBeforeGap
+                    && input.syntheticBytesDelivered() - syntheticBytesBeforeGap == 240 * 4,
+                    "queue stream did not report the PLC frames it actually delivered");
+            check(queue.sourceBufferedFrames() >= queue.queuedFrames(),
+                    "source buffering omitted queued frames while a payload was active");
+            int realPacketBytes = pcm.readFrames(input, buffer, buffer.length);
+            check(realPacketBytes == buffer.length
+                    && input.sourceBytesDelivered() - sourceBytesBeforeGap == 240 * 4
+                    && input.syntheticBytesDelivered() - syntheticBytesBeforeGap == 240 * 4,
+                    "real queue delivery after PLC was misclassified");
+            check(sink.underrunFrames() == 0,
+                    "gap wait caused an extra simulated AudioTrack underrun");
+        } finally {
+            queue.stop();
+            boolean readerStopped = true;
+            if (reader != null) {
+                reader.join(TimeUnit.SECONDS.toMillis(2));
+                readerStopped = !reader.isAlive();
+            }
+            decoder.destroy();
+            Arrays.fill(key, (byte) 0);
+            check(readerStopped, "synthetic queue reader survived cleanup");
+        }
+    }
+
+    private static final class FinitePlaybackSink {
+        private final int capacityFrames;
+        private int pendingFrames;
+        private long lastTimeNanos;
+        private long underrunFrames;
+
+        FinitePlaybackSink(int capacityFrames, long nowNanos) {
+            this.capacityFrames = capacityFrames;
+            lastTimeNanos = nowNanos;
+        }
+
+        void advanceTo(long nowNanos) {
+            long elapsedFrames = Math.max(0, nowNanos - lastTimeNanos) * 48_000L / 1_000_000_000L;
+            if (elapsedFrames > pendingFrames) {
+                underrunFrames += elapsedFrames - pendingFrames;
+                pendingFrames = 0;
+            } else pendingFrames -= (int) elapsedFrames;
+            lastTimeNanos = nowNanos;
+        }
+
+        void write(int frames) {
+            check(frames <= capacityFrames - pendingFrames, "finite sink capacity was exceeded");
+            pendingFrames += frames;
+        }
+
+        int pendingFrames() { return pendingFrames; }
+        long underrunFrames() { return underrunFrames; }
     }
 
     private static QueueInputStreamFixture startConcealmentQueue(UdpPcmQueue queue,

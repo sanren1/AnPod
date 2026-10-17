@@ -149,6 +149,20 @@ const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
         signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
     },
     AuditedReceiverArtifact {
+        sha256: "1791bf24f848e7470206b75151b081c05b4e5fd2af3e92c67f2077cda9cdbdbd",
+        version_code: 12,
+        version_name: "0.9.1-v3-flow-candidate",
+        source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
+        sha256: "de64b3473a7848481e9ff75e98e3171dd7052b0b44f40b09d4fdaffdd669de3f",
+        version_code: 13,
+        version_name: "0.10.0-v3-flow-candidate",
+        source_commit: "61f32f7798f29bb39cf256997de50992a85ea519",
+        signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439",
+    },
+    AuditedReceiverArtifact {
         sha256: "de3924d1e7801103b1fb9c9ebcde323c35493bb4fdd8aa63aa204c2998ebdb77",
         version_code: 3,
         version_name: "0.3.0-v2-candidate",
@@ -1781,6 +1795,39 @@ mod tests {
         let Some(directory) = std::env::var_os("ANPOD_RECEIVER_ARTIFACT_DIR") else { return; };
         let directory = Path::new(&directory);
         read_artifact(&directory.join("receiver.apk"), &directory.join("receiver.json")).unwrap();
+    }
+
+    #[test]
+    fn recognizes_audited_code12_and_code13_for_code14_upgrade_but_rejects_unknown_apks() {
+        let current = ArtifactMetadata {
+            application_id: PACKAGE.into(),
+            version_code: 14,
+            version_name: "0.11.0-v3-flow-candidate".into(),
+            sha256: "a".repeat(64),
+            signer_sha256: "f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439".into(),
+            source_commit: None,
+        };
+        for (digest, version_code, version_name) in [
+            (
+                "1791bf24f848e7470206b75151b081c05b4e5fd2af3e92c67f2077cda9cdbdbd",
+                12,
+                "0.9.1-v3-flow-candidate",
+            ),
+            (
+                "de64b3473a7848481e9ff75e98e3171dd7052b0b44f40b09d4fdaffdd669de3f",
+                13,
+                "0.10.0-v3-flow-candidate",
+            ),
+        ] {
+            let installed = verified_installed_artifact(digest, &current).unwrap();
+            assert_eq!(installed.version_code, version_code);
+            assert_eq!(installed.version_name, version_name);
+            let decision = decide_receiver_compatibility(
+                Some(&installed), true, None, CAP_AUTHENTICATED_STATUS, Some(&current),
+            );
+            assert_eq!(decision.update, UpdateAvailability::CandidateAvailable);
+        }
+        assert!(verified_installed_artifact(&"e".repeat(64), &current).is_none());
     }
 
     #[test]

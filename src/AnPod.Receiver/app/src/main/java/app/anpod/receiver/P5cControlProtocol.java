@@ -33,6 +33,8 @@ final class P5cControlProtocol {
     static final int BACKGROUND_START_REQUEST = 18;
     static final int BACKGROUND_START_STATUS = 19;
     static final int BACKGROUND_START_CANCEL = 20;
+    static final int BACKGROUND_TRUST_QUERY = 21;
+    static final int BACKGROUND_TRUST_REVOKE = 22;
     static final int ACK = 127;
     static final int MANAGEMENT_CONTROL_MAJOR = 3;
     static final int AUDIO_PROTOCOL_MAJOR = 1;
@@ -41,6 +43,7 @@ final class P5cControlProtocol {
     static final int CAP_PLAYBACK_PROGRESS = 0x00000008;
     static final int CAP_CONNECTION_INTENT = 0x00000010;
     static final int CAP_BACKGROUND_START_AUTH = 0x00000020;
+    static final int CAP_BACKGROUND_TRUST_MANAGEMENT = 0x00000040;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
     static final int AUTH_PENDING = 0;
     static final int AUTH_ONCE = 1;
@@ -166,6 +169,26 @@ final class P5cControlProtocol {
         byte[] extra = Arrays.copyOf(requestId, 17);
         extra[16] = (byte) status;
         return extra;
+    }
+
+    static byte[] backgroundTrustAckExtra(byte[] commitment, int kind, int persistence, long remainingMs) {
+        if (commitment == null || commitment.length != 32 || !validBackgroundTrust(kind, persistence, remainingMs))
+            throw new IllegalArgumentException("invalid background trust ACK");
+        byte[] extra = Arrays.copyOf(commitment, 42);
+        extra[32] = (byte) kind;
+        extra[33] = (byte) persistence;
+        putLong(extra, 34, remainingMs);
+        return extra;
+    }
+
+    static boolean validBackgroundTrust(int kind, int persistence, long remainingMs) {
+        return switch (kind) {
+            case 0 -> persistence == 0 && remainingMs == 0;
+            case 1 -> persistence == 1 && (remainingMs >= 0 && remainingMs <= 30_000 || remainingMs == -1L);
+            case 2 -> persistence == 1 && remainingMs >= 0 && remainingMs <= TimeUnit.HOURS.toMillis(8);
+            case 3 -> persistence == 2 && remainingMs == -1L;
+            default -> false;
+        };
     }
 
     static byte[] playbackProgressPayload(int sampleRate, int channels, int jitterTargetFrames,

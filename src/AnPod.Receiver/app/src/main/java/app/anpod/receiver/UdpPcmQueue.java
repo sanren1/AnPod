@@ -477,6 +477,8 @@ final class UdpPcmQueue {
                 int count = Math.min(length, stream.currentPayload.length - stream.payloadOffset);
                 System.arraycopy(stream.currentPayload, stream.payloadOffset, target, offset, count);
                 stream.payloadOffset += count;
+                if (stream.currentPayloadIsReal) stream.sourceBytesDelivered += count;
+                else stream.syntheticBytesDelivered += count;
                 if (stream.payloadOffset == stream.currentPayload.length) {
                     if (stream.currentPayloadIsReal) {
                         lastRealPayload = stream.currentPayload.clone();
@@ -524,7 +526,7 @@ final class UdpPcmQueue {
                             ? packetWaitDeadline : next.enqueuedAtNanos + waitBudgetNanos;
                 }
                 long remaining = gapDeadlineNanos - now;
-                if (remaining > 0) {
+                if (remaining > 0 && queuedFrames < targetFrames) {
                     waitForChange(remaining);
                     continue;
                 }
@@ -660,6 +662,17 @@ final class UdpPcmQueue {
     synchronized long expiredFrames() { return expiredFrames; }
     synchronized int targetFrames() { return targetFrames; }
     synchronized long queuedFrames() { return queuedFrames; }
+    synchronized long sourceBufferedFrames() {
+        long buffered = queuedFrames;
+        if (activePayloadStream != null
+                && activePayloadStream.payloadGeneration == payloadGeneration
+                && activePayloadStream.currentPayloadIsReal) {
+            buffered += (activePayloadStream.currentPayload.length - activePayloadStream.payloadOffset)
+                    / (format.channels * 2);
+        }
+        return buffered;
+    }
+    synchronized long payloadGeneration() { return payloadGeneration; }
     synchronized long plcEvents() { return plcEvents; }
     synchronized long plcRepeatedFrames() { return plcRepeatedFrames; }
     synchronized long plcSilentFrames() { return plcSilentFrames; }
@@ -721,6 +734,8 @@ final class UdpPcmQueue {
         private long payloadGeneration = -1;
         private long enqueuedAtNanos;
         private boolean currentPayloadIsReal;
+        private long sourceBytesDelivered;
+        private long syntheticBytesDelivered;
 
         QueueInputStream(UdpPcmQueue queue) { this.queue = queue; }
 
@@ -759,6 +774,14 @@ final class UdpPcmQueue {
         public void close() {
             closed = true;
             queue.stop();
+        }
+
+        long sourceBytesDelivered() {
+            synchronized (queue) { return sourceBytesDelivered; }
+        }
+
+        long syntheticBytesDelivered() {
+            synchronized (queue) { return syntheticBytesDelivered; }
         }
 
         private static void writeLittleInt(byte[] target, int offset, int value) {

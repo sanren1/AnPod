@@ -1,6 +1,6 @@
 [package]
 name = "anpod-tauri"
-version = "1.2.1"
+version = "1.4.0"
 description = "Windows system audio to Android over ADB"
 authors = ["AnPod"]
 edition = "2021"

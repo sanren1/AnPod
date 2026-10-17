@@ -1,4 +1,4 @@
-use crate::{audio::AudioActor, discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{ReceiverCapabilities, SessionLifecycleState, SessionOwner}, protocol::PcmFormat};
+use crate::{audio::AudioActor, discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener}, network::{PcmQueue}, network_interface::{self, Ipv4Interface}, p5c::{BackgroundTrustSnapshot, HostSession, ReceiverCapabilities, SessionLifecycleState, SessionOwner}, protocol::PcmFormat};
 use crate::receiver::{self, PlaybackDiagnostics, ReceiverStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
+    net::SocketAddr,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
@@ -50,7 +51,7 @@ pub struct AppSettings {
     pub preferred_transport: String,
     #[serde(default)]
     pub wireless_protocol: String,
-    #[serde(default)]
+    #[serde(default = "receiver")]
     pub audio_backend: String,
     #[serde(default = "yes")]
     pub auto_reconnect_wifi: bool,
@@ -66,7 +67,7 @@ fn schema_version() -> u32 { 1 }
 fn yes() -> bool { true }
 fn usb() -> String { "Usb".into() }
 fn udp() -> String { "udp".into() }
-fn legacy() -> String { "legacy".into() }
+fn receiver() -> String { "receiver".into() }
 fn balanced() -> String { "Balanced".into() }
 fn system() -> String { "System".into() }
 
@@ -80,7 +81,7 @@ impl Default for AppSettings {
             launch_at_login: false,
             preferred_transport: usb(),
             wireless_protocol: udp(),
-            audio_backend: legacy(),
+            audio_backend: receiver(),
             auto_reconnect_wifi: true,
             last_wireless_endpoint: None,
             playback_mode: balanced(),
@@ -99,6 +100,7 @@ pub struct AppSnapshot {
     pub selected_serial: Option<String>,
     pub session_serial: Option<String>,
     pub session_receiver_binding: Option<String>,
+    pub session_generation: Option<u64>,
     pub session_transport: Option<String>,
     pub session_connection_transport: Option<String>,
     pub session_wireless_protocol: Option<String>,
@@ -118,6 +120,24 @@ pub struct AppSnapshot {
     pub status_detail: String,
     pub audio_bitrate_bps: Option<u64>,
     pub version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "target", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum BackgroundTrustTarget {
+    ActiveSession { binding_reference: String, session_generation: u64 },
+    Receiver { binding_reference: String, local_address: String, peer: String },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTrustStatus {
+    pub target: String,
+    pub binding_reference: String,
+    pub session_generation: Option<u64>,
+    pub kind: String,
+    pub persistence: String,
+    pub remaining_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -170,6 +190,7 @@ struct ViewState {
     selected_serial: Option<String>,
     session_serial: Option<String>,
     session_receiver_binding: Option<String>,
+    session_generation: Option<u64>,
     session_transport: Option<String>,
     session_android_version: Option<String>,
     output: String,
@@ -267,6 +288,7 @@ impl AppState {
                 selected_serial: None,
                 session_serial: None,
                 session_receiver_binding: None,
+                session_generation: None,
                 session_transport: None,
                 session_android_version: None,
                 output: "computer".into(),
@@ -506,6 +528,189 @@ impl AppState {
             Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
     }
 
+    #[cfg(windows)]
+    pub async fn query_background_trust(&self, target: BackgroundTrustTarget)
+        -> Result<BackgroundTrustStatus, String> {
+        self.background_trust_operation(target, false, None).await
+    }
+
+    #[cfg(not(windows))]
+    pub async fn query_background_trust(&self, _target: BackgroundTrustTarget)
+        -> Result<BackgroundTrustStatus, String> {
+        Err("Windows 网络 Receiver 背景授权管理仅在 Windows 上可用。".into())
+    }
+
+    #[cfg(windows)]
+    pub async fn revoke_background_trust(&self, app: &AppHandle, target: BackgroundTrustTarget)
+        -> Result<BackgroundTrustStatus, String> {
+        self.background_trust_operation(target, true, Some(app)).await
+    }
+
+    #[cfg(not(windows))]
+    pub async fn revoke_background_trust(&self, _app: &AppHandle, _target: BackgroundTrustTarget)
+        -> Result<BackgroundTrustStatus, String> {
+        Err("Windows 网络 Receiver 背景授权管理仅在 Windows 上可用。".into())
+    }
+
+    #[cfg(windows)]
+    async fn background_trust_operation(&self, target: BackgroundTrustTarget, revoke: bool,
+        app: Option<&AppHandle>) -> Result<BackgroundTrustStatus, String> {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+        let (operation_generation, cancellation) = self.start_background_operation()
+            .ok_or_else(|| "AnPod 正在处理其他操作；请稍后再管理 Receiver 背景授权。".to_string())?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let deadline_tokio = tokio::time::Instant::from_std(deadline);
+        let gate = tokio::select! {
+            _ = cancellation.cancelled() => {
+                cancellation.cancel();
+                self.finish_operation(operation_generation);
+                return Err("背景授权管理已取消。".into());
+            }
+            _ = tokio::time::sleep_until(deadline_tokio) => {
+                cancellation.cancel();
+                self.finish_operation(operation_generation);
+                return Err("背景授权管理等待超时。".into());
+            }
+            guard = self.gate.lock() => guard,
+        };
+        let result = async {
+            token_check(&cancellation)?;
+            match target {
+                BackgroundTrustTarget::ActiveSession { binding_reference, session_generation } => {
+                    if !valid_binding_reference(&binding_reference) {
+                        return Err("Receiver 绑定引用格式无效。".into());
+                    }
+                    let mut session_slot = self.session.lock().await;
+                    let active = session_slot.as_mut().ok_or_else(|| "活动网络会话已结束；请刷新目标后重试。".to_string())?;
+                    let active_binding = active.network_binding_ref.as_deref()
+                        .ok_or_else(|| "当前会话不是可管理的 LAN Receiver 会话。".to_string())?;
+                    if active_binding != binding_reference {
+                        return Err("活动会话绑定与所选 Receiver 不匹配。".into());
+                    }
+                    if active.generation != session_generation {
+                        return Err("活动会话代际已变化；请刷新授权状态后重试。".into());
+                    }
+                    let owner = active.network_owner.as_ref()
+                        .ok_or_else(|| "活动网络会话 Owner 不可用。".to_string())?;
+                    let owner_snapshot = owner.snapshot();
+                    if !matches!(owner_snapshot.state, SessionLifecycleState::Authenticated
+                        | SessionLifecycleState::TransportConnected | SessionLifecycleState::ReceiverRunning
+                        | SessionLifecycleState::Streaming | SessionLifecycleState::Paused) {
+                        return Err("Receiver 当前未处于可管理的认证会话；请等待恢复后重试。".into());
+                    }
+                    let trust = if revoke {
+                        owner.revoke_background_trust(owner_snapshot.generation, deadline, cancellation.clone()).await?
+                    } else {
+                        owner.query_background_trust(owner_snapshot.generation, deadline, cancellation.clone()).await?
+                    };
+                    let status = background_trust_status(trust, "activeSession", binding_reference,
+                        Some(session_generation))?;
+                    drop(session_slot);
+                    if revoke {
+                        if let Some(mut ended_session) = self.session.lock().await.take() {
+                            if let Some(mut ended_owner) = ended_session.network_owner.take() { ended_owner.stop(); }
+                        }
+                        self.finish_revoked_audio(app.expect("revoke request carries AppHandle")).await?;
+                    }
+                    Ok(status)
+                }
+                BackgroundTrustTarget::Receiver { binding_reference, local_address, peer } => {
+                    if !valid_binding_reference(&binding_reference) {
+                        return Err("Receiver 绑定引用格式无效。".into());
+                    }
+                    if self.session.lock().await.is_some() {
+                        return Err("存在活动会话；请指定其 bindingReference 和 sessionGeneration。".into());
+                    }
+                    let interface = self.network_interfaces()?.into_iter()
+                        .find(|item| item.address.to_string() == local_address)
+                        .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
+                    let peer = peer.parse::<SocketAddr>()
+                        .map_err(|_| "Receiver 目标必须是明确的 IPv4 地址和端口。".to_string())?;
+                    let SocketAddr::V4(peer_v4) = peer else {
+                        return Err("背景授权管理仅支持 IPv4 Receiver 目标。".into());
+                    };
+                    if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) {
+                        return Err("Receiver 目标不在所选 IPv4 接口的本地网段内。".into());
+                    }
+                    let path = binding_store_path(&self.data_dir, &binding_reference)?;
+                    let material = crate::security::BindingStore::load(&path)
+                        .map_err(|_| "本机 DPAPI 绑定材料不可用；请重新选择已保存的 Receiver 绑定。".to_string())?;
+                    if crate::p5c::hex_string(&material.commitment()) != binding_reference.to_ascii_lowercase() {
+                        return Err("所选绑定材料与 bindingReference 不匹配。".into());
+                    }
+                    let interface = interface.clone();
+                    let request_cancellation = cancellation.clone();
+                    let absolute_deadline = deadline;
+                    let parameters = crate::security::AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 };
+                    let peer = SocketAddr::V4(peer_v4);
+                    let host_task = tokio::task::spawn_blocking(move || {
+                        let mut host = HostSession::authenticate_management_on_interface(&interface, peer,
+                            material, parameters, request_cancellation.clone())?;
+                        if request_cancellation.is_cancelled() || Instant::now() >= absolute_deadline {
+                            return Err("Receiver 背景授权管理已取消或超时。".into());
+                        }
+                        if revoke {
+                            host.revoke_background_trust_until(absolute_deadline, &request_cancellation)
+                        } else {
+                            host.query_background_trust_until(absolute_deadline, &request_cancellation)
+                        }
+                    });
+                    let trust = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            cancellation.cancel();
+                            return Err("背景授权管理已取消。".into());
+                        }
+                        _ = tokio::time::sleep_until(deadline_tokio) => {
+                            cancellation.cancel();
+                            return Err("Receiver 背景授权管理超时。".into());
+                        }
+                        joined = host_task => joined.map_err(|_| "Receiver 背景授权管理任务已停止。".to_string())??,
+                    };
+                    background_trust_status(trust, "receiver", binding_reference, None)
+                }
+            }
+        }.await;
+        drop(gate);
+        cancellation.cancel();
+        self.finish_operation(operation_generation);
+        if let Some(app) = app { self.emit(app); }
+        result
+    }
+
+    #[cfg(windows)]
+    async fn finish_revoked_audio(&self, app: &AppHandle) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.audio.stop_pcm_sink() { errors.push(format!("停止 PCM sink 失败：{error}")); }
+        if let Err(error) = self.audio.stop_and_cleanup() { errors.push(format!("清理本机音频失败：{error}")); }
+        if let Err(error) = self.audio.restore_muted() { errors.push(format!("恢复电脑输出失败：{error}")); }
+        let mut view = self.view.lock().expect("view lock");
+        view.session_active = false;
+        view.session_generation = None;
+        view.session_serial = None;
+        view.session_receiver_binding = None;
+        view.session_transport = None;
+        view.session_capabilities = None;
+        view.playback_diagnostics = None;
+        view.network_recovery_seconds_remaining = None;
+        view.audio_bitrate_bps = None;
+        view.output = "computer".into();
+        if errors.is_empty() {
+            view.state = if view.devices.is_empty() { "noDevice" } else { "ready" }.into();
+            view.message = "Receiver 背景授权已撤销".into();
+            view.status_detail = "Receiver 已确认撤销；PCM sink 已停止，电脑输出已恢复。".into();
+        } else {
+            view.state = "error".into();
+            view.message = "授权已撤销，但电脑音频清理未完成".into();
+            view.status_detail = errors.join("；");
+        }
+        view.busy = false;
+        drop(view);
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+        self.emit(app);
+        if errors.is_empty() { Ok(()) }
+        else { Err(format!("Receiver 已确认撤销，但本机清理失败：{}", errors.join("；"))) }
+    }
+
     pub fn set_wireless_connection_offers(&self, local_address: &str, allowed: bool,
         selected_binding: Option<&str>) -> Result<HostDiscoverySnapshot, String> {
         if !allowed {
@@ -593,7 +798,7 @@ impl AppState {
             Err(error) => { self.finish_operation(reservation.0); return Err(error); }
         };
         self.start_network_audio_inner(app, &address.to_string(), &offer.endpoint.to_string(), None,
-            None, None, Some(binding_ref), Some((offer.nonce, false, cancellation)), Some(reservation)).await
+            None, None, Some(binding_ref), Some((offer.nonce, false, cancellation)), Some(reservation), false).await
     }
 
     #[cfg(not(windows))]
@@ -605,16 +810,20 @@ impl AppState {
     #[cfg(windows)]
     pub async fn start_network_audio(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
-        selected_binding_ref: Option<&str>) -> Result<AppSnapshot, String> {
+        selected_binding_ref: Option<&str>, background_authorization_required: bool) -> Result<AppSnapshot, String> {
         self.start_network_audio_inner(app, local_address, peer, bootstrap_serial, receiver_address,
-            receiver_prefix, selected_binding_ref, None, None).await
+            receiver_prefix, selected_binding_ref, None, None, background_authorization_required).await
     }
 
     #[cfg(windows)]
     async fn start_network_audio_inner(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
         selected_binding_ref: Option<&str>, intent: Option<([u8; 16], bool, CancellationToken)>,
-        reservation: Option<(u64, CancellationToken)>) -> Result<AppSnapshot, String> {
+        reservation: Option<(u64, CancellationToken)>, background_authorization_required: bool) -> Result<AppSnapshot, String> {
+        if background_authorization_required && (bootstrap_serial.is_some() || intent.is_some()
+            || !selected_binding_ref.is_some_and(valid_binding_reference)) {
+            return Err("背景授权仅允许在明确选择已保存绑定、LAN 接口和 Receiver 目标时请求；USB/bootstrap 与手机 offer 使用原连接流程。".into());
+        }
         use crate::security::{AudioParameters, BindingStore};
         let (generation, token) = reservation.unwrap_or_else(|| self.start_operation());
         let mut audio_initialized = false;
@@ -679,9 +888,16 @@ impl AppState {
             if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) { return Err("接收端点不在所选 IPv4 接口的本地网段内。".into()); }
             token_check(&token)?;
             let binding = BindingStore::load(&binding_path).map_err(|_| "本机 DPAPI 绑定材料不可用；请通过授权 USB/bootstrap 建立绑定。".to_string())?;
+            if background_authorization_required
+                && crate::p5c::hex_string(&binding.commitment()) != binding_ref.to_ascii_lowercase() {
+                return Err("所选绑定材料与 bindingReference 不匹配；未请求 Receiver 授权。".into());
+            }
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
-            let mut owner = if let Some((nonce, required, _)) = &intent {
+            let mut owner = if background_authorization_required {
+                SessionOwner::start_on_interface_with_background_authorization(
+                    &interface, peer, binding, parameters, token.clone())?
+            } else if let Some((nonce, required, _)) = &intent {
                 SessionOwner::start_on_interface_with_intent(&interface, peer, binding, parameters, token.clone(), *nonce, *required)?
             } else { SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())? };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -732,8 +948,9 @@ impl AppState {
                 if let Some(current) = listener.as_mut() { current.attempt_cancel = None; }
                 listener.take();
             }
+            let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
             *self.session.lock().await = Some(Session {
-                generation: NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+                generation: session_generation,
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
                 installed_receiver: false, output: session_output.into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
                 network_owner: Some(owner), network_sink_queue: queue, network_binding_ref: Some(binding_ref.clone()),
@@ -745,6 +962,7 @@ impl AppState {
                 view.session_active = true;
                 view.session_serial = None;
                 view.session_receiver_binding = Some(binding_ref);
+                view.session_generation = Some(session_generation);
                 view.session_transport = Some("lan".into());
                 view.session_android_version = None;
                 view.session_capabilities = capabilities;
@@ -779,7 +997,7 @@ impl AppState {
     #[cfg(not(windows))]
     pub async fn start_network_audio(&self, _app: &AppHandle, _local_address: &str, _peer: &str,
         _bootstrap_serial: Option<&str>, _receiver_address: Option<&str>, _receiver_prefix: Option<u8>,
-        _selected_binding_ref: Option<&str>) -> Result<AppSnapshot, String> {
+        _selected_binding_ref: Option<&str>, _background_authorization_required: bool) -> Result<AppSnapshot, String> {
         Err("Windows 网络音频接收仅在 Windows 上可用。".into())
     }
 
@@ -839,6 +1057,7 @@ impl AppState {
             selected_serial: view.selected_serial.clone(),
             session_serial: view.session_serial.clone(),
             session_receiver_binding: view.session_receiver_binding.clone(),
+            session_generation: view.session_generation,
             session_transport: view.session_transport.clone(),
             session_connection_transport: view.session_transport.as_deref().and_then(session_connection_transport).map(str::to_owned),
             session_wireless_protocol: view.session_transport.as_deref().and_then(session_wireless_protocol).map(str::to_owned),
@@ -947,13 +1166,7 @@ impl AppState {
             .and_then(|json| serde_json::from_str::<AppSettings>(&json).ok())
             .filter(|s| s.schema_version == 1)
             .map(normalize_settings)
-            .unwrap_or_else(|| {
-                let mut settings = AppSettings::default();
-                if std::env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value == "installed-receiver") {
-                    settings.audio_backend = "receiver".into();
-                }
-                settings
-            });
+            .unwrap_or_default();
         self.view.lock().expect("app view lock").settings = settings;
     }
 
@@ -1054,7 +1267,7 @@ impl AppState {
         let Some(offer) = offer else { self.finish_operation(reservation.0); return false; };
         let generation = reservation.0;
         let result = self.start_network_audio_inner(app, &address.to_string(), &offer.endpoint.to_string(),
-            None, None, None, Some(&binding), Some((offer.nonce, true, cancellation)), Some(reservation)).await;
+            None, None, None, Some(&binding), Some((offer.nonce, true, cancellation)), Some(reservation), false).await;
         if let Err(error) = result {
             self.log(&format!("Wireless reception intent failed: {error}"));
             let mut view = self.view.lock().expect("app view lock");
@@ -1227,6 +1440,7 @@ impl AppState {
                 view.session_active = false;
                 view.session_serial = None;
                 view.session_receiver_binding = None;
+                view.session_generation = None;
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
@@ -1489,7 +1703,9 @@ impl AppState {
         let remote = format!("localabstract:{reverse}");
         let port_arg = format!("tcp:{port}");
         checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(&token)).await?;
-        *self.session.lock().await = Some(Session { generation: NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed), serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())), network_owner: None, network_sink_queue: None, network_binding_ref: None });
+        let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        *self.session.lock().await = Some(Session { generation: session_generation, serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())), network_owner: None, network_sink_queue: None, network_binding_ref: None });
+        self.view.lock().expect("view lock").session_generation = Some(session_generation);
         {
             let mut view = self.view.lock().expect("view lock");
             view.session_active = true;
@@ -1781,7 +1997,7 @@ impl AppState {
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
             let network_session = session.network_owner.is_some();
-            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_transport = None; view.session_capabilities = None; view.playback_diagnostics = None; view.network_recovery_seconds_remaining = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
+            { let mut view = self.view.lock().expect("view lock"); view.session_active = false; view.session_serial = None; view.session_receiver_binding = None; view.session_generation = None; view.session_transport = None; view.session_capabilities = None; view.playback_diagnostics = None; view.network_recovery_seconds_remaining = None; view.session_android_version = None; view.audio_bitrate_bps = None; }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -1909,6 +2125,7 @@ impl AppState {
                     view.session_active = false;
                     view.session_serial = None;
                     view.session_receiver_binding = None;
+                    view.session_generation = None;
                     view.session_transport = None;
                     view.session_capabilities = None;
                     view.playback_diagnostics = None;
@@ -2331,6 +2548,25 @@ fn valid_binding_reference(reference: &str) -> bool {
     reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn background_trust_status(snapshot: BackgroundTrustSnapshot, target: &str,
+    binding_reference: String, session_generation: Option<u64>) -> Result<BackgroundTrustStatus, String> {
+    let (kind, persistence) = match (snapshot.kind, snapshot.persistence) {
+        (0, 0) => ("none", "none"),
+        (1, 1) => ("once", "process"),
+        (2, 1) => ("eightHours", "process"),
+        (3, 2) => ("untilRevoked", "binding"),
+        _ => return Err("Receiver returned an invalid background trust snapshot.".into()),
+    };
+    Ok(BackgroundTrustStatus {
+        target: target.into(),
+        binding_reference,
+        session_generation,
+        kind: kind.into(),
+        persistence: persistence.into(),
+        remaining_ms: (snapshot.remaining_ms != u64::MAX).then_some(snapshot.remaining_ms),
+    })
+}
+
 fn automatic_reception_binding(references: &[String], selected: Option<&str>) -> Result<Option<String>, String> {
     match selected.filter(|value| !value.is_empty()) {
         Some(value) if references.iter().any(|item| item == value) => Ok(Some(value.to_owned())),
@@ -2594,10 +2830,7 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.wireless_protocol = if settings.wireless_protocol.is_empty() {
         if settings.preferred_transport == "Wifi" { "adb" } else { "udp" }.into()
     } else { normalize_wireless_protocol(&settings.wireless_protocol).into() };
-    settings.audio_backend = if settings.audio_backend.is_empty()
-        && std::env::var("ANPOD_AUDIO_BACKEND").is_ok_and(|value| value == "installed-receiver") {
-        "receiver".into()
-    } else { normalize_audio_backend(&settings.audio_backend).into() };
+    settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() { "lowlatency" | "low_latency" => "LowLatency".into(), _ => "Balanced".into() };
     settings.appearance_theme = match settings.appearance_theme.to_ascii_lowercase().as_str() { "light" => "Light".into(), "dark" => "Dark".into(), _ => "System".into() };
     settings
@@ -2605,7 +2838,7 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
 
 fn normalize_transport(value: &str) -> &'static str { if value.eq_ignore_ascii_case("wifi") { "Wifi" } else { "Usb" } }
 fn normalize_wireless_protocol(value: &str) -> &'static str { if value.eq_ignore_ascii_case("adb") { "adb" } else { "udp" } }
-fn normalize_audio_backend(value: &str) -> &'static str { if value.eq_ignore_ascii_case("receiver") { "receiver" } else { "legacy" } }
+fn normalize_audio_backend(value: &str) -> &'static str { if value.eq_ignore_ascii_case("legacy") { "legacy" } else { "receiver" } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReconfigureSelection { Playback, AudioBackend, Usb, WirelessAdb, WirelessUdp }
 fn wireless_adb_enabled(settings: &AppSettings) -> bool { settings.wireless_protocol == "adb" }
@@ -2660,6 +2893,42 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_trust_ipc_uses_camel_case_target_and_nullable_duration() {
+        let active: BackgroundTrustTarget = serde_json::from_value(serde_json::json!({
+            "target": "activeSession",
+            "bindingReference": "ab".repeat(32),
+            "sessionGeneration": 41
+        })).unwrap();
+        assert!(matches!(active, BackgroundTrustTarget::ActiveSession { session_generation: 41, .. }));
+
+        let receiver: BackgroundTrustTarget = serde_json::from_value(serde_json::json!({
+            "target": "receiver",
+            "bindingReference": "cd".repeat(32),
+            "localAddress": "192.168.1.10",
+            "peer": "192.168.1.30:45678"
+        })).unwrap();
+        assert!(matches!(receiver, BackgroundTrustTarget::Receiver { local_address, .. }
+            if local_address == "192.168.1.10"));
+
+        let status = BackgroundTrustStatus {
+            target: "receiver".into(),
+            binding_reference: "cd".repeat(32),
+            session_generation: None,
+            kind: "untilRevoked".into(),
+            persistence: "binding".into(),
+            remaining_ms: None,
+        };
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["target"], "receiver");
+        assert_eq!(json["bindingReference"], "cd".repeat(32));
+        assert!(json["sessionGeneration"].is_null());
+        assert_eq!(json["kind"], "untilRevoked");
+        assert_eq!(json["persistence"], "binding");
+        assert!(json["remainingMs"].is_null());
+        assert!(json.get("commitment").is_none());
+    }
 
     #[test]
     fn usb_playback_diagnostics_use_session_scoped_health_intervals() {
@@ -2806,7 +3075,7 @@ mod tests {
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["preferredTransport"], "Usb");
         assert_eq!(value["wirelessProtocol"], "udp");
-        assert_eq!(value["audioBackend"], "legacy");
+        assert_eq!(value["audioBackend"], "receiver");
         assert_eq!(value["playbackMode"], "Balanced");
         let settings = normalize_settings(serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Wifi",
@@ -2815,16 +3084,25 @@ mod tests {
         assert_eq!(settings.preferred_transport, "Wifi");
         assert_eq!(settings.wireless_protocol, "adb");
         assert_eq!(settings.audio_backend, "receiver");
+        let empty_backend = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "audioBackend": ""
+        })).unwrap());
+        assert_eq!(empty_backend.audio_backend, "receiver");
+        let explicit_legacy = normalize_settings(serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "audioBackend": "legacy"
+        })).unwrap());
+        assert_eq!(explicit_legacy.audio_backend, "legacy");
         let old_saved = normalize_settings(serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Wifi"
         })).unwrap());
         assert_eq!(old_saved.preferred_transport, "Wifi");
         assert_eq!(old_saved.wireless_protocol, "adb");
-        assert_eq!(old_saved.audio_backend, "legacy");
+        assert_eq!(old_saved.audio_backend, "receiver");
         let new_saved = normalize_settings(serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Usb", "wirelessProtocol": "udp"
         })).unwrap());
         assert_eq!(new_saved.wireless_protocol, "udp");
+        assert_eq!(new_saved.audio_backend, "receiver");
         assert_eq!(selected_transport_allows_auto_adb(&old_saved), true);
         assert_eq!(selected_transport_allows_auto_adb(&new_saved), true);
         let explicit_udp_wifi = normalize_settings(serde_json::from_value(serde_json::json!({
@@ -2835,6 +3113,34 @@ mod tests {
         assert_eq!(reconfigure_selection("transport", "wireless", &old_saved), Ok(ReconfigureSelection::WirelessAdb));
         assert_eq!(reconfigure_selection("wirelessProtocol", "udp", &old_saved), Ok(ReconfigureSelection::WirelessUdp));
         assert!(reconfigure_selection("wirelessProtocol", "invalid", &old_saved).is_err());
+
+        let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(".tmp-settings-default-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut settings_state = AppState::new();
+        settings_state.data_dir = test_dir.clone();
+        settings_state.load_settings();
+        assert_eq!(settings_state.snapshot().settings.audio_backend, "receiver",
+            "a missing settings file must use the Receiver default");
+
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(test_dir.join("settings.json"), r#"{"schemaVersion":1,"preferredTransport":"Wifi"}"#).unwrap();
+        settings_state.load_settings();
+        let missing_backend = settings_state.snapshot().settings;
+        assert_eq!(missing_backend.audio_backend, "receiver",
+            "a saved settings file without audioBackend must use Receiver");
+        assert_eq!(missing_backend.wireless_protocol, "adb",
+            "the existing Wifi-to-ADB migration must remain unchanged");
+        settings_state.save_settings(&explicit_legacy).unwrap();
+        settings_state.load_settings();
+        assert_eq!(settings_state.snapshot().settings.audio_backend, "legacy",
+            "an explicit Legacy choice must survive save and load");
+        let explicit_receiver = AppSettings { audio_backend: "receiver".into(), ..AppSettings::default() };
+        settings_state.save_settings(&explicit_receiver).unwrap();
+        settings_state.load_settings();
+        assert_eq!(settings_state.snapshot().settings.audio_backend, "receiver",
+            "an explicit Receiver choice must survive save and load");
+        fs::remove_dir_all(test_dir).unwrap();
+
         let state = AppState::new();
         state.view.lock().unwrap().settings.preferred_transport = "Wifi".into();
         assert_eq!(state.snapshot().connection_transport, "wireless");

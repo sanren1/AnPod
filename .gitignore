@@ -64,7 +64,7 @@ src-tauri/icons/icon.icns
 src-tauri/icons/Square*.png
 src-tauri/icons/StoreLogo.png
 
-# Local instructions and planning files are not part of public source.
+# Local project instructions and private planning records
 /AGENTS.md
 /AGENTS.override.md
 /plan.md

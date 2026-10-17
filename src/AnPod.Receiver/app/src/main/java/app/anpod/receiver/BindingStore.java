@@ -111,7 +111,14 @@ final class BindingStore implements BackgroundStartAuthorization.GrantStore {
         synchronized (FILE_LOCK) {
             if (!grantFile.getBaseFile().exists() && !new File(grantFile.getBaseFile().getPath() + ".bak").exists()) return false;
             byte[] record = grantFile.readFully();
-            try { return ("BSA1\n" + expectedCommitment + "\n").equals(new String(record, StandardCharsets.US_ASCII)); }
+            try {
+                String value = new String(record, StandardCharsets.US_ASCII);
+                String prefix = "BSA1\n";
+                if (!value.startsWith(prefix) || !value.endsWith("\n")
+                        || !isCommitment(value.substring(prefix.length(), value.length() - 1)))
+                    throw new IOException("invalid background grant record");
+                return (prefix + expectedCommitment + "\n").equals(value);
+            }
             finally { Arrays.fill(record, (byte) 0); }
         }
     }
@@ -140,9 +147,22 @@ final class BindingStore implements BackgroundStartAuthorization.GrantStore {
             byte[] record = grantFile.readFully();
             try {
                 String value = new String(record, StandardCharsets.US_ASCII);
-                if (value.equals("BSA1\n" + expectedCommitment + "\n")) grantFile.delete();
+                if (value.equals("BSA1\n" + expectedCommitment + "\n")) {
+                    grantFile.delete();
+                    if (hasUntilRevoked(expectedCommitment))
+                        throw new IOException("background grant remains after revoke");
+                }
             } finally { Arrays.fill(record, (byte) 0); }
         }
+    }
+
+    private static boolean isCommitment(String value) {
+        if (value.length() != 64) return false;
+        for (int index = 0; index < value.length(); index++) {
+            char item = value.charAt(index);
+            if (!(item >= '0' && item <= '9') && !(item >= 'a' && item <= 'f')) return false;
+        }
+        return true;
     }
 
     private static String hex(byte[] value) {

@@ -53,7 +53,9 @@ public final class P5cLoopbackEndpoint {
         }
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
+        byte[] fixtureBindingCommitment = binding.commitment();
         boolean verifyAutoRenewAfterAuth = Arrays.asList(args).contains("--verify-auto-renew-after-auth");
+        boolean verifyIntentRenewal = Arrays.asList(args).contains("--verify-intent-renewal");
         boolean verifyModeSwitch = Arrays.asList(args).contains("--verify-mode-switch");
         boolean verifyAudioWindow = Arrays.asList(args).contains("--verify-audio-window");
         FakePlayback playback = new FakePlayback(Arrays.asList(args).contains("--fail-resume"),
@@ -63,8 +65,11 @@ public final class P5cLoopbackEndpoint {
                         .map(value -> value.substring("--background-auth-mode=".length())).findFirst().orElse(""));
         String capabilityMode = Arrays.stream(args).filter(value -> value.startsWith("--capabilities-"))
                 .map(value -> value.substring("--capabilities-".length())).findFirst().orElse("");
-        playback.keepReceiveIntent = verifyAutoRenewAfterAuth;
-        P5cReceiverCoordinator opened = verifyAutoRenewAfterAuth
+        playback.keepReceiveIntent = verifyAutoRenewAfterAuth || verifyIntentRenewal || verifyModeSwitch;
+        playback.backgroundTrustManagement = Arrays.asList(args).contains("--background-trust-management")
+                || Arrays.asList(args).contains("--background-trust-wrong-binding");
+        playback.delayBackgroundTrustCapability = Arrays.asList(args).contains("--delay-background-trust-capability");
+        P5cReceiverCoordinator opened = verifyIntentRenewal || verifyAutoRenewAfterAuth
                 ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : Arrays.asList(args).contains("--connection-intent")
                 ? P5cReceiverCoordinator.openLoopbackIntentTest(binding, playback, repeated((byte) 0x5a, 16))
@@ -86,16 +91,24 @@ public final class P5cLoopbackEndpoint {
                 ? P5cReceiverCoordinator.openOnInterface(binding, playback, InetAddress.getByName("127.0.0.1"), 32)
                 : P5cReceiverCoordinator.openLoopback(binding, playback);
         try (P5cReceiverCoordinator endpoint = opened) {
-            if (verifyAutoRenewAfterAuth) {
+            if (Arrays.asList(args).contains("--background-trust-wrong-binding"))
+                endpoint.backgroundTrustTestMode = "wrong-binding";
+            if (verifyAutoRenewAfterAuth || verifyIntentRenewal) {
                 java.lang.reflect.Method beginIntent = P5cReceiverCoordinator.class
                         .getDeclaredMethod("beginConnectionIntent", byte[].class);
                 beginIntent.setAccessible(true);
                 beginIntent.invoke(endpoint, repeated((byte) 0x5a, 16));
             }
+            if (Arrays.asList(args).contains("--require-connection-intent")) {
+                java.lang.reflect.Method beginIntent = P5cReceiverCoordinator.class
+                        .getDeclaredMethod("beginConnectionIntent", byte[].class);
+                beginIntent.setAccessible(true);
+                beginIntent.invoke(endpoint, new Object[] { null });
+            }
             if (Arrays.asList(args).contains("--cancel-before-handoff")) playback.beforeStart = endpoint::cancelPendingConnectionIntent;
             endpoint.start();
             P5cDiscovery initialDiscovery = null;
-            if (Arrays.asList(args).contains("--discovery") || verifyAutoRenewAfterAuth) {
+            if (Arrays.asList(args).contains("--discovery") || verifyAutoRenewAfterAuth || verifyIntentRenewal) {
                 endpoint.startDiscovery();
                 if (Arrays.asList(args).contains("--discovery")) verifyInvalidDiscoveryDoesNotStartPlayback(playback);
                 if (verifyAutoRenewAfterAuth) {
@@ -106,6 +119,44 @@ public final class P5cLoopbackEndpoint {
             }
             System.out.println("PORT=" + endpoint.port());
             System.out.flush();
+            if (verifyIntentRenewal) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+                while (!playback.stopped.get() || playback.starts.get() < 1) {
+                    if (System.nanoTime() >= deadline) throw new IOException("intent-renewal fixture did not receive its first STOP");
+                    Thread.sleep(5);
+                }
+                java.lang.reflect.Field authenticatedField = P5cReceiverCoordinator.class.getDeclaredField("authenticatedSocket");
+                authenticatedField.setAccessible(true);
+                while (authenticatedField.get(endpoint) != null) {
+                    if (System.nanoTime() >= deadline) throw new IOException("first authenticated session did not close");
+                    Thread.sleep(5);
+                }
+                P5cDiscovery.SearchSnapshot renewed = endpoint.maintainAutomaticSearch();
+                if (!renewed.active || !"searching".equals(renewed.lastRequestStatus))
+                    throw new AssertionError("receive intent did not begin a fresh search between sessions");
+                System.out.println("INTENT_RENEWED");
+                System.out.flush();
+                while (playback.starts.get() < 2 || !playback.stopped.get()) {
+                    if (System.nanoTime() >= deadline) throw new IOException("established receive intent rejected reauthentication after search renewal");
+                    Thread.sleep(5);
+                }
+                while (authenticatedField.get(endpoint) != null) {
+                    if (System.nanoTime() >= deadline) throw new IOException("second authenticated session did not close");
+                    Thread.sleep(5);
+                }
+                endpoint.stopSearch();
+                java.lang.reflect.Method acceptsIntent = P5cReceiverCoordinator.class
+                        .getDeclaredMethod("acceptsConnectionIntent", byte[].class);
+                acceptsIntent.setAccessible(true);
+                if ((Boolean) acceptsIntent.invoke(endpoint, repeated((byte) 0x5a, 16)))
+                    throw new AssertionError("manual STOP must revoke the established receive intent");
+                endpoint.close();
+                System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
+                        + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get() + ","
+                        + playback.pcmBytes.get() + "," + playback.udpClosed.get() + "," + playback.shutdowns.get());
+                System.out.flush();
+                return;
+            }
             if (Arrays.asList(args).contains("--cancel-intent-on-stdin")) {
                 Thread cancel = new Thread(() -> {
                     try {
@@ -148,6 +199,15 @@ public final class P5cLoopbackEndpoint {
             String discoveryRecovery = verifyAutoRenewAfterAuth
                     ? verifyAutomaticSearchAfterAuthenticatedConnection(endpoint, initialDiscovery) + "|" : "";
             endpoint.close();
+            if (playback.backgroundTrustManagement) {
+                P5cReceiverCoordinator.BackgroundTrustSnapshot remainingTrust =
+                        playback.queryBackgroundTrust(fixtureBindingCommitment);
+                System.out.println("TRUST_REVOKED=" + playback.backgroundTrustRevoked.get()
+                        + ",TRUST_CLEARED=" + (remainingTrust.kind == 0 && remainingTrust.persistence == 0
+                                && remainingTrust.remainingMs == 0)
+                        + ",TRUST_QUERIES=" + playback.backgroundTrustQueries.get()
+                        + ",TRUST_CANCELS=" + playback.backgroundAuthCancels.get());
+            }
             if (verifyModeSwitch) playback.verifyModeSwitch();
             if (Arrays.asList(args).contains("--verify-background-auth") && playback.backgroundAuthRequests.get() > 0)
                 playback.verifyBackgroundAuthorization();
@@ -702,6 +762,11 @@ public final class P5cLoopbackEndpoint {
         volatile int backgroundAuthStatus = P5cControlProtocol.AUTH_PENDING;
         volatile long backgroundAuthRequestedAt;
         volatile boolean backgroundAuthKeptForRecovery;
+        volatile boolean backgroundTrustManagement;
+        volatile boolean delayBackgroundTrustCapability;
+        final AtomicInteger backgroundTrustQueries = new AtomicInteger();
+        final AtomicInteger backgroundAuthCancels = new AtomicInteger();
+        final AtomicBoolean backgroundTrustRevoked = new AtomicBoolean();
 
         FakePlayback(boolean failResume, boolean verifyModeSwitch, boolean verifyAudioWindow, boolean failStartOnce,
                 boolean throwStartOnce, boolean throwStopOnce) {
@@ -720,6 +785,35 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public boolean supportsPlaybackProgress() { return true; }
+        @Override public boolean supportsBackgroundTrustManagement() {
+            if (delayBackgroundTrustCapability) {
+                delayBackgroundTrustCapability = false;
+                System.out.println("CAPABILITIES_RECEIVED");
+                System.out.flush();
+                try { Thread.sleep(2_000); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(interrupted);
+                }
+            }
+            return backgroundTrustManagement;
+        }
+        @Override public P5cReceiverCoordinator.BackgroundTrustSnapshot queryBackgroundTrust(byte[] bindingCommitment) {
+            backgroundTrustQueries.incrementAndGet();
+            if (backgroundTrustRevoked.get())
+                return new P5cReceiverCoordinator.BackgroundTrustSnapshot(0, 0, 0);
+            return new P5cReceiverCoordinator.BackgroundTrustSnapshot(2, 1, TimeUnit.HOURS.toMillis(3));
+        }
+        @Override public boolean revokeBackgroundTrust(byte[] bindingCommitment) {
+            backgroundTrustRevoked.set(true);
+            return true;
+        }
+        @Override public void cancelBackgroundStartAuthorization(byte[] requestId, long sessionId, InetAddress peer,
+                byte[] bindingCommitment) {
+            backgroundAuthCancels.incrementAndGet();
+            P5cReceiverCoordinator.PlaybackEndpoint.super.cancelBackgroundStartAuthorization(
+                    requestId, sessionId, peer, bindingCommitment);
+        }
         @Override public boolean requiresBackgroundStartAuthorization() { return !backgroundAuthMode.isEmpty(); }
         @Override public int requestBackgroundStartAuthorization(byte[] requestId, long sessionId, InetAddress peer,
                 byte[] bindingCommitment) {
@@ -736,6 +830,10 @@ public final class P5cLoopbackEndpoint {
             if ("denied".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_DENIED;
             else if ("expired".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_EXPIRED;
             else if ("persistent-stop".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_UNTIL_REVOKED;
+            else if ("once".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_ONCE;
+            else if ("eight-hours".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_EIGHT_HOURS;
+            else if ("permanent".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_UNTIL_REVOKED;
+            else if ("no-grant".equals(backgroundAuthMode)) backgroundAuthStatus = P5cControlProtocol.AUTH_CANCELLED;
             else backgroundAuthStatus = P5cControlProtocol.AUTH_PENDING;
             return backgroundAuthStatus;
         }
@@ -786,6 +884,7 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public boolean start(UdpSessionContext context, P5cReceiverCoordinator.StartPermission permission) throws IOException {
+            if (backgroundTrustRevoked.get()) return false;
             beforeStart.run();
             if (!permission.allowed()) return false;
             this.context = context;

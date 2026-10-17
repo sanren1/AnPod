@@ -199,7 +199,7 @@ public final class Pcm16FrameStream {
             long pendingTrackFrames, int sourceTargetFrames, long nowNanos,
             boolean playbackAdvancing, boolean discontinuity) {
         return correctDriftInternal(buffer, sourceBytes, sourceBufferedFrames, pendingTrackFrames,
-                sourceTargetFrames, nowNanos, playbackAdvancing, discontinuity, 0, true);
+                sourceTargetFrames, nowNanos, playbackAdvancing, discontinuity, 0, true, true);
     }
 
     public int correctDrift(byte[] buffer, int sourceBytes, long sourceBufferedFrames,
@@ -207,13 +207,23 @@ public final class Pcm16FrameStream {
             boolean playbackAdvancing, boolean discontinuity, int sourceReadAdjustmentFrames) {
         return correctDriftInternal(buffer, sourceBytes, sourceBufferedFrames, pendingTrackFrames,
                 sourceTargetFrames, nowNanos, playbackAdvancing, discontinuity,
-                sourceReadAdjustmentFrames, false);
+                sourceReadAdjustmentFrames, false, true);
+    }
+
+    /** Pairs any requested source-read edit while sampling waterline only after playback-head progress. */
+    public int correctDrift(byte[] buffer, int sourceBytes, long sourceBufferedFrames,
+            long pendingTrackFrames, int sourceTargetFrames, long nowNanos,
+            boolean playbackAdvancing, boolean discontinuity, int sourceReadAdjustmentFrames,
+            boolean observePlaybackWaterline) {
+        return correctDriftInternal(buffer, sourceBytes, sourceBufferedFrames, pendingTrackFrames,
+                sourceTargetFrames, nowNanos, playbackAdvancing, discontinuity,
+                sourceReadAdjustmentFrames, false, observePlaybackWaterline);
     }
 
     private int correctDriftInternal(byte[] buffer, int sourceBytes, long sourceBufferedFrames,
             long pendingTrackFrames, int sourceTargetFrames, long nowNanos,
             boolean playbackAdvancing, boolean discontinuity, int sourceReadAdjustmentFrames,
-            boolean allowUnpairedEdits) {
+            boolean allowUnpairedEdits, boolean observePlaybackWaterline) {
         if (buffer == null) throw new NullPointerException("buffer");
         if (sourceBytes < 0 || sourceBytes % frameBytes != 0 || sourceBytes > buffer.length
                 || sourceBufferedFrames < 0 || pendingTrackFrames < 0 || sourceTargetFrames < 0
@@ -257,6 +267,7 @@ public final class Pcm16FrameStream {
             driftPlaybackAdvancing = false;
             return sourceBytes;
         }
+        if (!observePlaybackWaterline) return sourceBytes;
         if (!driftPlaybackAdvancing) beginDriftCorrection(driftSampleRate, sourceTargetFrames, nowNanos);
         driftPlaybackAdvancing = true;
         if (sourceBytes == 0) {

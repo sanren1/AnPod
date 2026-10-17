@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type Ref } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { QRCodeSVG } from "qrcode.react";
@@ -26,6 +26,7 @@ type Snapshot = {
   state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "managementOnly" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
   sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null;
+  sessionGeneration: number | null;
   sessionConnectionTransport: "usb" | "wireless" | null; sessionWirelessProtocol: "udp" | "adb" | null;
   sessionAndroidVersion: string | null; connectionTransport: "usb" | "wireless"; transport: "usb" | "wifi";
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
@@ -69,7 +70,15 @@ type HostDiscoverySnapshot = {
 };
 type NetworkStartRequest = {
   localAddress: string; peer: string; bootstrapSerial?: string; receiverAddress?: string;
-  receiverPrefixLength?: number; bindingReference?: string;
+  receiverPrefixLength?: number; bindingReference?: string; backgroundAuthorizationRequired?: boolean;
+};
+type BackgroundTrustTarget =
+  | { target: "activeSession"; bindingReference: string; sessionGeneration: number }
+  | { target: "receiver"; bindingReference: string; localAddress: string; peer: string };
+type BackgroundTrustStatus = {
+  target: "activeSession" | "receiver"; bindingReference: string; sessionGeneration: number | null;
+  kind: "none" | "once" | "eightHours" | "untilRevoked";
+  persistence: "none" | "process" | "binding"; remainingMs: number | null;
 };
 type OperationResult = { success: boolean; message: string; snapshot: Snapshot };
 
@@ -88,12 +97,24 @@ const connectionLabel = (transport: Snapshot["connectionTransport"] | null, prot
 const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
   snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
 const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);
-const bindingLabel = (reference: string | null | undefined) => reference ? zhCN.connection.pairedReceiverWithReference(reference) : zhCN.connection.pairedReceiver;
+const bindingLabel = (_reference: string | null | undefined) => zhCN.connection.pairedReceiver;
+const bindingReferenceLabel = (reference: string | null | undefined) => reference ? zhCN.connection.pairedReceiverWithReference(reference) : zhCN.connection.pairedReceiver;
 const resetPhoneStateLabel = (state: string) => ({ empty: zhCN.network.resetPhoneEmpty, pending: zhCN.network.resetPhonePending, saved: zhCN.network.resetPhoneSaved, failed: zhCN.network.resetPhoneFailed, unknown: zhCN.network.resetPhoneUnknown } as Record<string, string>)[state] ?? state;
 const resetPcStateLabel = (state: string) => ({ missing: zhCN.network.resetPcMissing, saved: zhCN.network.resetPcSaved, unknown: zhCN.network.resetPcUnknown } as Record<string, string>)[state] ?? state;
 const resetOutcomeLabel = (outcome: string) => ({ reset: zhCN.network.resetOutcomeReset, alreadyEmpty: zhCN.network.resetOutcomeAlreadyEmpty, phoneStateUnknown: zhCN.network.resetOutcomePhoneUnknown, phoneRetained: zhCN.network.resetOutcomePhoneRetained, phoneClearedPcUnknown: zhCN.network.resetOutcomePhoneClearedPcUnknown, phoneClearedPcRetained: zhCN.network.resetOutcomePhoneClearedPcRetained, phoneClearedPcChanged: zhCN.network.resetOutcomePhoneClearedPcChanged, pcClearedPhoneEmpty: zhCN.network.resetOutcomePcClearedPhoneEmpty, pcClearedPhoneUnknown: zhCN.network.resetOutcomePcClearedPhoneUnknown, pcClearedPhoneChanged: zhCN.network.resetOutcomePcClearedPhoneChanged, targetChanged: zhCN.network.resetOutcomeTargetChanged } as Record<string, string>)[outcome] ?? zhCN.network.resetOutcomeReview;
 const commitmentSummary = (value: string | null) => zhCN.network.commitmentSummary(value);
 const playbackModeLabel = (mode: Snapshot["settings"]["playbackMode"]) => mode === "Balanced" ? zhCN.app.balanced : zhCN.app.lowLatency;
+const backgroundTrustKindLabel = (kind: BackgroundTrustStatus["kind"]) => ({
+  none: zhCN.network.backgroundTrustNone, once: zhCN.network.backgroundTrustOnce,
+  eightHours: zhCN.network.backgroundTrustEightHours, untilRevoked: zhCN.network.backgroundTrustUntilRevoked,
+} as const)[kind];
+const backgroundTrustPersistenceLabel = (persistence: BackgroundTrustStatus["persistence"]) => ({
+  none: zhCN.network.backgroundTrustPersistenceNone, process: zhCN.network.backgroundTrustPersistenceProcess,
+  binding: zhCN.network.backgroundTrustPersistenceBinding,
+} as const)[persistence];
+const backgroundTrustRemaining = (remainingMs: number | null) => remainingMs === null
+  ? zhCN.network.backgroundTrustIndefinite
+  : zhCN.network.backgroundTrustReportedRemaining(Math.ceil(remainingMs / 1000));
 const readableStatus = (snapshot: Snapshot, cleanupPending: boolean) => {
   if (cleanupPending) return zhCN.app.disconnectedPending;
   if (snapshot.wirelessConnectionOffers.active) return zhCN.app.waitingPhone;
@@ -148,10 +169,13 @@ function App() {
   const panelRef = useRef(panel);
   panelRef.current = panel;
   const [networkDialogError, setNetworkDialogError] = useState("");
+  const [backgroundStartMode, setBackgroundStartMode] = useState(false);
+  const [backgroundChoicePrefill, setBackgroundChoicePrefill] = useState({ localAddress: "", bindingReference: "" });
   const [networkChoiceNeedsConfirmation, setNetworkChoiceNeedsConfirmation] = useState({ interfaceAddress: false, bindingReference: false });
   const [localSelected, setLocalSelected] = useState<string | null>(null);
   const [largeText, setLargeText] = useState(false);
   const [notice, setNotice] = useState("");
+  const [noticeDetail, setNoticeDetail] = useState("");
   const [working, setWorking] = useState(false);
   const snapshotRefreshGeneration = useRef(0);
   const lastOfferListenerChoice = useRef<{ localAddress: string; bindingReference: string } | null>(null);
@@ -177,10 +201,10 @@ function App() {
       apply(refreshed);
       const show = await listen("anpod://show-window", () => { void invokeApp("show_main_window"); });
       retain(show);
-      const pairing = await listen<string>("anpod://pairing-progress", event => setNotice(event.payload));
+      const pairing = await listen<string>("anpod://pairing-progress", event => { setNotice(event.payload); setNoticeDetail(""); });
       retain(pairing);
     };
-    void attach().catch(error => { if (!disposed) setNotice(String(error)); });
+    void attach().catch(error => { if (!disposed) { setNotice(zhCN.app.operationNotCompleted); setNoticeDetail(String(error)); } });
     return () => { disposed = true; cleanups.splice(0).forEach(cleanup => cleanup()); };
   }, []);
 
@@ -233,10 +257,22 @@ function App() {
     };
     return [current, ...devices];
   }, [snapshot, devices]);
-  const notify = (message: string) => { setNotice(receiverErrorMessage(message)); window.setTimeout(() => setNotice(""), 4200); };
+  const announce = (message: string, detail = "") => {
+    setNotice(message);
+    setNoticeDetail(detail);
+    window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
+  };
+  const notify = (message: string) => announce(needsReceiverUpdate(message) ? zhCN.app.receiverUpdateRequired : zhCN.app.operationNotCompleted, message);
   const openReceiverUpgrade = () => {
+    setBackgroundStartMode(false);
     setReceiverManagerSerial(snapshot?.sessionSerial ?? selected?.serial ?? "");
     setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver");
+  };
+  const openNetworkDialog = (backgroundStart = false, choices = { localAddress: "", bindingReference: "" }) => {
+    setBackgroundStartMode(backgroundStart);
+    setBackgroundChoicePrefill(choices);
+    setNetworkDialogError("");
+    setPanel("network");
   };
 
   const refresh = async () => {
@@ -280,7 +316,7 @@ function App() {
         try { next = await invokeApp<Snapshot>("refresh_devices"); apply(next); }
         catch (error) { refreshFailure = String(error); }
       }
-      if (refreshFailure) notify(zhCN.app.savedButRefreshFailed(refreshFailure)); else setNotice("");
+      if (refreshFailure) announce(zhCN.app.settingsSavedRefreshFailed, refreshFailure); else setNotice("");
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
   };
@@ -302,7 +338,7 @@ function App() {
       if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
       try { apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { setNetworkDialogError(zhCN.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
-      notify(zhCN.app.receiverVersionVerifiedReconnect(status.versionCode));
+      announce(zhCN.app.receiverVersionVerifiedReconnect(status.versionCode));
     } catch (error) {
       setNetworkDialogError(String(error));
       setReceiverManagerSerial(operation.serial);
@@ -338,6 +374,8 @@ function App() {
         apply(stopped.snapshot);
         if (!stopped.success) throw new Error(stopped.message);
         apply(await invokeApp<Snapshot>("start_network_audio", { ...pendingNetworkStart }));
+        if (pendingNetworkStart.backgroundAuthorizationRequired && pendingNetworkStart.bindingReference)
+          lastOfferListenerChoice.current = { localAddress: pendingNetworkStart.localAddress, bindingReference: pendingNetworkStart.bindingReference };
         setPanel(null);
       } else if (confirm.kind === "receiverUsb") {
         if (!pendingReceiverOperation) throw new Error(zhCN.app.staleUsbOperation);
@@ -354,7 +392,7 @@ function App() {
         apply(next);
         if (!hasActiveSession(next) && next.connectionTransport === "wireless" && next.settings.wirelessProtocol === "udp"
           && (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend")) {
-          setNetworkDialogError(""); setPanel("network");
+          openNetworkDialog();
         }
       }
       setConfirm(null);
@@ -390,9 +428,81 @@ function App() {
     setWorking(true);
     try {
       apply(await invokeApp<Snapshot>("start_network_audio", { ...request }));
+      if (request.backgroundAuthorizationRequired && request.bindingReference)
+        lastOfferListenerChoice.current = { localAddress: request.localAddress, bindingReference: request.bindingReference };
       setPanel(null);
     } catch (error) { setNetworkDialogError(String(error)); }
     finally { setWorking(false); }
+  };
+
+  const resolveWirelessChoice = async (localAddress: string, bindingReference?: string) => {
+    let selectedAddress = localAddress;
+    let selectedBinding = bindingReference;
+    const addressWasSpecified = !!selectedAddress;
+    const bindingWasSpecified = !!selectedBinding;
+    const [availableInterfaces, availableBindings] = await Promise.all([
+      invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
+      invokeApp<string[]>("receiver_binding_references"),
+    ]);
+    const availableAddress = (address: string | null | undefined) => !!address && availableInterfaces.some(value => value.address === address);
+    const availableBinding = (binding: string | null | undefined) => !!binding && availableBindings.includes(binding);
+    const snapshotAddress = snapshot?.wirelessConnectionOffers.interfaceAddress;
+    const snapshotBinding = snapshot?.wirelessConnectionOffers.automaticBinding;
+    const rememberedChoice = lastOfferListenerChoice.current;
+    const addressChoiceInvalidated = !selectedAddress && !localAddress && (!!snapshotAddress || !!rememberedChoice?.localAddress)
+      && !availableAddress(snapshotAddress) && !availableAddress(rememberedChoice?.localAddress);
+    const bindingChoiceInvalidated = !selectedBinding && !bindingReference && (!!snapshotBinding || !!rememberedChoice?.bindingReference)
+      && !availableBinding(snapshotBinding) && !availableBinding(rememberedChoice?.bindingReference);
+    if (!availableAddress(selectedAddress)) selectedAddress = "";
+    if (!availableBinding(selectedBinding)) selectedBinding = "";
+    if (!selectedAddress && !addressWasSpecified && availableAddress(snapshotAddress)) selectedAddress = snapshotAddress!;
+    if (!selectedBinding && !bindingWasSpecified && availableBinding(snapshotBinding)) selectedBinding = snapshotBinding!;
+    if (!selectedAddress && !addressWasSpecified && availableAddress(rememberedChoice?.localAddress)) selectedAddress = rememberedChoice!.localAddress;
+    if (!selectedBinding && !bindingWasSpecified && availableBinding(rememberedChoice?.bindingReference)) selectedBinding = rememberedChoice!.bindingReference;
+    if (!selectedAddress && !addressWasSpecified && !addressChoiceInvalidated && availableInterfaces.length === 1) selectedAddress = availableInterfaces[0].address;
+    if (!selectedBinding && !bindingWasSpecified && !bindingChoiceInvalidated && availableBindings.length === 1) selectedBinding = availableBindings[0];
+    return { selectedAddress, selectedBinding, addressChoiceInvalidated, bindingChoiceInvalidated, availableInterfaces, availableBindings };
+  };
+
+  const startBackgroundConnection = async () => {
+    if (!snapshot || working || snapshot.busy || active) return;
+    setWorking(true); setNetworkDialogError("");
+    try {
+      const choice = await resolveWirelessChoice("", undefined);
+      setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
+      const choices = { localAddress: choice.selectedAddress, bindingReference: choice.selectedBinding ?? "" };
+      if (!choices.bindingReference && choice.availableBindings.length === 0) {
+        setBackgroundStartMode(false);
+        setPanel("setup");
+        return;
+      }
+      if (!choices.localAddress || !choices.bindingReference) {
+        openNetworkDialog(true, choices);
+        return;
+      }
+      const local = choice.availableInterfaces.find(value => value.address === choices.localAddress);
+      const candidates = (await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress: choices.localAddress }))
+        .filter(candidate => endpointFitsInterface(candidate.endpoint, local));
+      if (candidates.length !== 1) {
+        openNetworkDialog(true, choices);
+        return;
+      }
+      try {
+        apply(await invokeApp<Snapshot>("start_network_audio", {
+          localAddress: choices.localAddress, peer: candidates[0].endpoint,
+          bindingReference: choices.bindingReference, backgroundAuthorizationRequired: true,
+        }));
+        lastOfferListenerChoice.current = { localAddress: choices.localAddress, bindingReference: choices.bindingReference };
+        setPanel(null);
+      } catch (error) {
+        setNetworkDialogError(String(error));
+        openNetworkDialog(true, choices);
+        setNetworkDialogError(String(error));
+      }
+    } catch (error) {
+      openNetworkDialog(true);
+      setNetworkDialogError(String(error));
+    } finally { setWorking(false); }
   };
 
   const setOfferListener = async (localAddress: string, allowed: boolean, bindingReference?: string) => {
@@ -403,35 +513,13 @@ function App() {
       let selectedAddress = localAddress;
       let selectedBinding = bindingReference;
       if (allowed) {
-        const addressWasSpecified = !!selectedAddress;
-        const bindingWasSpecified = !!selectedBinding;
-        const [availableInterfaces, availableBindings] = await Promise.all([
-          invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
-          invokeApp<string[]>("receiver_binding_references"),
-        ]);
-        const availableAddress = (address: string | null | undefined) => !!address && availableInterfaces.some(value => value.address === address);
-        const availableBinding = (binding: string | null | undefined) => !!binding && availableBindings.includes(binding);
-        const snapshotAddress = snapshot.wirelessConnectionOffers.interfaceAddress;
-        const snapshotBinding = snapshot.wirelessConnectionOffers.automaticBinding;
-        const rememberedChoice = lastOfferListenerChoice.current;
-        const addressChoiceInvalidated = !selectedAddress && !localAddress && (!!snapshotAddress || !!rememberedChoice?.localAddress)
-          && !availableAddress(snapshotAddress) && !availableAddress(rememberedChoice?.localAddress);
-        const bindingChoiceInvalidated = !selectedBinding && !bindingReference && (!!snapshotBinding || !!rememberedChoice?.bindingReference)
-          && !availableBinding(snapshotBinding) && !availableBinding(rememberedChoice?.bindingReference);
-        if (!availableAddress(selectedAddress)) selectedAddress = "";
-        if (!availableBinding(selectedBinding)) selectedBinding = "";
-        if (!selectedAddress && !addressWasSpecified && availableAddress(snapshotAddress)) selectedAddress = snapshotAddress!;
-        if (!selectedBinding && !bindingWasSpecified && availableBinding(snapshotBinding)) selectedBinding = snapshotBinding!;
-        if (!selectedAddress && !addressWasSpecified && availableAddress(lastOfferListenerChoice.current?.localAddress))
-          selectedAddress = lastOfferListenerChoice.current!.localAddress;
-        if (!selectedBinding && !bindingWasSpecified && availableBinding(lastOfferListenerChoice.current?.bindingReference))
-          selectedBinding = lastOfferListenerChoice.current!.bindingReference;
-        if (!selectedAddress && !addressWasSpecified && !addressChoiceInvalidated && availableInterfaces.length === 1) selectedAddress = availableInterfaces[0].address;
-        if (!selectedBinding && !bindingWasSpecified && !bindingChoiceInvalidated && availableBindings.length === 1) selectedBinding = availableBindings[0];
-        if (!selectedBinding && availableBindings.length === 0) { setPanel("setup"); return; }
+        const choice = await resolveWirelessChoice(selectedAddress, selectedBinding);
+        selectedAddress = choice.selectedAddress;
+        selectedBinding = choice.selectedBinding;
+        if (!selectedBinding && choice.availableBindings.length === 0) { setPanel("setup"); return; }
         if (!selectedAddress || !selectedBinding) {
-          setNetworkChoiceNeedsConfirmation({ interfaceAddress: addressChoiceInvalidated, bindingReference: bindingChoiceInvalidated });
-          setPanel("network"); return;
+          setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
+          openNetworkDialog(false); return;
         }
       }
       await invokeApp<HostDiscoverySnapshot>("set_wireless_connection_offers", {
@@ -467,7 +555,7 @@ function App() {
     if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
     if (output === "phone" && snapshot.state === "managementOnly") return;
     if (output === "phone" && !active && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
-      setNetworkDialogError(""); setPanel("network"); return;
+      openNetworkDialog(); return;
     }
     if (output === "phone" && !active && !selected) {
       setPanel(snapshot.connectionTransport === "wireless" ? "pair" : "help");
@@ -510,7 +598,7 @@ function App() {
     } else if (receiverUpdateNeeded && !active) {
       openReceiverUpgrade();
     } else if (!active && wirelessUdpMode) {
-      void setOfferListener("", true);
+      void startBackgroundConnection();
     } else if (active || selected?.connectable) {
       void setOutput("phone");
     } else {
@@ -521,7 +609,7 @@ function App() {
   const connectOnly = async () => {
     if (!snapshot) return;
     if (snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
-      setNetworkDialogError(""); setPanel("network"); return;
+      openNetworkDialog(); return;
     }
     if (!selected?.connectable) return;
     setWorking(true);
@@ -572,7 +660,7 @@ function App() {
         : receiverUpdateNeeded && !active ? zhCN.app.upgradePhone
         : active && snapshot.state === "managementOnly" ? zhCN.app.disconnectManagement
           : active && snapshot.output === "phone" ? zhCN.app.stop
-        : !active && wirelessUdpMode ? working || snapshot.busy ? zhCN.app.processing : zhCN.app.waitForPhone
+              : !active && wirelessUdpMode ? working || snapshot.busy ? zhCN.app.processing : zhCN.app.backgroundStart
               : active || selected?.connectable ? working || snapshot.busy ? zhCN.app.processing : zhCN.app.playToPhone
               : snapshot.connectionTransport === "usb" ? zhCN.app.connectUsbPhone : zhCN.app.addWirelessPhone;
   const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
@@ -587,19 +675,17 @@ function App() {
       <section className="device-section" aria-label={zhCN.app.targetPhone}>
         <div className="section-title"><h1>{zhCN.app.targetPhone}</h1></div>
         <div className="device-card">
-          <button className="device-select" onClick={() => setPanel(wirelessUdpMode && !active ? "network" : "device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup"} aria-label={`${zhCN.app.chooseTarget}，${active ? `${zhCN.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? zhCN.app.phone}` : cleanupPending ? zhCN.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : zhCN.app.choosePairedReceiver : cardDevice ? `${zhCN.app.currentSelection}${cardDevice.displayName}` : zhCN.app.openDeviceList}`}>
+          <button className="device-select" onClick={() => wirelessUdpMode ? openNetworkDialog() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup"} aria-label={`${zhCN.app.chooseTarget}，${active ? `${zhCN.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? zhCN.app.phone}` : cleanupPending ? zhCN.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : zhCN.app.choosePairedReceiver : cardDevice ? `${zhCN.app.currentSelection}${cardDevice.displayName}` : zhCN.app.openDeviceList}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
               <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? zhCN.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? zhCN.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : zhCN.app.chooseReceiverPhone : selected?.displayName ?? (empty ? zhCN.app.noPhone : zhCN.app.choosePhone)}</strong>
-              <span>{active ? `${actualConnectionLabel(snapshot)}${snapshot.sessionAndroidVersion ? ` · Android ${snapshot.sessionAndroidVersion}` : ""}` : cleanupPending ? zhCN.app.connectionUnavailable : wirelessUdpMode ? zhCN.connection.udp : cardDevice ? `${cardDevice.transport === "wifi" ? zhCN.connection.adb : zhCN.connection.usb}${cardDevice.androidVersion ? ` · Android ${cardDevice.androidVersion}` : ""}` : snapshot.connectionTransport === "wireless" ? zhCN.app.wirelessAdbDevice : zhCN.app.usbDevice}</span>
+              <span>{active ? zhCN.app.connectedPhone : cleanupPending ? zhCN.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? zhCN.app.wireless : zhCN.app.usb}</span>
               {cleanupPending && <span className="device-live-state" role="status">{zhCN.app.retryCleanup}</span>}
             </span>
             <ChevronDown size={18} aria-hidden="true" />
           </button>
           <div className="device-actions">
-            {!active && !wirelessUdpMode && selected?.connectable && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void connectOnly()}>{zhCN.app.connectOnly}</button>}
             {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{zhCN.app.switchToComputer}</button>}
-            {snapshot.connectionTransport === "wireless" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => setPanel(wirelessUdpMode ? "network" : "pair")}>{zhCN.app.addPhone}</button>}
           </div>
         </div>
       </section>
@@ -619,9 +705,12 @@ function App() {
       <button className="primary-button main-action" type="button" disabled={mainActionDisabled} onClick={runMainAction}>
         {mainActionLabel}
       </button>
-      {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{zhCN.app.wirelessUdpIdleHint}</p>}
-      {(!active || snapshot.sessionConnectionTransport === "wireless") && <button className="text-button setup-wizard-entry" type="button" disabled={working || receiverOperationBusy} onClick={() => setPanel("setup")}>{zhCN.app.firstSetup}</button>}
-      {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? <p className={`status-description${snapshot.state === "error" || cleanupPending ? " actionable-error" : ""}`} role={snapshot.state === "error" || cleanupPending ? "alert" : "status"} aria-live={snapshot.state === "error" || cleanupPending ? undefined : "polite"}>{cleanupPending || snapshot.state === "error" ? receiverErrorMessage(failureDetail) : zhCN.app.waitingForRequest}</p> : null}
+      {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{zhCN.app.backgroundStartIdleHint}</p>}
+      {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
+        className="status-description actionable-error"
+        summary={cleanupPending ? zhCN.app.cleanupRetryHint : receiverUpdateNeeded ? zhCN.app.receiverUpdateRequired : zhCN.app.operationNotCompleted}
+        details={failureDetail}
+      /> : <p className="status-description" role="status">{zhCN.app.waitingForRequest}</p> : null}
       {receiverUpdateNeeded && (active || cleanupPending) && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{zhCN.app.upgradePhone}</button>}
 
       <section className="mode-section" aria-label={zhCN.app.playbackMode}>
@@ -634,15 +723,15 @@ function App() {
     </main>
 
     <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />{zhCN.app.help}</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />{zhCN.app.diagnostics}</button></footer>
-    {notice && <div className="toast" role="status">{notice}</div>}
+    {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{zhCN.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
-    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onClose={() => setPanel(null)} />}
+    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={!active || snapshot.sessionConnectionTransport === "wireless" ? () => setPanel("setup") : null} onClose={() => setPanel(null)} />}
     {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} busy={controlsDisabled} onSetOption={(kind, value) => void setOption(kind, value)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onSave={async (key, value) => {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={panel} snapshot={snapshot} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => setPanel(null)} />}
-    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
+    {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { setBackgroundStartMode(false); setPanel(null); }} />}
+    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {confirm && <ConfirmDialog
@@ -675,8 +764,16 @@ function Modal({ title, children, onClose, className = "" }: { title: string; ch
   </dialog>;
 }
 
-function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onOpenReceiverManager, onClose }: {
+function ErrorDetails({ className = "", id, summary, details, summaryRef }: { className?: string; id?: string; summary: string; details: string; summaryRef?: Ref<HTMLParagraphElement> }) {
+  return <div id={id} className={`inline-error error-details ${className}`} role="alert">
+    <p ref={summaryRef} tabIndex={-1}>{summary}</p>
+    <details><summary>{zhCN.app.showTechnicalDetails}</summary><pre>{details}</pre></details>
+  </div>;
+}
+
+function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
   snapshot: Snapshot;
+  backgroundStartMode: boolean; backgroundChoicePrefill: { localAddress: string; bindingReference: string };
   setupWizard: boolean;
   receiverManagerOnly: boolean;
   initialReceiverSerial: string;
@@ -684,11 +781,10 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   usbDevices: Device[]; usbSeenDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; audioSessionActive: boolean; udpMode: boolean; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
   onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string) => void;
   onAcceptOffer: (offerId: string, bindingReference: string) => void; onReceiverSerialChange: (serial: string) => void;
-  onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onOpenReceiverManager: () => void; onClose: () => void;
+  onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onAddPhone: () => void; onOpenReceiverManager: () => void; onClose: () => void;
 }) {
-  const [method, setMethod] = useState<"bootstrap" | "paired">("bootstrap");
+  const [method, setMethod] = useState<"bootstrap" | "paired">(backgroundStartMode ? "paired" : "bootstrap");
   const [setupStep, setSetupStep] = useState<1 | 2 | 3>(1);
-  const [advancedOpen, setAdvancedOpen] = useState(receiverManagerOnly);
   const [interfaces, setInterfaces] = useState<PrivateIpv4Interface[]>([]);
   const [receiverInterfaces, setReceiverInterfaces] = useState<ReceiverIpv4Interface[]>([]);
   const [bindings, setBindings] = useState<string[]>([]);
@@ -713,6 +809,11 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   const [bindingResetError, setBindingResetError] = useState("");
   const [bindingResetLoading, setBindingResetLoading] = useState(false);
   const [bindingResetBusy, setBindingResetBusy] = useState(false);
+  const [backgroundTrust, setBackgroundTrust] = useState<{ value: BackgroundTrustStatus; checkedAt: number; targetKey: string } | null>(null);
+  const [backgroundTrustError, setBackgroundTrustError] = useState("");
+  const [backgroundTrustNotice, setBackgroundTrustNotice] = useState("");
+  const [backgroundTrustBusy, setBackgroundTrustBusy] = useState(false);
+  const [confirmBackgroundTrustRevoke, setConfirmBackgroundTrustRevoke] = useState(false);
   const alertRef = useRef<HTMLParagraphElement>(null);
   const setupStepRef = useRef<HTMLDivElement>(null);
   const receiverGeneration = useRef(0);
@@ -721,9 +822,16 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   const discoveryGeneration = useRef(0);
   const networkInfoGeneration = useRef(0);
   const bindingResetGeneration = useRef(0);
+  const backgroundTrustGeneration = useRef(0);
+  const backgroundTrustTargetKeyRef = useRef("");
+  const pendingBackgroundRevokeTargetRef = useRef<{ key: string; target: BackgroundTrustTarget } | null>(null);
+  const snapshotRef = useRef(snapshot);
+  const backgroundChoiceInvalidated = useRef({ interfaceAddress: false, bindingReference: false });
+  snapshotRef.current = snapshot;
   const methodManuallySelected = useRef(receiverManagerOnly || setupWizard);
   const peerManuallyEdited = useRef(false);
-  const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy;
+  const peerSelectionSource = useRef<"candidate" | "manual" | null>(null);
+  const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy || backgroundTrustBusy;
   const receiverDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
   const selectedReceiverDevice = usbDevices.find(device => device.serial === serial);
   const validBootstrapPairs = useMemo(() => bootstrapNetworkPairs(interfaces, receiverInterfaces), [interfaces, receiverInterfaces]);
@@ -759,19 +867,35 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
       setInterfaces([]); setLocalAddress("");
     } else if (interfacesResult.status === "fulfilled") {
       setInterfaces(interfacesResult.value);
-      setLocalAddress(current => interfacesResult.value.some(value => value.address === current) ? current
-        : !requiredChoices.interfaceAddress && interfacesResult.value.some(value => value.address === offers.interfaceAddress) ? offers.interfaceAddress ?? ""
-          : !requiredChoices.interfaceAddress && interfacesResult.value.length === 1 ? interfacesResult.value[0].address : "");
+      setLocalAddress(current => {
+        if (interfacesResult.value.some(value => value.address === current)) return current;
+        if (backgroundStartMode && current) { backgroundChoiceInvalidated.current.interfaceAddress = true; return ""; }
+        if (backgroundStartMode && backgroundChoiceInvalidated.current.interfaceAddress) return "";
+        if (backgroundStartMode && backgroundChoicePrefill.localAddress) {
+          if (interfacesResult.value.some(value => value.address === backgroundChoicePrefill.localAddress)) return backgroundChoicePrefill.localAddress;
+          backgroundChoiceInvalidated.current.interfaceAddress = true; return "";
+        }
+        return !requiredChoices.interfaceAddress && interfacesResult.value.some(value => value.address === offers.interfaceAddress) ? offers.interfaceAddress ?? ""
+          : !requiredChoices.interfaceAddress && interfacesResult.value.length === 1 ? interfacesResult.value[0].address : "";
+      });
       if (interfacesResult.value.length === 0) errors.push(zhCN.network.unavailableComputerInterface);
     } else errors.push(String(interfacesResult.reason));
     if (bindingsResult.status === "fulfilled") {
       const values = bindingsResult.value;
       setBindings(values);
-      setBindingReference(current => values.includes(current) ? current
-        : receiverManagerOnly && snapshot.sessionTransport === "lan" && snapshot.sessionReceiverBinding && values.includes(snapshot.sessionReceiverBinding)
+      setBindingReference(current => {
+        if (values.includes(current)) return current;
+        if (backgroundStartMode && current) { backgroundChoiceInvalidated.current.bindingReference = true; return ""; }
+        if (backgroundStartMode && backgroundChoiceInvalidated.current.bindingReference) return "";
+        if (backgroundStartMode && backgroundChoicePrefill.bindingReference) {
+          if (values.includes(backgroundChoicePrefill.bindingReference)) return backgroundChoicePrefill.bindingReference;
+          backgroundChoiceInvalidated.current.bindingReference = true; return "";
+        }
+        return receiverManagerOnly && snapshot.sessionTransport === "lan" && snapshot.sessionReceiverBinding && values.includes(snapshot.sessionReceiverBinding)
           ? snapshot.sessionReceiverBinding
-          : !receiverManagerOnly && !requiredChoices.bindingReference && values.length === 1 ? values[0] : "");
-      if (!methodManuallySelected.current) setMethod(values.length > 0 ? "paired" : "bootstrap");
+          : !receiverManagerOnly && !requiredChoices.bindingReference && values.length === 1 ? values[0] : "";
+      });
+      if (!methodManuallySelected.current) setMethod(backgroundStartMode ? "paired" : values.length > 0 ? "paired" : "bootstrap");
     } else errors.push(String(bindingsResult.reason));
     setLocalError(errors.join("；"));
     if (networkInfoGeneration.current === generation) setLoading(false);
@@ -900,7 +1024,8 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   useEffect(() => {
     if (receiverManagerOnly) return;
     if (method === "paired") {
-      if (!interfaces.some(value => value.address === localAddress)) setLocalAddress(!requiredChoices.interfaceAddress && interfaces.length === 1 ? interfaces[0].address : "");
+      if (!interfaces.some(value => value.address === localAddress)) setLocalAddress(backgroundStartMode && backgroundChoiceInvalidated.current.interfaceAddress
+        ? "" : !requiredChoices.interfaceAddress && interfaces.length === 1 ? interfaces[0].address : "");
       return;
     }
     if (receiverStatus?.installed !== true) return;
@@ -923,6 +1048,9 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
     if (!local) return;
     const generation = ++discoveryGeneration.current;
     setLoading(true); setCandidates([]);
+    if (backgroundStartMode && peerSelectionSource.current === "candidate") {
+      peerSelectionSource.current = null; peerManuallyEdited.current = false; setPeer("");
+    }
     if (!automatic) setLocalError("");
     setAddressNotice(zhCN.network.searchingCandidates);
     try {
@@ -930,12 +1058,12 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
       if (discoveryGeneration.current !== generation) return;
       const usable = values.filter(value => endpointFitsInterface(value.endpoint, local));
       setCandidates(usable);
-      if (!peerManuallyEdited.current) setPeer(usable.length === 1 ? usable[0].endpoint : "");
+      if (!peerManuallyEdited.current) setPeer(!backgroundStartMode && usable.length === 1 ? usable[0].endpoint : "");
       setAddressNotice(usable.length === 1 ? zhCN.network.oneUnverifiedCandidate
         : usable.length > 1 ? zhCN.network.manyUnverifiedCandidates
           : zhCN.network.noCandidateSuggestion);
       if (usable.length === 0 && !automatic) setLocalError(zhCN.network.noReceiverDiscovered);
-    } catch (reason) { if (discoveryGeneration.current === generation) { setAddressNotice(""); setLocalError(String(reason)); } }
+    } catch (reason) { if (discoveryGeneration.current === generation) { setAddressNotice(""); onError(String(reason)); } }
     finally { if (discoveryGeneration.current === generation) setLoading(false); }
   };
   useEffect(() => {
@@ -952,6 +1080,14 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
     event.preventDefault(); setLocalError(""); onError("");
     if (receiverManagerOnly) return;
     if (!localAddress) { setLocalError(zhCN.network.chooseComputerInterface); return; }
+    if (backgroundStartMode) {
+      if (!bindingReference) { setLocalError(zhCN.network.choosePairedBinding); return; }
+      const local = interfaces.find(value => value.address === localAddress);
+      if (!isIpv4Endpoint(peer)) { setLocalError(zhCN.network.chooseCandidateOrIpv4); return; }
+      if (!endpointFitsInterface(peer, local)) { setLocalError(zhCN.network.endpointOutsideSubnet); return; }
+      onStart({ localAddress, peer: peer.trim(), bindingReference, backgroundAuthorizationRequired: true });
+      return;
+    }
     if (method === "bootstrap") {
       if (!receiverStatus?.installed) { setLocalError(zhCN.network.checkInstallReceiverFirst); return; }
       const receiver = receiverInterfaces.find(value => value.address === receiverAddress);
@@ -982,9 +1118,75 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   const canRequestUsbInstall = receiverNeedsInstall && !!updateCandidate && !receiverError;
   const canRequestUsbMaintenance = receiverNeedsUpgrade && snapshot.sessionTransport !== "lan" && !bindingReference && !!updateCandidate && !receiverError;
   const canRequestUsbUpgrade = receiverNeedsUpgrade && bindings.length > 0 && !!updateCandidate && !!bindingReference && !receiverError;
-  const canStart = method === "bootstrap"
+  const canStart = backgroundStartMode ? method === "paired" && !!bindingReference && endpointFitsInterface(peer, selectedLocalInterface)
+    : method === "bootstrap"
     ? !!serial && receiverStatus?.installed === true && !!selectedBootstrapPair
     : !!bindingReference && endpointFitsInterface(peer, selectedLocalInterface);
+  const backgroundTrustTarget: BackgroundTrustTarget | null = audioSessionActive
+    && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp"
+    && snapshot.sessionReceiverBinding && typeof snapshot.sessionGeneration === "number" && Number.isSafeInteger(snapshot.sessionGeneration)
+      ? { target: "activeSession", bindingReference: snapshot.sessionReceiverBinding, sessionGeneration: snapshot.sessionGeneration }
+      : !audioSessionActive && bindingReference && localAddress && endpointFitsInterface(peer, selectedLocalInterface)
+        ? { target: "receiver", bindingReference, localAddress, peer: peer.trim() }
+        : null;
+  const backgroundTrustTargetKey = backgroundTrustTarget ? JSON.stringify(backgroundTrustTarget) : "";
+  useLayoutEffect(() => {
+    if (backgroundTrustTargetKey === backgroundTrustTargetKeyRef.current) return;
+    const previousKey = backgroundTrustTargetKeyRef.current;
+    const pendingRevoke = pendingBackgroundRevokeTargetRef.current;
+    const preservingRevokedSession = !!pendingRevoke && pendingRevoke.key === previousKey
+      && pendingRevoke.target.target === "activeSession" && !hasActiveSession(snapshotRef.current)
+      && (!backgroundTrustTarget || backgroundTrustTarget.bindingReference === pendingRevoke.target.bindingReference);
+    backgroundTrustTargetKeyRef.current = backgroundTrustTargetKey;
+    if (!preservingRevokedSession) {
+      backgroundTrustGeneration.current++;
+      setBackgroundTrust(null); setBackgroundTrustError(""); setBackgroundTrustNotice(""); setConfirmBackgroundTrustRevoke(false); setBackgroundTrustBusy(false);
+    }
+  }, [backgroundTrustTargetKey]);
+  useLayoutEffect(() => {
+    if (backgroundTrust && backgroundTrust.value.bindingReference !== bindingReference) {
+      setBackgroundTrust(null); setBackgroundTrustNotice(""); setBackgroundTrustError("");
+    }
+  }, [bindingReference]);
+  const operateBackgroundTrust = async (revoke: boolean) => {
+    const target = backgroundTrustTarget;
+    const targetKey = backgroundTrustTargetKey;
+    if (!target || !targetKey || backgroundTrustBusy) return;
+    const generation = ++backgroundTrustGeneration.current;
+    if (revoke) pendingBackgroundRevokeTargetRef.current = { key: targetKey, target };
+    setBackgroundTrustBusy(true); setBackgroundTrust(null); setBackgroundTrustError(""); setBackgroundTrustNotice("");
+    setConfirmBackgroundTrustRevoke(false);
+    const current = () => generation === backgroundTrustGeneration.current && targetKey === backgroundTrustTargetKeyRef.current;
+    const matchesRequest = (value: BackgroundTrustStatus) => value.target === target.target
+      && value.bindingReference === target.bindingReference
+      && value.sessionGeneration === (target.target === "activeSession" ? target.sessionGeneration : null);
+    try {
+      const value = await invokeApp<BackgroundTrustStatus>(revoke ? "revoke_background_trust" : "query_background_trust", { target });
+      if (!matchesRequest(value)) throw new Error(zhCN.network.backgroundTrustTargetMismatch);
+      const expectedSessionEnd = revoke && target.target === "activeSession"
+        && pendingBackgroundRevokeTargetRef.current?.key === targetKey
+        && !hasActiveSession(snapshotRef.current)
+        && (snapshotRef.current.sessionGeneration === null || snapshotRef.current.sessionGeneration !== target.sessionGeneration)
+        && (!backgroundTrustTarget || backgroundTrustTarget.bindingReference === target.bindingReference);
+      if (!current() && !expectedSessionEnd) return;
+      setBackgroundTrust({ value, checkedAt: Date.now(), targetKey });
+      setBackgroundTrustError("");
+      if (revoke) setBackgroundTrustNotice(zhCN.network.backgroundTrustRevokeAck);
+    } catch (reason) {
+      const expectedSessionEnd = revoke && target.target === "activeSession"
+        && pendingBackgroundRevokeTargetRef.current?.key === targetKey
+        && !hasActiveSession(snapshotRef.current)
+        && (!backgroundTrustTarget || backgroundTrustTarget.bindingReference === target.bindingReference);
+      if (current() || expectedSessionEnd) {
+        setBackgroundTrust(null);
+        setBackgroundTrustError(`${zhCN.network.backgroundTrustUnknown} ${String(reason)}`);
+        setBackgroundTrustNotice("");
+      }
+    } finally {
+      if (revoke && pendingBackgroundRevokeTargetRef.current?.key === targetKey) pendingBackgroundRevokeTargetRef.current = null;
+      if (current() || !hasActiveSession(snapshotRef.current)) setBackgroundTrustBusy(false);
+    }
+  };
   const requestUsbOperation = (kind: ReceiverUsbOperation["kind"]) => {
     if (!serial || !updateCandidate) return;
     onReceiverOperation({
@@ -994,15 +1196,8 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
   };
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
   const mainSummary = receiverManagerOnly ? selectedReceiverDevice?.displayName ?? zhCN.network.chooseAuthorizedUsb : method === "paired"
-    ? bindingReference ? bindingLabel(bindingReference) : zhCN.network.choosePairedReceiver
+    ? bindingReference ? bindings.length > 1 ? zhCN.app.pairedDeviceNumber(bindings.indexOf(bindingReference) + 1) : bindingLabel(bindingReference) : zhCN.network.choosePairedReceiver
     : selectedReceiverDevice?.displayName ?? zhCN.network.chooseUsbPhone;
-  const addressSummary = receiverManagerOnly ? zhCN.network.managerAddressSummary
-    : localAddress
-    ? `${interfaces.find(value => value.address === localAddress)?.name ?? zhCN.network.computerInterface} · ${localAddress}${method === "paired" && peer ? ` → ${peer}` : method === "bootstrap" && receiverAddress ? ` ↔ ${receiverAddress}` : ""}`
-    : zhCN.network.interfacePending;
-  const advancedRequired = method === "paired"
-    ? bindings.length !== 1 || !bindingReference || interfaces.length !== 1 && !localAddress
-    : usbDevices.length !== 1 || !serial || receiverStatus?.installed !== true || !selectedBootstrapPair;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
   const setUpStep = (step: 1 | 2 | 3) => { setSetupStep(step); setLocalError(""); onError(""); };
@@ -1037,12 +1232,12 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
               <div className="receiver-status-copy" role="status" aria-live="polite">
                 <strong>{receiverAction === "checking" ? zhCN.network.checkingReceiver : receiverError ? zhCN.network.receiverCheckFailed : !receiverStatus ? zhCN.network.waitingReceiverCheck : !receiverStatus.installed ? zhCN.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? zhCN.network.receiverHealthy : zhCN.network.receiverUnhealthy : zhCN.network.receiverStopped}</strong>
                 {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : zhCN.network.versionCode(receiverStatus.versionCode)].filter(Boolean).join(" · ")}</small>}
-                {receiverStatus && !receiverStatus.healthy && <small>{receiverStatus.error || receiverStatus.message}</small>}
+                {receiverStatus && !receiverStatus.healthy && <ErrorDetails summary={zhCN.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
                 {receiverNeedsUpgrade && <small>{zhCN.network.oldCompatibleCanContinue}</small>}
                 {receiverOperationResult?.serial === serial && <small>{zhCN.network.recheckedVersion(receiverOperationResult.status.versionCode)}</small>}
                 {updateCandidate && <small>{zhCN.network.availableVersion(updateCandidate.versionName, updateCandidate.versionCode, (updateCandidate.sizeBytes / (1024 * 1024)).toFixed(1))}</small>}
-                {!updateCandidate && <small>{candidateLoading ? zhCN.network.checkingBundledVersion : updateCandidateError || zhCN.network.bundledPackageUnavailable}</small>}
-                {updateCandidateError && updateCandidate && <small className="inline-error">{updateCandidateError}</small>}
+                {!updateCandidate && <small>{candidateLoading ? zhCN.network.checkingBundledVersion : updateCandidateError ? zhCN.app.operationNotCompleted : zhCN.network.bundledPackageUnavailable}</small>}
+                {updateCandidateError && <ErrorDetails summary={zhCN.app.operationNotCompleted} details={updateCandidateError} />}
               </div>
               <div className="receiver-status-actions setup-receiver-actions">
                 <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}>{zhCN.network.recheck}</button>
@@ -1052,8 +1247,8 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
                 {!setupWizard && canRequestUsbUpgrade && <button className="dialog-secondary" type="button" disabled={busy} onClick={() => requestUsbOperation("upgrade")}>{zhCN.network.optionalUpgrade(updateCandidate.versionCode)}</button>}
               </div>
             </div>
-            {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverErrorMessage(receiverError)}</p>}
-            {error && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{error}</p>}
+            {receiverError && <ErrorDetails summary={needsReceiverUpdate(receiverError) ? receiverErrorMessage(receiverError) : zhCN.app.operationNotCompleted} details={receiverError} summaryRef={alertRef} />}
+            {error && <ErrorDetails summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : zhCN.app.operationNotCompleted} details={error} summaryRef={alertRef} />}
             {canRequestUsbInstall && <p className="network-note">{zhCN.network.verifiedPackageInstallNote}</p>}
           </section> : <p className="network-recovery" role="status">{zhCN.network.goBackChooseUsb}</p>}
           <div className="setup-wizard-actions"><button className="dialog-secondary" type="button" disabled={busy} onClick={() => setUpStep(1)}>{zhCN.network.back}</button><button className="primary-button" type="button" disabled={busy || receiverStatus?.installed !== true || !!receiverError || !!error} onClick={async () => { const checkedSerial = serial; const checked = await checkReceiver(checkedSerial); if (checked?.installed === true && serialRef.current === checkedSerial) setUpStep(3); }}>{zhCN.network.next}</button></div>
@@ -1075,48 +1270,73 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
           {interfaces.length > 0 && receiverInterfaces.length > 0 && validBootstrapPairs.length === 0 && <div className="network-recovery" role="status"><span>{zhCN.network.noSameSubnet}</span></div>}
           {(interfaces.length === 0 || receiverInterfaces.length === 0) && <p className="network-note">{zhCN.network.requiresComputerAndPhoneIp}</p>}
           <button type="button" className="text-button network-refresh" disabled={busy || !serial} onClick={() => { void Promise.all([loadNetworkInfo(), checkReceiver(serial)]); }}>{zhCN.network.recheckNetworkInterfaces}</button>
-          {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(shownError)}</p>}
+          {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : zhCN.app.connectionNotCompleted} details={error} summaryRef={alertRef} />
+            : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
           <div className="setup-wizard-actions"><button className="dialog-secondary" type="button" disabled={busy} onClick={() => setUpStep(2)}>{zhCN.network.back}</button><button className="primary-button" type="submit" disabled={busy || !canStart}>{zhCN.network.bindAndConnect}</button></div>
         </div>}
       </section>}
       {!setupWizard && <>
       <div className="network-primary">
-        <div className="network-summary"><strong>{mainSummary}</strong><span>{addressSummary}</span></div>
+        {!receiverManagerOnly && <div className="network-summary"><strong>{mainSummary}</strong></div>}
         {receiverManagerOnly && <section className="receiver-manager receiver-usb-card" aria-label={zhCN.network.receiverUsbManagementLabel}>
+          <label className="network-field">{zhCN.network.authorizedOnlineUsb}
+            <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); setLocalError(""); onError(""); }}>
+              <option value="">{zhCN.network.chooseUsbPlaceholder}</option>
+              {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
+            </select>
+          </label>
           <div className="receiver-status-row">
             <div className="receiver-status-copy" role="status" aria-live="polite">
-              <strong>{candidateLoading ? zhCN.network.checkingLocalPackage : updateCandidate ? zhCN.network.checkAndUpgradeUsb : zhCN.network.localPackageUnavailable}</strong>
-              {updateCandidate && <small>{zhCN.network.managerVersionSummary(updateCandidate.versionName, currentVersionLabel, updateCandidate.versionCode, (updateCandidate.sizeBytes / (1024 * 1024)).toFixed(1))}</small>}
-              {!updateCandidate && <small>{updateCandidateError || zhCN.network.connectAuthorizedUsbToCheck}</small>}
-              {receiverAlreadyCurrent && <small>{zhCN.network.currentVersionIsTarget}</small>}
-              {receiverNeedsUpgrade && <small>{snapshot.sessionTransport === "lan"
-                ? bindingReference ? zhCN.network.selectedBindingAndUsbIdentity : zhCN.network.chooseSessionBinding
-                : zhCN.network.oldReceiverMaintenance}</small>}
-              {receiverOperationResult && <small>{zhCN.network.usbOperationVersionVerified(receiverOperationResult.serial, receiverOperationResult.status.versionCode)}</small>}
-              {usbDevices.length === 0 && <small>{zhCN.network.connectAndAuthorizeToRefresh}</small>}
-              {updateCandidateError && updateCandidate && <small className="inline-error">{updateCandidateError}</small>}
+              <strong>{candidateLoading || receiverAction === "checking" ? zhCN.network.checkingReceiver : receiverError ? zhCN.network.receiverCheckFailed : !serial ? zhCN.network.chooseAuthorizedUsb : !receiverStatus ? zhCN.network.waitingReceiverCheck : !receiverStatus.installed ? zhCN.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? zhCN.network.receiverHealthy : zhCN.network.receiverUnhealthy : zhCN.network.receiverStopped}</strong>
+              {receiverStatus?.installed && <small>{receiverAlreadyCurrent ? zhCN.network.currentVersionIsTarget : receiverNeedsUpgrade ? zhCN.network.oldCompatibleCanContinue : receiverStatus.versionName ?? zhCN.network.receiverInstalled}</small>}
+              {!candidateLoading && !updateCandidate && <small>{updateCandidateError ? zhCN.app.operationNotCompleted : zhCN.network.localPackageUnavailable}</small>}
+              {usbDevices.length === 0 && <small>{zhCN.network.connectAuthorizedUsbToCheck}</small>}
+              {updateCandidateError && <ErrorDetails summary={zhCN.app.operationNotCompleted} details={updateCandidateError} />}
             </div>
             <div className="receiver-status-actions">
+              <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? zhCN.network.checking : zhCN.network.checkStatus}</button>
               {canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{zhCN.network.installReceiver(updateCandidate.versionCode)}</button>}
               {canRequestUsbMaintenance && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{zhCN.network.usbMaintenanceInstall(updateCandidate.versionCode)}</button>}
               {canRequestUsbUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("upgrade")}>{zhCN.network.upgradeReceiver(updateCandidate.versionCode)}</button>}
               <button className="dialog-secondary" type="button" disabled={busy} onClick={onRefreshDevices}>{zhCN.network.refreshUsbDeviceList}</button>
             </div>
           </div>
-          {receiverNeedsUpgrade && bindings.length > 0 && <label className="network-field">{zhCN.network.optionalSavedBinding}
+              {(updateCandidate || receiverOperationResult || receiverNeedsUpgrade) && <details className="receiver-version-details">
+            <summary>{zhCN.network.versionDetails}</summary>
+            {updateCandidate && <small>{zhCN.network.managerVersionSummary(updateCandidate.versionName, currentVersionLabel, updateCandidate.versionCode, (updateCandidate.sizeBytes / (1024 * 1024)).toFixed(1))}</small>}
+            {receiverOperationResult && <small>{zhCN.network.usbOperationVersionVerified(receiverOperationResult.serial, receiverOperationResult.status.versionCode)}</small>}
+          </details>}
+          {receiverNeedsUpgrade && snapshot.sessionTransport === "lan" && bindings.length > 0 && <>
+            <small>{bindingReference ? zhCN.network.selectedBindingAndUsbIdentity : zhCN.network.chooseSessionBinding}</small>
+            <label className="network-field receiver-maintenance-binding">{zhCN.network.requiredSessionBinding}
               <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }}>
-              <option value="">{zhCN.network.noBindingUsbMaintenance}</option>
-              {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
-            </select>
-          </label>}
-          {receiverNeedsUpgrade && !bindingReference && <small>{zhCN.network.noBindingMaintenanceNote}</small>}
+                <option value="">{zhCN.network.chooseSessionBindingOption}</option>
+                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? zhCN.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
+              </select>
+            </label>
+            {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
+          </>}
+          {receiverNeedsUpgrade && snapshot.sessionTransport !== "lan" && bindings.length > 0 && <details className="receiver-maintenance-details">
+            <summary>{zhCN.network.upgradeTargetDetails}</summary>
+            <label className="network-field receiver-maintenance-binding">{zhCN.network.optionalSavedBinding}
+              <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }}>
+                <option value="">{zhCN.network.noBindingUsbMaintenance}</option>
+                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? zhCN.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
+              </select>
+            </label>
+            {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
+            {!bindingReference && <small>{zhCN.network.noBindingMaintenanceNote}</small>}
+          </details>}
+          {receiverError && <ErrorDetails className="receiver-error" summary={zhCN.app.operationNotCompleted} details={receiverError} />}
+          <details className="pairing-repair-disclosure">
+          <summary>{zhCN.network.pairingRepair}</summary>
           <section className="binding-reset" aria-label={zhCN.network.resetUsbPairing}>
             <div className="binding-reset-heading"><strong>{zhCN.network.resetPairing}</strong><small>{zhCN.network.resetOnlyCurrentUsb}</small></div>
             {!bindingResetPreview && !bindingResetResult && <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void previewBindingReset(serial)}>
               {bindingResetLoading ? zhCN.network.readingResetPreview : zhCN.network.resetPairingUsbRequired}
             </button>}
             {bindingResetLoading && <p className="network-loading" role="status"><LoaderCircle className="spin" size={15} />{zhCN.network.readOnlyUsbBindingCheck}</p>}
-            {bindingResetError && <div className="binding-reset-error" role="alert"><p>{receiverErrorMessage(bindingResetError)}</p><button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void previewBindingReset(serial, true)}>{zhCN.network.recheck}</button></div>}
+            {bindingResetError && <div className="binding-reset-error"><ErrorDetails summary={zhCN.app.operationNotCompleted} details={bindingResetError} /><button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void previewBindingReset(serial, true)}>{zhCN.network.recheck}</button></div>}
             {bindingResetPreview && <div className="binding-reset-preview">
               <strong>{zhCN.network.readOnlyPreview} · {bindingResetPreview.serial}</strong>
               <dl>
@@ -1147,12 +1367,14 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
               <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void previewBindingReset(serial, true)}>{zhCN.network.recheck}</button>
             </div>}
           </section>
+          </details>
         </section>}
         {pairedServiceStopped && <div className="network-recovery" role="status">
           <span>{zhCN.network.receiverServiceStopped}</span>
-          <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); setAdvancedOpen(true); }}>{zhCN.network.startSelectedPhoneOverUsb}</button>
+          <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); }}>{zhCN.network.startSelectedPhoneOverUsb}</button>
         </div>}
-        {shownError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(shownError)}</p>}
+        {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : zhCN.app.connectionNotCompleted} details={error} summaryRef={alertRef} />
+          : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
         {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverOperationBusy ? zhCN.network.usbOperationVerifying : receiverAction === "checking" ? zhCN.network.checkingReceiver : candidateLoading ? zhCN.network.checkingBundledVersion : zhCN.network.readingNetworkInfo}</p>}
         {!receiverManagerOnly && udpMode && <section className="receiver-manager offer-manager" aria-label={zhCN.network.offerListenerLabel}>
           <div className="receiver-status-row">
@@ -1181,35 +1403,78 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
           </>}
         </section>}
       </div>
-      <details className="network-advanced" open={receiverManagerOnly ? advancedOpen : advancedOpen || advancedRequired} onToggle={event => { if (receiverManagerOnly || !advancedRequired) setAdvancedOpen(event.currentTarget.open); }}>
-        <summary>{receiverManagerOnly ? zhCN.network.receiverStatusAndInstall : zhCN.network.connectionOptions}</summary>
-        <div className="network-advanced-body">
-          {!receiverManagerOnly && <p className="network-intro">{zhCN.network.addressHintNeedsAuth}</p>}
-          {!receiverManagerOnly && <div className="network-methods" role="group" aria-label={zhCN.network.receiverConnectionMode}>
-            <button type="button" aria-pressed={method === "bootstrap"} disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>{zhCN.network.usbFirstBinding}</button>
+      <div className="network-options">
+          {!setupWizard && udpMode && <details className="background-trust-disclosure">
+            <summary>{zhCN.network.backgroundTrustTitle}</summary>
+            <section className="background-trust" aria-label={zhCN.network.backgroundTrustTitle}>
+            {backgroundTrustTarget ? <>
+              <small>{backgroundTrustTarget.target === "activeSession"
+                ? zhCN.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
+                : zhCN.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer)}</small>
+              <small>{bindingLabel(backgroundTrustTarget.bindingReference)}</small>
+              <div className="background-trust-actions">
+                <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(false)}>{zhCN.network.backgroundTrustQuery}</button>
+                <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(true)}>{zhCN.network.backgroundTrustRevoke}</button>
+              </div>
+              {backgroundTrust && <div className="background-trust-result" role="status" aria-live="polite">
+                <span>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</span>
+                <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
+                <small>{zhCN.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
+                {backgroundTrust.value.kind === "none" && backgroundTrust.value.target === "activeSession" && !audioSessionActive && <small>{zhCN.network.backgroundTrustRecent}</small>}
+                {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
+              </div>}
+              {confirmBackgroundTrustRevoke && <div className="background-trust-confirm" role="group" aria-label={zhCN.network.backgroundTrustConfirmTitle}>
+                <p>{zhCN.network.backgroundTrustConfirmBody(
+                  backgroundTrustTarget.target === "activeSession"
+                    ? zhCN.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
+                    : zhCN.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer),
+                  bindingReferenceLabel(backgroundTrustTarget.bindingReference))}</p>
+                <div className="background-trust-actions">
+                  <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(false)}>{zhCN.network.backgroundTrustCancel}</button>
+                  <button className="primary-button" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(true)}>{zhCN.network.backgroundTrustConfirm}</button>
+                </div>
+              </div>}
+            </> : backgroundTrust?.value.target === "activeSession" && !audioSessionActive
+              ? <div className="background-trust-result" role="status" aria-live="polite">
+                  <strong>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</strong>
+                  <small>{zhCN.network.backgroundTrustScopeActive(backgroundTrust.value.sessionGeneration ?? 0)} · {backgroundTrust.value.bindingReference}</small>
+                  <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
+                  <small>{zhCN.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
+                  <small>{zhCN.network.backgroundTrustRecent}</small>
+                  {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
+                </div>
+              : <small>{zhCN.network.backgroundTrustNoTarget}</small>}
+            {backgroundTrustBusy && <small role="status">{zhCN.network.checking}</small>}
+            {backgroundTrustError && <ErrorDetails summary={zhCN.network.backgroundTrustUnknown} details={backgroundTrustError} />}
+            </section>
+          </details>}
+          {!receiverManagerOnly && !backgroundStartMode && <div className="network-methods" role="group" aria-label={zhCN.network.receiverConnectionMode}>
+              <button type="button" aria-pressed={method === "bootstrap"} disabled={busy || backgroundStartMode} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>{zhCN.network.usbFirstBinding}</button>
             <button type="button" aria-pressed={method === "paired"} disabled={busy || bindings.length === 0} onClick={() => { methodManuallySelected.current = true; setMethod("paired"); onError(""); setLocalError(""); }}>{zhCN.network.connectPairedPhone}</button>
           </div>}
+          {!receiverManagerOnly && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" && <div className="network-entry-actions">
+            <button className="text-button" type="button" disabled={busy} onClick={onAddPhone}>{zhCN.app.addPhone}</button>
+          </div>}
           {!receiverManagerOnly && <label className="network-field">{zhCN.network.computerInterface}
-            <select required value={localAddress} disabled={busy || offers.active} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (!peerManuallyEdited.current) setPeer(""); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <select required value={localAddress} disabled={busy || offers.active} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (backgroundStartMode || !peerManuallyEdited.current) { peerSelectionSource.current = null; peerManuallyEdited.current = false; setPeer(""); } backgroundChoiceInvalidated.current.interfaceAddress = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
               <option value="">{zhCN.network.chooseIpv4Interface}</option>
               {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
             </select>
           </label>}
           {method === "bootstrap" ? <>
-            <label className="network-field">{zhCN.network.authorizedOnlineUsb}
+            {!receiverManagerOnly && <label className="network-field">{zhCN.network.authorizedOnlineUsb}
               <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
                 <option value="">{zhCN.network.chooseUsbPlaceholder}</option>
                 {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
               </select>
-            </label>
-            {receiverManagerOnly && usbDevices.length === 0 && <div className="network-recovery" role="status"><span>{zhCN.network.connectUsbBeforeCheck}</span><button type="button" className="text-button" disabled={busy} onClick={onRefreshDevices}>{zhCN.network.refreshDevices}</button></div>}
-            {serial && <section className="receiver-manager" aria-label={zhCN.network.receiverManagement}>
+            </label>}
+            {!receiverManagerOnly && serial && <section className="receiver-manager" aria-label={zhCN.network.receiverManagement}>
               <div className="receiver-status-row">
                 <div className="receiver-status-copy" role="status" aria-live="polite">
                   <strong>{receiverOperationBusy ? zhCN.network.installingAndVerifying : receiverAction === "checking" ? zhCN.network.checkingReceiver : receiverError ? zhCN.network.receiverCheckFailed : !receiverStatus ? zhCN.network.waitingReceiverCheck : !receiverStatus.installed ? zhCN.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? zhCN.network.receiverHealthy : zhCN.network.receiverUnhealthy : zhCN.network.receiverStopped}</strong>
                   {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : zhCN.network.versionCode(receiverStatus.versionCode), receiverStatus.foreground ? zhCN.network.foregroundService : ""].filter(Boolean).join(" · ")}</small>}
                   {receiverStatus?.audioActive && <small>{zhCN.network.audioActiveNotPlaying}</small>}
-                  {receiverStatus && !receiverStatus.healthy && <small>{receiverStatus.error || receiverStatus.message}</small>}
+                  {receiverStatus && !receiverStatus.healthy && <ErrorDetails summary={zhCN.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
                   {!receiverManagerOnly && receiverNeedsUpgrade && <small>{zhCN.network.oldCompatibleUsbUpgrade}</small>}
                 </div>
                 <div className="receiver-status-actions">
@@ -1218,7 +1483,7 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
                   {!receiverManagerOnly && receiverNeedsUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{zhCN.network.usbUpgradeOptions}</button>}
                 </div>
               </div>
-              {receiverError && <p ref={alertRef} className="inline-error receiver-error" role="alert" tabIndex={-1}>{receiverErrorMessage(receiverError)}</p>}
+              {receiverError && <ErrorDetails className="receiver-error" summary={needsReceiverUpdate(receiverError) ? receiverErrorMessage(receiverError) : zhCN.app.operationNotCompleted} details={receiverError} summaryRef={alertRef} />}
               {!receiverManagerOnly && receiverNeedsInstall && <p className="network-note">{zhCN.network.installPackageFirstVerify}</p>}
               {!receiverManagerOnly && receiverNeedsUpgrade && <button type="button" className="text-button" disabled={busy} onClick={onOpenReceiverManager}>{zhCN.network.openUsbUpgradeManager}</button>}
             </section>}
@@ -1231,31 +1496,31 @@ function NetworkReceiverDialog({ snapshot, setupWizard, usbDevices, usbSeenDevic
             {!receiverManagerOnly && <p className="network-note">{zhCN.network.onlySameSubnetPhoneAddresses}</p>}
           </> : <>
             <label className="network-field">{zhCN.network.pairedReceiver}
-              <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+              <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); backgroundChoiceInvalidated.current.bindingReference = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
                 <option value="">{zhCN.network.chooseBinding}</option>
-                {bindings.map(value => <option key={value} value={value}>{bindingLabel(value)}</option>)}
+                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? zhCN.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
               </select>
             </label>
+            <BindingReferenceList bindings={bindings} />
             <label className="network-field">{zhCN.network.receiverIpv4Endpoint}
-              <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
+              <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; peerSelectionSource.current = "manual"; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
             </label>
             <small id="network-peer-hint" className="network-hint">{zhCN.network.addressSuggestionNeedsConnection}</small>
             {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{zhCN.network.invalidSubnetConnectDisabled}</small>}
             <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
             <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{zhCN.network.searchAddressAgain}</button>
-            {candidates.length > 0 && <div className="candidate-list" aria-label={zhCN.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>{zhCN.network.addressOnlyUnverified}</small></button>)}</div>}
+            {candidates.length > 0 && <div className="candidate-list" aria-label={zhCN.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span></button>)}</div>}
           </>}
           {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />{zhCN.network.refreshInterfacesAndBindings}</button>}
-          {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? zhCN.network.processing : method === "bootstrap" ? zhCN.network.firstBindAndConnect : zhCN.network.connectReceiverDirectly}</button>}
-        </div>
-      </details>
+          {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? zhCN.network.processing : backgroundStartMode ? zhCN.app.backgroundStartConnect : method === "bootstrap" ? zhCN.network.firstBindAndConnect : zhCN.network.connectReceiverDirectly}</button>}
+          </div>
       </>}
       {!receiverManagerOnly && needsReceiverUpdate([shownError, receiverError, bindingResetError].join(" ")) && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{zhCN.app.upgradePhone}</button>}
     </form>
   </Modal>;
 }
 
-function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onClose: () => void }) {
+function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onConnectOnly, onAddPhone, onFirstSetup, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onConnectOnly: () => void; onAddPhone: (() => void) | null; onFirstSetup: (() => void) | null; onClose: () => void }) {
   return <Modal title={zhCN.deviceDialog.title} onClose={onClose} className="device-dialog">
     <div className="dialog-tools"><span>{zhCN.deviceDialog.onlyCurrentTransport}</span><button className="text-button" onClick={onRefresh} disabled={busy}><Search size={15} />{zhCN.deviceDialog.refresh}</button></div>
     {activeBinding && <div className="network-active-card"><strong>{bindingLabel(activeBinding)}</strong><span>{zhCN.deviceDialog.activeDirectUdp}</span></div>}
@@ -1263,8 +1528,21 @@ function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, on
       <Smartphone size={18} aria-hidden="true" /><span><strong>{device.displayName}</strong><small>{zhCN.deviceDialog.deviceDetails(connected, device.statusText, device.transport, device.androidVersion)}</small></span>{chosen && <Check size={17} aria-hidden="true" />}
     </button>; })}</div>
     {devices.length === 0 && <div className="empty-note"><Info size={17} /><span>{activeBinding ? zhCN.deviceDialog.emptyForBinding : zhCN.deviceDialog.empty}</span></div>}
+    <div className="network-entry-actions">
+      {devices.some(device => device.serial === selected && device.connectable) && <button className="text-button" type="button" disabled={busy} onClick={onConnectOnly}>{zhCN.app.connectOnly}</button>}
+      {onAddPhone && <button className="text-button" type="button" disabled={busy} onClick={onAddPhone}>{zhCN.app.addPhone}</button>}
+      {onFirstSetup && <button className="text-button" type="button" disabled={busy} onClick={onFirstSetup}>{zhCN.app.firstSetup}</button>}
+    </div>
     <button className="dialog-secondary" onClick={onClose}>{zhCN.deviceDialog.finish}</button>
   </Modal>;
+}
+
+function BindingReferenceList({ bindings }: { bindings: string[] }) {
+  if (bindings.length < 2) return null;
+  return <details className="binding-reference-list">
+    <summary>{zhCN.app.pairedRecordReferences}</summary>
+    <ol>{bindings.map((value, index) => <li key={value}><span>{zhCN.app.pairedDeviceNumber(index + 1)}</span><code>{value}</code></li>)}</ol>
+  </details>;
 }
 
 function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
@@ -1274,12 +1552,14 @@ function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, bus
     <h3>{zhCN.app.settingsConnection}</h3>
     <SettingToggle disabled={snapshot.busy} title={zhCN.app.autoConnect} description={zhCN.app.autoConnectDescription} checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
     <SettingToggle disabled={snapshot.busy} title={zhCN.app.wirelessRecovery} description={zhCN.app.wirelessRecoveryDescription} checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />
-    <h3>{zhCN.app.advancedConnection}</h3>
-    <label className="select-setting"><span>{zhCN.app.wirelessProtocol}</span><select aria-label={zhCN.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{zhCN.app.udpRecommended}</option><option value="adb">{zhCN.app.wirelessAdbCompatible}</option></select></label>
-    <label className="select-setting"><span>{zhCN.app.receiverBackend}</span><select aria-label={zhCN.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{zhCN.app.legacyCompatible}</option><option value="receiver">Receiver</option></select></label>
-    {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{zhCN.app.wirelessAdbHelp}</p>}
-    {udpBackendFixed && <p className="dialog-footnote">{zhCN.app.udpUsesReceiver}</p>}
-    <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{zhCN.app.receiverManager}</button>
+    <details className="settings-advanced">
+      <summary>{zhCN.app.advancedConnection}</summary>
+      <label className="select-setting"><span>{zhCN.app.wirelessProtocol}</span><select aria-label={zhCN.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{zhCN.app.udpRecommended}</option><option value="adb">{zhCN.app.wirelessAdbCompatible}</option></select></label>
+      <label className="select-setting"><span>{zhCN.app.receiverBackend}</span><select aria-label={zhCN.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{zhCN.app.legacyCompatible}</option><option value="receiver">Receiver</option></select></label>
+      {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{zhCN.app.wirelessAdbHelp}</p>}
+      {udpBackendFixed && <p className="dialog-footnote">{zhCN.app.udpUsesReceiver}</p>}
+      <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{zhCN.app.phoneApplication}</button>
+    </details>
     <h3>{zhCN.app.windowAppearance}</h3>
     <SettingToggle disabled={snapshot.busy} title={zhCN.app.minimizeToTray} description={zhCN.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
     <SettingToggle title={zhCN.app.enlargeText} description={zhCN.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
@@ -1370,7 +1650,7 @@ function PairDialog({ transport, initialEndpoint, disabled, onClose, onDone }: {
       </form>}
     </> : <div className="help-pane"><p>{zhCN.pairDialog.usbStep1}</p><p>{zhCN.pairDialog.usbStep2}</p><p>{zhCN.pairDialog.usbStep3}</p><button className="primary-button" onClick={async () => { await onDone(); }}>{zhCN.pairDialog.refreshDeviceList}</button></div>}
     {disabled && <p className="dialog-footnote" role="status">{zhCN.pairDialog.processingConnection}</p>}
-    {error && <p className="inline-error" role="alert">{error}</p>}
+    {error && <ErrorDetails summary={zhCN.app.pairingNotCompleted} details={error} />}
   </Modal>;
 }
 
@@ -1441,7 +1721,7 @@ function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose:
     `${zhCN.diagnostics.state}：${readableStatus(snapshot, snapshot.canDisconnect && snapshot.state === "error")}`,
     `${zhCN.diagnostics.serviceMessage}：${snapshot.message}`, `${zhCN.diagnostics.actualConnection}：${active ? actualConnectionLabel(snapshot) : zhCN.diagnostics.notConnected}`,
     `${zhCN.diagnostics.chosenConnection}：${intendedConnectionLabel(snapshot)}`, `${zhCN.diagnostics.receiverBackend}：${snapshot.settings.audioBackend}`,
-    `${zhCN.diagnostics.device}：${snapshot.sessionReceiverBinding ? bindingLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName ?? zhCN.diagnostics.none}`,
+    `${zhCN.diagnostics.device}：${snapshot.sessionReceiverBinding ? bindingReferenceLabel(snapshot.sessionReceiverBinding) : snapshot.deviceName ?? zhCN.diagnostics.none}`,
     `${zhCN.diagnostics.output}：${snapshot.output === "phone" ? zhCN.diagnostics.phone : zhCN.diagnostics.computer}`, `${zhCN.diagnostics.visibleDevices}：${snapshot.devices.length}`,
     `${zhCN.diagnostics.detail}：${snapshot.statusDetail}`,
     `${zhCN.diagnostics.capabilities}：${capabilities ? zhCN.diagnostics.protocolCompatibility(capabilities.controlMajor, capabilities.managementCompatible, capabilities.audioMajor, capabilities.audioCompatible, capabilities.capabilityBits.toString(16), capabilities.versionCode) : zhCN.diagnostics.unknownCapabilities}`,
