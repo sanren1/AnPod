@@ -1,4 +1,3 @@
-
 use super::{forget_restored, receive_handshake, remember_before_muting};
 use std::time::Duration;
 use std::{fs, path::PathBuf};

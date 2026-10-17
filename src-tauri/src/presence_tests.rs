@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn address(last: u8) -> Ipv4Addr {
