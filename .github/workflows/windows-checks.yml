@@ -79,6 +79,10 @@ jobs:
       - name: Clippy
         # Bin target only: under --tests the harness replaces main(), so every
         # command reachable only from it reports as dead code.
+        # Runtime files in deps/ are intentionally ignored by Git and unused by
+        # clippy; strip the bundle resources so tauri-build does not require them.
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 
       - name: Test Rust on Windows
