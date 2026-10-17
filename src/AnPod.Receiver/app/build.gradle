@@ -84,4 +84,6 @@ dependencies {
         "${android.sdkDirectory}/platforms/android-35/optional/android.test.base.jar",
         "${android.sdkDirectory}/platforms/android-35/optional/android.test.runner.jar"
     )
+
+    testImplementation 'junit:junit:4.13.2'
 }
