@@ -532,4 +532,4 @@ export const zhCN = {
     connectReceiverDirectly: "直接连接 Receiver",
   },
   modal: { close: "关闭" },
-} as const;
+};

@@ -9,7 +9,7 @@ const out = path.resolve(process.env.ANPOD_CHECK_OUTPUT || path.resolve(__dirnam
 fs.mkdirSync(out, {recursive:true});
 (async () => {
  const browser=await chromium.launch({executablePath:process.env.ANPOD_BROWSER_EXECUTABLE || undefined,headless:true});
- const page=await browser.newPage({viewport:{width:420,height:590}});
+ const page=await browser.newPage({viewport:{width:420,height:590},locale:'zh-CN'});
  page.setDefaultTimeout(10000);
  const errors=[];
  page.on('pageerror',e=>errors.push(e.message));

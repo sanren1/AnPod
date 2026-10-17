@@ -1,10 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { zhCN } from "./strings.zh-CN";
+import { strings } from "./strings";
 import type { Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, NetworkInterfacePair, BackgroundTrustStatus } from "./appTypes";
 
 export const isDesktop = "__TAURI_INTERNALS__" in window;
 export const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
-  if (!isDesktop) return Promise.reject(new Error(zhCN.app.desktopOnly));
+  if (!isDesktop) return Promise.reject(new Error(strings.app.desktopOnly));
   return invoke<T>(command, args);
 };
 export const byTransport = (snapshot: Snapshot) => {
@@ -13,46 +13,46 @@ export const byTransport = (snapshot: Snapshot) => {
 };
 export const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
 export const connectionLabel = (transport: Snapshot["connectionTransport"] | null, protocol: Snapshot["sessionWirelessProtocol"] | null) =>
-  transport === "usb" ? zhCN.connection.usb : transport === "wireless" ? protocol === "udp" ? zhCN.connection.udp : zhCN.connection.adb : zhCN.connection.unknown;
+  transport === "usb" ? strings.connection.usb : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
 export const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
   snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
 export const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);
-export const bindingLabel = (_reference: string | null | undefined) => zhCN.connection.pairedReceiver;
-export const bindingReferenceLabel = (reference: string | null | undefined) => reference ? zhCN.connection.pairedReceiverWithReference(reference) : zhCN.connection.pairedReceiver;
-export const resetPhoneStateLabel = (state: string) => ({ empty: zhCN.network.resetPhoneEmpty, pending: zhCN.network.resetPhonePending, saved: zhCN.network.resetPhoneSaved, failed: zhCN.network.resetPhoneFailed, unknown: zhCN.network.resetPhoneUnknown } as Record<string, string>)[state] ?? state;
-export const resetPcStateLabel = (state: string) => ({ missing: zhCN.network.resetPcMissing, saved: zhCN.network.resetPcSaved, unknown: zhCN.network.resetPcUnknown } as Record<string, string>)[state] ?? state;
-export const resetOutcomeLabel = (outcome: string) => ({ reset: zhCN.network.resetOutcomeReset, alreadyEmpty: zhCN.network.resetOutcomeAlreadyEmpty, phoneStateUnknown: zhCN.network.resetOutcomePhoneUnknown, phoneRetained: zhCN.network.resetOutcomePhoneRetained, phoneClearedPcUnknown: zhCN.network.resetOutcomePhoneClearedPcUnknown, phoneClearedPcRetained: zhCN.network.resetOutcomePhoneClearedPcRetained, phoneClearedPcChanged: zhCN.network.resetOutcomePhoneClearedPcChanged, pcClearedPhoneEmpty: zhCN.network.resetOutcomePcClearedPhoneEmpty, pcClearedPhoneUnknown: zhCN.network.resetOutcomePcClearedPhoneUnknown, pcClearedPhoneChanged: zhCN.network.resetOutcomePcClearedPhoneChanged, targetChanged: zhCN.network.resetOutcomeTargetChanged } as Record<string, string>)[outcome] ?? zhCN.network.resetOutcomeReview;
-export const commitmentSummary = (value: string | null) => zhCN.network.commitmentSummary(value);
-export const playbackModeLabel = (mode: Snapshot["settings"]["playbackMode"]) => mode === "Balanced" ? zhCN.app.balanced : zhCN.app.lowLatency;
+export const bindingLabel = (_reference: string | null | undefined) => strings.connection.pairedReceiver;
+export const bindingReferenceLabel = (reference: string | null | undefined) => reference ? strings.connection.pairedReceiverWithReference(reference) : strings.connection.pairedReceiver;
+export const resetPhoneStateLabel = (state: string) => ({ empty: strings.network.resetPhoneEmpty, pending: strings.network.resetPhonePending, saved: strings.network.resetPhoneSaved, failed: strings.network.resetPhoneFailed, unknown: strings.network.resetPhoneUnknown } as Record<string, string>)[state] ?? state;
+export const resetPcStateLabel = (state: string) => ({ missing: strings.network.resetPcMissing, saved: strings.network.resetPcSaved, unknown: strings.network.resetPcUnknown } as Record<string, string>)[state] ?? state;
+export const resetOutcomeLabel = (outcome: string) => ({ reset: strings.network.resetOutcomeReset, alreadyEmpty: strings.network.resetOutcomeAlreadyEmpty, phoneStateUnknown: strings.network.resetOutcomePhoneUnknown, phoneRetained: strings.network.resetOutcomePhoneRetained, phoneClearedPcUnknown: strings.network.resetOutcomePhoneClearedPcUnknown, phoneClearedPcRetained: strings.network.resetOutcomePhoneClearedPcRetained, phoneClearedPcChanged: strings.network.resetOutcomePhoneClearedPcChanged, pcClearedPhoneEmpty: strings.network.resetOutcomePcClearedPhoneEmpty, pcClearedPhoneUnknown: strings.network.resetOutcomePcClearedPhoneUnknown, pcClearedPhoneChanged: strings.network.resetOutcomePcClearedPhoneChanged, targetChanged: strings.network.resetOutcomeTargetChanged } as Record<string, string>)[outcome] ?? strings.network.resetOutcomeReview;
+export const commitmentSummary = (value: string | null) => strings.network.commitmentSummary(value);
+export const playbackModeLabel = (mode: Snapshot["settings"]["playbackMode"]) => mode === "Balanced" ? strings.app.balanced : strings.app.lowLatency;
 export const backgroundTrustKindLabel = (kind: BackgroundTrustStatus["kind"]) => ({
-  none: zhCN.network.backgroundTrustNone, once: zhCN.network.backgroundTrustOnce,
-  eightHours: zhCN.network.backgroundTrustEightHours, untilRevoked: zhCN.network.backgroundTrustUntilRevoked,
+  none: strings.network.backgroundTrustNone, once: strings.network.backgroundTrustOnce,
+  eightHours: strings.network.backgroundTrustEightHours, untilRevoked: strings.network.backgroundTrustUntilRevoked,
 } as const)[kind];
 export const backgroundTrustPersistenceLabel = (persistence: BackgroundTrustStatus["persistence"]) => ({
-  none: zhCN.network.backgroundTrustPersistenceNone, process: zhCN.network.backgroundTrustPersistenceProcess,
-  binding: zhCN.network.backgroundTrustPersistenceBinding,
+  none: strings.network.backgroundTrustPersistenceNone, process: strings.network.backgroundTrustPersistenceProcess,
+  binding: strings.network.backgroundTrustPersistenceBinding,
 } as const)[persistence];
 export const backgroundTrustRemaining = (remainingMs: number | null) => remainingMs === null
-  ? zhCN.network.backgroundTrustIndefinite
-  : zhCN.network.backgroundTrustReportedRemaining(Math.ceil(remainingMs / 1000));
+  ? strings.network.backgroundTrustIndefinite
+  : strings.network.backgroundTrustReportedRemaining(Math.ceil(remainingMs / 1000));
 export const readableStatus = (snapshot: Snapshot, cleanupPending: boolean) => {
-  if (cleanupPending) return zhCN.app.disconnectedPending;
-  if (snapshot.wirelessConnectionOffers.active) return zhCN.app.waitingPhone;
+  if (cleanupPending) return strings.app.disconnectedPending;
+  if (snapshot.wirelessConnectionOffers.active) return strings.app.waitingPhone;
   if (snapshot.state === "reconnecting" && snapshot.networkRecoverySecondsRemaining != null)
-    return zhCN.app.reconnecting(snapshot.networkRecoverySecondsRemaining);
-  if (snapshot.state === "streaming" && snapshot.output === "computer") return zhCN.app.connectedComputer;
+    return strings.app.reconnecting(snapshot.networkRecoverySecondsRemaining);
+  if (snapshot.state === "streaming" && snapshot.output === "computer") return strings.app.connectedComputer;
   if (snapshot.state === "streaming" && snapshot.playbackDiagnostics?.playbackAdvancing !== true)
-    return zhCN.app.receivingAudio;
+    return strings.app.receivingAudio;
   return ({
-    noDevice: snapshot.devices.length ? zhCN.app.waitingAuthorization : snapshot.connectionTransport === "wireless" ? zhCN.app.choosePairedPhone : zhCN.app.noPhone,
-    unauthorized: zhCN.app.waitingAuthorization, ready: zhCN.app.ready, connecting: zhCN.app.connecting, connected: zhCN.app.connectedComputer,
-    streaming: zhCN.app.playingOnPhone, phoneReady: zhCN.app.phoneReady, paused: zhCN.app.paused,
-    reconnecting: zhCN.app.reconnectingShort, managementOnly: zhCN.app.managementOnly, error: zhCN.app.error,
+    noDevice: snapshot.devices.length ? strings.app.waitingAuthorization : snapshot.connectionTransport === "wireless" ? strings.app.choosePairedPhone : strings.app.noPhone,
+    unauthorized: strings.app.waitingAuthorization, ready: strings.app.ready, connecting: strings.app.connecting, connected: strings.app.connectedComputer,
+    streaming: strings.app.playingOnPhone, phoneReady: strings.app.phoneReady, paused: strings.app.paused,
+    reconnecting: strings.app.reconnectingShort, managementOnly: strings.app.managementOnly, error: strings.app.error,
   } satisfies Record<Snapshot["state"], string>)[snapshot.state];
 };
 export const CAP_PLAYBACK_PROGRESS = 1 << 3;
 export const needsReceiverUpdate = (message: string) => message.includes("RECEIVER_UPDATE_REQUIRED:");
-export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? zhCN.app.receiverUpdateRequired : message;
+export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
   return !!match && match[1].split(".").every(part => Number(part) <= 255) && Number(match[2]) > 0 && Number(match[2]) <= 65535;

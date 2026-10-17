@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
-import { zhCN } from "./strings.zh-CN";
+import { strings } from "./strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
 import { isDesktop, invokeApp, byTransport, hasActiveSession, bindingLabel, readableStatus, needsReceiverUpdate, endpointFitsInterface } from "./appRuntime";
 import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
@@ -60,7 +60,7 @@ function App() {
       const pairing = await listen<string>("anpod://pairing-progress", event => { setNotice(event.payload); setNoticeDetail(""); });
       retain(pairing);
     };
-    void attach().catch(error => { if (!disposed) { setNotice(zhCN.app.operationNotCompleted); setNoticeDetail(String(error)); } });
+    void attach().catch(error => { if (!disposed) { setNotice(strings.app.operationNotCompleted); setNoticeDetail(String(error)); } });
     return () => { disposed = true; cleanups.splice(0).forEach(cleanup => cleanup()); };
   }, []);
 
@@ -108,8 +108,8 @@ function App() {
     if (!snapshot?.sessionSerial || devices.some(device => device.serial === snapshot.sessionSerial)) return devices;
     const current = snapshot.devices.find(device => device.serial === snapshot.sessionSerial) ?? {
       serial: snapshot.sessionSerial, transport: snapshot.sessionTransport === "lan" ? "unknown" : snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
-      androidVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? zhCN.app.connectedPhone,
-      statusText: zhCN.app.staleDeviceScan, connectable: false,
+      androidVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? strings.app.connectedPhone,
+      statusText: strings.app.staleDeviceScan, connectable: false,
     };
     return [current, ...devices];
   }, [snapshot, devices]);
@@ -118,7 +118,7 @@ function App() {
     setNoticeDetail(detail);
     window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
   };
-  const notify = (message: string) => announce(needsReceiverUpdate(message) ? zhCN.app.receiverUpdateRequired : zhCN.app.operationNotCompleted, message);
+  const notify = (message: string) => announce(needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted, message);
   const openReceiverUpgrade = () => {
     setBackgroundStartMode(false);
     setReceiverManagerSerial(snapshot?.sessionSerial ?? selected?.serial ?? "");
@@ -154,7 +154,7 @@ function App() {
       catch (error) {
         let message = String(error);
         try { apply(await invokeApp<Snapshot>("get_snapshot")); }
-        catch (refreshError) { message += zhCN.app.refreshFailureSuffix(String(refreshError)); }
+        catch (refreshError) { message += strings.app.refreshFailureSuffix(String(refreshError)); }
         notify(message);
       }
       finally { setWorking(false); }
@@ -172,7 +172,7 @@ function App() {
         try { next = await invokeApp<Snapshot>("refresh_devices"); apply(next); }
         catch (error) { refreshFailure = String(error); }
       }
-      if (refreshFailure) announce(zhCN.app.settingsSavedRefreshFailed, refreshFailure); else setNotice("");
+      if (refreshFailure) announce(strings.app.settingsSavedRefreshFailed, refreshFailure); else setNotice("");
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
   };
@@ -187,14 +187,14 @@ function App() {
       await invokeApp<ReceiverStatus>(command, args);
       const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: operation.serial });
       if (!status.installed || status.versionCode !== operation.targetVersionCode) {
-        throw new Error(zhCN.app.usbVersionVerificationFailed(operation.targetVersionCode));
+        throw new Error(strings.app.usbVersionVerificationFailed(operation.targetVersionCode));
       }
       setReceiverOperationResult({ serial: operation.serial, kind: operation.kind, targetVersionCode: operation.targetVersionCode, status });
       setReceiverManagerSerial(operation.serial);
       if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
       try { apply(await invokeApp<Snapshot>("refresh_devices")); }
-      catch (error) { setNetworkDialogError(zhCN.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
-      announce(zhCN.app.receiverVersionVerifiedReconnect(status.versionCode));
+      catch (error) { setNetworkDialogError(strings.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
+      announce(strings.app.receiverVersionVerifiedReconnect(status.versionCode));
     } catch (error) {
       setNetworkDialogError(String(error));
       setReceiverManagerSerial(operation.serial);
@@ -209,7 +209,7 @@ function App() {
         ? operation.bindingReference === snapshot.sessionReceiverBinding
         : operation.serial === snapshot.sessionSerial;
       if (!targetMatches) {
-        setNetworkDialogError(zhCN.app.differentCurrentSessionTarget);
+        setNetworkDialogError(strings.app.differentCurrentSessionTarget);
         return;
       }
       setPendingReceiverOperation(operation);
@@ -225,7 +225,7 @@ function App() {
     setWorking(true);
     try {
       if (confirm.kind === "network") {
-        if (!pendingNetworkStart) throw new Error(zhCN.app.staleNetworkParameters);
+        if (!pendingNetworkStart) throw new Error(strings.app.staleNetworkParameters);
         const stopped = await invokeApp<OperationResult>("disconnect");
         apply(stopped.snapshot);
         if (!stopped.success) throw new Error(stopped.message);
@@ -234,7 +234,7 @@ function App() {
           lastOfferListenerChoice.current = { localAddress: pendingNetworkStart.localAddress, bindingReference: pendingNetworkStart.bindingReference };
         setPanel(null);
       } else if (confirm.kind === "receiverUsb") {
-        if (!pendingReceiverOperation) throw new Error(zhCN.app.staleUsbOperation);
+        if (!pendingReceiverOperation) throw new Error(strings.app.staleUsbOperation);
         const operation = pendingReceiverOperation;
         setConfirm(null); setPendingReceiverOperation(null);
         setPanel(operation.returnPanel);
@@ -262,7 +262,7 @@ function App() {
         let message = String(error);
         if (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" || confirm.kind === "playback") {
           try { apply(await invokeApp<Snapshot>("get_snapshot")); }
-          catch (refreshError) { message += zhCN.app.refreshFailureSuffix(String(refreshError)); }
+          catch (refreshError) { message += strings.app.refreshFailureSuffix(String(refreshError)); }
         }
         notify(message);
       }
@@ -275,7 +275,7 @@ function App() {
 
   const startNetwork = async (request: NetworkStartRequest) => {
     setNetworkDialogError("");
-    if (cleanupPending) { setNetworkDialogError(zhCN.app.cleanupBeforeNetworkStart); return; }
+    if (cleanupPending) { setNetworkDialogError(strings.app.cleanupBeforeNetworkStart); return; }
     if (active) {
       setPendingNetworkStart(request);
       setConfirm({ kind: "network", value: "" });
@@ -489,68 +489,68 @@ function App() {
     void invokeApp<Snapshot>("select_device", { serial: device.serial }).then(apply).catch(error => notify(String(error)));
   };
 
-  if (!snapshot) return <main className="loading-shell"><AudioLines size={25} /><span>{zhCN.app.loading}</span></main>;
+  if (!snapshot) return <main className="loading-shell"><AudioLines size={25} /><span>{strings.app.loading}</span></main>;
   const empty = devices.length === 0;
   const cancellingConnection = snapshot.state === "connecting" || snapshot.state === "reconnecting";
   const statusTitle = readableStatus(snapshot, cleanupPending);
   const statusDetail = snapshot.state === "streaming"
-    ? snapshot.output !== "phone" ? zhCN.app.outputComputer
+    ? snapshot.output !== "phone" ? strings.app.outputComputer
       : snapshot.playbackDiagnostics?.playbackAdvancing === true
-      ? zhCN.app.playbackProgress
-      : zhCN.app.receivingAudio
+      ? strings.app.playbackProgress
+      : strings.app.receivingAudio
     : lanSession
-    ? snapshot.state === "managementOnly" ? zhCN.app.receiverManagementOnly
-      : snapshot.state === "phoneReady" ? snapshot.output === "computer" ? zhCN.app.receiverComputer : zhCN.app.receiverAwaitingPlayback
-      : snapshot.state === "paused" ? zhCN.app.receiverPaused
-      : snapshot.state === "reconnecting" ? zhCN.app.directNetworkRecovering
-          : snapshot.state === "error" ? snapshot.statusDetail || snapshot.message || zhCN.app.retryDisconnectOrDiagnostics
-            : snapshot.output === "computer" ? zhCN.app.networkSessionComputer : zhCN.app.networkSessionPhone
+    ? snapshot.state === "managementOnly" ? strings.app.receiverManagementOnly
+      : snapshot.state === "phoneReady" ? snapshot.output === "computer" ? strings.app.receiverComputer : strings.app.receiverAwaitingPlayback
+      : snapshot.state === "paused" ? strings.app.receiverPaused
+      : snapshot.state === "reconnecting" ? strings.app.directNetworkRecovering
+          : snapshot.state === "error" ? snapshot.statusDetail || snapshot.message || strings.app.retryDisconnectOrDiagnostics
+            : snapshot.output === "computer" ? strings.app.networkSessionComputer : strings.app.networkSessionPhone
     : snapshot.statusDetail;
   const mainActionCanStop = snapshot.wirelessConnectionOffers.active || cleanupPending
     || (active && (snapshot.output === "phone" || snapshot.state === "managementOnly"));
   const mainActionDisabled = !cancellingConnection && !mainActionCanStop
     && (receiverOperationBusy || working || snapshot.busy);
-  const mainActionLabel = cancellingConnection ? zhCN.app.connectCancel
-    : snapshot.wirelessConnectionOffers.active ? zhCN.app.stopReceiving
-      : cleanupPending ? zhCN.app.retryDisconnect
-        : receiverUpdateNeeded && !active ? zhCN.app.upgradePhone
-        : active && snapshot.state === "managementOnly" ? zhCN.app.disconnectManagement
-          : active && snapshot.output === "phone" ? zhCN.app.stop
-              : !active && wirelessUdpMode ? working || snapshot.busy ? zhCN.app.processing : zhCN.app.backgroundStart
-              : active || selected?.connectable ? working || snapshot.busy ? zhCN.app.processing : zhCN.app.playToPhone
-              : snapshot.connectionTransport === "usb" ? zhCN.app.connectUsbPhone : zhCN.app.addWirelessPhone;
+  const mainActionLabel = cancellingConnection ? strings.app.connectCancel
+    : snapshot.wirelessConnectionOffers.active ? strings.app.stopReceiving
+      : cleanupPending ? strings.app.retryDisconnect
+        : receiverUpdateNeeded && !active ? strings.app.upgradePhone
+        : active && snapshot.state === "managementOnly" ? strings.app.disconnectManagement
+          : active && snapshot.output === "phone" ? strings.app.stop
+              : !active && wirelessUdpMode ? working || snapshot.busy ? strings.app.processing : strings.app.backgroundStart
+              : active || selected?.connectable ? working || snapshot.busy ? strings.app.processing : strings.app.playToPhone
+              : snapshot.connectionTransport === "usb" ? strings.app.connectUsbPhone : strings.app.addWirelessPhone;
   const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
 
   return <div className={`app-shell ${largeText ? "large-text" : ""}`}>
     <header className="topbar">
-      <div className="brand"><img src="/icon.png" alt="" /><div><strong>AnPod</strong><span>{zhCN.app.tagline}</span></div></div>
-      <button className="icon-button" aria-label={zhCN.app.openSettings} title={zhCN.app.settings} onClick={() => setPanel("settings")}><Settings2 size={18} /></button>
+      <div className="brand"><img src="/icon.png" alt="" /><div><strong>AnPod</strong><span>{strings.app.tagline}</span></div></div>
+      <button className="icon-button" aria-label={strings.app.openSettings} title={strings.app.settings} onClick={() => setPanel("settings")}><Settings2 size={18} /></button>
     </header>
 
     <main className="main-scroll">
-      <section className="device-section" aria-label={zhCN.app.targetPhone}>
-        <div className="section-title"><h1>{zhCN.app.targetPhone}</h1></div>
+      <section className="device-section" aria-label={strings.app.targetPhone}>
+        <div className="section-title"><h1>{strings.app.targetPhone}</h1></div>
         <div className="device-card">
-          <button className="device-select" onClick={() => wirelessUdpMode ? openNetworkDialog() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup"} aria-label={`${zhCN.app.chooseTarget}，${active ? `${zhCN.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? zhCN.app.phone}` : cleanupPending ? zhCN.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : zhCN.app.choosePairedReceiver : cardDevice ? `${zhCN.app.currentSelection}${cardDevice.displayName}` : zhCN.app.openDeviceList}`}>
+          <button className="device-select" onClick={() => wirelessUdpMode ? openNetworkDialog() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : strings.app.choosePairedReceiver : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
-              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? zhCN.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? zhCN.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : zhCN.app.chooseReceiverPhone : selected?.displayName ?? (empty ? zhCN.app.noPhone : zhCN.app.choosePhone)}</strong>
-              <span>{active ? zhCN.app.connectedPhone : cleanupPending ? zhCN.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? zhCN.app.wireless : zhCN.app.usb}</span>
-              {cleanupPending && <span className="device-live-state" role="status">{zhCN.app.retryCleanup}</span>}
+              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : strings.app.chooseReceiverPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
+              <span>{active ? strings.app.connectedPhone : cleanupPending ? strings.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? strings.app.wireless : strings.app.usb}</span>
+              {cleanupPending && <span className="device-live-state" role="status">{strings.app.retryCleanup}</span>}
             </span>
             <ChevronDown size={18} aria-hidden="true" />
           </button>
           <div className="device-actions">
-            {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{zhCN.app.switchToComputer}</button>}
+            {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{strings.app.switchToComputer}</button>}
           </div>
         </div>
       </section>
 
-      <section className="connection-section" aria-label={zhCN.app.connectionMode}>
-        <div className="section-title"><h2>{zhCN.app.connectionMode}</h2></div>
-        <div className="transport-switch" role="group" aria-label={zhCN.app.connectionMode}>
-          <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} aria-hidden="true" />{zhCN.app.usb}</button>
-          <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} aria-hidden="true" />{zhCN.app.wireless}</button>
+      <section className="connection-section" aria-label={strings.app.connectionMode}>
+        <div className="section-title"><h2>{strings.app.connectionMode}</h2></div>
+        <div className="transport-switch" role="group" aria-label={strings.app.connectionMode}>
+          <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} aria-hidden="true" />{strings.app.usb}</button>
+          <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</button>
         </div>
       </section>
 
@@ -561,25 +561,25 @@ function App() {
       <button className="primary-button main-action" type="button" disabled={mainActionDisabled} onClick={runMainAction}>
         {mainActionLabel}
       </button>
-      {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{zhCN.app.backgroundStartIdleHint}</p>}
+      {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{strings.app.backgroundStartIdleHint}</p>}
       {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
         className="status-description actionable-error"
-        summary={cleanupPending ? zhCN.app.cleanupRetryHint : receiverUpdateNeeded ? zhCN.app.receiverUpdateRequired : zhCN.app.operationNotCompleted}
+        summary={cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted}
         details={failureDetail}
-      /> : <p className="status-description" role="status">{zhCN.app.waitingForRequest}</p> : null}
-      {receiverUpdateNeeded && (active || cleanupPending) && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{zhCN.app.upgradePhone}</button>}
+      /> : <p className="status-description" role="status">{strings.app.waitingForRequest}</p> : null}
+      {receiverUpdateNeeded && (active || cleanupPending) && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{strings.app.upgradePhone}</button>}
 
-      <section className="mode-section" aria-label={zhCN.app.playbackMode}>
-        <div className="mode-row"><h2>{zhCN.app.playbackMode}</h2><div className="mode-switch" role="group" aria-label={zhCN.app.playbackMode}>
-          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled} onClick={() => void setOption("playback", "balanced")}>{zhCN.app.balanced}</button>
-          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled} onClick={() => void setOption("playback", "lowLatency")}>{zhCN.app.lowLatency}</button>
+      <section className="mode-section" aria-label={strings.app.playbackMode}>
+        <div className="mode-row"><h2>{strings.app.playbackMode}</h2><div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
+          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
         </div></div>
-        <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? zhCN.app.balancedDescription : zhCN.app.lowLatencyDescription}</p>
+        <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
       </section>
     </main>
 
-    <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />{zhCN.app.help}</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />{zhCN.app.diagnostics}</button></footer>
-    {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{zhCN.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
+    <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />{strings.app.help}</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />{strings.app.diagnostics}</button></footer>
+    {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{strings.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
     {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={!active || snapshot.sessionConnectionTransport === "wireless" ? () => setPanel("setup") : null} onClose={() => setPanel(null)} />}
     {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} busy={controlsDisabled} onSetOption={(kind, value) => void setOption(kind, value)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onSave={async (key, value) => {
@@ -591,15 +591,15 @@ function App() {
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {confirm && <ConfirmDialog
-      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? zhCN.app.switchReceiverUpgradeTitle : zhCN.app.switchReceiverInstallTitle : confirm.kind === "network" ? zhCN.app.switchNetworkTitle : confirm.kind === "device" ? zhCN.app.switchDeviceTitle : confirm.kind === "transport" ? zhCN.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? zhCN.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? zhCN.app.switchAudioBackendTitle : zhCN.app.switchPlaybackTitle}
-      body={confirm.kind === "receiverUsb" ? pendingReceiverOperation ? zhCN.app.receiverInstallOrCheck(pendingReceiverOperation.targetVersionCode) : zhCN.app.receiverOperation
-        : confirm.kind === "network" ? zhCN.app.networkConfirmation
-        : confirm.kind === "device" && lanSession ? zhCN.app.switchLanDevice(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? zhCN.app.selectedPhone)
-          : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? zhCN.app.switchConnectionSettings
-            : confirm.kind === "audioBackend" ? zhCN.app.switchBackend
-            : confirm.kind === "device" ? zhCN.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? zhCN.app.selectedPhone, snapshot.output === "phone")
-              : zhCN.app.switchPlayback}
-      confirmLabel={confirm.kind === "receiverUsb" ? zhCN.app.stopAndContinue : confirm.kind === "network" ? zhCN.app.disconnectAndStart : confirm.kind === "device" ? zhCN.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? zhCN.app.confirmSwitch : zhCN.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
+      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? strings.app.switchReceiverUpgradeTitle : strings.app.switchReceiverInstallTitle : confirm.kind === "network" ? strings.app.switchNetworkTitle : confirm.kind === "device" ? strings.app.switchDeviceTitle : confirm.kind === "transport" ? strings.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? strings.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? strings.app.switchAudioBackendTitle : strings.app.switchPlaybackTitle}
+      body={confirm.kind === "receiverUsb" ? pendingReceiverOperation ? strings.app.receiverInstallOrCheck(pendingReceiverOperation.targetVersionCode) : strings.app.receiverOperation
+        : confirm.kind === "network" ? strings.app.networkConfirmation
+        : confirm.kind === "device" && lanSession ? strings.app.switchLanDevice(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone)
+          : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? strings.app.switchConnectionSettings
+            : confirm.kind === "audioBackend" ? strings.app.switchBackend
+            : confirm.kind === "device" ? strings.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone, snapshot.output === "phone")
+              : strings.app.switchPlayback}
+      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 
