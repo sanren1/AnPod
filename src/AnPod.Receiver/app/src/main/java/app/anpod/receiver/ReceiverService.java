@@ -348,16 +348,7 @@ public final class ReceiverService extends Service {
     }
 
     private boolean notificationPermissionAvailable() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
-            return false;
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager == null || Build.VERSION.SDK_INT >= 24 && !manager.areNotificationsEnabled()) return false;
-        if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel channel = manager.getNotificationChannel(CHANNEL_ID);
-            if (channel == null || channel.getImportance() == NotificationManager.IMPORTANCE_NONE) return false;
-        }
-        return true;
+        return ReceiverNotifications.canPost(this, CHANNEL_ID);
     }
 
     private boolean applicationIsVisible() {
@@ -387,23 +378,14 @@ public final class ReceiverService extends Service {
             return;
         }
         int immutable = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
-        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
-                ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-        builder.setSmallIcon(android.R.drawable.stat_sys_headset)
-                .setContentTitle("AnPod Receiver")
-                .setContentText("已配对电脑请求后台播放，请选择是否允许。")
-                .setContentIntent(mainActivityPendingIntent())
-                .setAutoCancel(true)
-                .setOnlyAlertOnce(true)
-                .addAction(android.R.drawable.ic_media_play, "允许一次", backgroundDecisionPendingIntent(token,
-                        BackgroundStartAuthorization.ONCE, immutable))
-                .addAction(android.R.drawable.ic_lock_lock, "信任 8 小时", backgroundDecisionPendingIntent(token,
-                        BackgroundStartAuthorization.EIGHT_HOURS, immutable))
-                .addAction(android.R.drawable.ic_delete, "拒绝", backgroundDecisionPendingIntent(token,
-                        BackgroundStartAuthorization.DENIED, immutable));
-        builder.setDeleteIntent(backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.DENIED, immutable));
+        PendingIntent once = backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.ONCE, immutable);
+        PendingIntent eightHours = backgroundDecisionPendingIntent(token,
+                BackgroundStartAuthorization.EIGHT_HOURS, immutable);
+        PendingIntent deny = backgroundDecisionPendingIntent(token, BackgroundStartAuthorization.DENIED, immutable);
+        Notification notification = ReceiverNotifications.authorization(this, CHANNEL_ID,
+                mainActivityPendingIntent(), once, eightHours, deny);
         NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) manager.notify(AUTH_NOTIFICATION_ID, builder.build());
+        if (manager != null) manager.notify(AUTH_NOTIFICATION_ID, notification);
     }
 
     private PendingIntent backgroundDecisionPendingIntent(BackgroundStartAuthorization.Token token,
@@ -491,23 +473,15 @@ public final class ReceiverService extends Service {
 
     private Notification serviceNotification(String text, String ownerId, long generation, boolean canStop) {
         int immutable = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
-        PendingIntent content = mainActivityPendingIntent();
-        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
-                ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-        builder.setSmallIcon(android.R.drawable.stat_sys_headset)
-                .setContentTitle("AnPod Receiver")
-                .setContentText(text)
-                .setContentIntent(content)
-                .setOngoing(true);
+        PendingIntent stopAction = null;
         if (canStop && ownerId != null && !ownerId.isEmpty()) {
             Intent stop = new Intent(this, ReceiverService.class).setAction(ACTION_NOTIFICATION_STOP)
                     .setData(Uri.parse("anpod://receiver/stop/" + Uri.encode(ownerId) + "/" + generation))
                     .putExtra(EXTRA_UI_OWNER_ID, ownerId).putExtra(EXTRA_UI_GENERATION, generation);
-            PendingIntent action = PendingIntent.getService(this, 2, stop,
+            stopAction = PendingIntent.getService(this, 2, stop,
                     PendingIntent.FLAG_UPDATE_CURRENT | immutable);
-            builder.addAction(android.R.drawable.ic_media_pause, "停止接收", action);
         }
-        return builder.build();
+        return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction);
     }
 
     private PendingIntent mainActivityPendingIntent() {
