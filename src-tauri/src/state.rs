@@ -570,6 +570,7 @@ impl AppState {
                 &self.receiver_apk_path, &self.receiver_metadata_path, &token, &is_current).await
         }.await;
         if let Ok(reset) = &result {
+            self.presence.lock().expect("presence lock").forget(&expected.binding_reference);
             if !reset_preserves_wireless_listener(reset, &expected) {
                 let dropped = {
                     let mut listener = self.host_offer_listener.lock().expect("offer listener lock");

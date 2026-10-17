@@ -298,7 +298,7 @@ pub(crate) fn decode_auth_candidate(frame: &[u8], secret: &[u8; 32], nonce: &[u8
         return None;
     }
     let tag: [u8; TAG_BYTES] = frame[26..34].try_into().ok()?;
-    if tag != binding_tag(secret) { return None; }
+    if !constant_time_eq(&tag, &binding_tag(secret)) { return None; }
     let port = u16::from_be_bytes([frame[24], frame[25]]);
     if port == 0 { return None; }
     if !constant_time_eq(&candidate_mac(secret, nonce, &tag, port), &frame[34..]) { return None; }

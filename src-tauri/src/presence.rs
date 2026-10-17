@@ -78,6 +78,12 @@ impl PresenceTracker {
         due
     }
 
+    /// Drops a binding that no longer exists, so a reset cannot leave a stale
+    /// "last seen" line behind in the UI.
+    pub(crate) fn forget(&mut self, binding: &str) {
+        self.entries.remove(binding);
+    }
+
     pub(crate) fn view(&self) -> Vec<PresenceView> {
         let mut view: Vec<_> = self.entries.iter().map(|(binding, entry)| PresenceView {
             binding_reference: binding.clone(),
@@ -134,5 +140,15 @@ mod tests {
         assert!(!view[1].online);
         assert_eq!(view[1].last_seen_unix, None, "a registered binding that never answered is not online");
         assert_eq!(tracker.due(now).len(), 1, "only the registered binding is due; the observed one just answered");
+    }
+
+    #[test]
+    fn a_forgotten_binding_disappears_from_the_view_and_stops_being_probed() {
+        let now = Instant::now();
+        let mut tracker = PresenceTracker::default();
+        tracker.observe("a".repeat(32).as_str(), address(23), now, 42);
+        tracker.forget("a".repeat(32).as_str());
+        assert!(tracker.view().is_empty(), "a reset binding must not keep a presence line");
+        assert!(tracker.due(now + ONLINE_INTERVAL).is_empty(), "a reset binding must not be probed again");
     }
 }
