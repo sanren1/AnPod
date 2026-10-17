@@ -3,17 +3,21 @@
 mod state;
 mod audio;
 mod receiver;
-#[allow(dead_code)] // P3/P4/P5 network backend has explicit internal callers only.
+// Receiver-side protocol, session, and handshake code below is a cross-language
+// test oracle for the Java Receiver: the shipped binary only drives the host
+// side, so clippy sees those items as dead. Keep the allowance until W6-4 moves
+// the oracle into a #[cfg(test)] module. network_interface has no test-only
+// items and stays under the gate.
+#[allow(dead_code)]
 mod network;
-#[allow(dead_code)] // Explicit LAN commands expose only enumerated interfaces and authenticated endpoints.
 mod network_interface;
-#[allow(dead_code)] // P3 protocol is exercised by its focused test receiver for now.
+#[allow(dead_code)]
 mod protocol;
-#[allow(dead_code)] // P5-A is invoked only by explicit LAN session commands.
+#[allow(dead_code)]
 mod security;
-#[allow(dead_code)] // P5-C/E sessions are invoked only by explicit LAN commands.
+#[allow(dead_code)]
 mod p5c;
-#[allow(dead_code)] // P5-E discovery is opt-in and has no default startup caller.
+#[allow(dead_code)]
 mod discovery;
 mod presence;
 

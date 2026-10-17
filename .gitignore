@@ -52,6 +52,10 @@ adbkey.pub
 *.pem
 *.pfx
 *.p12
+*.jks
+# Release signing material must never live inside the repository
+/AnPod-release-key/
+/*-release-key/
 *.pkt
 *.dmp
 
