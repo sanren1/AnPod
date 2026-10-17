@@ -316,6 +316,7 @@ impl Drop for UdpSender {
     fn drop(&mut self) { let _ = self.stop_worker(); }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_loop(socket: UdpSocket, remote: SocketAddr, queue: Arc<PcmQueue>, stopping: Arc<AtomicBool>,
     material: UdpSessionMaterial, format: PcmFormat, pcm_payload_bytes_sent: Arc<AtomicU64>,
     send_format: bool) -> Result<NetworkStats, String> {

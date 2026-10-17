@@ -1176,6 +1176,7 @@ fn execute_background_trust_command(session: &mut HostSession, owner_generation:
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_session_owner(endpoint: SessionEndpoint, binding: BindingMaterial, parameters: AudioParameters,
     cancellation: CancellationToken, enabled: Arc<AtomicBool>, commands: mpsc::Receiver<OwnerCommand>,
     status: Arc<Mutex<SessionSnapshot>>, queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,

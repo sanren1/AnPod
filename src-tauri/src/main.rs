@@ -165,6 +165,7 @@ async fn discover_network_receivers(state: State<'_, AppState>, local_address: S
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn start_network_audio(app: tauri::AppHandle, state: State<'_, AppState>, local_address: String,
     peer: String, bootstrap_serial: Option<String>, receiver_address: Option<String>,
     receiver_prefix_length: Option<u8>, binding_reference: Option<String>,

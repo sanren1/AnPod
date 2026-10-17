@@ -874,6 +874,7 @@ impl AppState {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_network_audio(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
         selected_binding_ref: Option<&str>, background_authorization_required: bool) -> Result<AppSnapshot, String> {
@@ -882,6 +883,7 @@ impl AppState {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     async fn start_network_audio_inner(&self, app: &AppHandle, local_address: &str, peer: &str,
         bootstrap_serial: Option<&str>, receiver_address: Option<&str>, receiver_prefix: Option<u8>,
         selected_binding_ref: Option<&str>, intent: Option<([u8; 16], bool, CancellationToken)>,
@@ -1757,7 +1759,7 @@ impl AppState {
 
     async fn connect_inner(&self, app: &AppHandle, device: &Device, token: &CancellationToken, play_on_phone: bool) -> Result<String, String> {
         let serial = device.serial.as_str();
-        token_check(&token)?;
+        token_check(token)?;
         let installed_receiver = self.view.lock().expect("view lock").settings.audio_backend == "receiver";
         self.audio.initialize()?;
         self.audio.set_streaming(false)?;
@@ -1768,7 +1770,7 @@ impl AppState {
         self.audio.listen(port, &token_text)?;
         let remote = format!("localabstract:{reverse}");
         let port_arg = format!("tcp:{port}");
-        checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(&token)).await?;
+        checked_adb(&self.adb_path, Some(serial), &["reverse", &remote, &port_arg], Duration::from_secs(5), Some(token)).await?;
         let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
         *self.session.lock().await = Some(Session { generation: session_generation, serial: serial.into(), transport: device.transport.clone(), reverse: reverse.clone(), child: None, installed_receiver, output: "computer".into(), output_tail: Arc::new(Mutex::new(VecDeque::new())), network_owner: None, network_sink_queue: None, network_binding_ref: None });
         self.view.lock().expect("view lock").session_generation = Some(session_generation);
@@ -1791,7 +1793,7 @@ impl AppState {
             receiver::start_audio(&self.adb_path, serial, &self.receiver_apk_path, &self.receiver_metadata_path,
                 &reverse, &token_text, playback_mode, token).await?;
         } else {
-            checked_adb(&self.adb_path, Some(serial), &["push", self.server_path.to_string_lossy().as_ref(), "/data/local/tmp/anpod_server"], Duration::from_secs(15), Some(&token)).await?;
+            checked_adb(&self.adb_path, Some(serial), &["push", self.server_path.to_string_lossy().as_ref(), "/data/local/tmp/anpod_server"], Duration::from_secs(15), Some(token)).await?;
             let mut command = Command::new(&self.adb_path);
             command.args(["-s", serial, "shell", "app_process", "-Djava.class.path=/data/local/tmp/anpod_server", "/data/local/tmp", "com.anpod.server.Main"])
                 .arg(format!("socketName={reverse}"))
@@ -1807,18 +1809,18 @@ impl AppState {
             if let Some(stderr) = child.stderr.take() { tokio::spawn(capture_child_output(stderr, "stderr", output_tail.clone(), log_path)); }
             if let Some(session) = self.session.lock().await.as_mut() { session.child = Some(child); }
         }
-        token_check(&token)?;
-        let handshake = self.audio.wait_handshake(&token_text, Duration::from_secs(10), &token).await?;
-        token_check(&token)?;
+        token_check(token)?;
+        let handshake = self.audio.wait_handshake(&token_text, Duration::from_secs(10), token).await?;
+        token_check(token)?;
         if handshake != token_text { return Err("握手校验失败，已拒绝连接。".into()); }
         if !installed_receiver && self.session.lock().await.as_mut().and_then(|session| session.child.as_mut()).is_some_and(|child| child.try_wait().map_or(true, |status| status.is_some())) { return Err("手机端音频服务已停止。".into()); }
         if !self.audio.is_connected()? { return Err("手机端音频连接已中断。".into()); }
-        token_check(&token)?;
+        token_check(token)?;
         if play_on_phone && !installed_receiver { self.audio.mute_active()?; }
         self.audio.set_streaming(play_on_phone)?;
-        token_check(&token)?;
+        token_check(token)?;
         self.audio.start()?;
-        token_check(&token)?;
+        token_check(token)?;
         if play_on_phone && installed_receiver {
             self.audio.mute_active()?;
         }
@@ -2452,7 +2454,7 @@ impl AppState {
         let _guard = self.gate.lock().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let endpoint = loop {
-            token_check(&token)?;
+            token_check(token)?;
             let found = self.discover_wifi_with_cancel(Some(token)).await?;
             let services = found.get("services").and_then(Value::as_array).cloned().unwrap_or_default();
             if let Some(pairing) = services.into_iter().find(|s| s["kind"] == "pairing" && normalize_mdns_instance(s["name"].as_str().unwrap_or("")) == instance) {
@@ -2464,7 +2466,7 @@ impl AppState {
         };
         *self.last_pairing_endpoint.lock().expect("pair endpoint lock") = Some(endpoint.clone());
         let _ = app.emit("anpod://pairing-progress", "已识别手机，正在配对…");
-        let pair = adb_run(&self.adb_path, None, &["pair", &endpoint, &password], Duration::from_secs(20), Some(&token)).await?;
+        let pair = adb_run(&self.adb_path, None, &["pair", &endpoint, password], Duration::from_secs(20), Some(token)).await?;
         if !pair.success || !pair.stdout.to_ascii_lowercase().contains("successfully paired") { return Err("二维码配对失败，请重新生成后重试。".into()); }
         self.log("Wireless QR pairing succeeded");
         let host = endpoint.rsplit_once(':').map(|(h,_)| h).unwrap_or("");

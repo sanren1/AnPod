@@ -47,7 +47,7 @@ pub(crate) struct ConnectionOffer {
     pub(crate) nonce: [u8; 16],
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HostDiscoverySnapshot {
     pub(crate) active: bool,
@@ -55,10 +55,6 @@ pub(crate) struct HostDiscoverySnapshot {
     pub(crate) interface_address: Option<Ipv4Addr>,
     pub(crate) interface_prefix_length: Option<u8>,
     pub(crate) offers: Vec<ConnectionOffer>,
-}
-
-impl Default for HostDiscoverySnapshot {
-    fn default() -> Self { Self { active: false, automatic_binding: None, interface_address: None, interface_prefix_length: None, offers: Vec::new() } }
 }
 
 pub(crate) struct HostOfferListener {
@@ -233,7 +229,7 @@ fn encode_host_packet(kind: u8, nonce: [u8; 16], port: u16) -> [u8; HOST_PACKET_
 fn decode_host_probe(frame: &[u8]) -> Option<[u8; 16]> {
     if frame.len() != HOST_PROBE_BYTES || &frame[..4] != MAGIC || frame[4] != V2_VERSION
         || frame[5] != HOST_PROBE || frame[6..8] != [0, 0] || frame[8..24].iter().all(|byte| *byte == 0) { return None; }
-    Some(frame[8..24].try_into().ok()?)
+    frame[8..24].try_into().ok()
 }
 
 fn decode_connect_offer(frame: &[u8]) -> Option<([u8; 16], u16)> {

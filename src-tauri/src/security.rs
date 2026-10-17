@@ -259,14 +259,14 @@ mod dpapi {
     }
 
     pub(super) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecurityError> {
-        let mut input = CRYPT_INTEGER_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: u32::try_from(plaintext.len()).map_err(|_| SecurityError::Malformed)?,
             pbData: plaintext.as_ptr().cast_mut(),
         };
         let mut output = OutputBlob::default();
         unsafe {
             CryptProtectData(
-                &mut input,
+                &input,
                 PCWSTR::null(),
                 None,
                 None,
@@ -279,14 +279,14 @@ mod dpapi {
     }
 
     pub(super) fn unprotect(ciphertext: &[u8]) -> Result<super::SensitiveBytes, SecurityError> {
-        let mut input = CRYPT_INTEGER_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: u32::try_from(ciphertext.len()).map_err(|_| SecurityError::Malformed)?,
             pbData: ciphertext.as_ptr().cast_mut(),
         };
         let mut output = OutputBlob::default();
         unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 None,
                 None,
                 None,

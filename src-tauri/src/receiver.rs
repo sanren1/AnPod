@@ -358,6 +358,7 @@ async fn read_reset_network_state(adb: &impl AdbRunner, serial: &str, user: &str
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn reset_result(preview: &BindingResetPreview, outcome: &str, phone_state: &str,
     phone_commitment: Option<String>, pc_state: &str, pc_commitment: Option<String>,
     reason: &str, next_action: &str) -> BindingResetResult {
@@ -889,6 +890,7 @@ pub async fn start(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path, c
     start_with(&SystemAdb(adb), serial, apk, metadata_path, cancel).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_audio(adb: &Path, serial: &str, apk: &Path, metadata_path: &Path,
     socket_name: &str, connect_code: &str, playback_mode: &str, cancel: &CancellationToken) -> Result<ReceiverStatus, String> {
     start_with_action(&SystemAdb(adb), serial, apk, metadata_path, cancel,
@@ -1033,16 +1035,16 @@ async fn confirmed_adb_device(adb: &impl AdbRunner, serial: &str, cancel: &Cance
 }
 
 async fn is_installed(adb: &impl AdbRunner, serial: &str, user: &str, cancel: &CancellationToken) -> Result<bool, String> {
-    let result = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
+    let result = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     if !result.success { return Err(adb_error(&result)); }
     Ok(has_listed_package(&result.stdout))
 }
 
 async fn verify_installed_identity(adb: &impl AdbRunner, serial: &str, user: &str, metadata: &ArtifactMetadata, cancel: &CancellationToken) -> Result<VerifiedReceiverArtifact, String> {
-    let listed = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
+    let listed = adb.run(Some(serial), &["shell", "pm", "list", "packages", "--user", user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     ensure_adb_success(&listed)?;
     if !has_listed_package(&listed.stdout) { return Err("当前 Android 用户未安装 AnPod Receiver，已拒绝管理操作。".into()); }
-    let path_result = adb.run(Some(serial), &["shell", "pm", "path", "--user", &user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
+    let path_result = adb.run(Some(serial), &["shell", "pm", "path", "--user", user, PACKAGE], Duration::from_secs(6), Some(cancel)).await?;
     ensure_adb_success(&path_result)?;
     let path = parse_installed_apk_path(&path_result.stdout)
         .ok_or_else(|| "Receiver 安装路径不存在或不受支持，已拒绝管理操作。".to_string())?;
@@ -1227,7 +1229,7 @@ fn parse_optional_metric<T: std::str::FromStr>(value: Option<&&str>) -> Option<T
 }
 
 fn ensure_adb_success(result: &AdbResult) -> Result<(), String> {
-    if result.success { Ok(()) } else { Err(adb_error(&result)) }
+    if result.success { Ok(()) } else { Err(adb_error(result)) }
 }
 
 fn adb_error(result: &AdbResult) -> String {
