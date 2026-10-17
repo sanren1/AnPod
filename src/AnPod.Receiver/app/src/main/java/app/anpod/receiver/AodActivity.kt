@@ -98,7 +98,8 @@ class AodActivity : ComponentActivity() {
                 while (isActive) {
                     val current = binder?.aodSnapshot()
                     telemetry = current
-                    if (current != null && current.status != AodTelemetrySnapshot.DisplayStatus.DISCONNECTED) {
+                    if (current != null && (current.status != AodTelemetrySnapshot.DisplayStatus.DISCONNECTED
+                            || current.receivedAudioRecently)) {
                         sawSession = true
                         disconnectedAt = 0L
                     } else if (sawSession) {
