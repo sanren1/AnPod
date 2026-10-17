@@ -122,6 +122,72 @@ pub struct AppSnapshot {
     pub version: String,
 }
 
+/// Sanitised snapshot written by `export_diagnostics`.
+///
+/// Deliberately excludes device serials, display names, binding references,
+/// network addresses and free-form messages, so the file can be shared when
+/// reporting a problem. Only structured counters and negotiated capabilities
+/// are kept.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsExport {
+    pub schema_version: u32,
+    pub exported_at: String,
+    pub app_version: String,
+    pub state: String,
+    pub transport: String,
+    pub connection_transport: String,
+    pub session_transport: Option<String>,
+    pub session_wireless_protocol: Option<String>,
+    pub output: String,
+    pub playback_mode: String,
+    pub audio_backend: String,
+    pub audio_bitrate_bps: Option<u64>,
+    pub session_capabilities: Option<ReceiverCapabilities>,
+    pub playback: Option<PlaybackDiagnostics>,
+    pub network_recovery_seconds_remaining: Option<u64>,
+}
+
+fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
+    DiagnosticsExport {
+        schema_version: 1,
+        exported_at: iso8601_utc(unix_seconds()),
+        app_version: snapshot.version.clone(),
+        state: snapshot.state.clone(),
+        transport: snapshot.transport.clone(),
+        connection_transport: snapshot.connection_transport.clone(),
+        session_transport: snapshot.session_transport.clone(),
+        session_wireless_protocol: snapshot.session_wireless_protocol.clone(),
+        output: snapshot.output.clone(),
+        playback_mode: snapshot.settings.playback_mode.clone(),
+        audio_backend: snapshot.settings.audio_backend.clone(),
+        audio_bitrate_bps: snapshot.audio_bitrate_bps,
+        session_capabilities: snapshot.session_capabilities.clone(),
+        playback: snapshot.playback_diagnostics.clone(),
+        network_recovery_seconds_remaining: snapshot.network_recovery_seconds_remaining,
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// UTC timestamp without pulling in a date library (Howard Hinnant's civil_from_days).
+fn iso8601_utc(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let rest = seconds % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3_600, (rest % 3_600) / 60, rest % 60)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "target", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum BackgroundTrustTarget {
@@ -1992,6 +2058,18 @@ impl AppState {
         std::process::Command::new("explorer.exe").arg(directory).spawn().map(|_| ()).map_err(|_| "无法打开日志文件夹。".into())
     }
 
+    /// Writes a sanitised diagnostics snapshot and returns its absolute path.
+    pub fn export_diagnostics(&self) -> Result<String, String> {
+        let export = diagnostics_export(&self.snapshot());
+        let directory = self.data_dir.join("exports");
+        fs::create_dir_all(&directory).map_err(|e| format!("无法创建诊断导出目录：{e}"))?;
+        let path = directory.join(format!("diagnostics-{}.json", unix_seconds()));
+        let body = serde_json::to_vec_pretty(&export).map_err(|e| format!("无法序列化诊断数据：{e}"))?;
+        fs::write(&path, body).map_err(|e| format!("无法写入诊断文件：{e}"))?;
+        self.log("Exported sanitized diagnostics snapshot");
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
         self.host_offer_listener.lock().expect("offer listener lock").take();
         let mut errors = Vec::new();
@@ -2893,6 +2971,55 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_snapshot() -> AppSnapshot {
+        AppSnapshot {
+            state: "connected".into(),
+            message: "正在从手机播放".into(),
+            device_name: Some("Test Phone".into()),
+            devices: Vec::new(),
+            selected_serial: Some("TESTSERIAL".into()),
+            session_serial: Some("TESTSERIAL".into()),
+            session_receiver_binding: Some("phoneA-abcdef".into()),
+            session_generation: Some(7),
+            session_transport: Some("lan".into()),
+            session_connection_transport: Some("wireless".into()),
+            session_wireless_protocol: Some("udp".into()),
+            session_capabilities: None,
+            playback_diagnostics: Some(PlaybackDiagnostics::default()),
+            network_recovery_seconds_remaining: None,
+            wireless_connection_offers: HostDiscoverySnapshot::default(),
+            session_android_version: Some("15".into()),
+            connection_transport: "wireless".into(),
+            transport: "wifi".into(),
+            output: "phone".into(),
+            settings: AppSettings::default(),
+            busy: false,
+            can_disconnect: true,
+            can_change_modes: false,
+            status_detail: "192.168.50.2 已连接".into(),
+            audio_bitrate_bps: Some(1_536_000),
+            version: "1.4.0".into(),
+        }
+    }
+
+    #[test]
+    fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
+        let json = serde_json::to_string(&diagnostics_export(&sample_snapshot())).unwrap();
+        for leaked in ["TESTSERIAL", "Test Phone", "phoneA-abcdef", "192.168.50.2"] {
+            assert!(!json.contains(leaked), "{leaked} leaked into {json}");
+        }
+        assert!(json.contains("\"schemaVersion\":1"));
+        assert!(json.contains("\"state\":\"connected\""));
+        assert!(json.contains("\"playbackMode\":\"Balanced\""));
+        assert!(json.contains("\"audioBitrateBps\":1536000"));
+    }
+
+    #[test]
+    fn iso8601_formats_utc_seconds() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
 
     #[test]
     fn background_trust_ipc_uses_camel_case_target_and_nullable_duration() {

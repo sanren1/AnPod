@@ -220,6 +220,11 @@ fn open_logs(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    state.export_diagnostics()
+}
+
+#[tauri::command]
 async fn close_to_tray(app: tauri::AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
     if state.snapshot().settings.minimize_to_tray {
         window.hide().map_err(|error| error.to_string())
@@ -309,6 +314,7 @@ fn main() {
             reconfigure_session,
             show_main_window,
             open_logs,
+            export_diagnostics,
             close_to_tray
         ])
         .setup(|app| {

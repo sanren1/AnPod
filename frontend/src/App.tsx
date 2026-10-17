@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { QRCodeSVG } from "qrcode.react";
 import {
-  Activity, AudioLines, Check, ChevronDown, CircleHelp, Copy,
+  Activity, AudioLines, Check, ChevronDown, CircleHelp, Copy, Download,
   ExternalLink, Info, LoaderCircle, Search, Settings2,
   Smartphone, Usb, Wifi, X,
 } from "lucide-react";
@@ -1668,6 +1668,15 @@ function HelpDialog({ transport, wirelessProtocol, onClose }: { transport: Snaps
 function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose: () => void }) {
   const capabilities = snapshot.sessionCapabilities;
   const diagnostic = snapshot.playbackDiagnostics;
+  const [exporting, setExporting] = useState(false);
+  const [exportPath, setExportPath] = useState<string | null>(null);
+  const [exportError, setExportError] = useState("");
+  const exportSnapshot = async () => {
+    setExporting(true); setExportError(""); setExportPath(null);
+    try { setExportPath(await invokeApp<string>("export_diagnostics")); }
+    catch (error) { setExportError(error instanceof Error ? error.message : String(error)); }
+    finally { setExporting(false); }
+  };
   const active = hasActiveSession(snapshot);
   const udpSession = active && snapshot.sessionTransport === "lan"
     && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp";
@@ -1756,7 +1765,9 @@ function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose:
         <h3>{zhCN.diagnostics.playbackDiagnostics}</h3>
         {diagnostic ? groups.map(metricGroup) : <p className="diagnostic-empty">{unavailable}</p>}
       </section>
-      <div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={15} />{zhCN.diagnostics.copyDiagnostics}</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>{zhCN.diagnostics.openLogs}<ExternalLink size={14} /></button></div>
+      <div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={15} />{zhCN.diagnostics.copyDiagnostics}</button><button className="dialog-secondary" disabled={exporting} onClick={() => void exportSnapshot()}><Download size={15} />{exporting ? zhCN.diagnostics.exporting : zhCN.diagnostics.exportDiagnostics}</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>{zhCN.diagnostics.openLogs}<ExternalLink size={14} /></button></div>
+      {exportPath && <p className="diagnostic-context" role="status">{zhCN.diagnostics.exportSaved(exportPath)}</p>}
+      {exportError && <ErrorDetails summary={zhCN.diagnostics.exportFailed} details={exportError} />}
     </details>
   </Modal>;
 }
