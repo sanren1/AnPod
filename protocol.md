@@ -496,6 +496,43 @@ the wire exchange and full authenticated PCM handoff only on loopback with a
 fake sink; real LAN/hotspot broadcast, Android runtime, ADB, WASAPI, AudioTrack,
 and audible output remain NOT_TESTED.
 
+## P5-C authenticated discovery (V3 records)
+
+Discovery v1 (`PROBE`/`CANDIDATE`) and the V3 records above stay
+unauthenticated: their replies carry only an endpoint, so a host cannot tell
+which saved binding answered, and any host in the prefix can fabricate one.
+Two additional records bind a reply to the USB-provisioned binding secret:
+
+| Record | Version/type | Bytes | Payload |
+| --- | --- | ---: | --- |
+| `AUTH_PROBE` | 3 / 6 | 50 | zero flags, fresh 16-byte nonce, 8-byte binding tag, 16-byte MAC |
+| `AUTH_CANDIDATE` | 3 / 7 | 50 | zero flags, echoed nonce, Receiver TCP control port, tag, MAC |
+
+All integers are big-endian. The tag is `HMAC-SHA256(secret,
+"anpod-discovery-tag-v3")[0..8]`; it identifies the binding without revealing
+its identifiers. The probe MAC is `HMAC-SHA256(secret, "anpod-probe-v3" ||
+nonce || tag)[0..16]`; the reply MAC is `HMAC-SHA256(secret,
+"anpod-candidate-v3" || nonce || tag || controlPort)[0..16]`. The distinct
+labels keep these values separate from every other use of the binding secret.
+
+The host sends one `AUTH_PROBE` per saved binding alongside each v1 probe and
+records which binding produced a verified `AUTH_CANDIDATE`. A Receiver replies
+only when it holds a binding whose tag and probe MAC verify, at most once per
+200 ms, and after a random delay of up to 20 ms. Replies are dropped rather
+than queued, so a flood cannot delay audio work. A host that receives no
+authenticated reply still sees the v1 candidate, which the interface marks as
+unverified; authenticated candidates are the only ones a future presence
+tracker may trust. Verification never replaces P5-A: a verified candidate is
+still an unauthenticated endpoint hint until the session handshake succeeds.
+
+The shared vector (`secret = 00..1f`, `nonce = 00..0f`, control port `41234`)
+is asserted by both `src-tauri/src/discovery.rs` and
+`tests/AnPodDiscoveryAuthCheck.java`: tag `26414e36e4dc63e6`, probe MAC
+`83ec229f58b0088dd60051cb736e6db8`, reply MAC
+`a82f6568b5e977d37c46b22155edcba4`.
+
+
+
 ## P5-C V3 bidirectional discovery and host offers
 
 Discovery v1 remains unchanged for host-initiated discovery. V3 adds three

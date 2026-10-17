@@ -8,12 +8,15 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.SocketTimeoutException;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Explicit selected-interface discovery for an already running P5-C endpoint. */
 final class P5cDiscovery implements AutoCloseable {
@@ -27,6 +30,11 @@ final class P5cDiscovery implements AutoCloseable {
     private static final int HOST_PROBE = 3;
     private static final int HOST_CANDIDATE = 4;
     private static final int CONNECT_OFFER = 5;
+    private static final int AUTH_VERSION = 3;
+    private static final int AUTH_PROBE = 6;
+    private static final int AUTH_CANDIDATE = 7;
+    private static final int AUTH_FRAME_BYTES = 50;
+    private static final long AUTH_REPLY_INTERVAL_MILLIS = 200L;
     private static final long SEARCH_MILLIS = 10_000L;
     private static final SecureRandom RANDOM = new SecureRandom();
 
@@ -35,6 +43,8 @@ final class P5cDiscovery implements AutoCloseable {
     private final InetAddress localAddress;
     private final int prefixLength;
     private final int controlPort;
+    private final byte[] bindingSecret;
+    private long lastAuthReplyAt;
     private volatile Thread worker;
     private byte[] searchNonce;
     private long searchDeadline;
@@ -63,16 +73,17 @@ final class P5cDiscovery implements AutoCloseable {
     }
 
     static P5cDiscovery open(InetAddress localAddress, int prefixLength, int controlPort,
-            SocketBinder socketBinder) throws IOException {
-        return openInternal(localAddress, prefixLength, controlPort, socketBinder, true, false);
+            SocketBinder socketBinder, byte[] bindingSecret) throws IOException {
+        return openInternal(localAddress, prefixLength, controlPort, socketBinder, true, false, bindingSecret);
     }
 
     static P5cDiscovery openLoopbackForTest(InetAddress localAddress, int prefixLength, int controlPort) throws IOException {
-        return openInternal(localAddress, prefixLength, controlPort, null, false, true);
+        return openInternal(localAddress, prefixLength, controlPort, null, false, true, null);
     }
 
     private static P5cDiscovery openInternal(InetAddress localAddress, int prefixLength, int controlPort,
-            SocketBinder socketBinder, boolean wildcardReceive, boolean allowLoopbackPrefix) throws IOException {
+            SocketBinder socketBinder, boolean wildcardReceive, boolean allowLoopbackPrefix,
+            byte[] bindingSecret) throws IOException {
         if (!(localAddress instanceof Inet4Address) || prefixLength < 1 || prefixLength > 32
                 || (!localAddress.isLoopbackAddress() && !localAddress.isSiteLocalAddress()))
             throw new IOException("Discovery requires an explicit private IPv4 address and prefix");
@@ -90,7 +101,7 @@ final class P5cDiscovery implements AutoCloseable {
             responseSocket.setReuseAddress(false);
             if (socketBinder != null) socketBinder.bind(responseSocket);
             responseSocket.bind(new InetSocketAddress(localAddress, 0));
-            return new P5cDiscovery(socket, responseSocket, localAddress, prefixLength, controlPort);
+            return new P5cDiscovery(socket, responseSocket, localAddress, prefixLength, controlPort, bindingSecret);
         } catch (IOException | RuntimeException error) {
             socket.close();
             if (responseSocket != null) responseSocket.close();
@@ -99,12 +110,13 @@ final class P5cDiscovery implements AutoCloseable {
     }
 
     private P5cDiscovery(DatagramSocket socket, DatagramSocket responseSocket,
-            InetAddress localAddress, int prefixLength, int controlPort) {
+            InetAddress localAddress, int prefixLength, int controlPort, byte[] bindingSecret) {
         this.socket = socket;
         this.responseSocket = responseSocket;
         this.localAddress = localAddress;
         this.prefixLength = prefixLength;
         this.controlPort = controlPort;
+        this.bindingSecret = bindingSecret == null ? null : bindingSecret.clone();
     }
 
     synchronized void start() {
@@ -213,6 +225,8 @@ final class P5cDiscovery implements AutoCloseable {
                         || !isInSelectedPrefix(localAddress, prefixLength, source)) continue;
                 if (isHostCandidate(request.getData(), request.getOffset(), request.getLength(), source)) {
                     synchronized (this) { acceptCandidate(request.getData(), request.getOffset(), source); }
+                } else if (isAuthProbe(request.getData(), request.getOffset(), request.getLength())) {
+                    respondAuthenticated(request);
                 } else if (isProbe(request.getData(), request.getOffset(), request.getLength())) {
                     byte[] response = response(request.getData(), request.getOffset(), controlPort);
                     responseSocket.send(new DatagramPacket(response, response.length, request.getAddress(), request.getPort()));
@@ -289,6 +303,46 @@ final class P5cDiscovery implements AutoCloseable {
         candidates.clear(); requestedCandidates.clear(); searchNonce = null; searchDeadline = 0;
         lastRequestStatus = "interface-lost";
         close();
+    }
+
+    private static boolean isAuthProbe(byte[] packet, int offset, int length) {
+        return length == AUTH_FRAME_BYTES && hasHeader(packet, offset, AUTH_VERSION, AUTH_PROBE)
+                && packet[offset + 6] == 0 && packet[offset + 7] == 0
+                && !allZero(packet, offset + 8, 16);
+    }
+
+    private void respondAuthenticated(DatagramPacket request) throws IOException {
+        byte[] secret = bindingSecret;
+        if (secret == null) return;
+        byte[] packet = request.getData();
+        int offset = request.getOffset();
+        byte[] nonce = Arrays.copyOfRange(packet, offset + 8, offset + 24);
+        byte[] tag = Arrays.copyOfRange(packet, offset + 26, offset + 34);
+        if (!MessageDigest.isEqual(tag, DiscoveryAuth.tag(secret))) return;
+        byte[] expected = DiscoveryAuth.probeMac(secret, nonce, tag);
+        if (!MessageDigest.isEqual(expected, Arrays.copyOfRange(packet, offset + 34, offset + 50))) return;
+        long now = monotonicMillis();
+        if (now - lastAuthReplyAt < AUTH_REPLY_INTERVAL_MILLIS) return;
+        lastAuthReplyAt = now;
+        try { Thread.sleep(RANDOM.nextInt(20)); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+        byte[] response = authCandidate(secret, nonce);
+        responseSocket.send(new DatagramPacket(response, response.length, request.getAddress(), request.getPort()));
+    }
+
+    private byte[] authCandidate(byte[] secret, byte[] nonce) {
+        byte[] tag = DiscoveryAuth.tag(secret);
+        byte[] port = { (byte) (controlPort >>> 8), (byte) controlPort };
+        byte[] packet = new byte[AUTH_FRAME_BYTES];
+        System.arraycopy(MAGIC, 0, packet, 0, 4);
+        packet[4] = AUTH_VERSION;
+        packet[5] = AUTH_CANDIDATE;
+        System.arraycopy(nonce, 0, packet, 8, 16);
+        packet[24] = port[0];
+        packet[25] = port[1];
+        System.arraycopy(tag, 0, packet, 26, 8);
+        System.arraycopy(DiscoveryAuth.candidateMac(secret, nonce, tag, controlPort), 0, packet, 34, 16);
+        return packet;
     }
 
     private static boolean hasHeader(byte[] packet, int offset, int version, int type) {

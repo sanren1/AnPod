@@ -594,10 +594,21 @@ impl AppState {
         let interface = self.network_interfaces()?.into_iter().find(|item| item.address.to_string() == local_address)
             .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
         let cached = self.last_receiver_address();
+        let bindings = self.discovery_bindings();
         let cancellation = CancellationToken::new();
         let targets = discovery::probe_targets(&interface);
         tokio::task::spawn_blocking(move || discovery::discover_on_interface(&interface, &targets, cached,
-            Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
+            &bindings, Duration::from_secs(2), &cancellation)).await.map_err(|_| "网络发现任务已停止。".to_string())?
+    }
+
+    /// Binding secrets used to authenticate discovery replies. Unreadable bindings are
+    /// skipped: they simply cannot produce an authenticated candidate.
+    fn discovery_bindings(&self) -> Vec<discovery::DiscoveryBinding> {
+        self.receiver_binding_references().unwrap_or_default().into_iter().filter_map(|reference| {
+            let path = binding_store_path(&self.data_dir, &reference).ok()?;
+            let material = crate::security::BindingStore::load(&path).ok()?;
+            Some(discovery::DiscoveryBinding { reference, secret: material.discovery_secret() })
+        }).collect()
     }
 
     /// Address of the Receiver that last accepted a session, if it is a usable IPv4 literal.

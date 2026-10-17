@@ -107,6 +107,9 @@ impl BindingMaterial {
         Sha256::digest(&record.0).into()
     }
 
+    /// Copy of the binding secret, for authenticated discovery MACs only.
+    pub(crate) fn discovery_secret(&self) -> [u8; 32] { self.secret }
+
     fn matches(&self, other: &Self) -> bool {
         self.host_id.iter().chain(&self.receiver_id).chain(&self.secret)
             .zip(other.host_id.iter().chain(&other.receiver_id).chain(&other.secret))

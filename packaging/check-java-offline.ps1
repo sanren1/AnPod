@@ -19,16 +19,21 @@ $sources = @(
     'src\AnPod.AndroidServer\src\main\java\com\anpod\server\Options.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AudioFocusState.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\BackgroundStartAuthorization.java',
+    'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\DiscoveryAuth.java',
     'tests\AnPodUdpVectorCheck.java',
     'tests\AnPod.AndroidServer.PcmCheck.java',
     'tests\AnPodAudioFocusStateCheck.java',
-    'tests\BackgroundStartAuthorizationCheck.java'
+    'tests\BackgroundStartAuthorizationCheck.java',
+    'tests\AnPodDiscoveryAuthCheck.java'
 ) | ForEach-Object { Join-Path $repo $_ }
 
 New-Item -ItemType Directory -Path $classes | Out-Null
 try {
     & $javac --release 17 -encoding UTF-8 -d $classes @sources
     if ($LASTEXITCODE -ne 0) { throw "javac failed with exit code $LASTEXITCODE" }
+
+    & $java -cp $classes app.anpod.receiver.AnPodDiscoveryAuthCheck
+    if ($LASTEXITCODE -ne 0) { throw "AnPodDiscoveryAuthCheck failed with exit code $LASTEXITCODE" }
 
     & $java -cp $classes app.anpod.receiver.AnPodUdpVectorCheck
     if ($LASTEXITCODE -ne 0) { throw "AnPodUdpVectorCheck failed with exit code $LASTEXITCODE" }

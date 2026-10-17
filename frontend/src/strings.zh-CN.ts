@@ -515,6 +515,8 @@ export const zhCN = {
     receiverIpv4Endpoint: "手机地址",
     addressSuggestionNeedsConnection: "选择找到的地址，连接时手机仍会核对配对信息。",
     lastReceiverHint: (endpoint: string) => `上次连接过 ${endpoint}；重新搜索会先试这个地址，再广播。`,
+    verifiedCandidate: "已配对 · 已验证",
+    unverifiedCandidate: "未验证",
     invalidSubnetConnectDisabled: "此地址不在所选电脑接口的网段内，连接按钮不可用。",
     searchAddressAgain: "重新搜索地址",
     unverifiedDiscoveryCandidates: "未验证的发现候选",

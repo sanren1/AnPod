@@ -1305,7 +1305,13 @@ public final class ReceiverService extends Service {
             networkAudioAddress = coordinator.localAddress().getHostAddress();
             networkAudioPort = coordinator.port();
             coordinator.start();
-            coordinator.startDiscovery(selectedNetwork::bindSocket);
+            byte[] discoverySecret = null;
+            try (PairingProtocol.BindingMaterial material = new BindingStore(getFilesDir()).load()) {
+                discoverySecret = material.discoverySecret();
+            } catch (java.io.IOException | PairingProtocol.Failure ignored) {
+            }
+            coordinator.startDiscovery(selectedNetwork::bindSocket, discoverySecret);
+            if (discoverySecret != null) java.util.Arrays.fill(discoverySecret, (byte) 0);
             if (keepReceiveIntent) coordinator.startAutomaticSearch();
             uiOperation.running(ownerId);
             networkAudioState = "prepared";

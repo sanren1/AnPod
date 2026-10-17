@@ -2137,7 +2137,7 @@ mod tests {
     const JAVA_SOURCES: &[&str] = &[
         "PairingProtocol.java", "P5cControlProtocol.java", "UdpSessionContext.java",
         "UdpPacketDecoder.java", "UdpPcmQueue.java", "UdpReceiver.java",
-        "P5cDiscovery.java", "P5cReceiverCoordinator.java",
+        "P5cDiscovery.java", "P5cReceiverCoordinator.java", "DiscoveryAuth.java",
     ];
 
     fn java_paths() -> (PathBuf, PathBuf) {
@@ -2422,7 +2422,7 @@ mod tests {
             assert_eq!(length, 26);
             unrelated_probe.send_to(&crate::discovery::candidate_for_test([0xA5; 16], 43210), source).unwrap();
         });
-        let no_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None,
+        let no_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None, &[],
             Duration::from_millis(120), &CancellationToken::new());
         unrelated.join().unwrap();
         assert!(no_candidates.is_err(), "a response with an unrelated probe token is not a candidate");
@@ -2437,7 +2437,7 @@ mod tests {
                 flood_responder.send_to(&crate::discovery::candidate_for_test(token, port), target).unwrap();
             }
         });
-        let bounded_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None,
+        let bounded_candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None, &[],
             Duration::from_millis(250), &CancellationToken::new()).unwrap();
         flood.join().unwrap();
         assert_eq!(bounded_candidates.len(), 16, "discovery caps candidates and stops accepting a response flood");
@@ -2449,7 +2449,7 @@ mod tests {
             cancel_token.cancel();
         });
         let start = Instant::now();
-        let cancelled_discovery = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None,
+        let cancelled_discovery = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None, &[],
             Duration::from_secs(1), &discovery_cancel);
         canceller.join().unwrap();
         assert!(cancelled_discovery.as_ref().is_err_and(|error| error == "Network discovery was cancelled."),
@@ -2459,7 +2459,7 @@ mod tests {
         let (child, stdout, advertised_peer) = spawn_discoverable_endpoint(&classes);
         let malformed_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         malformed_sender.send_to(&[0; 26], (Ipv4Addr::LOCALHOST, crate::discovery::DISCOVERY_PORT)).unwrap();
-        let candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None,
+        let candidates = crate::discovery::discover_on_interface(&interface, &[Ipv4Addr::LOCALHOST], None, &[],
             Duration::from_millis(250), &CancellationToken::new()).unwrap();
         assert_eq!(candidates.len(), 1, "only a response correlated to the fresh probe is returned");
         let peer = candidates[0].endpoint;

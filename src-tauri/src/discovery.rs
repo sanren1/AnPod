@@ -1,6 +1,8 @@
 use crate::network_interface::Ipv4Interface;
 use getrandom::fill;
+use hmac::{Hmac, Mac};
 use serde::Serialize;
+use sha2::Sha256;
 use std::{
     collections::VecDeque,
     io,
@@ -29,11 +31,32 @@ const HOST_PACKET_BYTES: usize = 26;
 const HOST_REQUEST_TTL: Duration = Duration::from_secs(10);
 const HOST_OFFER_TTL: Duration = Duration::from_secs(30);
 
+// Authenticated discovery (v3). The tag identifies which binding a probe is for
+// without revealing the binding identifiers; the MAC proves the sender holds the
+// binding secret. Labels keep these MACs separate from every other use of it.
+const AUTH_VERSION: u8 = 3;
+const AUTH_PROBE: u8 = 6;
+const AUTH_CANDIDATE: u8 = 7;
+const AUTH_FRAME_BYTES: usize = 50;
+const TAG_BYTES: usize = 8;
+const MAC_BYTES: usize = 16;
+const TAG_LABEL: &[u8] = b"anpod-discovery-tag-v3";
+const PROBE_LABEL: &[u8] = b"anpod-probe-v3";
+const CANDIDATE_LABEL: &[u8] = b"anpod-candidate-v3";
+
+/// Binding material needed to authenticate a discovery exchange.
+pub(crate) struct DiscoveryBinding {
+    pub(crate) reference: String,
+    pub(crate) secret: [u8; 32],
+}
+
 /// Unauthenticated network hint. Callers must authenticate it with P5-A before START.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Candidate {
     pub(crate) endpoint: SocketAddr,
+    /// Set only when the reply carried a MAC for this binding.
+    pub(crate) binding_reference: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -238,6 +261,54 @@ fn decode_connect_offer(frame: &[u8]) -> Option<([u8; 16], u16)> {
     Some((frame[8..24].try_into().ok()?, u16::from_be_bytes([frame[24], frame[25]])))
 }
 
+fn hmac_sha256(secret: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
+    for part in parts { mac.update(part); }
+    mac.finalize().into_bytes().into()
+}
+
+pub(crate) fn binding_tag(secret: &[u8; 32]) -> [u8; TAG_BYTES] {
+    hmac_sha256(secret, &[TAG_LABEL])[..TAG_BYTES].try_into().expect("tag length")
+}
+
+fn probe_mac(secret: &[u8; 32], nonce: &[u8; 16], tag: &[u8; TAG_BYTES]) -> [u8; MAC_BYTES] {
+    hmac_sha256(secret, &[PROBE_LABEL, nonce, tag])[..MAC_BYTES].try_into().expect("mac length")
+}
+
+fn candidate_mac(secret: &[u8; 32], nonce: &[u8; 16], tag: &[u8; TAG_BYTES], port: u16) -> [u8; MAC_BYTES] {
+    hmac_sha256(secret, &[CANDIDATE_LABEL, nonce, tag, &port.to_be_bytes()])[..MAC_BYTES].try_into().expect("mac length")
+}
+
+pub(crate) fn encode_auth_probe(secret: &[u8; 32], nonce: [u8; 16]) -> [u8; AUTH_FRAME_BYTES] {
+    let tag = binding_tag(secret);
+    let mut frame = [0; AUTH_FRAME_BYTES];
+    frame[..4].copy_from_slice(MAGIC);
+    frame[4] = AUTH_VERSION;
+    frame[5] = AUTH_PROBE;
+    frame[8..24].copy_from_slice(&nonce);
+    frame[26..34].copy_from_slice(&tag);
+    frame[34..].copy_from_slice(&probe_mac(secret, &nonce, &tag));
+    frame
+}
+
+/// Verifies an authenticated reply against one binding and returns its control port.
+pub(crate) fn decode_auth_candidate(frame: &[u8], secret: &[u8; 32], nonce: &[u8; 16]) -> Option<u16> {
+    if frame.len() != AUTH_FRAME_BYTES || &frame[..4] != MAGIC || frame[4] != AUTH_VERSION
+        || frame[5] != AUTH_CANDIDATE || frame[6..8] != [0, 0] || &frame[8..24] != nonce {
+        return None;
+    }
+    let tag: [u8; TAG_BYTES] = frame[26..34].try_into().ok()?;
+    if tag != binding_tag(secret) { return None; }
+    let port = u16::from_be_bytes([frame[24], frame[25]]);
+    if port == 0 { return None; }
+    if !constant_time_eq(&candidate_mac(secret, nonce, &tag, port), &frame[34..]) { return None; }
+    Some(port)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).fold(0u8, |difference, (a, b)| difference | (a ^ b)) == 0
+}
+
 fn hex_nonce(nonce: &[u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     nonce.iter().flat_map(|byte| [HEX[(byte >> 4) as usize] as char, HEX[(byte & 15) as usize] as char]).collect()
@@ -284,7 +355,7 @@ fn probe_schedule(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Optio
 /// explicit gateway targets of the interface selected by the caller. This function is
 /// never called implicitly.
 pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Option<Ipv4Addr>,
-    timeout: Duration, cancellation: &CancellationToken) -> Result<Vec<Candidate>, String> {
+    bindings: &[DiscoveryBinding], timeout: Duration, cancellation: &CancellationToken) -> Result<Vec<Candidate>, String> {
     let local_valid = interface.address.is_loopback()
         || (interface.address.is_private() && !interface.address.is_link_local());
     if !local_valid || interface.prefix_length == 0 || interface.prefix_length > 32 {
@@ -308,29 +379,49 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
     let mut token = [0u8; 16];
     fill(&mut token).map_err(|_| "Unable to create a fresh discovery probe token.".to_string())?;
     let probe = encode(PROBE, token, 0);
+    let auth_probes: Vec<[u8; AUTH_FRAME_BYTES]> = bindings.iter()
+        .map(|binding| encode_auth_probe(&binding.secret, token)).collect();
     let schedule = probe_schedule(interface, targets, cached);
     let started = Instant::now();
     let mut next_step = 0;
 
     let deadline = Instant::now() + timeout;
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut bytes = [0u8; 128];
     while Instant::now() < deadline {
         if cancellation.is_cancelled() { return Err("Network discovery was cancelled.".into()); }
         while next_step < schedule.len() && started.elapsed() >= schedule[next_step].at {
-            socket.send_to(&probe, SocketAddr::from((schedule[next_step].target, DISCOVERY_PORT)))
+            let target = SocketAddr::from((schedule[next_step].target, DISCOVERY_PORT));
+            socket.send_to(&probe, target)
                 .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
+            for frame in &auth_probes {
+                socket.send_to(frame, target)
+                    .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
+            }
             next_step += 1;
         }
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) => {
                 let SocketAddr::V4(source) = source else { continue; };
                 if source.port() == 0 || !interface.contains(*source.ip()) { continue; }
-                let Some(port) = decode_candidate(&bytes[..length], &token) else { continue; };
+                let frame = &bytes[..length];
+                let (port, binding_reference) = match decode_candidate(frame, &token) {
+                    Some(port) => (port, None),
+                    None => match bindings.iter().find_map(|binding|
+                        decode_auth_candidate(frame, &binding.secret, &token).map(|port| (port, Some(binding.reference.clone())))) {
+                        Some(found) => found,
+                        None => continue,
+                    },
+                };
                 let endpoint = SocketAddr::new((*source.ip()).into(), port);
-                if !candidates.iter().any(|item: &Candidate| item.endpoint == endpoint) {
-                    candidates.push(Candidate { endpoint });
-                    if candidates.len() == MAX_CANDIDATES { break; }
+                match candidates.iter_mut().find(|item| item.endpoint == endpoint) {
+                    // An authenticated reply upgrades a candidate first seen unverified.
+                    Some(existing) if existing.binding_reference.is_none() => existing.binding_reference = binding_reference,
+                    Some(_) => {}
+                    None => {
+                        candidates.push(Candidate { endpoint, binding_reference });
+                        if candidates.len() == MAX_CANDIDATES { break; }
+                    }
                 }
             }
             Err(error) if is_poll_timeout(&error) => {}
@@ -431,6 +522,32 @@ mod tests {
         listener.attempt_cancel = Some(attempt.clone());
         drop(listener);
         assert!(attempt.is_cancelled(), "stopping discovery cancels an in-flight authentication attempt");
+    }
+
+    #[test]
+    fn authenticated_discovery_matches_the_shared_protocol_vector() {
+        fn hex(value: &str) -> Vec<u8> {
+            (0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap()).collect()
+        }
+        let secret: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let nonce: [u8; 16] = std::array::from_fn(|index| index as u8);
+        assert_eq!(binding_tag(&secret).to_vec(), hex("26414e36e4dc63e6"));
+        let probe = encode_auth_probe(&secret, nonce);
+        assert_eq!(probe[34..].to_vec(), hex("83ec229f58b0088dd60051cb736e6db8"));
+        assert_eq!(probe[26..34].to_vec(), hex("26414e36e4dc63e6"));
+
+        let mut candidate = [0u8; AUTH_FRAME_BYTES];
+        candidate[..4].copy_from_slice(MAGIC);
+        candidate[4] = AUTH_VERSION;
+        candidate[5] = AUTH_CANDIDATE;
+        candidate[8..24].copy_from_slice(&nonce);
+        candidate[24..26].copy_from_slice(&41_234u16.to_be_bytes());
+        candidate[26..34].copy_from_slice(&binding_tag(&secret));
+        candidate[34..].copy_from_slice(&hex("a82f6568b5e977d37c46b22155edcba4"));
+        assert_eq!(decode_auth_candidate(&candidate, &secret, &nonce), Some(41_234));
+        candidate[40] ^= 1;
+        assert_eq!(decode_auth_candidate(&candidate, &secret, &nonce), None, "a tampered MAC is rejected");
+        assert_eq!(decode_auth_candidate(&candidate, &[9u8; 32], &nonce), None, "another binding cannot verify it");
     }
 
     #[test]

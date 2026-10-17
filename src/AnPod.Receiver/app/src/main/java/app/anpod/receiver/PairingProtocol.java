@@ -49,6 +49,8 @@ final class PairingProtocol {
             this.secret = secret.clone();
         }
 
+        byte[] discoverySecret() { return secret.clone(); }
+
         static BindingMaterial generate() {
             byte[] random = new byte[64];
             RANDOM.nextBytes(random);

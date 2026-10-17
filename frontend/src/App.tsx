@@ -45,7 +45,7 @@ type ReceiverStatus = {
   installed: boolean; versionName: string | null; versionCode: number | null; serviceActive: boolean;
   foreground: boolean; healthy: boolean; audioActive: boolean; error: string | null; message: string;
 };
-type NetworkCandidate = { endpoint: string };
+type NetworkCandidate = { endpoint: string; bindingReference: string | null };
 type ReceiverCapabilities = {
   controlMajor: number; audioMajor: number; managementCompatible: boolean;
   audioCompatible: boolean; compatible: boolean; capabilityBits: number; versionCode: number;
@@ -1511,7 +1511,7 @@ function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoice
             {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{zhCN.network.invalidSubnetConnectDisabled}</small>}
             <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
             <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{zhCN.network.searchAddressAgain}</button>
-            {candidates.length > 0 && <div className="candidate-list" aria-label={zhCN.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span></button>)}</div>}
+            {candidates.length > 0 && <div className="candidate-list" aria-label={zhCN.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>{candidate.bindingReference ? zhCN.network.verifiedCandidate : zhCN.network.unverifiedCandidate}</small></button>)}</div>}
           </>}
           {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />{zhCN.network.refreshInterfacesAndBindings}</button>}
           {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? zhCN.network.processing : backgroundStartMode ? zhCN.app.backgroundStartConnect : method === "bootstrap" ? zhCN.network.firstBindAndConnect : zhCN.network.connectReceiverDirectly}</button>}

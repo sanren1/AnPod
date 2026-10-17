@@ -118,6 +118,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     private volatile Thread worker;
     private volatile P5cDiscovery discovery;
     private P5cDiscovery.SocketBinder discoverySocketBinder;
+    private byte[] bindingSecret;
     private volatile String failure = "";
     private volatile boolean shutdownRequested;
     private boolean loopbackConnectionAccepted;
@@ -234,11 +235,16 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     synchronized void startDiscovery(P5cDiscovery.SocketBinder socketBinder) throws IOException {
+        startDiscovery(socketBinder, bindingSecret);
+    }
+
+    synchronized void startDiscovery(P5cDiscovery.SocketBinder socketBinder, byte[] discoverySecret) throws IOException {
         if (worker == null) throw new IllegalStateException("P5-C control listener must be started first");
         if (socketBinder != null) discoverySocketBinder = socketBinder;
+        if (discoverySecret != null) bindingSecret = discoverySecret.clone();
         if (authenticatedSocket != null || discovery != null) return;
         P5cDiscovery service = P5cDiscovery.open(listener.getInetAddress(), discoveryPrefixLength,
-                listener.getLocalPort(), discoverySocketBinder);
+                listener.getLocalPort(), discoverySocketBinder, bindingSecret);
         service.start();
         discovery = service;
     }
