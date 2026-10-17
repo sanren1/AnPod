@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -68,6 +69,15 @@ public final class ReceiverServiceRobolectricTest {
 
         service.authorization.handleDecision(new Intent(), 1);
         service.authorization.cancel();
+    }
+
+    @Test
+    public void idleStopIsRejected() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
+
+        assertFalse(binder.stop("unknown-owner"));
+        assertFalse(service.stopFromUi("unknown-owner", 1L));
     }
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
