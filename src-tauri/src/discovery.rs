@@ -96,12 +96,18 @@ impl HostOfferListener {
     fn start_inner(interface: &Ipv4Interface, allow_loopback: bool) -> Result<Self, String> {
         if !((interface.address.is_private() && !interface.address.is_link_local())
             || (allow_loopback && interface.address.is_loopback()))
-            || interface.prefix_length == 0 || interface.prefix_length > 32 {
+            || interface.prefix_length == 0
+            || interface.prefix_length > 32
+        {
             return Err("Select one active private IPv4 interface before allowing wireless UDP connections.".into());
         }
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)))
-            .map_err(|_| "Unable to listen for connection requests on the selected interface.".to_string())?;
-        socket.set_read_timeout(Some(IO_POLL)).map_err(|_| "Unable to configure selected-interface discovery polling.".to_string())?;
+            .map_err(|_| {
+                "Unable to listen for connection requests on the selected interface.".to_string()
+            })?;
+        socket
+            .set_read_timeout(Some(IO_POLL))
+            .map_err(|_| "Unable to configure selected-interface discovery polling.".to_string())?;
         let response_socket = UdpSocket::bind(SocketAddr::from((interface.address, 0)))
             .map_err(|_| "Unable to prepare replies on the selected interface.".to_string())?;
         let local = interface.address;
@@ -109,13 +115,35 @@ impl HostOfferListener {
         let cancellation = CancellationToken::new();
         let worker_cancel = cancellation.clone();
         let snapshot = Arc::new(Mutex::new(HostDiscoverySnapshot {
-            active: true, automatic_binding: None, interface_address: Some(local), interface_prefix_length: Some(prefix), offers: Vec::new(),
+            active: true,
+            automatic_binding: None,
+            interface_address: Some(local),
+            interface_prefix_length: Some(prefix),
+            offers: Vec::new(),
         }));
         let worker_snapshot = snapshot.clone();
-        let worker = thread::Builder::new().name("AnPod selected-interface connection offers".into())
-            .spawn(move || run_host_offer_listener(socket, response_socket, local, prefix, worker_cancel, worker_snapshot))
-            .map_err(|error| format!("Unable to start selected-interface offer listener: {error}"))?;
-        Ok(Self { automatic_binding: None, attempt_cancel: None, cancellation, snapshot, worker: Some(worker) })
+        let worker = thread::Builder::new()
+            .name("AnPod selected-interface connection offers".into())
+            .spawn(move || {
+                run_host_offer_listener(
+                    socket,
+                    response_socket,
+                    local,
+                    prefix,
+                    worker_cancel,
+                    worker_snapshot,
+                )
+            })
+            .map_err(|error| {
+                format!("Unable to start selected-interface offer listener: {error}")
+            })?;
+        Ok(Self {
+            automatic_binding: None,
+            attempt_cancel: None,
+            cancellation,
+            snapshot,
+            worker: Some(worker),
+        })
     }
 
     #[cfg(test)]
@@ -124,7 +152,10 @@ impl HostOfferListener {
     }
 
     pub(crate) fn snapshot(&self) -> HostDiscoverySnapshot {
-        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .expect("host discovery snapshot lock poisoned");
         discard_expired_offers(&mut snapshot.offers);
         let mut result = snapshot.clone();
         result.automatic_binding = self.automatic_binding.clone();
@@ -132,13 +163,21 @@ impl HostOfferListener {
     }
 
     pub(crate) fn interface_address(&self) -> Option<Ipv4Addr> {
-        self.snapshot.lock().expect("host discovery snapshot lock poisoned").interface_address
+        self.snapshot
+            .lock()
+            .expect("host discovery snapshot lock poisoned")
+            .interface_address
     }
 
-    pub(crate) fn cancellation(&self) -> CancellationToken { self.cancellation.clone() }
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 
     pub(crate) fn take_offer(&self, id: &str) -> Option<ConnectionOffer> {
-        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .expect("host discovery snapshot lock poisoned");
         discard_expired_offers(&mut snapshot.offers);
         let index = snapshot.offers.iter().position(|offer| offer.id == id)?;
         Some(snapshot.offers.remove(index))
@@ -147,12 +186,19 @@ impl HostOfferListener {
 
 impl Drop for HostOfferListener {
     fn drop(&mut self) {
-        if let Some(token) = self.attempt_cancel.take() { token.cancel(); }
+        if let Some(token) = self.attempt_cancel.take() {
+            token.cancel();
+        }
         self.cancellation.cancel();
         if let Some(worker) = self.worker.take() {
-            if worker.thread().id() != thread::current().id() { let _ = worker.join(); }
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
         }
-        let mut snapshot = self.snapshot.lock().expect("host discovery snapshot lock poisoned");
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .expect("host discovery snapshot lock poisoned");
         snapshot.active = false;
         snapshot.interface_address = None;
         snapshot.interface_prefix_length = None;
@@ -165,37 +211,66 @@ fn discard_expired_offers(offers: &mut Vec<ConnectionOffer>) {
     offers.retain(|offer| offer.expires_at > now);
 }
 
-fn run_host_offer_listener(socket: UdpSocket, response_socket: UdpSocket, local: Ipv4Addr, prefix: u8,
-    cancellation: CancellationToken, snapshot: Arc<Mutex<HostDiscoverySnapshot>>) {
+fn run_host_offer_listener(
+    socket: UdpSocket,
+    response_socket: UdpSocket,
+    local: Ipv4Addr,
+    prefix: u8,
+    cancellation: CancellationToken,
+    snapshot: Arc<Mutex<HostDiscoverySnapshot>>,
+) {
     let mut pending_nonces: VecDeque<([u8; 16], Ipv4Addr, Instant)> = VecDeque::new();
     let mut used_nonces: VecDeque<([u8; 16], Instant)> = VecDeque::new();
     let mut bytes = [0; 128];
     while !cancellation.is_cancelled() {
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) => {
-                let SocketAddr::V4(source) = source else { continue; };
-                if source.port() != DISCOVERY_PORT || !ipv4_in_prefix(local, prefix, *source.ip()) { continue; }
+                let SocketAddr::V4(source) = source else {
+                    continue;
+                };
+                if source.port() != DISCOVERY_PORT || !ipv4_in_prefix(local, prefix, *source.ip()) {
+                    continue;
+                }
                 let packet = &bytes[..length];
                 if let Some(nonce) = decode_host_probe(packet) {
                     pending_nonces.retain(|(_, _, at)| at.elapsed() <= HOST_REQUEST_TTL);
                     used_nonces.retain(|(_, at)| at.elapsed() <= HOST_OFFER_TTL);
-                    if used_nonces.iter().any(|(used, _)| used == &nonce) { continue; }
-                    if !pending_nonces.iter().any(|(pending, _, _)| pending == &nonce) {
-                        if pending_nonces.len() == MAX_CANDIDATES || used_nonces.len() == MAX_CANDIDATES { continue; }
+                    if used_nonces.iter().any(|(used, _)| used == &nonce) {
+                        continue;
+                    }
+                    if !pending_nonces
+                        .iter()
+                        .any(|(pending, _, _)| pending == &nonce)
+                    {
+                        if pending_nonces.len() == MAX_CANDIDATES
+                            || used_nonces.len() == MAX_CANDIDATES
+                        {
+                            continue;
+                        }
                         pending_nonces.push_back((nonce, *source.ip(), Instant::now()));
                     }
                     let response = encode_host_candidate(nonce, DISCOVERY_PORT);
                     let _ = response_socket.send_to(&response, source);
                     continue;
                 }
-                let Some((nonce, port)) = decode_connect_offer(packet) else { continue; };
+                let Some((nonce, port)) = decode_connect_offer(packet) else {
+                    continue;
+                };
                 pending_nonces.retain(|(_, _, at)| at.elapsed() <= HOST_REQUEST_TTL);
                 used_nonces.retain(|(_, at)| at.elapsed() <= HOST_OFFER_TTL);
-                if port == 0 || used_nonces.iter().any(|(used, _)| used == &nonce) { continue; }
-                let Some(index) = pending_nonces.iter().position(|(pending, address, _)|
-                    pending == &nonce && address == source.ip()) else { continue; };
+                if port == 0 || used_nonces.iter().any(|(used, _)| used == &nonce) {
+                    continue;
+                }
+                let Some(index) = pending_nonces
+                    .iter()
+                    .position(|(pending, address, _)| pending == &nonce && address == source.ip())
+                else {
+                    continue;
+                };
                 pending_nonces.remove(index).expect("pending nonce index");
-                if used_nonces.len() == MAX_CANDIDATES { continue; }
+                if used_nonces.len() == MAX_CANDIDATES {
+                    continue;
+                }
                 let received_at = Instant::now();
                 used_nonces.push_back((nonce, received_at));
                 let offer = ConnectionOffer {
@@ -204,10 +279,14 @@ fn run_host_offer_listener(socket: UdpSocket, response_socket: UdpSocket, local:
                     endpoint: SocketAddr::new((*source.ip()).into(), port),
                     expires_at: received_at + HOST_OFFER_TTL,
                 };
-                let mut current = snapshot.lock().expect("host discovery snapshot lock poisoned");
+                let mut current = snapshot
+                    .lock()
+                    .expect("host discovery snapshot lock poisoned");
                 discard_expired_offers(&mut current.offers);
                 if current.active && !current.offers.iter().any(|item| item.id == offer.id) {
-                    if current.offers.len() == MAX_CANDIDATES { continue; }
+                    if current.offers.len() == MAX_CANDIDATES {
+                        continue;
+                    }
                     current.offers.push(offer);
                 }
             }
@@ -215,21 +294,31 @@ fn run_host_offer_listener(socket: UdpSocket, response_socket: UdpSocket, local:
             Err(_) => break,
         }
     }
-    let mut current = snapshot.lock().expect("host discovery snapshot lock poisoned");
+    let mut current = snapshot
+        .lock()
+        .expect("host discovery snapshot lock poisoned");
     current.active = false;
     current.interface_address = None;
     current.interface_prefix_length = None;
 }
 
 fn ipv4_in_prefix(local: Ipv4Addr, prefix: u8, remote: Ipv4Addr) -> bool {
-    if prefix == 0 || prefix > 32 { return false; }
-    let mask = if prefix == 32 { u32::MAX } else { u32::MAX << (32 - prefix) };
+    if prefix == 0 || prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     u32::from(local) & mask == u32::from(remote) & mask
 }
 
 fn encode_host_probe(nonce: [u8; 16]) -> [u8; HOST_PROBE_BYTES] {
     let mut frame = [0; HOST_PROBE_BYTES];
-    frame[..4].copy_from_slice(MAGIC); frame[4] = V2_VERSION; frame[5] = HOST_PROBE;
+    frame[..4].copy_from_slice(MAGIC);
+    frame[4] = V2_VERSION;
+    frame[5] = HOST_PROBE;
     frame[8..24].copy_from_slice(&nonce);
     frame
 }
@@ -238,45 +327,82 @@ fn encode_host_candidate(nonce: [u8; 16], port: u16) -> [u8; HOST_PACKET_BYTES] 
     encode_host_packet(HOST_CANDIDATE, nonce, port)
 }
 
-pub(crate) fn encode_connect_offer(nonce: [u8; 16], receiver_control_port: u16) -> [u8; HOST_PACKET_BYTES] {
+pub(crate) fn encode_connect_offer(
+    nonce: [u8; 16],
+    receiver_control_port: u16,
+) -> [u8; HOST_PACKET_BYTES] {
     encode_host_packet(CONNECT_OFFER, nonce, receiver_control_port)
 }
 
 fn encode_host_packet(kind: u8, nonce: [u8; 16], port: u16) -> [u8; HOST_PACKET_BYTES] {
     let mut frame = [0; HOST_PACKET_BYTES];
-    frame[..4].copy_from_slice(MAGIC); frame[4] = V2_VERSION; frame[5] = kind;
-    frame[8..24].copy_from_slice(&nonce); frame[24..].copy_from_slice(&port.to_be_bytes());
+    frame[..4].copy_from_slice(MAGIC);
+    frame[4] = V2_VERSION;
+    frame[5] = kind;
+    frame[8..24].copy_from_slice(&nonce);
+    frame[24..].copy_from_slice(&port.to_be_bytes());
     frame
 }
 
 fn decode_host_probe(frame: &[u8]) -> Option<[u8; 16]> {
-    if frame.len() != HOST_PROBE_BYTES || &frame[..4] != MAGIC || frame[4] != V2_VERSION
-        || frame[5] != HOST_PROBE || frame[6..8] != [0, 0] || frame[8..24].iter().all(|byte| *byte == 0) { return None; }
+    if frame.len() != HOST_PROBE_BYTES
+        || &frame[..4] != MAGIC
+        || frame[4] != V2_VERSION
+        || frame[5] != HOST_PROBE
+        || frame[6..8] != [0, 0]
+        || frame[8..24].iter().all(|byte| *byte == 0)
+    {
+        return None;
+    }
     frame[8..24].try_into().ok()
 }
 
 fn decode_connect_offer(frame: &[u8]) -> Option<([u8; 16], u16)> {
-    if frame.len() != HOST_PACKET_BYTES || &frame[..4] != MAGIC || frame[4] != V2_VERSION
-        || frame[5] != CONNECT_OFFER || frame[6..8] != [0, 0] || frame[8..24].iter().all(|byte| *byte == 0) { return None; }
-    Some((frame[8..24].try_into().ok()?, u16::from_be_bytes([frame[24], frame[25]])))
+    if frame.len() != HOST_PACKET_BYTES
+        || &frame[..4] != MAGIC
+        || frame[4] != V2_VERSION
+        || frame[5] != CONNECT_OFFER
+        || frame[6..8] != [0, 0]
+        || frame[8..24].iter().all(|byte| *byte == 0)
+    {
+        return None;
+    }
+    Some((
+        frame[8..24].try_into().ok()?,
+        u16::from_be_bytes([frame[24], frame[25]]),
+    ))
 }
 
 fn hmac_sha256(secret: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
-    for part in parts { mac.update(part); }
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
+    for part in parts {
+        mac.update(part);
+    }
     mac.finalize().into_bytes().into()
 }
 
 pub(crate) fn binding_tag(secret: &[u8; 32]) -> [u8; TAG_BYTES] {
-    hmac_sha256(secret, &[TAG_LABEL])[..TAG_BYTES].try_into().expect("tag length")
+    hmac_sha256(secret, &[TAG_LABEL])[..TAG_BYTES]
+        .try_into()
+        .expect("tag length")
 }
 
 fn probe_mac(secret: &[u8; 32], nonce: &[u8; 16], tag: &[u8; TAG_BYTES]) -> [u8; MAC_BYTES] {
-    hmac_sha256(secret, &[PROBE_LABEL, nonce, tag])[..MAC_BYTES].try_into().expect("mac length")
+    hmac_sha256(secret, &[PROBE_LABEL, nonce, tag])[..MAC_BYTES]
+        .try_into()
+        .expect("mac length")
 }
 
-fn candidate_mac(secret: &[u8; 32], nonce: &[u8; 16], tag: &[u8; TAG_BYTES], port: u16) -> [u8; MAC_BYTES] {
-    hmac_sha256(secret, &[CANDIDATE_LABEL, nonce, tag, &port.to_be_bytes()])[..MAC_BYTES].try_into().expect("mac length")
+fn candidate_mac(
+    secret: &[u8; 32],
+    nonce: &[u8; 16],
+    tag: &[u8; TAG_BYTES],
+    port: u16,
+) -> [u8; MAC_BYTES] {
+    hmac_sha256(secret, &[CANDIDATE_LABEL, nonce, tag, &port.to_be_bytes()])[..MAC_BYTES]
+        .try_into()
+        .expect("mac length")
 }
 
 pub(crate) fn encode_auth_probe(secret: &[u8; 32], nonce: [u8; 16]) -> [u8; AUTH_FRAME_BYTES] {
@@ -292,35 +418,71 @@ pub(crate) fn encode_auth_probe(secret: &[u8; 32], nonce: [u8; 16]) -> [u8; AUTH
 }
 
 /// Verifies an authenticated reply against one binding and returns its control port.
-pub(crate) fn decode_auth_candidate(frame: &[u8], secret: &[u8; 32], nonce: &[u8; 16]) -> Option<u16> {
-    if frame.len() != AUTH_FRAME_BYTES || &frame[..4] != MAGIC || frame[4] != AUTH_VERSION
-        || frame[5] != AUTH_CANDIDATE || frame[6..8] != [0, 0] || &frame[8..24] != nonce {
+pub(crate) fn decode_auth_candidate(
+    frame: &[u8],
+    secret: &[u8; 32],
+    nonce: &[u8; 16],
+) -> Option<u16> {
+    if frame.len() != AUTH_FRAME_BYTES
+        || &frame[..4] != MAGIC
+        || frame[4] != AUTH_VERSION
+        || frame[5] != AUTH_CANDIDATE
+        || frame[6..8] != [0, 0]
+        || &frame[8..24] != nonce
+    {
         return None;
     }
     let tag: [u8; TAG_BYTES] = frame[26..34].try_into().ok()?;
-    if !constant_time_eq(&tag, &binding_tag(secret)) { return None; }
+    if !constant_time_eq(&tag, &binding_tag(secret)) {
+        return None;
+    }
     let port = u16::from_be_bytes([frame[24], frame[25]]);
-    if port == 0 { return None; }
-    if !constant_time_eq(&candidate_mac(secret, nonce, &tag, port), &frame[34..]) { return None; }
+    if port == 0 {
+        return None;
+    }
+    if !constant_time_eq(&candidate_mac(secret, nonce, &tag, port), &frame[34..]) {
+        return None;
+    }
     Some(port)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len() && left.iter().zip(right).fold(0u8, |difference, (a, b)| difference | (a ^ b)) == 0
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
 }
 
 fn hex_nonce(nonce: &[u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    nonce.iter().flat_map(|byte| [HEX[(byte >> 4) as usize] as char, HEX[(byte & 15) as usize] as char]).collect()
+    nonce
+        .iter()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 15) as usize] as char,
+            ]
+        })
+        .collect()
 }
 
 pub(crate) fn probe_targets(interface: &Ipv4Interface) -> Vec<Ipv4Addr> {
     let mut targets = Vec::new();
-    if let Some(gateway) = interface.gateways.iter().find(|gateway| interface.contains(**gateway)) {
-        if !targets.contains(gateway) { targets.push(*gateway); }
+    if let Some(gateway) = interface
+        .gateways
+        .iter()
+        .find(|gateway| interface.contains(**gateway))
+    {
+        if !targets.contains(gateway) {
+            targets.push(*gateway);
+        }
     }
     if let Some(broadcast) = interface.directed_broadcast() {
-        if !targets.contains(&broadcast) { targets.push(broadcast); }
+        if !targets.contains(&broadcast) {
+            targets.push(broadcast);
+        }
     }
     targets
 }
@@ -335,17 +497,42 @@ struct ProbeStep {
 /// Unicast to the last known address first, then fall back to the gateway and
 /// directed broadcast. Broadcasts repeat three times because a single datagram
 /// is routinely lost on Wi-Fi; the cached address is retried once before that.
-fn probe_schedule(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Option<Ipv4Addr>) -> Vec<ProbeStep> {
-    let cached = cached.filter(|address|
-        *address != interface.address && interface.contains(*address) && !address.is_broadcast() && !address.is_unspecified());
-    let broadcast_start = if cached.is_some() { Duration::from_millis(250) } else { Duration::ZERO };
+fn probe_schedule(
+    interface: &Ipv4Interface,
+    targets: &[Ipv4Addr],
+    cached: Option<Ipv4Addr>,
+) -> Vec<ProbeStep> {
+    let cached = cached.filter(|address| {
+        *address != interface.address
+            && interface.contains(*address)
+            && !address.is_broadcast()
+            && !address.is_unspecified()
+    });
+    let broadcast_start = if cached.is_some() {
+        Duration::from_millis(250)
+    } else {
+        Duration::ZERO
+    };
     let mut steps = Vec::new();
     if let Some(address) = cached {
-        steps.push(ProbeStep { target: address, at: Duration::ZERO });
-        steps.push(ProbeStep { target: address, at: Duration::from_millis(250) });
+        steps.push(ProbeStep {
+            target: address,
+            at: Duration::ZERO,
+        });
+        steps.push(ProbeStep {
+            target: address,
+            at: Duration::from_millis(250),
+        });
     }
-    for offset in [broadcast_start, broadcast_start + Duration::from_millis(350), broadcast_start + Duration::from_millis(700)] {
-        steps.extend(targets.iter().map(|target| ProbeStep { target: *target, at: offset }));
+    for offset in [
+        broadcast_start,
+        broadcast_start + Duration::from_millis(350),
+        broadcast_start + Duration::from_millis(700),
+    ] {
+        steps.extend(targets.iter().map(|target| ProbeStep {
+            target: *target,
+            at: offset,
+        }));
     }
     steps.sort_by_key(|step| step.at);
     steps
@@ -354,12 +541,21 @@ fn probe_schedule(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Optio
 /// Sends a correlated probe to the cached address first, then to the broadcast and/or
 /// explicit gateway targets of the interface selected by the caller. This function is
 /// never called implicitly.
-pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Addr], cached: Option<Ipv4Addr>,
-    bindings: &[DiscoveryBinding], timeout: Duration, cancellation: &CancellationToken) -> Result<Vec<Candidate>, String> {
+pub(crate) fn discover_on_interface(
+    interface: &Ipv4Interface,
+    targets: &[Ipv4Addr],
+    cached: Option<Ipv4Addr>,
+    bindings: &[DiscoveryBinding],
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Candidate>, String> {
     let local_valid = interface.address.is_loopback()
         || (interface.address.is_private() && !interface.address.is_link_local());
     if !local_valid || interface.prefix_length == 0 || interface.prefix_length > 32 {
-        return Err("Selected IPv4 interface details are unavailable or outside the private LAN scope.".into());
+        return Err(
+            "Selected IPv4 interface details are unavailable or outside the private LAN scope."
+                .into(),
+        );
     }
     if timeout.is_zero() || timeout > MAX_DISCOVERY_TIMEOUT {
         return Err("IPv4 discovery is limited to a two-second cancellable window.".into());
@@ -368,19 +564,31 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
         return Err("Select one broadcast target and at most one explicit gateway target.".into());
     }
     let allowed_targets = probe_targets(interface);
-    if targets.iter().any(|target| !allowed_targets.contains(target)) {
-        return Err("Discovery targets must be the selected interface's gateway or directed broadcast.".into());
+    if targets
+        .iter()
+        .any(|target| !allowed_targets.contains(target))
+    {
+        return Err(
+            "Discovery targets must be the selected interface's gateway or directed broadcast."
+                .into(),
+        );
     }
     let socket = UdpSocket::bind(SocketAddr::from((interface.address, 0)))
         .map_err(|_| "Selected network interface is unavailable for discovery.".to_string())?;
-    socket.set_broadcast(true).map_err(|_| "Unable to enable bounded UDP discovery broadcast.".to_string())?;
-    socket.set_read_timeout(Some(IO_POLL)).map_err(|_| "Unable to configure discovery receive polling.".to_string())?;
+    socket
+        .set_broadcast(true)
+        .map_err(|_| "Unable to enable bounded UDP discovery broadcast.".to_string())?;
+    socket
+        .set_read_timeout(Some(IO_POLL))
+        .map_err(|_| "Unable to configure discovery receive polling.".to_string())?;
 
     let mut token = [0u8; 16];
     fill(&mut token).map_err(|_| "Unable to create a fresh discovery probe token.".to_string())?;
     let probe = encode(PROBE, token, 0);
-    let auth_probes: Vec<[u8; AUTH_FRAME_BYTES]> = bindings.iter()
-        .map(|binding| encode_auth_probe(&binding.secret, token)).collect();
+    let auth_probes: Vec<[u8; AUTH_FRAME_BYTES]> = bindings
+        .iter()
+        .map(|binding| encode_auth_probe(&binding.secret, token))
+        .collect();
     let schedule = probe_schedule(interface, targets, cached);
     let started = Instant::now();
     let mut next_step = 0;
@@ -389,26 +597,36 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut bytes = [0u8; 128];
     while Instant::now() < deadline {
-        if cancellation.is_cancelled() { return Err("Network discovery was cancelled.".into()); }
+        if cancellation.is_cancelled() {
+            return Err("Network discovery was cancelled.".into());
+        }
         while next_step < schedule.len() && started.elapsed() >= schedule[next_step].at {
             let target = SocketAddr::from((schedule[next_step].target, DISCOVERY_PORT));
-            socket.send_to(&probe, target)
-                .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
+            socket.send_to(&probe, target).map_err(|_| {
+                "Unable to send a discovery probe on the selected interface.".to_string()
+            })?;
             for frame in &auth_probes {
-                socket.send_to(frame, target)
-                    .map_err(|_| "Unable to send a discovery probe on the selected interface.".to_string())?;
+                socket.send_to(frame, target).map_err(|_| {
+                    "Unable to send a discovery probe on the selected interface.".to_string()
+                })?;
             }
             next_step += 1;
         }
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) => {
-                let SocketAddr::V4(source) = source else { continue; };
-                if source.port() == 0 || !interface.contains(*source.ip()) { continue; }
+                let SocketAddr::V4(source) = source else {
+                    continue;
+                };
+                if source.port() == 0 || !interface.contains(*source.ip()) {
+                    continue;
+                }
                 let frame = &bytes[..length];
                 let (port, binding_reference) = match decode_candidate(frame, &token) {
                     Some(port) => (port, None),
-                    None => match bindings.iter().find_map(|binding|
-                        decode_auth_candidate(frame, &binding.secret, &token).map(|port| (port, Some(binding.reference.clone())))) {
+                    None => match bindings.iter().find_map(|binding| {
+                        decode_auth_candidate(frame, &binding.secret, &token)
+                            .map(|port| (port, Some(binding.reference.clone())))
+                    }) {
                         Some(found) => found,
                         None => continue,
                     },
@@ -416,16 +634,25 @@ pub(crate) fn discover_on_interface(interface: &Ipv4Interface, targets: &[Ipv4Ad
                 let endpoint = SocketAddr::new((*source.ip()).into(), port);
                 match candidates.iter_mut().find(|item| item.endpoint == endpoint) {
                     // An authenticated reply upgrades a candidate first seen unverified.
-                    Some(existing) if existing.binding_reference.is_none() => existing.binding_reference = binding_reference,
+                    Some(existing) if existing.binding_reference.is_none() => {
+                        existing.binding_reference = binding_reference
+                    }
                     Some(_) => {}
                     None => {
-                        candidates.push(Candidate { endpoint, binding_reference });
-                        if candidates.len() == MAX_CANDIDATES { break; }
+                        candidates.push(Candidate {
+                            endpoint,
+                            binding_reference,
+                        });
+                        if candidates.len() == MAX_CANDIDATES {
+                            break;
+                        }
                     }
                 }
             }
             Err(error) if is_poll_timeout(&error) => {}
-            Err(_) if cancellation.is_cancelled() => return Err("Network discovery was cancelled.".into()),
+            Err(_) if cancellation.is_cancelled() => {
+                return Err("Network discovery was cancelled.".into())
+            }
             // Windows reports ICMP port-unreachable for an earlier UDP response as a
             // connection reset on the next receive; it is not a listener failure.
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
@@ -449,8 +676,13 @@ fn encode(kind: u8, token: [u8; 16], control_port: u16) -> [u8; FRAME_BYTES] {
 }
 
 fn decode_candidate(frame: &[u8], token: &[u8; 16]) -> Option<u16> {
-    if frame.len() != FRAME_BYTES || &frame[..4] != MAGIC || frame[4] != VERSION
-        || frame[5] != CANDIDATE || frame[6..8] != [0, 0] || &frame[8..24] != token {
+    if frame.len() != FRAME_BYTES
+        || &frame[..4] != MAGIC
+        || frame[4] != VERSION
+        || frame[5] != CANDIDATE
+        || frame[6..8] != [0, 0]
+        || &frame[8..24] != token
+    {
         return None;
     }
     let port = u16::from_be_bytes([frame[24], frame[25]]);
@@ -458,7 +690,10 @@ fn decode_candidate(frame: &[u8], token: &[u8; 16]) -> Option<u16> {
 }
 
 fn is_poll_timeout(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(test)]
@@ -477,25 +712,58 @@ mod tests {
         let receiver_address = Ipv4Addr::new(127, 0, 0, 1);
         let interface = interface_for_test(host_address, 24);
         let mut listener = HostOfferListener::start_loopback_for_test(&interface).unwrap();
-        let receiver = UdpSocket::bind(SocketAddr::from((receiver_address, DISCOVERY_PORT))).unwrap();
-        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let receiver =
+            UdpSocket::bind(SocketAddr::from((receiver_address, DISCOVERY_PORT))).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let nonce = [0xA7; 16];
-        receiver.send_to(&encode_host_probe(nonce), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        receiver
+            .send_to(
+                &encode_host_probe(nonce),
+                SocketAddr::from((host_address, DISCOVERY_PORT)),
+            )
+            .unwrap();
         let mut response = [0; 64];
         let (length, source) = receiver.recv_from(&mut response).unwrap();
         assert_eq!(source.ip(), host_address);
-        assert_ne!(source.port(), 0, "candidate reply uses an ephemeral selected-interface port");
-        assert_eq!(response[..length], encode_host_candidate(nonce, DISCOVERY_PORT));
+        assert_ne!(
+            source.port(),
+            0,
+            "candidate reply uses an ephemeral selected-interface port"
+        );
+        assert_eq!(
+            response[..length],
+            encode_host_candidate(nonce, DISCOVERY_PORT)
+        );
 
-        receiver.send_to(&encode_connect_offer([0xA8; 16], 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        receiver
+            .send_to(
+                &encode_connect_offer([0xA8; 16], 41_001),
+                SocketAddr::from((host_address, DISCOVERY_PORT)),
+            )
+            .unwrap();
         thread::sleep(Duration::from_millis(80));
-        assert!(listener.snapshot().offers.is_empty(), "unrelated nonce must not create a connection request");
-        receiver.send_to(&encode_connect_offer(nonce, 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        assert!(
+            listener.snapshot().offers.is_empty(),
+            "unrelated nonce must not create a connection request"
+        );
+        receiver
+            .send_to(
+                &encode_connect_offer(nonce, 41_001),
+                SocketAddr::from((host_address, DISCOVERY_PORT)),
+            )
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         let offer = loop {
             let snapshot = listener.snapshot();
-            if let Some(offer) = snapshot.offers.into_iter().next() { break offer; }
-            assert!(Instant::now() < deadline, "correlated connection request was not captured");
+            if let Some(offer) = snapshot.offers.into_iter().next() {
+                break offer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "correlated connection request was not captured"
+            );
             thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(offer.endpoint, SocketAddr::from((receiver_address, 41_001)));
@@ -503,37 +771,67 @@ mod tests {
         assert!(offer.expires_at.duration_since(Instant::now()) > HOST_REQUEST_TTL,
             "the offer window starts when CONNECT_OFFER arrives, separately from the search nonce window");
         assert!(listener.take_offer(&offer.id).is_some());
-        assert!(listener.take_offer(&offer.id).is_none(), "a connection request is accepted at most once");
+        assert!(
+            listener.take_offer(&offer.id).is_none(),
+            "a connection request is accepted at most once"
+        );
         {
             let mut current = listener.snapshot.lock().unwrap();
             current.offers.push(ConnectionOffer {
                 nonce: [1; 16],
-                id: "expired".into(), endpoint: SocketAddr::from((receiver_address, 41_002)),
+                id: "expired".into(),
+                endpoint: SocketAddr::from((receiver_address, 41_002)),
                 expires_at: Instant::now() - Duration::from_millis(1),
             });
         }
-        assert!(listener.snapshot().offers.iter().all(|item| item.id != "expired"),
-            "expired offers must disappear from snapshots");
-        assert!(listener.take_offer("expired").is_none(), "expired offers cannot be accepted");
-        receiver.send_to(&encode_connect_offer(nonce, 41_001), SocketAddr::from((host_address, DISCOVERY_PORT))).unwrap();
+        assert!(
+            listener
+                .snapshot()
+                .offers
+                .iter()
+                .all(|item| item.id != "expired"),
+            "expired offers must disappear from snapshots"
+        );
+        assert!(
+            listener.take_offer("expired").is_none(),
+            "expired offers cannot be accepted"
+        );
+        receiver
+            .send_to(
+                &encode_connect_offer(nonce, 41_001),
+                SocketAddr::from((host_address, DISCOVERY_PORT)),
+            )
+            .unwrap();
         thread::sleep(Duration::from_millis(80));
-        assert!(listener.snapshot().offers.is_empty(), "a consumed nonce cannot replay a connection request");
+        assert!(
+            listener.snapshot().offers.is_empty(),
+            "a consumed nonce cannot replay a connection request"
+        );
         let attempt = CancellationToken::new();
         listener.attempt_cancel = Some(attempt.clone());
         drop(listener);
-        assert!(attempt.is_cancelled(), "stopping discovery cancels an in-flight authentication attempt");
+        assert!(
+            attempt.is_cancelled(),
+            "stopping discovery cancels an in-flight authentication attempt"
+        );
     }
 
     #[test]
     fn authenticated_discovery_matches_the_shared_protocol_vector() {
         fn hex(value: &str) -> Vec<u8> {
-            (0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap()).collect()
+            (0..value.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+                .collect()
         }
         let secret: [u8; 32] = std::array::from_fn(|index| index as u8);
         let nonce: [u8; 16] = std::array::from_fn(|index| index as u8);
         assert_eq!(binding_tag(&secret).to_vec(), hex("26414e36e4dc63e6"));
         let probe = encode_auth_probe(&secret, nonce);
-        assert_eq!(probe[34..].to_vec(), hex("83ec229f58b0088dd60051cb736e6db8"));
+        assert_eq!(
+            probe[34..].to_vec(),
+            hex("83ec229f58b0088dd60051cb736e6db8")
+        );
         assert_eq!(probe[26..34].to_vec(), hex("26414e36e4dc63e6"));
 
         let mut candidate = [0u8; AUTH_FRAME_BYTES];
@@ -544,10 +842,21 @@ mod tests {
         candidate[24..26].copy_from_slice(&41_234u16.to_be_bytes());
         candidate[26..34].copy_from_slice(&binding_tag(&secret));
         candidate[34..].copy_from_slice(&hex("a82f6568b5e977d37c46b22155edcba4"));
-        assert_eq!(decode_auth_candidate(&candidate, &secret, &nonce), Some(41_234));
+        assert_eq!(
+            decode_auth_candidate(&candidate, &secret, &nonce),
+            Some(41_234)
+        );
         candidate[40] ^= 1;
-        assert_eq!(decode_auth_candidate(&candidate, &secret, &nonce), None, "a tampered MAC is rejected");
-        assert_eq!(decode_auth_candidate(&candidate, &[9u8; 32], &nonce), None, "another binding cannot verify it");
+        assert_eq!(
+            decode_auth_candidate(&candidate, &secret, &nonce),
+            None,
+            "a tampered MAC is rejected"
+        );
+        assert_eq!(
+            decode_auth_candidate(&candidate, &[9u8; 32], &nonce),
+            None,
+            "another binding cannot verify it"
+        );
     }
 
     #[test]
@@ -556,22 +865,55 @@ mod tests {
         let targets = probe_targets(&interface);
         let cached = Ipv4Addr::new(192, 168, 1, 23);
         let steps = probe_schedule(&interface, &targets, Some(cached));
-        assert_eq!(steps[0], ProbeStep { target: cached, at: Duration::ZERO }, "the cached address is probed first");
-        assert_eq!(steps.iter().filter(|step| step.target == cached).count(), 2, "the unicast round is retried once");
-        let broadcast: Vec<_> = steps.iter().filter(|step| targets.contains(&step.target)).collect();
+        assert_eq!(
+            steps[0],
+            ProbeStep {
+                target: cached,
+                at: Duration::ZERO
+            },
+            "the cached address is probed first"
+        );
+        assert_eq!(
+            steps.iter().filter(|step| step.target == cached).count(),
+            2,
+            "the unicast round is retried once"
+        );
+        let broadcast: Vec<_> = steps
+            .iter()
+            .filter(|step| targets.contains(&step.target))
+            .collect();
         assert_eq!(broadcast.len(), 3, "broadcasts repeat three times");
-        assert!(broadcast.iter().all(|step| step.at >= Duration::from_millis(250)), "broadcast waits for the unicast round");
-        assert!(broadcast.windows(2).all(|pair| pair[0].at < pair[1].at), "broadcast rounds are spaced out");
+        assert!(
+            broadcast
+                .iter()
+                .all(|step| step.at >= Duration::from_millis(250)),
+            "broadcast waits for the unicast round"
+        );
+        assert!(
+            broadcast.windows(2).all(|pair| pair[0].at < pair[1].at),
+            "broadcast rounds are spaced out"
+        );
     }
 
     #[test]
     fn probe_schedule_ignores_a_cached_address_outside_the_interface() {
         let interface = interface_for_test(Ipv4Addr::new(192, 168, 1, 10), 24);
         let targets = probe_targets(&interface);
-        for unusable in [Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::BROADCAST] {
+        for unusable in [
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::BROADCAST,
+        ] {
             let steps = probe_schedule(&interface, &targets, Some(unusable));
-            assert!(steps.iter().all(|step| targets.contains(&step.target)), "{unusable} must not be probed");
-            assert_eq!(steps[0].at, Duration::ZERO, "broadcast starts immediately without a usable cache");
+            assert!(
+                steps.iter().all(|step| targets.contains(&step.target)),
+                "{unusable} must not be probed"
+            );
+            assert_eq!(
+                steps[0].at,
+                Duration::ZERO,
+                "broadcast starts immediately without a usable cache"
+            );
         }
     }
 }

@@ -51,7 +51,9 @@ impl fmt::Display for SecurityError {
 impl std::error::Error for SecurityError {}
 
 impl From<std::io::Error> for SecurityError {
-    fn from(error: std::io::Error) -> Self { Self::Io(error) }
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 /// Shared USB-provisioned record. It is not Clone and never formats its secret.
@@ -63,7 +65,11 @@ pub(crate) struct BindingMaterial {
 
 impl BindingMaterial {
     pub(crate) fn duplicate_for_session(&self) -> Self {
-        Self { host_id: self.host_id, receiver_id: self.receiver_id, secret: self.secret }
+        Self {
+            host_id: self.host_id,
+            receiver_id: self.receiver_id,
+            secret: self.secret,
+        }
     }
 
     pub(crate) fn generate() -> Result<Self, SecurityError> {
@@ -76,7 +82,11 @@ impl BindingMaterial {
         receiver_id.copy_from_slice(&bytes[16..32]);
         secret.copy_from_slice(&bytes[32..]);
         bytes.fill(0);
-        Ok(Self { host_id, receiver_id, secret })
+        Ok(Self {
+            host_id,
+            receiver_id,
+            secret,
+        })
     }
 
     pub(crate) fn encode(&self) -> SensitiveBytes {
@@ -90,7 +100,10 @@ impl BindingMaterial {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, SecurityError> {
-        if bytes.len() != BINDING_BYTES || &bytes[..4] != BINDING_MAGIC || bytes[4] != BINDING_VERSION {
+        if bytes.len() != BINDING_BYTES
+            || &bytes[..4] != BINDING_MAGIC
+            || bytes[4] != BINDING_VERSION
+        {
             return Err(SecurityError::Malformed);
         }
         let mut host_id = [0u8; 16];
@@ -99,7 +112,11 @@ impl BindingMaterial {
         host_id.copy_from_slice(&bytes[5..21]);
         receiver_id.copy_from_slice(&bytes[21..37]);
         secret.copy_from_slice(&bytes[37..69]);
-        Ok(Self { host_id, receiver_id, secret })
+        Ok(Self {
+            host_id,
+            receiver_id,
+            secret,
+        })
     }
 
     pub(crate) fn commitment(&self) -> [u8; 32] {
@@ -108,17 +125,32 @@ impl BindingMaterial {
     }
 
     /// Copy of the binding secret, for authenticated discovery MACs only.
-    pub(crate) fn discovery_secret(&self) -> [u8; 32] { self.secret }
+    pub(crate) fn discovery_secret(&self) -> [u8; 32] {
+        self.secret
+    }
 
     fn matches(&self, other: &Self) -> bool {
-        self.host_id.iter().chain(&self.receiver_id).chain(&self.secret)
-            .zip(other.host_id.iter().chain(&other.receiver_id).chain(&other.secret))
-            .fold(0u8, |difference, (left, right)| difference | (left ^ right)) == 0
+        self.host_id
+            .iter()
+            .chain(&self.receiver_id)
+            .chain(&self.secret)
+            .zip(
+                other
+                    .host_id
+                    .iter()
+                    .chain(&other.receiver_id)
+                    .chain(&other.secret),
+            )
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
     }
 }
 
 #[cfg(windows)]
-pub(crate) enum BindingRemoval { Removed, AlreadyMissing }
+pub(crate) enum BindingRemoval {
+    Removed,
+    AlreadyMissing,
+}
 
 impl Drop for BindingMaterial {
     fn drop(&mut self) {
@@ -131,7 +163,9 @@ impl Drop for BindingMaterial {
 pub(crate) struct SensitiveBytes(pub(crate) Vec<u8>);
 
 impl Drop for SensitiveBytes {
-    fn drop(&mut self) { self.0.fill(0); }
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
 }
 
 /// Explicit-path, create-only storage. Existing files are never overwritten or removed.
@@ -148,7 +182,11 @@ impl BindingStore {
             Ok(()) => Ok(()),
             Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let existing = Self::load(path)?;
-                if material.matches(&existing) { Ok(()) } else { Err(SecurityError::BindingConflict) }
+                if material.matches(&existing) {
+                    Ok(())
+                } else {
+                    Err(SecurityError::BindingConflict)
+                }
             }
             Err(error) => Err(error),
         }
@@ -169,7 +207,10 @@ impl BindingStore {
         getrandom::fill(&mut random_name).map_err(|_| SecurityError::Random)?;
         let temp = parent.join(format!(".anpod-binding-{}.tmp", hex(&random_name)));
         let result = (|| -> Result<(), SecurityError> {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
             file.write_all(&protected)?;
             file.sync_all()?;
             drop(file);
@@ -198,19 +239,33 @@ impl BindingStore {
         result
     }
 
-    pub(crate) fn remove_if_matches(path: &std::path::Path, expected: Option<&[u8; 32]>) -> Result<BindingRemoval, SecurityError> {
+    pub(crate) fn remove_if_matches(
+        path: &std::path::Path,
+        expected: Option<&[u8; 32]>,
+    ) -> Result<BindingRemoval, SecurityError> {
         use std::fs;
 
         match Self::load(path) {
             Ok(material) => {
-                let Some(expected) = expected else { return Err(SecurityError::BindingConflict); };
-                if material.commitment() != *expected { return Err(SecurityError::BindingConflict); }
+                let Some(expected) = expected else {
+                    return Err(SecurityError::BindingConflict);
+                };
+                if material.commitment() != *expected {
+                    return Err(SecurityError::BindingConflict);
+                }
                 fs::remove_file(path)?;
-                if path.exists() { return Err(SecurityError::Io(std::io::Error::other("binding file remains after removal"))); }
+                if path.exists() {
+                    return Err(SecurityError::Io(std::io::Error::other(
+                        "binding file remains after removal",
+                    )));
+                }
                 Ok(BindingRemoval::Removed)
             }
-            Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() =>
-                Ok(BindingRemoval::AlreadyMissing),
+            Err(SecurityError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() =>
+            {
+                Ok(BindingRemoval::AlreadyMissing)
+            }
             Err(error) => Err(error),
         }
     }
@@ -234,30 +289,41 @@ mod dpapi {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
 
     struct OutputBlob(CRYPT_INTEGER_BLOB);
 
     impl Default for OutputBlob {
         fn default() -> Self {
-            Self(CRYPT_INTEGER_BLOB { cbData: 0, pbData: ptr::null_mut() })
+            Self(CRYPT_INTEGER_BLOB {
+                cbData: 0,
+                pbData: ptr::null_mut(),
+            })
         }
     }
 
     impl Drop for OutputBlob {
         fn drop(&mut self) {
-            if self.0.pbData.is_null() { return; }
+            if self.0.pbData.is_null() {
+                return;
+            }
             for index in 0..self.0.cbData as usize {
                 // DPAPI's unprotect output is plaintext allocated by LocalAlloc.
-                unsafe { ptr::write_volatile(self.0.pbData.add(index), 0); }
+                unsafe {
+                    ptr::write_volatile(self.0.pbData.add(index), 0);
+                }
             }
-            unsafe { LocalFree(Some(HLOCAL(self.0.pbData.cast()))); }
+            unsafe {
+                LocalFree(Some(HLOCAL(self.0.pbData.cast())));
+            }
         }
     }
 
     fn copy_output(output: &CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, SecurityError> {
-        if output.pbData.is_null() || output.cbData == 0 { return Err(SecurityError::Protection); }
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err(SecurityError::Protection);
+        }
         Ok(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec())
     }
 
@@ -276,7 +342,8 @@ mod dpapi {
                 None,
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output.0,
-            ).map_err(|_| SecurityError::Protection)?;
+            )
+            .map_err(|_| SecurityError::Protection)?;
         }
         copy_output(&output.0)
     }
@@ -296,7 +363,8 @@ mod dpapi {
                 None,
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output.0,
-            ).map_err(|_| SecurityError::Protection)?;
+            )
+            .map_err(|_| SecurityError::Protection)?;
         }
         Ok(super::SensitiveBytes(copy_output(&output.0)?))
     }
@@ -321,7 +389,9 @@ impl AudioParameters {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, SecurityError> {
-        if bytes.len() != 7 || bytes[0] != 1 { return Err(SecurityError::InvalidParameters); }
+        if bytes.len() != 7 || bytes[0] != 1 {
+            return Err(SecurityError::InvalidParameters);
+        }
         let value = Self {
             channels: bytes[1],
             sample_rate: u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
@@ -361,7 +431,15 @@ impl HostHandshake {
         getrandom::fill(&mut session_bytes).map_err(|_| SecurityError::Random)?;
         let session_id = u64::from_be_bytes(session_bytes);
         let hello = encode_hello(&material, &host_nonce, session_id, parameters);
-        Ok((Self { material, parameters, host_nonce, session_id }, hello))
+        Ok((
+            Self {
+                material,
+                parameters,
+                host_nonce,
+                session_id,
+            },
+            hello,
+        ))
     }
 
     pub(crate) fn accept_challenge(
@@ -369,7 +447,9 @@ impl HostHandshake {
         challenge: &[u8],
     ) -> Result<(HostAwaitReady, Vec<u8>), SecurityError> {
         let body = parse_message(challenge, CHALLENGE, 86)?;
-        if body[0..16] != self.material.receiver_id { return Err(SecurityError::WrongIdentity); }
+        if body[0..16] != self.material.receiver_id {
+            return Err(SecurityError::WrongIdentity);
+        }
         let receiver_nonce: [u8; 32] = body[16..48].try_into().unwrap();
         let receiver_proof: [u8; 32] = body[48..80].try_into().unwrap();
         let transcript = transcript(
@@ -379,17 +459,26 @@ impl HostHandshake {
             self.session_id,
             self.parameters,
         );
-        verify_hmac(&self.material.secret, b"AnPod P5-A proof receiver v1", &transcript, &[], &receiver_proof)?;
+        verify_hmac(
+            &self.material.secret,
+            b"AnPod P5-A proof receiver v1",
+            &transcript,
+            &[],
+            &receiver_proof,
+        )?;
         let host_proof = proof_host(&transcript, &self.material.secret);
         let finish = encode_proof_message(FINISH, &host_proof);
-        Ok((HostAwaitReady {
-            material: self.material,
-            parameters: self.parameters,
-            session_id: self.session_id,
-            transcript,
-            receiver_proof,
-            host_proof,
-        }, finish))
+        Ok((
+            HostAwaitReady {
+                material: self.material,
+                parameters: self.parameters,
+                session_id: self.session_id,
+                transcript,
+                receiver_proof,
+                host_proof,
+            },
+            finish,
+        ))
     }
 }
 
@@ -412,7 +501,12 @@ impl HostAwaitReady {
             &[self.host_proof.as_slice(), self.receiver_proof.as_slice()].concat(),
             body,
         )?;
-        Ok(AuthenticatedSession::new(self.session_id, self.parameters, &self.transcript, &self.material.secret))
+        Ok(AuthenticatedSession::new(
+            self.session_id,
+            self.parameters,
+            &self.transcript,
+            &self.material.secret,
+        ))
     }
 }
 
@@ -432,14 +526,29 @@ impl ReceiverHandshake {
         let parameters = AudioParameters::decode(&body[72..79])?;
         let mut receiver_nonce = [0u8; 32];
         getrandom::fill(&mut receiver_nonce).map_err(|_| SecurityError::Random)?;
-        let transcript = transcript(&material, &host_nonce, &receiver_nonce, session_id, parameters);
+        let transcript = transcript(
+            &material,
+            &host_nonce,
+            &receiver_nonce,
+            session_id,
+            parameters,
+        );
         let receiver_proof = proof_receiver(&transcript, &material.secret);
         let mut challenge = Vec::with_capacity(86);
         start_message(&mut challenge, CHALLENGE);
         challenge.extend_from_slice(&material.receiver_id);
         challenge.extend_from_slice(&receiver_nonce);
         challenge.extend_from_slice(&receiver_proof);
-        Ok((ReceiverAwaitFinish { material, parameters, session_id, transcript, receiver_proof }, challenge))
+        Ok((
+            ReceiverAwaitFinish {
+                material,
+                parameters,
+                session_id,
+                transcript,
+                receiver_proof,
+            },
+            challenge,
+        ))
     }
 }
 
@@ -458,10 +567,26 @@ impl ReceiverAwaitFinish {
     ) -> Result<(Vec<u8>, AuthenticatedSession), SecurityError> {
         let body = parse_message(finish, FINISH, 38)?;
         let host_proof = proof_host(&self.transcript, &self.material.secret);
-        verify_hmac(&self.material.secret, b"AnPod P5-A proof host v1", &self.transcript, &[], body)?;
-        let ready = ready_proof(&self.transcript, &host_proof, &self.receiver_proof, &self.material.secret);
+        verify_hmac(
+            &self.material.secret,
+            b"AnPod P5-A proof host v1",
+            &self.transcript,
+            &[],
+            body,
+        )?;
+        let ready = ready_proof(
+            &self.transcript,
+            &host_proof,
+            &self.receiver_proof,
+            &self.material.secret,
+        );
         let ready_message = encode_proof_message(READY, &ready);
-        let session = AuthenticatedSession::new(self.session_id, self.parameters, &self.transcript, &self.material.secret);
+        let session = AuthenticatedSession::new(
+            self.session_id,
+            self.parameters,
+            &self.transcript,
+            &self.material.secret,
+        );
         Ok((ready_message, session))
     }
 }
@@ -473,7 +598,12 @@ pub(crate) struct AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
-    fn new(session_id: u64, parameters: AudioParameters, transcript: &[u8], secret: &[u8; 32]) -> Self {
+    fn new(
+        session_id: u64,
+        parameters: AudioParameters,
+        transcript: &[u8],
+        secret: &[u8; 32],
+    ) -> Self {
         let mut salt_input = b"AnPod P5-A HKDF-SHA256 salt v1\0".to_vec();
         salt_input.extend_from_slice(transcript);
         let salt = Sha256::digest(&salt_input);
@@ -485,16 +615,42 @@ impl AuthenticatedSession {
             host_to_receiver_control: [0; 32],
             receiver_to_host_control: [0; 32],
         };
-        hkdf.expand(AUDIO_KEY_HOST_TO_RECEIVER.as_bytes(), &mut keys.host_to_receiver_audio).expect("32-byte HKDF output");
-        hkdf.expand(AUDIO_KEY_RECEIVER_TO_HOST.as_bytes(), &mut keys.receiver_to_host_audio).expect("32-byte HKDF output");
-        hkdf.expand(CONTROL_KEY_HOST_TO_RECEIVER.as_bytes(), &mut keys.host_to_receiver_control).expect("32-byte HKDF output");
-        hkdf.expand(CONTROL_KEY_RECEIVER_TO_HOST.as_bytes(), &mut keys.receiver_to_host_control).expect("32-byte HKDF output");
-        Self { session_id, parameters, keys: Some(keys) }
+        hkdf.expand(
+            AUDIO_KEY_HOST_TO_RECEIVER.as_bytes(),
+            &mut keys.host_to_receiver_audio,
+        )
+        .expect("32-byte HKDF output");
+        hkdf.expand(
+            AUDIO_KEY_RECEIVER_TO_HOST.as_bytes(),
+            &mut keys.receiver_to_host_audio,
+        )
+        .expect("32-byte HKDF output");
+        hkdf.expand(
+            CONTROL_KEY_HOST_TO_RECEIVER.as_bytes(),
+            &mut keys.host_to_receiver_control,
+        )
+        .expect("32-byte HKDF output");
+        hkdf.expand(
+            CONTROL_KEY_RECEIVER_TO_HOST.as_bytes(),
+            &mut keys.receiver_to_host_control,
+        )
+        .expect("32-byte HKDF output");
+        Self {
+            session_id,
+            parameters,
+            keys: Some(keys),
+        }
     }
 
-    pub(crate) fn session_id(&self) -> u64 { self.session_id }
-    pub(crate) fn parameters(&self) -> AudioParameters { self.parameters }
-    pub(crate) fn into_keys(mut self) -> SessionKeys { self.keys.take().expect("session keys are consumed once") }
+    pub(crate) fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub(crate) fn parameters(&self) -> AudioParameters {
+        self.parameters
+    }
+    pub(crate) fn into_keys(mut self) -> SessionKeys {
+        self.keys.take().expect("session keys are consumed once")
+    }
 }
 
 pub(crate) struct SessionKeys {
@@ -515,11 +671,18 @@ impl Drop for SessionKeys {
 
 #[cfg(test)]
 pub(crate) fn test_binding_material() -> BindingMaterial {
-    BindingMaterial { host_id: [0x11; 16], receiver_id: [0x22; 16], secret: [0x33; 32] }
+    BindingMaterial {
+        host_id: [0x11; 16],
+        receiver_id: [0x22; 16],
+        secret: [0x33; 32],
+    }
 }
 
 #[cfg(all(test, windows))]
-pub(crate) fn write_test_binding_file(path: &std::path::Path, material: &BindingMaterial) -> Result<(), SecurityError> {
+pub(crate) fn write_test_binding_file(
+    path: &std::path::Path,
+    material: &BindingMaterial,
+) -> Result<(), SecurityError> {
     let mut plaintext = material.encode();
     let protected = dpapi::protect(&plaintext.0)?;
     plaintext.0.fill(0);
@@ -541,7 +704,12 @@ pub(crate) fn test_binding_material_with_wrong_secret() -> BindingMaterial {
     material
 }
 
-fn encode_hello(material: &BindingMaterial, host_nonce: &[u8; 32], session_id: u64, parameters: AudioParameters) -> Vec<u8> {
+fn encode_hello(
+    material: &BindingMaterial,
+    host_nonce: &[u8; 32],
+    session_id: u64,
+    parameters: AudioParameters,
+) -> Vec<u8> {
     let mut message = Vec::with_capacity(85);
     start_message(&mut message, HELLO);
     message.extend_from_slice(&material.host_id);
@@ -565,11 +733,17 @@ fn start_message(message: &mut Vec<u8>, message_type: u8) {
     message.push(message_type);
 }
 
-fn parse_message(message: &[u8], expected_type: u8, expected_len: usize) -> Result<&[u8], SecurityError> {
+fn parse_message(
+    message: &[u8],
+    expected_type: u8,
+    expected_len: usize,
+) -> Result<&[u8], SecurityError> {
     if message.len() != expected_len || &message[..4] != MAGIC || message[4] != VERSION {
         return Err(SecurityError::Malformed);
     }
-    if message[5] != expected_type { return Err(SecurityError::WrongIdentity); }
+    if message[5] != expected_type {
+        return Err(SecurityError::WrongIdentity);
+    }
     Ok(&message[6..])
 }
 
@@ -611,7 +785,12 @@ fn proof_receiver(transcript: &[u8], secret: &[u8; 32]) -> [u8; 32] {
     hmac(secret, b"AnPod P5-A proof receiver v1", transcript, &[])
 }
 
-fn ready_proof(transcript: &[u8], host_proof: &[u8; 32], receiver_proof: &[u8; 32], secret: &[u8; 32]) -> [u8; 32] {
+fn ready_proof(
+    transcript: &[u8],
+    host_proof: &[u8; 32],
+    receiver_proof: &[u8; 32],
+    secret: &[u8; 32],
+) -> [u8; 32] {
     let mut proofs = Vec::with_capacity(64);
     proofs.extend_from_slice(host_proof);
     proofs.extend_from_slice(receiver_proof);
@@ -627,14 +806,17 @@ fn verify_hmac(
     extra: &[u8],
     received: &[u8],
 ) -> Result<(), SecurityError> {
-    if received.len() != 32 { return Err(SecurityError::InvalidProof); }
+    if received.len() != 32 {
+        return Err(SecurityError::InvalidProof);
+    }
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
     mac.update(label);
     mac.update(&[0]);
     mac.update(transcript);
     mac.update(extra);
     // Use the crate's constant-time tag verifier rather than ordinary equality.
-    mac.verify_slice(received).map_err(|_| SecurityError::InvalidProof)
+    mac.verify_slice(received)
+        .map_err(|_| SecurityError::InvalidProof)
 }
 
 #[cfg(all(test, windows))]
@@ -645,18 +827,28 @@ mod storage_tests {
 
     #[test]
     fn dpapi_storage_is_create_only_and_corruption_fails_closed() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let directory = std::env::temp_dir().join(format!("anpod-p5a-{}-{stamp}", std::process::id()));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("anpod-p5a-{}-{stamp}", std::process::id()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("binding.dpapi");
         let material = BindingMaterial::generate().unwrap();
         BindingStore::create_if_absent(&path, &material).unwrap();
         let first_ciphertext = fs::read(&path).unwrap();
         BindingStore::create_or_confirm(&path, &material).unwrap();
-        assert!(matches!(BindingStore::create_or_confirm(&path, &BindingMaterial::generate().unwrap()),
-            Err(SecurityError::BindingConflict)));
-        assert!(!first_ciphertext.windows(32).any(|window| window == &material.secret[..]));
-        assert!(BindingStore::create_if_absent(&path, &BindingMaterial::generate().unwrap()).is_err());
+        assert!(matches!(
+            BindingStore::create_or_confirm(&path, &BindingMaterial::generate().unwrap()),
+            Err(SecurityError::BindingConflict)
+        ));
+        assert!(!first_ciphertext
+            .windows(32)
+            .any(|window| window == &material.secret[..]));
+        assert!(
+            BindingStore::create_if_absent(&path, &BindingMaterial::generate().unwrap()).is_err()
+        );
         assert_eq!(fs::read(&path).unwrap(), first_ciphertext);
         let loaded = BindingStore::load(&path).unwrap();
         assert_eq!(loaded.host_id, material.host_id);
@@ -673,8 +865,17 @@ mod storage_tests {
 
     #[test]
     fn dpapi_binding_removal_is_targeted_and_compare_and_delete() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let directory = std::env::current_dir().unwrap().join("target").join(format!("anpod-binding-reset-{}-{stamp}", std::process::id()));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "anpod-binding-reset-{}-{stamp}",
+                std::process::id()
+            ));
         fs::create_dir_all(directory.parent().unwrap()).unwrap();
         fs::create_dir(&directory).unwrap();
         let path = directory.join("selected.dpapi");
@@ -684,14 +885,32 @@ mod storage_tests {
         write_test_binding_file(&path, &selected).unwrap();
         write_test_binding_file(&other, &unrelated).unwrap();
         let wrong = [0x55; 32];
-        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&wrong)), Err(SecurityError::BindingConflict)));
-        assert!(matches!(BindingStore::remove_if_matches(&path, None), Err(SecurityError::BindingConflict)));
+        assert!(matches!(
+            BindingStore::remove_if_matches(&path, Some(&wrong)),
+            Err(SecurityError::BindingConflict)
+        ));
+        assert!(matches!(
+            BindingStore::remove_if_matches(&path, None),
+            Err(SecurityError::BindingConflict)
+        ));
         assert!(path.exists());
-        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&selected.commitment())), Ok(BindingRemoval::Removed)));
+        assert!(matches!(
+            BindingStore::remove_if_matches(&path, Some(&selected.commitment())),
+            Ok(BindingRemoval::Removed)
+        ));
         assert!(!path.exists());
-        assert!(other.exists(), "a reset must not remove another saved binding");
-        assert!(matches!(BindingStore::remove_if_matches(&path, None), Ok(BindingRemoval::AlreadyMissing)));
-        assert!(matches!(BindingStore::remove_if_matches(&path, Some(&selected.commitment())), Err(SecurityError::Io(_))));
+        assert!(
+            other.exists(),
+            "a reset must not remove another saved binding"
+        );
+        assert!(matches!(
+            BindingStore::remove_if_matches(&path, None),
+            Ok(BindingRemoval::AlreadyMissing)
+        ));
+        assert!(matches!(
+            BindingStore::remove_if_matches(&path, Some(&selected.commitment())),
+            Err(SecurityError::Io(_))
+        ));
         fs::remove_dir_all(directory).unwrap();
     }
 }
@@ -701,10 +920,20 @@ mod tests {
     use super::*;
 
     fn material() -> BindingMaterial {
-        BindingMaterial { host_id: [0x11; 16], receiver_id: [0x22; 16], secret: [0x33; 32] }
+        BindingMaterial {
+            host_id: [0x11; 16],
+            receiver_id: [0x22; 16],
+            secret: [0x33; 32],
+        }
     }
 
-    fn parameters() -> AudioParameters { AudioParameters { sample_rate: 48_000, channels: 2, mode: 0 } }
+    fn parameters() -> AudioParameters {
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        }
+    }
 
     fn complete() -> (AuthenticatedSession, AuthenticatedSession) {
         let (host, hello) = HostHandshake::start(material(), parameters()).unwrap();
@@ -726,22 +955,47 @@ mod tests {
         assert_eq!(host.parameters(), receiver.parameters());
         let host_keys = host.into_keys();
         let receiver_keys = receiver.into_keys();
-        assert_eq!(host_keys.host_to_receiver_audio, receiver_keys.host_to_receiver_audio);
-        assert_eq!(host_keys.receiver_to_host_audio, receiver_keys.receiver_to_host_audio);
-        assert_eq!(host_keys.host_to_receiver_control, receiver_keys.host_to_receiver_control);
-        assert_eq!(host_keys.receiver_to_host_control, receiver_keys.receiver_to_host_control);
-        assert_ne!(host_keys.host_to_receiver_audio, host_keys.host_to_receiver_control);
+        assert_eq!(
+            host_keys.host_to_receiver_audio,
+            receiver_keys.host_to_receiver_audio
+        );
+        assert_eq!(
+            host_keys.receiver_to_host_audio,
+            receiver_keys.receiver_to_host_audio
+        );
+        assert_eq!(
+            host_keys.host_to_receiver_control,
+            receiver_keys.host_to_receiver_control
+        );
+        assert_eq!(
+            host_keys.receiver_to_host_control,
+            receiver_keys.receiver_to_host_control
+        );
+        assert_ne!(
+            host_keys.host_to_receiver_audio,
+            host_keys.host_to_receiver_control
+        );
         let (next_host, next_receiver) = complete();
-        assert_ne!(host_keys.host_to_receiver_audio, next_host.into_keys().host_to_receiver_audio);
-        assert_ne!(receiver_keys.receiver_to_host_audio, next_receiver.into_keys().receiver_to_host_audio);
+        assert_ne!(
+            host_keys.host_to_receiver_audio,
+            next_host.into_keys().host_to_receiver_audio
+        );
+        assert_ne!(
+            receiver_keys.receiver_to_host_audio,
+            next_receiver.into_keys().receiver_to_host_audio
+        );
     }
 
     #[test]
     fn bad_identity_role_proof_and_cross_session_response_are_rejected() {
         let (host, hello) = HostHandshake::start(material(), parameters()).unwrap();
-        let (receiver, mut challenge) = ReceiverHandshake::accept_hello(material(), &hello).unwrap();
+        let (receiver, mut challenge) =
+            ReceiverHandshake::accept_hello(material(), &hello).unwrap();
         challenge[22] ^= 1;
-        assert!(matches!(host.accept_challenge(&challenge), Err(SecurityError::InvalidProof)));
+        assert!(matches!(
+            host.accept_challenge(&challenge),
+            Err(SecurityError::InvalidProof)
+        ));
         drop(receiver);
 
         let (host_one, hello_one) = HostHandshake::start(material(), parameters()).unwrap();
@@ -754,13 +1008,22 @@ mod tests {
         let (receiver, challenge) = ReceiverHandshake::accept_hello(material(), &hello).unwrap();
         let mut wrong_identity = challenge.clone();
         wrong_identity[6] ^= 1;
-        assert!(matches!(host.accept_challenge(&wrong_identity), Err(SecurityError::WrongIdentity)));
+        assert!(matches!(
+            host.accept_challenge(&wrong_identity),
+            Err(SecurityError::WrongIdentity)
+        ));
         let mut wrong_identity_hello = hello.clone();
         wrong_identity_hello[6] ^= 1;
-        assert!(matches!(ReceiverHandshake::accept_hello(material(), &wrong_identity_hello), Err(SecurityError::WrongIdentity)));
+        assert!(matches!(
+            ReceiverHandshake::accept_hello(material(), &wrong_identity_hello),
+            Err(SecurityError::WrongIdentity)
+        ));
         let mut wrong_role = hello.clone();
         wrong_role[5] = FINISH;
-        assert!(matches!(ReceiverHandshake::accept_hello(material(), &wrong_role), Err(SecurityError::WrongIdentity)));
+        assert!(matches!(
+            ReceiverHandshake::accept_hello(material(), &wrong_role),
+            Err(SecurityError::WrongIdentity)
+        ));
         drop(receiver);
 
         let (host, hello) = HostHandshake::start(material(), parameters()).unwrap();
@@ -780,20 +1043,51 @@ mod tests {
         let host_nonce = core::array::from_fn(|index| 0x30 + index as u8);
         let receiver_nonce = core::array::from_fn(|index| 0x50 + index as u8);
         let params = parameters();
-        assert_eq!(hex(&value.commitment()), "dcb02a268976be74a08d28d7124724dbeef4c130715d6544ad8b7eb74f79eda4");
-        let transcript = transcript(&value, &host_nonce, &receiver_nonce, 0x0102_0304_0506_0708, params);
+        assert_eq!(
+            hex(&value.commitment()),
+            "dcb02a268976be74a08d28d7124724dbeef4c130715d6544ad8b7eb74f79eda4"
+        );
+        let transcript = transcript(
+            &value,
+            &host_nonce,
+            &receiver_nonce,
+            0x0102_0304_0506_0708,
+            params,
+        );
         assert_eq!(hex(&transcript), "414e5035010102101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f010203040506070801020000bb8000");
         let proof_h = proof_host(&transcript, &value.secret);
         let proof_r = proof_receiver(&transcript, &value.secret);
-        assert_eq!(hex(&proof_h), "2d28ffee9d17f1930898388aa09f4291dc47aba00f201ecdf58a00163388aaed");
-        assert_eq!(hex(&proof_r), "1b4af0b2591a958ddb36186bdccd8fd1cdfc6c2f599a48aabeea5a865a8482a6");
-        assert_eq!(hex(&ready_proof(&transcript, &proof_h, &proof_r, &value.secret)), "80f32dbf0a5c1a29ec777fd06090593869254a34bc05eca236ad8b47b440fa1c");
-        let session = AuthenticatedSession::new(0x0102_0304_0506_0708, params, &transcript, &value.secret);
+        assert_eq!(
+            hex(&proof_h),
+            "2d28ffee9d17f1930898388aa09f4291dc47aba00f201ecdf58a00163388aaed"
+        );
+        assert_eq!(
+            hex(&proof_r),
+            "1b4af0b2591a958ddb36186bdccd8fd1cdfc6c2f599a48aabeea5a865a8482a6"
+        );
+        assert_eq!(
+            hex(&ready_proof(&transcript, &proof_h, &proof_r, &value.secret)),
+            "80f32dbf0a5c1a29ec777fd06090593869254a34bc05eca236ad8b47b440fa1c"
+        );
+        let session =
+            AuthenticatedSession::new(0x0102_0304_0506_0708, params, &transcript, &value.secret);
         let keys = session.into_keys();
-        assert_eq!(hex(&keys.host_to_receiver_audio), "00021dc01623e41fc2a636df8fb67b19bfc7d83bd0a762ef8759d149132fac58");
-        assert_eq!(hex(&keys.receiver_to_host_audio), "fdbf5d4561402f457655b436f24557461e523eecd4a3e56b3634f4c47e1ebc7a");
-        assert_eq!(hex(&keys.host_to_receiver_control), "7b307e8464b5860d3cacf168026bab443e1ddf98adbe87204d4ccdcd6c324050");
-        assert_eq!(hex(&keys.receiver_to_host_control), "4c9c03cc5cc1fb8e04f7fc3a710886f8c9833901ab90464184d5256319943711");
+        assert_eq!(
+            hex(&keys.host_to_receiver_audio),
+            "00021dc01623e41fc2a636df8fb67b19bfc7d83bd0a762ef8759d149132fac58"
+        );
+        assert_eq!(
+            hex(&keys.receiver_to_host_audio),
+            "fdbf5d4561402f457655b436f24557461e523eecd4a3e56b3634f4c47e1ebc7a"
+        );
+        assert_eq!(
+            hex(&keys.host_to_receiver_control),
+            "7b307e8464b5860d3cacf168026bab443e1ddf98adbe87204d4ccdcd6c324050"
+        );
+        assert_eq!(
+            hex(&keys.receiver_to_host_control),
+            "4c9c03cc5cc1fb8e04f7fc3a710886f8c9833901ab90464184d5256319943711"
+        );
         value.secret.fill(0);
     }
 

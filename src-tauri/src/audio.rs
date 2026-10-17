@@ -1,12 +1,12 @@
-use libloading::Library;
+use crate::network::PcmQueue;
 use crate::protocol::PcmFormat;
+use libloading::Library;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex, OnceLock},
     time::Duration,
 };
-use crate::network::PcmQueue;
 use tokio::sync::{mpsc as async_mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
@@ -57,27 +57,61 @@ struct NativeFns {
 
 impl NativeFns {
     unsafe fn load(path: &PathBuf) -> Result<Self, String> {
-        let library = Library::new(path).map_err(|_| format!("无法加载音频采集组件：{}", path.display()))?;
-        macro_rules! sym { ($name:literal, $ty:ty) => { *library.get::<$ty>(concat!($name, "\0").as_bytes()).map_err(|_| format!("音频采集组件缺少函数 {}", $name))? }; }
-        let set_pcm_callback = library.get::<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>(b"AudioCapture_SetPcmCallback\0")
-            .ok().map(|symbol| *symbol);
-        let get_pcm_format = library.get::<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>(b"AudioCapture_GetPcmFormat\0")
-            .ok().map(|symbol| *symbol);
+        let library =
+            Library::new(path).map_err(|_| format!("无法加载音频采集组件：{}", path.display()))?;
+        macro_rules! sym {
+            ($name:literal, $ty:ty) => {
+                *library
+                    .get::<$ty>(concat!($name, "\0").as_bytes())
+                    .map_err(|_| format!("音频采集组件缺少函数 {}", $name))?
+            };
+        }
+        let set_pcm_callback = library
+            .get::<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>(
+                b"AudioCapture_SetPcmCallback\0",
+            )
+            .ok()
+            .map(|symbol| *symbol);
+        let get_pcm_format = library
+            .get::<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>(b"AudioCapture_GetPcmFormat\0")
+            .ok()
+            .map(|symbol| *symbol);
         Ok(Self {
             initialize: sym!("AudioCapture_Initialize", unsafe extern "C" fn() -> i32),
-            listen: sym!("AudioCapture_Listen", unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32),
+            listen: sym!(
+                "AudioCapture_Listen",
+                unsafe extern "C" fn(i32, Option<ConnectCallback>) -> i32
+            ),
             start: sym!("AudioCapture_Start", unsafe extern "C" fn() -> i32),
             set_pcm_callback,
             get_pcm_format,
-            set_stream: sym!("AudioCapture_SetStreamingEnabled", unsafe extern "C" fn(i32)),
+            set_stream: sym!(
+                "AudioCapture_SetStreamingEnabled",
+                unsafe extern "C" fn(i32)
+            ),
             stop: sym!("AudioCapture_Stop", unsafe extern "C" fn()),
             cleanup: sym!("AudioCapture_Cleanup", unsafe extern "C" fn()),
-            set_token: sym!("AudioCapture_SetConnectToken", unsafe extern "C" fn(*const c_char)),
-            error_code: sym!("AudioCapture_GetLastErrorCode", unsafe extern "C" fn() -> i32),
-            error_message: sym!("AudioCapture_GetLastErrorMessage", unsafe extern "C" fn() -> *const c_char),
+            set_token: sym!(
+                "AudioCapture_SetConnectToken",
+                unsafe extern "C" fn(*const c_char)
+            ),
+            error_code: sym!(
+                "AudioCapture_GetLastErrorCode",
+                unsafe extern "C" fn() -> i32
+            ),
+            error_message: sym!(
+                "AudioCapture_GetLastErrorMessage",
+                unsafe extern "C" fn() -> *const c_char
+            ),
             clear_error: sym!("AudioCapture_ClearLastError", unsafe extern "C" fn()),
-            is_connected: sym!("AudioCapture_IsConnected", unsafe extern "C" fn(*mut c_char, i32) -> i32),
-            sent_pcm_bytes: sym!("AudioCapture_GetSentPcmBytes", unsafe extern "C" fn() -> u64),
+            is_connected: sym!(
+                "AudioCapture_IsConnected",
+                unsafe extern "C" fn(*mut c_char, i32) -> i32
+            ),
+            sent_pcm_bytes: sym!(
+                "AudioCapture_GetSentPcmBytes",
+                unsafe extern "C" fn() -> u64
+            ),
             _library: library,
         })
     }
@@ -86,20 +120,32 @@ impl NativeFns {
         let code = unsafe { (self.error_code)() };
         let message = unsafe {
             let ptr = (self.error_message)();
-            if ptr.is_null() { String::new() } else { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+            if ptr.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
         };
-        if message.is_empty() { format!("{fallback} (错误 {code})") } else { message }
+        if message.is_empty() {
+            format!("{fallback} (错误 {code})")
+        } else {
+            message
+        }
     }
 
     fn pcm_format(&self) -> Result<PcmFormat, String> {
-        let get_format = self.get_pcm_format.ok_or_else(||
-            "当前音频采集组件不支持读取已协商的 PCM 格式；请更新 Native DLL。".to_string())?;
+        let get_format = self.get_pcm_format.ok_or_else(|| {
+            "当前音频采集组件不支持读取已协商的 PCM 格式；请更新 Native DLL。".to_string()
+        })?;
         let mut sample_rate = 0;
         let mut channels = 0;
         if unsafe { get_format(&mut sample_rate, &mut channels) } == 0 {
             return Err(self.describe_error("无法读取 WASAPI 已协商的 PCM 格式"));
         }
-        Ok(PcmFormat { sample_rate, channels })
+        Ok(PcmFormat {
+            sample_rate,
+            channels,
+        })
     }
 }
 
@@ -107,7 +153,10 @@ impl AudioActor {
     pub fn new(dll_path: PathBuf, marker_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
         let (handshake_tx, handshake_rx) = async_mpsc::unbounded_channel();
-        *HANDSHAKES.get_or_init(|| Mutex::new(None)).lock().expect("handshake callback lock") = Some(handshake_tx);
+        *HANDSHAKES
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("handshake callback lock") = Some(handshake_tx);
         std::thread::Builder::new().name("AnPod audio control".into()).spawn(move || {
             let mut native = None;
             let mut pcm_sink: Option<Arc<PcmQueue>> = None;
@@ -279,87 +328,165 @@ impl AudioActor {
             drop(pcm_sink.take());
             let _ = restore_endpoints(&marker_path, &mut muted_ids);
         }).expect("create audio worker thread");
-        Self { tx, handshake_rx: std::sync::Arc::new(AsyncMutex::new(handshake_rx)) }
+        Self {
+            tx,
+            handshake_rx: std::sync::Arc::new(AsyncMutex::new(handshake_rx)),
+        }
     }
 
-    pub fn initialize(&self) -> Result<(), String> { self.call(Request::Initialize) }
-    pub fn listen(&self, port: u16, token: &str) -> Result<(), String> { self.call(|reply| Request::Listen(port, token.into(), reply)) }
-    pub fn start(&self) -> Result<(), String> { self.call(Request::Start) }
-    pub fn start_pcm_sink(&self, queue: Arc<PcmQueue>) -> Result<(), String> { self.call(|reply| Request::StartPcmSink(queue, reply)) }
-    pub fn pcm_format(&self) -> Result<PcmFormat, String> { self.call(Request::PcmFormat) }
-    pub fn stop_pcm_sink(&self) -> Result<(), String> { self.call(Request::StopPcmSink) }
-    pub fn set_streaming(&self, enabled: bool) -> Result<(), String> { self.call(|reply| Request::Stream(enabled, reply)) }
-    pub fn stop_and_cleanup(&self) -> Result<(), String> { self.call(Request::StopAndCleanup) }
-    pub fn mute_active(&self) -> Result<(), String> { self.call(Request::Mute) }
-    pub fn restore_ids(&self, ids: Vec<String>) -> Result<(), String> { self.call(|reply| Request::Restore(ids, reply)) }
-    pub fn restore_muted(&self) -> Result<(), String> { self.call(Request::RestoreMuted) }
-    pub fn is_connected(&self) -> Result<bool, String> { self.call(Request::IsConnected) }
-    pub fn sent_pcm_bytes(&self) -> Result<u64, String> { self.call(Request::SentPcmBytes) }
-    pub fn take_last_error(&self) -> Result<Option<String>, String> { self.call(Request::TakeLastError) }
+    pub fn initialize(&self) -> Result<(), String> {
+        self.call(Request::Initialize)
+    }
+    pub fn listen(&self, port: u16, token: &str) -> Result<(), String> {
+        self.call(|reply| Request::Listen(port, token.into(), reply))
+    }
+    pub fn start(&self) -> Result<(), String> {
+        self.call(Request::Start)
+    }
+    pub fn start_pcm_sink(&self, queue: Arc<PcmQueue>) -> Result<(), String> {
+        self.call(|reply| Request::StartPcmSink(queue, reply))
+    }
+    pub fn pcm_format(&self) -> Result<PcmFormat, String> {
+        self.call(Request::PcmFormat)
+    }
+    pub fn stop_pcm_sink(&self) -> Result<(), String> {
+        self.call(Request::StopPcmSink)
+    }
+    pub fn set_streaming(&self, enabled: bool) -> Result<(), String> {
+        self.call(|reply| Request::Stream(enabled, reply))
+    }
+    pub fn stop_and_cleanup(&self) -> Result<(), String> {
+        self.call(Request::StopAndCleanup)
+    }
+    pub fn mute_active(&self) -> Result<(), String> {
+        self.call(Request::Mute)
+    }
+    pub fn restore_ids(&self, ids: Vec<String>) -> Result<(), String> {
+        self.call(|reply| Request::Restore(ids, reply))
+    }
+    pub fn restore_muted(&self) -> Result<(), String> {
+        self.call(Request::RestoreMuted)
+    }
+    pub fn is_connected(&self) -> Result<bool, String> {
+        self.call(Request::IsConnected)
+    }
+    pub fn sent_pcm_bytes(&self) -> Result<u64, String> {
+        self.call(Request::SentPcmBytes)
+    }
+    pub fn take_last_error(&self) -> Result<Option<String>, String> {
+        self.call(Request::TakeLastError)
+    }
 
-    pub async fn wait_handshake(&self, expected: &str, limit: Duration, cancel: &CancellationToken) -> Result<String, String> {
+    pub async fn wait_handshake(
+        &self,
+        expected: &str,
+        limit: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         let mut receiver = self.handshake_rx.lock().await;
         receive_handshake(&mut receiver, expected, limit, cancel).await
     }
 
-    fn call<T>(&self, make: impl FnOnce(mpsc::SyncSender<Result<T, String>>) -> Request) -> Result<T, String> {
+    fn call<T>(
+        &self,
+        make: impl FnOnce(mpsc::SyncSender<Result<T, String>>) -> Request,
+    ) -> Result<T, String> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.tx.send(make(tx)).map_err(|_| "音频控制线程已停止。".to_string())?;
-        rx.recv().map_err(|_| "音频控制线程未返回结果。".to_string())?
+        self.tx
+            .send(make(tx))
+            .map_err(|_| "音频控制线程已停止。".to_string())?;
+        rx.recv()
+            .map_err(|_| "音频控制线程未返回结果。".to_string())?
     }
 }
 
-async fn receive_handshake(receiver: &mut async_mpsc::UnboundedReceiver<String>, expected: &str, limit: Duration, cancel: &CancellationToken) -> Result<String, String> {
-        let deadline = tokio::time::Instant::now() + limit;
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Err("连接已取消。".into()),
-                result = tokio::time::timeout_at(deadline, receiver.recv()) => match result {
-                    Ok(Some(code)) if code == expected => return Ok(code),
-                    Ok(Some(_stale_code)) => continue,
-                    Ok(None) => return Err("音频连接监听已停止。".into()),
-                    Err(_) => return Err("等待手机完成握手超时。".into()),
-                }
+async fn receive_handshake(
+    receiver: &mut async_mpsc::UnboundedReceiver<String>,
+    expected: &str,
+    limit: Duration,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("连接已取消。".into()),
+            result = tokio::time::timeout_at(deadline, receiver.recv()) => match result {
+                Ok(Some(code)) if code == expected => return Ok(code),
+                Ok(Some(_stale_code)) => continue,
+                Ok(None) => return Err("音频连接监听已停止。".into()),
+                Err(_) => return Err("等待手机完成握手超时。".into()),
             }
         }
+    }
 }
 
 unsafe extern "C" fn on_native_connect(code: *const c_char) {
-    if code.is_null() { return; }
+    if code.is_null() {
+        return;
+    }
     let text = CStr::from_ptr(code).to_string_lossy();
-    if text.len() > 128 { return; }
-    if let Some(tx) = HANDSHAKES.get().and_then(|value| value.lock().ok()?.clone()) { let _ = tx.send(text.into_owned()); }
+    if text.len() > 128 {
+        return;
+    }
+    if let Some(tx) = HANDSHAKES
+        .get()
+        .and_then(|value| value.lock().ok()?.clone())
+    {
+        let _ = tx.send(text.into_owned());
+    }
 }
 
-pub(crate) unsafe extern "C" fn on_native_pcm(samples: *const i16, frame_count: u32, sample_rate: u32,
-    channels: u16, frame_index: u64, user_data: *mut c_void) {
-    if user_data.is_null() { return; }
+pub(crate) unsafe extern "C" fn on_native_pcm(
+    samples: *const i16,
+    frame_count: u32,
+    sample_rate: u32,
+    channels: u16,
+    frame_index: u64,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
     let queue = &*user_data.cast::<PcmQueue>();
     queue.push_raw(samples, frame_count, sample_rate, channels, frame_index);
 }
 
 #[cfg(windows)]
 fn mute_active_endpoints(marker_path: &PathBuf, muted_ids: &mut Vec<String>) -> Result<(), String> {
-    use windows::{
-        Win32::{
-            Media::Audio::{eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE},
-            Media::Audio::Endpoints::IAudioEndpointVolume,
-            System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
+    use windows::Win32::{
+        Media::Audio::Endpoints::IAudioEndpointVolume,
+        Media::Audio::{eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE},
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
         },
     };
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if initialized.is_err() { return Err(format!("无法初始化音频设备控制：{initialized:?}")); }
+        if initialized.is_err() {
+            return Err(format!("无法初始化音频设备控制：{initialized:?}"));
+        }
         let result = (|| -> Result<(), String> {
-            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-            let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE).map_err(|e| e.to_string())?;
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| e.to_string())?;
+            let devices = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .map_err(|e| e.to_string())?;
             for index in 0..devices.GetCount().map_err(|e| e.to_string())? {
                 let device = devices.Item(index).map_err(|e| e.to_string())?;
-                let id = device.GetId().map_err(|e| e.to_string())?.to_string().map_err(|e| e.to_string())?;
-                let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+                let id = device
+                    .GetId()
+                    .map_err(|e| e.to_string())?
+                    .to_string()
+                    .map_err(|e| e.to_string())?;
+                let volume: IAudioEndpointVolume = device
+                    .Activate(CLSCTX_ALL, None)
+                    .map_err(|e| e.to_string())?;
                 if !volume.GetMute().map_err(|e| e.to_string())?.as_bool() {
                     remember_before_muting(marker_path, muted_ids, &id)?;
-                    volume.SetMute(true, std::ptr::null()).map_err(|e| e.to_string())?;
+                    volume
+                        .SetMute(true, std::ptr::null())
+                        .map_err(|e| e.to_string())?;
                 }
             }
             Ok(())
@@ -370,46 +497,71 @@ fn mute_active_endpoints(marker_path: &PathBuf, muted_ids: &mut Vec<String>) -> 
 }
 
 #[cfg(not(windows))]
-fn mute_active_endpoints(_: &PathBuf, _: &mut Vec<String>) -> Result<(), String> { Err("AnPod 音频端点控制仅支持 Windows。".into()) }
+fn mute_active_endpoints(_: &PathBuf, _: &mut Vec<String>) -> Result<(), String> {
+    Err("AnPod 音频端点控制仅支持 Windows。".into())
+}
 
 #[cfg(windows)]
 fn restore_endpoints(marker_path: &PathBuf, muted_ids: &mut Vec<String>) -> Result<(), String> {
-    use windows::{
-        Win32::{
-            Media::Audio::{eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE},
-            Media::Audio::Endpoints::IAudioEndpointVolume,
-            System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
+    use windows::Win32::{
+        Media::Audio::Endpoints::IAudioEndpointVolume,
+        Media::Audio::{eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE},
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
         },
     };
-    if muted_ids.is_empty() { return Ok(()); }
+    if muted_ids.is_empty() {
+        return Ok(());
+    }
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if initialized.is_err() { return Err(format!("无法初始化音频设备控制：{initialized:?}")); }
+        if initialized.is_err() {
+            return Err(format!("无法初始化音频设备控制：{initialized:?}"));
+        }
         let result = (|| -> Result<(), String> {
-            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-            let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE).map_err(|e| e.to_string())?;
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| e.to_string())?;
+            let devices = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .map_err(|e| e.to_string())?;
             let wanted = muted_ids.clone();
             let mut seen = std::collections::HashSet::new();
             let mut first_error = None;
             for index in 0..devices.GetCount().map_err(|e| e.to_string())? {
                 let device = devices.Item(index).map_err(|e| e.to_string())?;
-                let id = device.GetId().map_err(|e| e.to_string())?.to_string().map_err(|e| e.to_string())?;
-                if !wanted.contains(&id) { continue; }
+                let id = device
+                    .GetId()
+                    .map_err(|e| e.to_string())?
+                    .to_string()
+                    .map_err(|e| e.to_string())?;
+                if !wanted.contains(&id) {
+                    continue;
+                }
                 seen.insert(id.clone());
-                let restored = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                let restored = device
+                    .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
                     .map_err(|e| e.to_string())
-                    .and_then(|volume| volume.SetMute(false, std::ptr::null()).map_err(|e| e.to_string()));
+                    .and_then(|volume| {
+                        volume
+                            .SetMute(false, std::ptr::null())
+                            .map_err(|e| e.to_string())
+                    });
                 match restored {
                     Ok(()) => {
                         if let Err(error) = forget_restored(marker_path, muted_ids, &id) {
                             first_error.get_or_insert(error);
                         }
                     }
-                    Err(error) => { first_error.get_or_insert_with(|| format!("无法恢复音频设备 {id}：{error}")); }
+                    Err(error) => {
+                        first_error
+                            .get_or_insert_with(|| format!("无法恢复音频设备 {id}：{error}"));
+                    }
                 }
             }
             if let Some(id) = wanted.iter().find(|id| !seen.contains(*id)) {
-                first_error.get_or_insert_with(|| format!("音频设备 {id} 当前不可用；恢复记录已保留。"));
+                first_error
+                    .get_or_insert_with(|| format!("音频设备 {id} 当前不可用；恢复记录已保留。"));
             }
             first_error.map_or(Ok(()), Err)
         })();
@@ -426,7 +578,9 @@ fn restore_endpoints(marker_path: &PathBuf, muted_ids: &mut Vec<String>) -> Resu
 }
 
 fn remember_before_muting(path: &PathBuf, ids: &mut Vec<String>, id: &str) -> Result<(), String> {
-    if ids.iter().any(|existing| existing == id) { return Ok(()); }
+    if ids.iter().any(|existing| existing == id) {
+        return Ok(());
+    }
     ids.push(id.to_owned());
     if let Err(error) = write_marker(path, ids) {
         ids.pop();
@@ -436,7 +590,9 @@ fn remember_before_muting(path: &PathBuf, ids: &mut Vec<String>, id: &str) -> Re
 }
 
 fn forget_restored(path: &PathBuf, ids: &mut Vec<String>, id: &str) -> Result<(), String> {
-    let Some(index) = ids.iter().position(|existing| existing == id) else { return Ok(()); };
+    let Some(index) = ids.iter().position(|existing| existing == id) else {
+        return Ok(());
+    };
     let restored = ids.remove(index);
     if let Err(error) = write_marker(path, ids) {
         ids.insert(index, restored);
@@ -453,7 +609,9 @@ fn write_marker(path: &PathBuf, ids: &[String]) -> Result<(), String> {
             Err(error) => Err(error.to_string()),
         };
     }
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let temp = path.with_extension("txt.tmp");
     std::fs::write(&temp, ids.join("\r\n")).map_err(|e| e.to_string())?;
     crate::state::atomic_replace(&temp, path).map_err(|e| e.to_string())
@@ -462,8 +620,8 @@ fn write_marker(path: &PathBuf, ids: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{forget_restored, receive_handshake, remember_before_muting};
-    use std::{fs, path::PathBuf};
     use std::time::Duration;
+    use std::{fs, path::PathBuf};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -491,7 +649,13 @@ mod tests {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         sender.send("previous-session".into()).unwrap();
         sender.send("current-session".into()).unwrap();
-        let result = receive_handshake(&mut receiver, "current-session", Duration::from_secs(1), &CancellationToken::new()).await;
+        let result = receive_handshake(
+            &mut receiver,
+            "current-session",
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(result.unwrap(), "current-session");
     }
 
@@ -500,7 +664,13 @@ mod tests {
         let (_sender, mut receiver) = mpsc::unbounded_channel();
         let token = CancellationToken::new();
         token.cancel();
-        let result = receive_handshake(&mut receiver, "current-session", Duration::from_secs(30), &token).await;
+        let result = receive_handshake(
+            &mut receiver,
+            "current-session",
+            Duration::from_secs(30),
+            &token,
+        )
+        .await;
         assert_eq!(result.unwrap_err(), "连接已取消。");
     }
 }
