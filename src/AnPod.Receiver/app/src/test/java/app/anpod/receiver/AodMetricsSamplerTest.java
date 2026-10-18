@@ -69,6 +69,17 @@ public final class AodMetricsSamplerTest {
         assertNull(sampler.bitsPerSecond(5_100_000_000L));
     }
 
+
+    @Test
+    public void rateStaysStableBetweenPolls() {
+        AodMetricsSampler sampler = new AodMetricsSampler();
+        sampler.recordCumulativeBytes(0, 0);
+        sampler.recordCumulativeBytes(192_000, 0);
+        assertEquals(Long.valueOf(1_536_000L), sampler.bitsPerSecond(1_000_000_000L));
+        assertEquals(Long.valueOf(1_536_000L), sampler.bitsPerSecond(1_250_000_000L));
+        assertEquals(Long.valueOf(0L), sampler.bitsPerSecond(2_000_000_000L));
+    }
+
     @Test
     public void bufferLatencyUsesQueuePlusTrackPending() {
         assertEquals(18.0f, AodMetricsSampler.bufferMs(240, 624, 48_000), 0.0001f);

@@ -35,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -90,7 +91,12 @@ class AodActivity : ComponentActivity() {
         setContent {
             LaunchedEffect(binder) {
                 while (isActive) {
-                    binder?.let { waveform = it.aodWaveform() }
+                    waveform = try {
+                        ReceiverService.aodWaveform()
+                    } catch (error: Throwable) {
+                        android.util.Log.e("AnPodAod", "waveform failed", error)
+                        null
+                    }
                     delay(33)
                 }
             }
@@ -144,8 +150,8 @@ private fun AodScreen(
     }
     val drift = rememberDrift()
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
-        val clockSize = (maxHeight.value * 0.38f).coerceIn(84f, 168f)
-        val waveformHeight = (maxHeight.value * 0.22f).coerceIn(60f, 120f)
+        val clockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
+        val waveformHeight = (maxHeight.value * 0.24f).coerceIn(64f, 132f)
         Text(
             text = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE)),
             fontFamily = RubikClock,
@@ -188,33 +194,27 @@ private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, modifier: Modifie
 
 /** The two lines overlap at center when silent and bend independently around it when audio plays. */
 private fun DrawScope.drawRibbon(left: FloatArray?, right: FloatArray?, centerY: Float, color: Color) {
-    if (left == null || right == null || left.isEmpty() || right.isEmpty()) return
+    if (left == null || right == null || left.size < 2 || right.size < 2) return
     val count = minOf(left.size, right.size)
-    val upper = Path()
-    val lower = Path()
-    val amplitude = size.height * 0.44f
-    for (index in 0 until count) {
-        val x = size.width * index / (count - 1).coerceAtLeast(1)
-        val taper = sin(PI * index / (count - 1).coerceAtLeast(1)).toFloat().pow(0.7f)
-        val up = (left[index] * 1.6f).coerceIn(0f, 1f) * taper * amplitude
-        val down = (right[index] * 1.6f).coerceIn(0f, 1f) * taper * amplitude
-        if (index == 0) {
-            upper.moveTo(x, centerY - up)
-            lower.moveTo(x, centerY + down)
-        } else {
-            val previousX = size.width * (index - 1) / (count - 1)
-            val controlX = (previousX + x) / 2f
-            val previousTaper = sin(PI * (index - 1) / (count - 1)).toFloat().pow(0.7f)
-            val previousUp = (left[index - 1] * 1.6f).coerceIn(0f, 1f) * previousTaper * amplitude
-            val previousDown = (right[index - 1] * 1.6f).coerceIn(0f, 1f) * previousTaper * amplitude
-            upper.cubicTo(controlX, centerY - previousUp, controlX, centerY - up, x, centerY - up)
-            lower.cubicTo(controlX, centerY + previousDown, controlX, centerY + down, x, centerY + down)
-        }
+    val amplitude = size.height * 0.46f
+    for (index in 0 until count - 1) {
+        val x1 = size.width * index / (count - 1)
+        val x2 = size.width * (index + 1) / (count - 1)
+        val taper1 = sin(PI * index / (count - 1)).toFloat().pow(0.7f)
+        val taper2 = sin(PI * (index + 1) / (count - 1)).toFloat().pow(0.7f)
+        val up1 = (left[index] * 2.2f).coerceIn(0f, 1f) * taper1 * amplitude
+        val up2 = (left[index + 1] * 2.2f).coerceIn(0f, 1f) * taper2 * amplitude
+        val down1 = (right[index] * 2.2f).coerceIn(0f, 1f) * taper1 * amplitude
+        val down2 = (right[index + 1] * 2.2f).coerceIn(0f, 1f) * taper2 * amplitude
+        drawLine(color.copy(alpha = 0.14f), Offset(x1, centerY - up1), Offset(x2, centerY - up2),
+            strokeWidth = 10f, cap = StrokeCap.Round)
+        drawLine(color.copy(alpha = 0.14f), Offset(x1, centerY + down1), Offset(x2, centerY + down2),
+            strokeWidth = 10f, cap = StrokeCap.Round)
+        drawLine(color, Offset(x1, centerY - up1), Offset(x2, centerY - up2),
+            strokeWidth = 2.4f, cap = StrokeCap.Round)
+        drawLine(Color(0xFF0891B2), Offset(x1, centerY + down1), Offset(x2, centerY + down2),
+            strokeWidth = 2.4f, cap = StrokeCap.Round)
     }
-    drawPath(upper, color.copy(alpha = 0.14f), style = Stroke(width = 10f, cap = StrokeCap.Round))
-    drawPath(lower, color.copy(alpha = 0.14f), style = Stroke(width = 10f, cap = StrokeCap.Round))
-    drawPath(upper, color, style = Stroke(width = 2.4f, cap = StrokeCap.Round))
-    drawPath(lower, Color(0xFF0891B2), style = Stroke(width = 2.4f, cap = StrokeCap.Round))
 }
 
 @Composable
