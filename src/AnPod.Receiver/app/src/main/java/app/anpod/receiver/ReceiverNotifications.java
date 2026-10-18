@@ -45,13 +45,14 @@ final class ReceiverNotifications {
     }
 
     static Notification playback(Context context, String channelId, String text,
-            PendingIntent content, PendingIntent stopAction) {
+            PendingIntent content, PendingIntent stopAction, PendingIntent aodAction) {
         Notification.Builder builder = builder(context, channelId);
         builder.setSmallIcon(android.R.drawable.stat_sys_headset)
                 .setContentTitle(TITLE)
                 .setContentText(text)
                 .setContentIntent(content)
                 .setOngoing(true);
+        if (aodAction != null) builder.addAction(android.R.drawable.ic_menu_view, "打开常显", aodAction);
         if (stopAction != null) builder.addAction(android.R.drawable.ic_media_pause, "停止接收", stopAction);
         return builder.build();
     }

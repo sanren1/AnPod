@@ -366,7 +366,12 @@ public final class ReceiverService extends Service {
             stopAction = PendingIntent.getService(this, 2, stop,
                     PendingIntent.FLAG_UPDATE_CURRENT | immutable);
         }
-        return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction);
+        PendingIntent aodAction = null;
+        if (getSharedPreferences("anpod_receiver", MODE_PRIVATE).getBoolean("aod_enabled", false)) {
+            Intent aod = new Intent(this, AodActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            aodAction = PendingIntent.getActivity(this, 3, aod, PendingIntent.FLAG_UPDATE_CURRENT | immutable);
+        }
+        return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction, aodAction);
     }
 
     PendingIntent mainActivityPendingIntent() {

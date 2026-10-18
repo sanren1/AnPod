@@ -14,13 +14,13 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -34,7 +34,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -51,7 +50,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import java.util.Calendar
 import java.util.Locale
+import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -125,7 +126,6 @@ class AodActivity : ComponentActivity() {
         }
         super.onDestroy()
     }
-
 }
 
 @Composable
@@ -142,29 +142,38 @@ private fun AodScreen(
         }
     }
     val drift = rememberDrift()
-    Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+        val clockSize = (maxHeight.value * 0.30f).coerceIn(72f, 132f)
+        val waveformHeight = (maxHeight.value * 0.18f).coerceIn(44f, 96f)
         Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.offset(x = drift.x.dp, y = drift.y.dp)
+            modifier = Modifier.fillMaxSize().padding(start = 36.dp, top = 18.dp, end = 36.dp, bottom = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            Spacer(Modifier.weight(0.55f))
             Text(
                 text = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE)),
                 fontFamily = RubikClock,
-                fontWeight = FontWeight.ExtraBold,
-                fontSize = 168.sp,
-                letterSpacing = (-6).sp,
-                color = Color(0xFFF2F2F2)
+                fontWeight = FontWeight.Black,
+                fontSize = clockSize.sp,
+                letterSpacing = (-4).sp,
+                color = Color(0xFFF5F5F5),
+                modifier = Modifier.padding(start = drift.first.dp, top = drift.second.dp)
             )
-            Spacer(Modifier.height(18.dp))
-            WaveformCanvas(waveform, Modifier.fillMaxWidth(0.82f).height(120.dp))
-            Spacer(Modifier.height(26.dp))
-            MetricsRow(telemetry)
+            Spacer(Modifier.weight(0.30f))
+            WaveformCanvas(
+                waveform,
+                Modifier.fillMaxWidth(0.84f).height(waveformHeight.dp)
+                    .padding(start = drift.first.dp, top = drift.second.dp)
+            )
+            Spacer(Modifier.weight(0.65f))
+            MetricsRow(telemetry, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(10.dp))
         }
         TextButton(
             onClick = onExit,
-            modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 12.dp)
         ) {
-            Text(stringResource(R.string.aod_exit), color = Color(0x66FFFFFF), fontSize = 14.sp)
+            Text(stringResource(R.string.aod_exit), color = Color(0x55FFFFFF), fontSize = 13.sp)
         }
     }
 }
@@ -172,50 +181,61 @@ private fun AodScreen(
 @Composable
 private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, modifier: Modifier) {
     Canvas(modifier) {
-        val left = waveform?.left
-        val right = waveform?.right
-        drawEnvelope(left, size.height * 0.48f, Color(0xFF22D3EE), 0.40f)
-        drawEnvelope(right, size.height * 0.54f, Color(0xFF0891B2), 0.34f)
+        val center = size.height / 2f
+        drawRibbon(waveform?.left, waveform?.right, center, Color(0xFF22D3EE))
     }
 }
 
-private fun DrawScope.drawEnvelope(values: FloatArray?, centerY: Float, color: Color, amplitude: Float) {
-    if (values == null || values.isEmpty()) return
-    val path = Path()
-    val step = size.width / (values.size - 1).coerceAtLeast(1)
-    val points = ArrayList<Offset>(values.size)
-    for (index in values.indices) {
-        val x = step * index
-        val y = centerY - values[index].coerceIn(0f, 1f) * size.height * amplitude
-        points.add(Offset(x, y))
+/** The two lines overlap at center when silent and bend independently around it when audio plays. */
+private fun DrawScope.drawRibbon(left: FloatArray?, right: FloatArray?, centerY: Float, color: Color) {
+    if (left == null || right == null || left.isEmpty() || right.isEmpty()) return
+    val count = minOf(left.size, right.size)
+    val upper = Path()
+    val lower = Path()
+    val amplitude = size.height * 0.44f
+    for (index in 0 until count) {
+        val x = size.width * index / (count - 1).coerceAtLeast(1)
+        val taper = sin(PI * index / (count - 1).coerceAtLeast(1)).toFloat().pow(0.7f)
+        val up = (left[index] * 3.4f).coerceIn(0f, 1f) * taper * amplitude
+        val down = (right[index] * 3.4f).coerceIn(0f, 1f) * taper * amplitude
+        if (index == 0) {
+            upper.moveTo(x, centerY - up)
+            lower.moveTo(x, centerY + down)
+        } else {
+            val previousX = size.width * (index - 1) / (count - 1)
+            val controlX = (previousX + x) / 2f
+            val previousTaper = sin(PI * (index - 1) / (count - 1)).toFloat().pow(0.7f)
+            val previousUp = (left[index - 1] * 3.4f).coerceIn(0f, 1f) * previousTaper * amplitude
+            val previousDown = (right[index - 1] * 3.4f).coerceIn(0f, 1f) * previousTaper * amplitude
+            upper.cubicTo(controlX, centerY - previousUp, controlX, centerY - up, x, centerY - up)
+            lower.cubicTo(controlX, centerY + previousDown, controlX, centerY + down, x, centerY + down)
+        }
     }
-    path.moveTo(points.first().x, points.first().y)
-    for (index in 0 until points.size - 1) {
-        val start = points[index]
-        val end = points[index + 1]
-        val controlX = (start.x + end.x) / 2f
-        path.cubicTo(controlX, start.y, controlX, end.y, end.x, end.y)
-    }
-    drawPath(path, color.copy(alpha = 0.16f), style = Stroke(width = 12f, cap = StrokeCap.Round))
-    drawPath(path, color, style = Stroke(width = 2.5f, cap = StrokeCap.Round))
+    drawPath(upper, color.copy(alpha = 0.14f), style = Stroke(width = 10f, cap = StrokeCap.Round))
+    drawPath(lower, color.copy(alpha = 0.14f), style = Stroke(width = 10f, cap = StrokeCap.Round))
+    drawPath(upper, color, style = Stroke(width = 2.4f, cap = StrokeCap.Round))
+    drawPath(lower, Color(0xFF0891B2), style = Stroke(width = 2.4f, cap = StrokeCap.Round))
 }
 
 @Composable
-private fun MetricsRow(telemetry: AodTelemetrySnapshot?) {
+private fun MetricsRow(telemetry: AodTelemetrySnapshot?, modifier: Modifier) {
     Row(
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(18.dp)
+        horizontalArrangement = Arrangement.SpaceEvenly
     ) {
-        StatusDot(telemetry)
-        Text(statusLabel(telemetry), color = Color(0xFFE6E6E6), fontSize = 17.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            StatusDot(telemetry)
+            Text(statusLabel(telemetry), color = Color(0xFFE6E6E6), fontSize = 14.sp)
+        }
         Divider()
-        Text(protocolLabel(telemetry), color = Color(0xFFB3B3B3), fontSize = 17.sp)
+        Text(protocolLabel(telemetry), color = Color(0xFFB3B3B3), fontSize = 14.sp)
         Divider()
-        Text("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}", color = Color(0xFFB3B3B3), fontSize = 17.sp)
+        Text("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
         Divider()
-        Text("Latency ${latencyLabel(telemetry?.receiverBufferMs)}", color = Color(0xFFB3B3B3), fontSize = 17.sp)
+        Text("Latency ${latencyLabel(telemetry?.receiverBufferMs)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
         Divider()
-        Text("Loss ${lossLabel(telemetry?.udpLossPercent)}", color = Color(0xFFB3B3B3), fontSize = 17.sp)
+        Text("Loss ${lossLabel(telemetry?.udpLossPercent)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
     }
 }
 
@@ -227,12 +247,12 @@ private fun StatusDot(telemetry: AodTelemetrySnapshot?) {
         AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> Color(0xFFF59E0B)
         else -> Color(0xFF4B5563)
     }
-    Box(Modifier.size(10.dp).background(color, CircleShape))
+    Box(Modifier.size(8.dp).background(color, CircleShape))
 }
 
 @Composable
 private fun Divider() {
-    Text("|", color = Color(0xFF2F3B3F), fontSize = 17.sp)
+    Text("|", color = Color(0xFF2F3B3F), fontSize = 14.sp)
 }
 
 private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.status) {
@@ -261,18 +281,16 @@ private fun latencyLabel(millis: Float?): String =
 private fun lossLabel(percent: Float?): String =
     percent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—"
 
-private val RubikClock = FontFamily(Font(R.font.rubik_variable, FontWeight.ExtraBold))
+private val RubikClock = FontFamily(Font(R.font.rubik_black, FontWeight.Black))
 
 @Composable
-private fun rememberDrift(): Offset {
-    var offset by remember { mutableStateOf(Offset.Zero) }
+private fun rememberDrift(): Pair<Float, Float> {
+    var offset by remember { mutableStateOf(0f to 0f) }
     LaunchedEffect(Unit) {
         while (isActive) {
             val seconds = SystemClock.elapsedRealtime() / 1_000.0
-            offset = Offset(
-                (sin(seconds / 120.0 * 2 * Math.PI) * 10.0).toFloat(),
-                (cos(seconds / 150.0 * 2 * Math.PI) * 5.0).toFloat()
-            )
+            offset = (sin(seconds / 120.0 * 2 * PI) * 9.0).toFloat() to
+                (cos(seconds / 150.0 * 2 * PI) * 4.0).toFloat()
             delay(1_000)
         }
     }
