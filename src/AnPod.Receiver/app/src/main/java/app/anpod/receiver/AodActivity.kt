@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -157,13 +158,13 @@ private fun AodScreen(
                 fontSize = clockSize.sp,
                 letterSpacing = (-4).sp,
                 color = Color(0xFFF5F5F5),
-                modifier = Modifier.padding(start = drift.first.dp, top = drift.second.dp)
+                modifier = Modifier.offset(x = drift.first.dp, y = drift.second.dp)
             )
             Spacer(Modifier.weight(0.30f))
             WaveformCanvas(
                 waveform,
                 Modifier.fillMaxWidth(0.84f).height(waveformHeight.dp)
-                    .padding(start = drift.first.dp, top = drift.second.dp)
+                    .offset(x = drift.first.dp, y = drift.second.dp)
             )
             Spacer(Modifier.weight(0.65f))
             MetricsRow(telemetry, Modifier.fillMaxWidth())
