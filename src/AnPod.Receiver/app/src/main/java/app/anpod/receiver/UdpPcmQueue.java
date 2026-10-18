@@ -38,6 +38,8 @@ final class UdpPcmQueue {
     private long playoutFrame;
     private long payloadGeneration;
     private long droppedFrames;
+    private long acceptedAudioFrames;
+    private long audioPayloadBytes;
     private long expiredFrames;
     private long queuedFrames;
     private QueueInputStream activePayloadStream;
@@ -156,6 +158,8 @@ final class UdpPcmQueue {
             throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
 
         decoder.commit(packet.sequence);
+        acceptedAudioFrames += frameCount;
+        audioPayloadBytes += packet.payload.length;
         lastAuthenticatedAudioAtNanos = now;
         hasAuthenticatedAudio = true;
         if (paused) {
@@ -673,6 +677,12 @@ final class UdpPcmQueue {
         return buffered;
     }
     synchronized long payloadGeneration() { return payloadGeneration; }
+    synchronized long acceptedAudioFrames() { return acceptedAudioFrames; }
+
+    synchronized long audioPayloadBytes() { return audioPayloadBytes; }
+
+    synchronized long concealedFrames() { return plcRepeatedFrames + plcSilentFrames; }
+
     synchronized long plcEvents() { return plcEvents; }
     synchronized long plcRepeatedFrames() { return plcRepeatedFrames; }
     synchronized long plcSilentFrames() { return plcSilentFrames; }

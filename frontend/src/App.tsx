@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
 import { strings } from "./strings";
-import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
+import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
 import { isDesktop, invokeApp, byTransport, hasActiveSession, bindingLabel, readableStatus, needsReceiverUpdate, endpointFitsInterface } from "./appRuntime";
 import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
 import { DeviceDialog } from "./components/DeviceDialog";
@@ -22,6 +22,11 @@ function App() {
   const [receiverOperationBusy, setReceiverOperationBusy] = useState(false);
   const [receiverManagerSerial, setReceiverManagerSerial] = useState("");
   const [receiverOperationResult, setReceiverOperationResult] = useState<ReceiverUsbOperationResult | null>(null);
+  const [receiverOperationProgress, setReceiverOperationProgress] = useState<ReceiverInstallProgress | null>(null);
+  const receiverOperationLock = useRef(false);
+  const receiverConfirmationStarted = useRef(false);
+  const appMounted = useRef(true);
+  const receiverOperationUnlisten = useRef<(() => void) | null>(null);
   const panelRef = useRef(panel);
   panelRef.current = panel;
   const [networkDialogError, setNetworkDialogError] = useState("");
@@ -33,6 +38,15 @@ function App() {
   const [notice, setNotice] = useState("");
   const [noticeDetail, setNoticeDetail] = useState("");
   const [working, setWorking] = useState(false);
+
+  useEffect(() => {
+    appMounted.current = true;
+    return () => {
+      appMounted.current = false;
+      receiverOperationUnlisten.current?.();
+      receiverOperationUnlisten.current = null;
+    };
+  }, []);
   const snapshotRefreshGeneration = useRef(0);
   const lastOfferListenerChoice = useRef<{ localAddress: string; bindingReference: string } | null>(null);
 
@@ -178,32 +192,72 @@ function App() {
   };
 
   const performReceiverUsbOperation = async (operation: ReceiverUsbOperation) => {
+    const operationId = crypto.randomUUID();
+    let unlisten: (() => void) | null = null;
+    let commandStarted = false;
     setWorking(true); setReceiverOperationBusy(true); setNetworkDialogError(""); setReceiverOperationResult(null);
+    setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "checking" });
     try {
+      const stopListening = await listen<ReceiverInstallProgress>("anpod://receiver-install-progress", event => {
+        const payload = event.payload;
+        if (payload.operationId !== operationId || payload.serial !== operation.serial) return;
+        if (payload.stage === "completed") return;
+        setReceiverOperationProgress(current => {
+          if (current?.operationId !== operationId || current.serial !== operation.serial
+            || current.stage === "completed" || current.stage === "failed") return current;
+          const order = { checking: 0, transferring: 1, verifying: 2, completed: 3, failed: 3 };
+          return order[payload.stage] >= order[current.stage] ? payload : current;
+        });
+      });
+      let listening = true;
+      unlisten = () => {
+        if (!listening) return;
+        listening = false;
+        stopListening();
+        if (receiverOperationUnlisten.current === unlisten) receiverOperationUnlisten.current = null;
+      };
+      receiverOperationUnlisten.current = unlisten;
+      if (!appMounted.current) { unlisten(); return; }
       const command = operation.kind === "upgrade" ? "receiver_upgrade_usb" : "receiver_install";
       const args = operation.kind === "upgrade"
-        ? { serial: operation.serial, bindingReference: operation.bindingReference }
-        : { serial: operation.serial };
-      await invokeApp<ReceiverStatus>(command, args);
-      const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: operation.serial });
+        ? { serial: operation.serial, bindingReference: operation.bindingReference, operationId }
+        : { serial: operation.serial, operationId };
+      commandStarted = true;
+      const status = await invokeApp<ReceiverStatus>(command, args);
+      if (!appMounted.current) return;
       if (!status.installed || status.versionCode !== operation.targetVersionCode) {
         throw new Error(strings.app.usbVersionVerificationFailed(operation.targetVersionCode));
       }
+      setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "completed" });
       setReceiverOperationResult({ serial: operation.serial, kind: operation.kind, targetVersionCode: operation.targetVersionCode, status });
       setReceiverManagerSerial(operation.serial);
       if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
-      try { apply(await invokeApp<Snapshot>("refresh_devices")); }
-      catch (error) { setNetworkDialogError(strings.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
-      announce(strings.app.receiverVersionVerifiedReconnect(status.versionCode));
+      try {
+        const next = await invokeApp<Snapshot>("refresh_devices");
+        if (appMounted.current) apply(next);
+      }
+      catch (error) { if (appMounted.current) setNetworkDialogError(strings.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
+      if (appMounted.current) announce(strings.app.receiverVersionVerifiedReconnect(status.versionCode));
     } catch (error) {
-      setNetworkDialogError(String(error));
-      setReceiverManagerSerial(operation.serial);
-      if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
-    } finally { setReceiverOperationBusy(false); setWorking(false); }
+      if (appMounted.current) {
+        if (commandStarted) setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "failed" });
+        else setReceiverOperationProgress(null);
+        setNetworkDialogError(String(error));
+        setReceiverManagerSerial(operation.serial);
+        if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
+      }
+    } finally {
+      unlisten?.();
+      receiverOperationLock.current = false;
+      receiverConfirmationStarted.current = false;
+      if (appMounted.current) { setReceiverOperationBusy(false); setWorking(false); }
+    }
   };
 
   const requestReceiverUsbOperation = (operation: ReceiverUsbOperation) => {
+    if (receiverOperationLock.current) return;
     setReceiverOperationResult(null); setNetworkDialogError("");
+    setReceiverOperationProgress(null);
     if (active && snapshot) {
       const targetMatches = snapshot.sessionTransport === "lan"
         ? operation.bindingReference === snapshot.sessionReceiverBinding
@@ -212,16 +266,23 @@ function App() {
         setNetworkDialogError(strings.app.differentCurrentSessionTarget);
         return;
       }
+      receiverOperationLock.current = true;
+      receiverConfirmationStarted.current = false;
       setPendingReceiverOperation(operation);
       setPanel(null);
       setConfirm({ kind: "receiverUsb", value: "" });
       return;
     }
+    receiverOperationLock.current = true;
     void performReceiverUsbOperation(operation);
   };
 
   const applyConfirmed = async () => {
     if (!confirm) return;
+    if (confirm.kind === "receiverUsb") {
+      if (receiverConfirmationStarted.current) return;
+      receiverConfirmationStarted.current = true;
+    }
     setWorking(true);
     try {
       if (confirm.kind === "network") {
@@ -270,7 +331,13 @@ function App() {
       setPendingNetworkStart(null);
       if (confirm.kind === "receiverUsb") setPendingReceiverOperation(null);
     }
-    finally { setWorking(false); }
+    finally {
+      if (confirm.kind === "receiverUsb") {
+        receiverOperationLock.current = false;
+        receiverConfirmationStarted.current = false;
+      }
+      setWorking(false);
+    }
   };
 
   const startNetwork = async (request: NetworkStartRequest) => {
@@ -586,7 +653,7 @@ function App() {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { setBackgroundStartMode(false); setPanel(null); }} />}
+    {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} receiverOperationProgress={receiverOperationProgress} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { setBackgroundStartMode(false); if (!receiverOperationBusy) { setReceiverOperationResult(null); setReceiverOperationProgress(null); } setPanel(null); }} />}
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
@@ -599,7 +666,7 @@ function App() {
             : confirm.kind === "audioBackend" ? strings.app.switchBackend
             : confirm.kind === "device" ? strings.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone, snapshot.output === "phone")
               : strings.app.switchPlayback}
-      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
+      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 

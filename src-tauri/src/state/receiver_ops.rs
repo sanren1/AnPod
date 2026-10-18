@@ -6,7 +6,7 @@ impl AppState {
         reject_active_audio: bool,
     ) -> Result<(u64, CancellationToken, tokio::sync::MutexGuard<'a, ()>), String> {
         let (generation, token) =
-            begin_operation_slot(&self.operation_generation, &self.operation, true)
+            begin_foreground_receiver_operation(&self.operation_generation, &self.operation)
                 .ok_or_else(|| "AnPod 正在执行其他设备操作。".to_string())?;
         let guard = self.gate.lock().await;
         if !self.operation_is_current(generation, &token) {
@@ -38,8 +38,30 @@ impl AppState {
         result
     }
 
-    pub async fn receiver_install(&self, serial: &str) -> Result<ReceiverStatus, String> {
-        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+    pub async fn receiver_install(
+        &self,
+        app: &AppHandle,
+        serial: &str,
+        operation_id: &str,
+    ) -> Result<ReceiverStatus, String> {
+        let mut report = |stage| {
+            let _ = app.emit(
+                "anpod://receiver-install-progress",
+                receiver::InstallProgress {
+                    operation_id: operation_id.to_owned(),
+                    serial: serial.to_owned(),
+                    stage,
+                },
+            );
+        };
+        report(receiver::InstallProgressStage::Checking);
+        let (generation, token, _guard) = match self.begin_receiver_operation(false).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                report(receiver::InstallProgressStage::Failed);
+                return Err(error);
+            }
+        };
         let result = async {
             receiver::validate_usb_install(
                 &self.adb_path,
@@ -63,20 +85,45 @@ impl AppState {
                 &self.receiver_apk_path,
                 &self.receiver_metadata_path,
                 &token,
+                &mut report,
             )
             .await
         }
         .await;
         self.finish_operation(generation);
+        report(if result.is_ok() {
+            receiver::InstallProgressStage::Completed
+        } else {
+            receiver::InstallProgressStage::Failed
+        });
         result
     }
 
     pub async fn receiver_upgrade_usb(
         &self,
+        app: &AppHandle,
         serial: &str,
         binding_reference: &str,
+        operation_id: &str,
     ) -> Result<ReceiverStatus, String> {
-        let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
+        let mut report = |stage| {
+            let _ = app.emit(
+                "anpod://receiver-install-progress",
+                receiver::InstallProgress {
+                    operation_id: operation_id.to_owned(),
+                    serial: serial.to_owned(),
+                    stage,
+                },
+            );
+        };
+        report(receiver::InstallProgressStage::Checking);
+        let (generation, token, _guard) = match self.begin_receiver_operation(false).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                report(receiver::InstallProgressStage::Failed);
+                return Err(error);
+            }
+        };
         let result = async {
             let path = binding_store_path(&self.data_dir, binding_reference)?;
             let actual_reference =
@@ -113,11 +160,17 @@ impl AppState {
                 &self.receiver_apk_path,
                 &self.receiver_metadata_path,
                 &token,
+                &mut report,
             )
             .await
         }
         .await;
         self.finish_operation(generation);
+        report(if result.is_ok() {
+            receiver::InstallProgressStage::Completed
+        } else {
+            receiver::InstallProgressStage::Failed
+        });
         result
     }
 

@@ -316,7 +316,10 @@ if (-not $ReuseExistingBuild) {
         $env:CARGO_TARGET_DIR = $targetDir
         $cargoArguments = @('build', '--release', '--locked', '--manifest-path', (Join-Path $root 'src-tauri\Cargo.toml'))
         if ($Offline) { $cargoArguments += '--offline' }
-        & $cargo.Source @cargoArguments
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & $cargo.Source @cargoArguments 2>&1 | ForEach-Object { Write-Host $_ }
+        $ErrorActionPreference = $previousErrorAction
         if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE." }
     }
     finally {

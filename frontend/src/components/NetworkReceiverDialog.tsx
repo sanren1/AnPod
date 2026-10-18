@@ -1,20 +1,20 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Search } from "lucide-react";
 import { strings } from "../strings";
-import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
+import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
 import { invokeApp, hasActiveSession, bindingLabel, bindingReferenceLabel, resetPhoneStateLabel, resetPcStateLabel, resetOutcomeLabel, commitmentSummary, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
 
-export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
+export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
   snapshot: Snapshot;
   backgroundStartMode: boolean; backgroundChoicePrefill: { localAddress: string; bindingReference: string };
   setupWizard: boolean;
   receiverManagerOnly: boolean;
   initialReceiverSerial: string;
   requiredChoices: { interfaceAddress: boolean; bindingReference: boolean };
-  usbDevices: Device[]; usbSeenDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; audioSessionActive: boolean; udpMode: boolean; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
+  usbDevices: Device[]; usbSeenDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; receiverOperationProgress: ReceiverInstallProgress | null; audioSessionActive: boolean; udpMode: boolean; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
   onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string) => void;
   onAcceptOffer: (offerId: string, bindingReference: string) => void; onReceiverSerialChange: (serial: string) => void;
   onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onAddPhone: () => void; onOpenReceiverManager: () => void; onClose: () => void;
@@ -53,6 +53,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const alertRef = useRef<HTMLParagraphElement>(null);
   const setupStepRef = useRef<HTMLDivElement>(null);
   const receiverGeneration = useRef(0);
+  const receiverCheckInFlight = useRef<{ serial: string; generation: number; promise: Promise<ReceiverStatus | null> } | null>(null);
   const serialRef = useRef(serial);
   serialRef.current = serial;
   const discoveryGeneration = useRef(0);
@@ -68,6 +69,12 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const peerManuallyEdited = useRef(false);
   const peerSelectionSource = useRef<"candidate" | "manual" | null>(null);
   const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy || backgroundTrustBusy;
+  const receiverProgressStage = receiverOperationProgress?.serial === serial ? receiverOperationProgress.stage : null;
+  const receiverProgressLabel = receiverProgressStage === "checking" ? strings.network.receiverProgressChecking
+    : receiverProgressStage === "transferring" ? strings.network.receiverProgressTransferring
+      : receiverProgressStage === "verifying" ? strings.network.receiverProgressVerifying
+        : receiverProgressStage === "completed" ? strings.network.receiverProgressCompleted
+          : receiverProgressStage === "failed" ? strings.network.receiverProgressFailed : "";
   const receiverDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
   const selectedReceiverDevice = usbDevices.find(device => device.serial === serial);
   const validBootstrapPairs = useMemo(() => bootstrapNetworkPairs(interfaces, receiverInterfaces), [interfaces, receiverInterfaces]);
@@ -214,6 +221,13 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     setSerial(next);
     onReceiverSerialChange(next);
   }, [receiverDeviceKey, receiverManagerOnly, initialReceiverSerial]);
+  const readReceiverInterfaces = async (deviceSerial: string, generation: number) => {
+    const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial: deviceSerial });
+    if (receiverGeneration.current !== generation || serialRef.current !== deviceSerial) return;
+    setReceiverInterfaces(values);
+    setReceiverAddress(current => values.some(value => value.address === current) ? current : "");
+    setLocalError(values.length === 0 ? strings.network.receiverHasNoIpv4 : "");
+  };
   const readReceiverStatusAndInterfaces = async (deviceSerial: string, generation: number): Promise<ReceiverStatus | null> => {
     const status = await invokeApp<ReceiverStatus>("receiver_status", { serial: deviceSerial });
     if (receiverGeneration.current !== generation || serialRef.current !== deviceSerial) return null;
@@ -227,35 +241,57 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
       return status;
     }
-    const values = await invokeApp<ReceiverIpv4Interface[]>("receiver_network_interfaces", { serial: deviceSerial });
-    if (receiverGeneration.current !== generation || serialRef.current !== deviceSerial) return null;
-    setReceiverInterfaces(values);
-    setReceiverAddress(current => values.some(value => value.address === current) ? current : "");
-    setLocalError(values.length === 0 ? strings.network.receiverHasNoIpv4 : "");
+    await readReceiverInterfaces(deviceSerial, generation);
     return status;
   };
-  const checkReceiver = async (deviceSerial: string): Promise<ReceiverStatus | null> => {
+  const checkReceiver = (deviceSerial: string, clearFlowError = true): Promise<ReceiverStatus | null> => {
+    if (receiverCheckInFlight.current) {
+      const inFlight = receiverCheckInFlight.current;
+      if (inFlight.serial === deviceSerial && inFlight.generation === receiverGeneration.current) return inFlight.promise;
+      return inFlight.promise.then(() => serialRef.current === deviceSerial ? checkReceiver(deviceSerial, clearFlowError) : null);
+    }
     const generation = ++receiverGeneration.current;
-    onError("");
+    if (clearFlowError) onError("");
     setReceiverStatus(null); setReceiverError(""); setReceiverInterfaces([]); setReceiverAddress(""); setLocalError("");
     setReceiverAction("checking");
-    try { return await readReceiverStatusAndInterfaces(deviceSerial, generation); }
-    catch (reason) {
-      if (receiverGeneration.current === generation && serialRef.current === deviceSerial) setReceiverError(String(reason));
-      return null;
-    }
-    finally { if (receiverGeneration.current === generation && serialRef.current === deviceSerial) setReceiverAction(null); }
+    const promise = (async () => {
+      try { return await readReceiverStatusAndInterfaces(deviceSerial, generation); }
+      catch (reason) {
+        if (receiverGeneration.current === generation && serialRef.current === deviceSerial) setReceiverError(String(reason));
+        return null;
+      }
+      finally {
+        if (receiverCheckInFlight.current?.generation === generation) receiverCheckInFlight.current = null;
+        if (receiverGeneration.current === generation && serialRef.current === deviceSerial) setReceiverAction(null);
+      }
+    })();
+    receiverCheckInFlight.current = { serial: deviceSerial, generation, promise };
+    return promise;
   };
   useEffect(() => {
+    if (receiverOperationBusy) { setReceiverAction(null); return; }
+    if (receiverOperationResult?.serial === serial) {
+      const generation = ++receiverGeneration.current;
+      setReceiverStatus(receiverOperationResult.status);
+      setReceiverError("");
+      if (receiverManagerOnly || !receiverOperationResult.status.installed) {
+        setReceiverInterfaces([]); setReceiverAddress(""); setLocalError(""); setReceiverAction(null);
+        return;
+      }
+      setReceiverAction("checking");
+      void readReceiverInterfaces(serial, generation).catch(reason => {
+        if (receiverGeneration.current === generation && serialRef.current === serial) setReceiverError(String(reason));
+      }).finally(() => {
+        if (receiverGeneration.current === generation && serialRef.current === serial) setReceiverAction(null);
+      });
+      return;
+    }
     setReceiverInterfaces([]); setReceiverAddress("");
     setReceiverStatus(null); setReceiverError(""); setLocalError("");
-    if (serial) void checkReceiver(serial);
+    if (serial) void checkReceiver(serial, false);
     else setReceiverAction(null);
     return () => { receiverGeneration.current++; };
-  }, [serial]);
-  useEffect(() => {
-    if (receiverOperationResult?.serial === serial) setReceiverStatus(receiverOperationResult.status);
-  }, [receiverOperationResult, serial]);
+  }, [receiverManagerOnly, receiverOperationBusy, receiverOperationResult, serial]);
 
   useEffect(() => {
     if (receiverManagerOnly) return;
@@ -611,7 +647,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
         </div>}
         {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={error} summaryRef={alertRef} />
           : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
-        {busy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverOperationBusy ? strings.network.usbOperationVerifying : receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
+        {busy && !receiverOperationBusy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
         {!receiverManagerOnly && udpMode && <section className="receiver-manager offer-manager" aria-label={strings.network.offerListenerLabel}>
           <div className="receiver-status-row">
             <div className="receiver-status-copy" role="status" aria-live="polite">
@@ -753,6 +789,10 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? strings.network.processing : backgroundStartMode ? strings.app.backgroundStartConnect : method === "bootstrap" ? strings.network.firstBindAndConnect : strings.network.connectReceiverDirectly}</button>}
           </div>
       </>}
+      {receiverProgressStage && <div className={`receiver-operation-progress${receiverProgressStage === "failed" ? " is-failed" : ""}`} role={receiverProgressStage === "failed" ? "alert" : "status"} aria-live={receiverProgressStage === "failed" ? "assertive" : "polite"}>
+        <span>{receiverProgressLabel}</span>
+        {(receiverProgressStage === "checking" || receiverProgressStage === "transferring" || receiverProgressStage === "verifying") && <progress aria-label={receiverProgressLabel} />}
+      </div>}
       {!receiverManagerOnly && needsReceiverUpdate([shownError, receiverError, bindingResetError].join(" ")) && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.upgradePhone}</button>}
     </form>
   </Modal>;

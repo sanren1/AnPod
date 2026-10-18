@@ -305,11 +305,11 @@ impl AppState {
                         return Err("Receiver 目标不在所选 IPv4 接口的本地网段内。".into());
                     }
                     let path = binding_store_path(&self.data_dir, &binding_reference)?;
+                    // The reference names this DPAPI file; the phone's commitment is a hash of the
+                    // material, so comparing the two always failed. The management handshake below
+                    // still authenticates against the phone's stored material.
                     let material = crate::security::BindingStore::load(&path)
                         .map_err(|_| "本机 DPAPI 绑定材料不可用；请重新选择已保存的 Receiver 绑定。".to_string())?;
-                    if crate::p5c::hex_string(&material.commitment()) != binding_reference.to_ascii_lowercase() {
-                        return Err("所选绑定材料与 bindingReference 不匹配。".into());
-                    }
                     let interface = interface.clone();
                     let request_cancellation = cancellation.clone();
                     let absolute_deadline = deadline;

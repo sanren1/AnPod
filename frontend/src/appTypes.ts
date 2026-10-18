@@ -55,6 +55,7 @@ export type BindingResetPreview = { serial: string; androidUser: string; binding
 export type BindingResetResult = Omit<BindingResetPreview, "receiverBusy"> & { outcome: string; reason: string; nextAction: string };
 export type ReceiverUsbOperation = { kind: "install" | "upgrade"; serial: string; bindingReference?: string; targetVersionCode: number; returnPanel: "network" | "receiver" | "setup" };
 export type ReceiverUsbOperationResult = { serial: string; kind: ReceiverUsbOperation["kind"]; targetVersionCode: number; status: ReceiverStatus };
+export type ReceiverInstallProgress = { operationId: string; serial: string; stage: "checking" | "transferring" | "verifying" | "completed" | "failed" };
 export type ConnectionOffer = { id: string; endpoint: string };
 export type HostDiscoverySnapshot = {
   active: boolean; automaticBinding?: string | null; interfaceAddress: string | null; interfacePrefixLength: number | null; offers: ConnectionOffer[];

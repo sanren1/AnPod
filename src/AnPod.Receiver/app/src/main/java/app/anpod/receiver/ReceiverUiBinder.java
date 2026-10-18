@@ -13,6 +13,8 @@ import java.util.List;
     }
 
         public UiSnapshot snapshot() { return service.uiState.snapshot(); }
+        public AodTelemetrySnapshot aodSnapshot() { return service.uiState.aodSnapshot(); }
+        public PcmWaveformTap.Waveform aodWaveform() { return ReceiverService.aodWaveform(); }
         public List<UiInterface> interfaces() { return service.uiState.interfaces(); }
         public String start(String address, int prefixLength, String requestId) { return service.startFromUi(address, prefixLength, requestId); }
         public String startReceiving(String address, int prefixLength, String requestId) {

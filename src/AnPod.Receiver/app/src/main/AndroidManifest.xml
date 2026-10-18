@@ -29,11 +29,21 @@
 
         <!-- No launcher filter. The explicit USB bootstrap is restricted to adb shell. -->
         <activity
+            android:name=".AodActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/AnPodAodTheme" />
+
+
+        <!-- No window: the DUMP-protected adb bootstrap must not flash a management screen over
+             the AOD. It forwards the action to ReceiverService and finishes immediately. -->
+        <activity
             android:name=".BootstrapActivity"
             android:excludeFromRecents="true"
             android:exported="true"
             android:permission="android.permission.DUMP"
-            android:theme="@style/AnPodTheme" />
+            android:theme="@android:style/Theme.NoDisplay" />
 
         <service
             android:name=".ReceiverService"

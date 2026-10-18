@@ -6,6 +6,24 @@ const TEST_USER: &str = "10";
 const INSTALLED_PATH: &str = "/data/app/~~AbCdEf0123==/app.anpod.receiver-xYz987==/base.apk";
 
 #[test]
+fn receiver_install_progress_matches_frontend_event_contract() {
+    let payload = serde_json::to_value(InstallProgress {
+        operation_id: "operation-1".into(),
+        serial: SERIAL.into(),
+        stage: InstallProgressStage::Verifying,
+    })
+    .unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "operationId": "operation-1",
+            "serial": SERIAL,
+            "stage": "verifying"
+        })
+    );
+}
+
+#[test]
 fn content_rows_preserve_multiple_interfaces_and_bootstrap_listener_endpoint() {
     let output = "Row: 0 address=192.168.1.20, prefixLength=24, interfaceIndex=3, interfaceName=wlan0\nRow: 1 address=192.168.43.1, prefixLength=24, interfaceIndex=7, interfaceName=ap0\n";
     let interfaces = parse_receiver_interfaces(output);
@@ -21,11 +39,32 @@ fn content_rows_preserve_multiple_interfaces_and_bootstrap_listener_endpoint() {
 }
 
 #[test]
+fn network_listener_is_ready_before_authentication_but_not_while_starting() {
+    assert!(network_listener_ready("prepared"));
+    assert!(network_listener_ready("authenticated"));
+    assert!(network_listener_ready("receiverRunning"));
+    assert!(network_listener_ready("streaming"));
+    assert!(network_listener_ready("paused"));
+    assert!(!network_listener_ready("starting"));
+    assert!(!network_listener_ready("stopped"));
+    assert!(!network_listener_ready("failed"));
+}
+
+#[test]
 #[cfg(windows)]
 fn saved_binding_reference_isolated_by_usb_identity_and_android_user() {
     let first = binding_reference_for("USB-A", "0");
     assert_ne!(first, binding_reference_for("USB-B", "0"));
     assert_ne!(first, binding_reference_for("USB-A", "10"));
+}
+
+#[test]
+#[cfg(windows)]
+fn saved_binding_reference_is_not_the_material_commitment() {
+    // Guards the removed check that compared the DPAPI file name with the phone's commitment.
+    let reference = binding_reference_for("USB-A", "0");
+    let material = crate::security::BindingMaterial::generate().unwrap();
+    assert_ne!(reference, hex_digest(&material.commitment()));
 }
 
 #[derive(Default)]
@@ -386,6 +425,17 @@ impl AdbRunner for FakeAdb {
                     AdbResult {
                         success: true,
                         stdout: "Status: ok".into(),
+                        stderr: String::new(),
+                    }
+                }
+                [shell, getprop, key]
+                    if shell == "shell"
+                        && getprop == "getprop"
+                        && key == "ro.build.version.sdk" =>
+                {
+                    AdbResult {
+                        success: true,
+                        stdout: "34\n".into(),
                         stderr: String::new(),
                     }
                 }
@@ -1234,18 +1284,28 @@ async fn fake_adb_installs_a_verified_newer_candidate_over_an_existing_receiver(
             state.install_version_name = Some(version_name.into());
         }
 
-        let status = install_with(
+        let mut stages = Vec::new();
+        let status = install_usb_with(
             &adb,
             SERIAL,
             &files.apk,
             &files.metadata,
+            None,
             &CancellationToken::new(),
+            &mut |stage| stages.push(stage),
         )
         .await
         .unwrap();
 
         assert_eq!(status.version_code, Some(12));
         assert_eq!(status.version_name.as_deref(), Some(version_name));
+        assert_eq!(
+            stages,
+            vec![
+                InstallProgressStage::Transferring,
+                InstallProgressStage::Verifying
+            ]
+        );
         assert!(adb.call_index(&["install", "-r"]).is_some());
         assert!(!adb
             .calls()
@@ -1297,6 +1357,7 @@ async fn fake_adb_usb_upgrade_requires_the_saved_binding_and_preserves_it() {
         &files.metadata,
         Some((&reference, &binding_path)),
         &CancellationToken::new(),
+        &mut |_| {},
     )
     .await
     .unwrap();
@@ -1345,6 +1406,7 @@ async fn fake_adb_usb_upgrade_requires_the_saved_binding_and_preserves_it() {
             &files.metadata,
             Some((&reference, &binding_path)),
             &CancellationToken::new(),
+            &mut |_| {},
         )
         .await
         .err()
@@ -1370,7 +1432,8 @@ async fn fake_adb_usb_upgrade_requires_the_saved_binding_and_preserves_it() {
         &files.apk,
         &files.metadata,
         Some((&reference, &binding_path)),
-        &CancellationToken::new()
+        &CancellationToken::new(),
+        &mut |_| {}
     )
     .await
     .is_err());
@@ -1395,7 +1458,8 @@ async fn fake_adb_usb_upgrade_requires_the_saved_binding_and_preserves_it() {
         &files.apk,
         &files.metadata,
         Some((&reference, &binding_path)),
-        &CancellationToken::new()
+        &CancellationToken::new(),
+        &mut |_| {}
     )
     .await
     .is_err());
@@ -1447,6 +1511,14 @@ async fn fake_adb_audio_start_sends_session_handshake_and_playback_mode() {
     assert!(audio_start
         .windows(2)
         .any(|pair| pair[0] == "--user" && pair[1] == TEST_USER));
+    // ReceiverService is unexported, so the shell must go through the DUMP-protected, invisible
+    // BootstrapActivity trampoline and must never try to start the service component directly.
+    assert!(audio_start
+        .iter()
+        .any(|arg| arg == "app.anpod.receiver/.BootstrapActivity"));
+    assert!(!audio_start
+        .iter()
+        .any(|arg| arg == "start-foreground-service" || arg == "startservice"));
 }
 
 #[tokio::test]

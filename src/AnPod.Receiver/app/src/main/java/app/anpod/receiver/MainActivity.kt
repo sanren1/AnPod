@@ -16,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -36,6 +37,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -49,11 +51,13 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
+import androidx.lifecycle.Lifecycle
 import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 
@@ -81,6 +85,8 @@ class MainActivity : ComponentActivity() {
         val operationId: String? = null
     )
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
+    private var aodEnabled by mutableStateOf(false)
+    private var aodShownForSession: String? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -128,6 +134,27 @@ class MainActivity : ComponentActivity() {
             }
         }
         advancePendingConnection(snapshot)
+        maybeEnterAod()
+    }
+
+    private fun maybeEnterAod() {
+        if (!aodEnabled) return
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        val current = snapshot ?: return
+        if (current.serviceState !in setOf("authenticated", "receiverRunning", "streaming")) return
+        val key = current.operationId + "/" + current.operationGeneration
+        if (aodShownForSession == key) return
+        aodShownForSession = key
+        startActivity(Intent(this, AodActivity::class.java))
+    }
+
+    private fun updateAodEnabled(value: Boolean) {
+        aodEnabled = value
+        getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit().putBoolean("aod_enabled", value).apply()
+    }
+
+    private fun openAod() {
+        startActivity(Intent(this, AodActivity::class.java))
     }
 
     override fun onStart() {
@@ -160,6 +187,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        aodEnabled = getSharedPreferences("anpod_receiver", MODE_PRIVATE).getBoolean("aod_enabled", false)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             ReceiverTheme {
@@ -181,7 +209,10 @@ class MainActivity : ComponentActivity() {
                         val current = snapshot
                         cancelPendingConnection()
                         if (current != null) receiver?.stop(current.operationId)
-                    }
+                    },
+                    aodEnabled = aodEnabled,
+                    onToggleAod = { updateAodEnabled(it) },
+                    onOpenAod = { openAod() }
                 )
             }
         }
@@ -336,7 +367,10 @@ private fun ReceiverScreen(
     serviceConnected: Boolean,
     onTrustBinding: (BackgroundTrustTarget) -> Unit,
     onRevokeBackgroundTrust: (BackgroundTrustTarget, String) -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    aodEnabled: Boolean,
+    onToggleAod: (Boolean) -> Unit,
+    onOpenAod: () -> Unit
 ) {
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
     val currentTrustTarget = snapshot?.takeIf {
@@ -396,6 +430,31 @@ private fun ReceiverScreen(
                     connectionPending -> stringResource(R.string.processing)
                     else -> stringResource(R.string.start_receiving)
                 })
+            }
+
+
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(stringResource(R.string.aod_title), style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                stringResource(R.string.aod_toggle_description),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(checked = aodEnabled, onCheckedChange = onToggleAod)
+                    }
+                    TextButton(
+                        onClick = onOpenAod,
+                        enabled = serviceConnected,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    ) { Text(stringResource(R.string.aod_preview)) }
+                }
             }
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {

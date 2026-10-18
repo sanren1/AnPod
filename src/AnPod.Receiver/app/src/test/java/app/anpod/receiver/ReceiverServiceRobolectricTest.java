@@ -38,7 +38,7 @@ public final class ReceiverServiceRobolectricTest {
         UiSnapshot snapshot = invokeSnapshot(service);
 
         assertNotNull(snapshot.serviceState);
-        assertEquals(15, snapshot.versionCode);
+        assertEquals(BuildConfig.VERSION_CODE, snapshot.versionCode);
         assertNotNull(snapshot.searchCandidates);
         assertEquals(false, snapshot.searchActive);
     }
@@ -58,7 +58,7 @@ public final class ReceiverServiceRobolectricTest {
         ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
 
         UiSnapshot snapshot = binder.snapshot();
-        assertEquals(15, snapshot.versionCode);
+        assertEquals(BuildConfig.VERSION_CODE, snapshot.versionCode);
         assertNotNull(snapshot.serviceState);
         assertNotNull(binder.interfaces());
     }
@@ -79,6 +79,30 @@ public final class ReceiverServiceRobolectricTest {
         assertFalse(binder.stop("unknown-owner"));
         assertFalse(service.stopFromUi("unknown-owner", 1L));
     }
+
+    @Test
+    public void aodSnapshotIsDisconnectedWhenIdle() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+
+        AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
+        assertEquals(AodTelemetrySnapshot.DisplayStatus.DISCONNECTED, snapshot.status);
+        assertNull(snapshot.recvAudioPayloadBps);
+        assertNull(snapshot.receiverBufferMs);
+        assertNull(snapshot.udpLossPercent);
+        assertFalse(snapshot.receivedAudioRecently);
+    }
+
+
+    @Test
+    public void idleWaveformIsFlat() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        ReceiverUiBinder binder = (ReceiverUiBinder) service.onBind(new Intent());
+
+        PcmWaveformTap.Waveform waveform = binder.aodWaveform();
+        for (float value : waveform.left) assertEquals(0f, value, 0.0001f);
+        for (float value : waveform.right) assertEquals(0f, value, 0.0001f);
+    }
+
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
     }

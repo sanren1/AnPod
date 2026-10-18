@@ -41,9 +41,9 @@ public final class ReceiverNotificationsTest {
     @Test
     public void playbackOnlyAddsStopActionWhenProvided() {
         Notification withStop = ReceiverNotifications.playback(context, "test-channel", "text",
-                pending(1), pending(2));
+                pending(1), pending(2), null);
         Notification withoutStop = ReceiverNotifications.playback(context, "test-channel", "text",
-                pending(1), null);
+                pending(1), null, null);
 
         assertEquals(1, withStop.actions.length);
         assertNull(withoutStop.actions);

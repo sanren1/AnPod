@@ -153,20 +153,24 @@ async fn receiver_status(
 
 #[tauri::command]
 async fn receiver_install(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     serial: String,
+    operation_id: String,
 ) -> Result<receiver::ReceiverStatus, String> {
-    state.receiver_install(&serial).await
+    state.receiver_install(&app, &serial, &operation_id).await
 }
 
 #[tauri::command]
 async fn receiver_upgrade_usb(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     serial: String,
     binding_reference: String,
+    operation_id: String,
 ) -> Result<receiver::ReceiverStatus, String> {
     state
-        .receiver_upgrade_usb(&serial, &binding_reference)
+        .receiver_upgrade_usb(&app, &serial, &binding_reference, &operation_id)
         .await
 }
 

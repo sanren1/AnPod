@@ -82,6 +82,7 @@ public final class ReceiverService extends Service {
     private static volatile ReceiverService activeService;
     private static final AtomicLong NEXT_AUDIO_ID = new AtomicLong();
     static final AtomicLong PCM_BYTES_WRITTEN = new AtomicLong();
+    private static final PcmWaveformTap WAVEFORM = new PcmWaveformTap();
 
     static volatile boolean foregroundReady;
     static volatile long startedAtElapsedMs;
@@ -195,6 +196,18 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
         if (intent != null && BootstrapActivity.ACTION_STOP.equals(intent.getAction())) {
+            // The invisible trampoline starts us with startForegroundService even when the session
+            // just ended; satisfy the 5 s contract before tearing the service down.
+            try {
+                Notification stopping = serviceNotification("正在停止 AnPod 接收…", "", 0, false);
+                if (Build.VERSION.SDK_INT >= 34) {
+                    startForeground(NOTIFICATION_ID, stopping, ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE);
+                } else {
+                    startForeground(NOTIFICATION_ID, stopping);
+                }
+            } catch (RuntimeException ignored) {
+                // Termination below still runs.
+            }
             int disposition = uiOperation.bootstrapStopDisposition();
             if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_OWNER) {
                 requestTermination(uiOperation.ownerId(), currentOperationGeneration, false, "");
@@ -291,9 +304,20 @@ public final class ReceiverService extends Service {
             if (timeout != null) handler.removeCallbacks(timeout);
             timeout = () -> requestTermination(ownerId, generation, true, "BootstrapTimeout");
             handler.postDelayed(timeout, networkBootstrapTimeoutMs(uiNetworkAudio));
-            startNetworkBootstrap(intent.getStringExtra("networkAddress"),
-                    intent.getIntExtra("networkPrefixLength", 0), generation, ownerId,
-                    backgroundStandbyEnabled, receiveIntentEnabled);
+            // Opening the control listener and the discovery sockets binds sockets, which Android
+            // forbids on the main thread (NetworkOnMainThreadException). Keep the whole bootstrap on
+            // its own thread; it reports state changes through the volatile fields and the handler.
+            final String bootstrapAddress = intent.getStringExtra("networkAddress");
+            final int bootstrapPrefix = intent.getIntExtra("networkPrefixLength", 0);
+            final long bootstrapGeneration = generation;
+            final String bootstrapOwner = ownerId;
+            final boolean bootstrapStandby = backgroundStandbyEnabled;
+            final boolean bootstrapReceiveIntent = receiveIntentEnabled;
+            Thread bootstrap = new Thread(() -> startNetworkBootstrap(bootstrapAddress, bootstrapPrefix,
+                    bootstrapGeneration, bootstrapOwner, bootstrapStandby, bootstrapReceiveIntent),
+                    "AnPod P5-C bootstrap setup");
+            bootstrap.setDaemon(true);
+            bootstrap.start();
             return START_NOT_STICKY;
         }
 
@@ -365,7 +389,12 @@ public final class ReceiverService extends Service {
             stopAction = PendingIntent.getService(this, 2, stop,
                     PendingIntent.FLAG_UPDATE_CURRENT | immutable);
         }
-        return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction);
+        PendingIntent aodAction = null;
+        if (getSharedPreferences("anpod_receiver", MODE_PRIVATE).getBoolean("aod_enabled", false)) {
+            Intent aod = new Intent(this, AodActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            aodAction = PendingIntent.getActivity(this, 3, aod, PendingIntent.FLAG_UPDATE_CURRENT | immutable);
+        }
+        return ReceiverNotifications.playback(this, CHANNEL_ID, text, mainActivityPendingIntent(), stopAction, aodAction);
     }
 
     PendingIntent mainActivityPendingIntent() {
@@ -697,6 +726,7 @@ public final class ReceiverService extends Service {
     }
 
     private AudioSession startAudio(AudioRequest request) {
+        WAVEFORM.reset();
         if (destroyed) return null;
         AudioSession existing = currentAudio;
         if (existing != null) {
@@ -754,6 +784,7 @@ public final class ReceiverService extends Service {
 
     /** In-process hook for an authenticated session coordinator; no Intent or exported API calls it. */
     void startUdpAudio(UdpSessionContext context) {
+        WAVEFORM.reset();
         String ownerId = networkCoordinatorOwnerId;
         long generation = currentOperationGeneration;
         Runnable start = () -> {
@@ -1662,6 +1693,8 @@ public final class ReceiverService extends Service {
             ensureRunning(session);
             long writeGeneration = session.focusState.writeGeneration();
             if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+            if (session.udpQueue == null) session.inputPcmBytes += length;
+            WAVEFORM.accept(data, offset, length, frameBytes, System.nanoTime());
             int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
             synchronized (session) {
                 if (!session.focusState.acceptsWrite(writeGeneration)) return length;
@@ -1935,6 +1968,10 @@ public final class ReceiverService extends Service {
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) actualMode = mode; }
     }
 
+    static PcmWaveformTap.Waveform aodWaveform() {
+        return WAVEFORM.waveform(System.nanoTime());
+    }
+
     static PlaybackMetrics playbackMetricsSnapshot() {
         AudioSession session = currentAudio;
         if (session == null) return PlaybackMetrics.unknown();
@@ -2068,7 +2105,7 @@ public final class ReceiverService extends Service {
         AudioStartTicket() {}
     }
 
-    private static final class AudioSession {
+    static final class AudioSession {
         final long id;
         final AudioRequest request;
         final String ownerId;
@@ -2086,6 +2123,7 @@ public final class ReceiverService extends Service {
         volatile AudioTrack audioTrack;
         boolean trackReady;
         volatile long trackWrittenFrames;
+        volatile long inputPcmBytes;
         volatile boolean trackPlaying;
         final AudioFocusState focusState = new AudioFocusState();
         volatile boolean cancelled;

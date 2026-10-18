@@ -7,6 +7,22 @@ pub(crate) fn begin_operation_slot(
     slot: &Mutex<Option<ActiveOperation>>,
     background: bool,
 ) -> Option<(u64, CancellationToken)> {
+    begin_operation_slot_with_preemptibility(generation, slot, background, false)
+}
+
+pub(crate) fn begin_preemptible_background_operation(
+    generation: &AtomicU64,
+    slot: &Mutex<Option<ActiveOperation>>,
+) -> Option<(u64, CancellationToken)> {
+    begin_operation_slot_with_preemptibility(generation, slot, true, true)
+}
+
+fn begin_operation_slot_with_preemptibility(
+    generation: &AtomicU64,
+    slot: &Mutex<Option<ActiveOperation>>,
+    background: bool,
+    receiver_preemptible: bool,
+) -> Option<(u64, CancellationToken)> {
     let mut current = slot.lock().expect("operation lock");
     if background && current.is_some() {
         return None;
@@ -19,6 +35,33 @@ pub(crate) fn begin_operation_slot(
     *current = Some(ActiveOperation {
         generation: next_generation,
         token: token.clone(),
+        background,
+        receiver_preemptible,
+    });
+    Some((next_generation, token))
+}
+
+pub(crate) fn begin_foreground_receiver_operation(
+    generation: &AtomicU64,
+    slot: &Mutex<Option<ActiveOperation>>,
+) -> Option<(u64, CancellationToken)> {
+    let mut current = slot.lock().expect("operation lock");
+    if current
+        .as_ref()
+        .is_some_and(|active| !(active.background && active.receiver_preemptible))
+    {
+        return None;
+    }
+    let next_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let token = CancellationToken::new();
+    if let Some(previous) = current.as_ref() {
+        previous.token.cancel();
+    }
+    *current = Some(ActiveOperation {
+        generation: next_generation,
+        token: token.clone(),
+        background: false,
+        receiver_preemptible: false,
     });
     Some((next_generation, token))
 }
