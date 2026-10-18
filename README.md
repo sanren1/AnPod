@@ -42,7 +42,7 @@ Receiver 0.13.6 起提供“伪 AOD”：手机上的纯黑横屏常显，显示
 
 完整说明、指标口径与限制见 [`docs/AOD.md`](docs/AOD.md)。
 
-![手机常显预览](docs/aod-preview.png)
+![手机常显预览](docs/aod-preview.jpg)
 
 ## 升级
 
