@@ -7,6 +7,7 @@ These files are generated or obtained from their upstream distributions and are 
 | `audio_capture.dll` | `packaging/build-native.ps1` | x64 WASAPI capture from `src/AnPod.Native/` |
 | `server` | `packaging/build-android.ps1` | Android `app_process` payload built from `src/AnPod.AndroidServer/` |
 | `receiver.apk` | `packaging/build-receiver.ps1` | Installed Android Receiver; use `-Variant release` for a publishable package and the candidate variant only for review builds |
+| `receiver.json` | `packaging/build-receiver.ps1` | Version, versionCode, APK SHA-256, signer and source commit; its digest must match `AUDITED_RECEIVER_ARTIFACTS` |
 | `adb.exe` | Android SDK Platform-Tools | Record the exact version in `upstream/SOURCE_VERSIONS.md` |
 | `AdbWinApi.dll` | Same Platform-Tools archive | Keep the version matched to `adb.exe` |
 | `AdbWinUsbApi.dll` | Same Platform-Tools archive | Keep the version matched to `adb.exe` |
