@@ -143,14 +143,14 @@ const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
         sha256: "b2d501f8a387e1b339dea1f40d153f4beb00545a3f5d8597da6b0c686ca14d35",
         version_code: 16,
         version_name: "0.13.0-v3-flow-candidate",
-        source_commit: "6f641de",
+        source_commit: "6f641de5748cc2adb4b41c9a4e84178a19c99549",
         signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
     },
     AuditedReceiverArtifact {
         sha256: "c3d56258a0ffa94dae4a861affb21ff5783f53b7a1c22813eb8be47b0e14313b",
         version_code: 17,
         version_name: "0.13.1-v3-flow-candidate",
-        source_commit: "3c13025",
+        source_commit: "3c13025ff4ae096a0e5a6001a8befa1887276edb",
         signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
     },
     AuditedReceiverArtifact {
