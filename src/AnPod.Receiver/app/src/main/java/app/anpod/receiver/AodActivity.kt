@@ -13,6 +13,8 @@ import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -50,8 +52,10 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.res.stringResource
@@ -168,18 +172,43 @@ private fun AodScreen(
         }
     }
     val drift = rememberDrift()
-    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+    // Any touch or drag restores the exit label; it fades out after a few untouched seconds.
+    var lastInteraction by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    var exitVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val visible = AodDrift.exitVisible(SystemClock.elapsedRealtime() - lastInteraction)
+            if (visible != exitVisible) exitVisible = visible
+            delay(400)
+        }
+    }
+    val exitAlpha by animateFloatAsState(
+        targetValue = if (exitVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 700),
+        label = "aodExitAlpha"
+    )
+    BoxWithConstraints(
+        Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    awaitPointerEvent(PointerEventPass.Initial)
+                    lastInteraction = SystemClock.elapsedRealtime()
+                }
+            }
+        }
+    ) {
         val clockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
         val density = LocalDensity.current
         val screenHeightPx = with(density) { maxHeight.toPx() }
-        val driftPx = with(density) { 4.dp.toPx() }
+        val driftXPx = with(density) { drift.first.dp.toPx() }
+        val driftYPx = with(density) { drift.second.dp.toPx() }
         val clearancePx = with(density) { 4.dp.toPx() }
         var clockBottomPx by remember { mutableStateOf(Float.NaN) }
         var footerTopPx by remember { mutableStateOf(Float.NaN) }
         val waveformLayout = AodWaveformGeometry.layout(
             if (clockBottomPx.isFinite()) clockBottomPx else screenHeightPx * 0.54f,
             if (footerTopPx.isFinite()) footerTopPx else screenHeightPx * 0.88f,
-            driftPx,
+            with(density) { AodDrift.MAX_Y_DP.dp.toPx() },
             clearancePx
         )
         val waveformHeight = with(density) { waveformLayout.regionHeight.toDp() }
@@ -195,7 +224,9 @@ private fun AodScreen(
                 .padding(top = (maxHeight.value * 0.10f).dp)
                 .offset(x = drift.first.dp, y = drift.second.dp)
                 .onGloballyPositioned { coordinates ->
-                    val bottom = coordinates.positionInRoot().y + coordinates.size.height
+                    // The anchors describe the undrifted layout so the waveform region keeps its size
+                    // while every element drifts together.
+                    val bottom = coordinates.positionInRoot().y + coordinates.size.height - driftYPx
                     if (clockBottomPx.isNaN() || kotlin.math.abs(clockBottomPx - bottom) > 0.5f)
                         clockBottomPx = bottom
                 }
@@ -213,8 +244,9 @@ private fun AodScreen(
             telemetry,
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                 .padding(start = 28.dp, end = 28.dp, bottom = 22.dp)
+                .offset(x = drift.first.dp, y = drift.second.dp)
                 .onGloballyPositioned { coordinates ->
-                    val top = coordinates.positionInRoot().y
+                    val top = coordinates.positionInRoot().y - driftYPx
                     if (footerTopPx.isNaN() || kotlin.math.abs(footerTopPx - top) > 0.5f)
                         footerTopPx = top
                 }
@@ -226,7 +258,9 @@ private fun AodScreen(
         )
         TextButton(
             onClick = onExit,
+            enabled = exitVisible,
             modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
+                .graphicsLayer { alpha = exitAlpha }
         ) {
             Text(stringResource(R.string.aod_exit), color = Color(0x55FFFFFF), fontSize = 13.sp)
         }
@@ -427,8 +461,7 @@ private fun rememberDrift(): Pair<Float, Float> {
     LaunchedEffect(Unit) {
         while (isActive) {
             val seconds = SystemClock.elapsedRealtime() / 1_000.0
-            offset = (sin(seconds / 120.0 * 2 * PI) * 9.0).toFloat() to
-                (cos(seconds / 150.0 * 2 * PI) * 4.0).toFloat()
+            offset = AodDrift.xDp(seconds) to AodDrift.yDp(seconds)
             delay(1_000)
         }
     }

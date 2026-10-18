@@ -25,7 +25,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 | 0.12.0 / code 15 | `5a29fc35e9ac065b57744abef13d8d06996a8554a5a0c17277bc425a58fac2e9` | 首个对外发布签名版本，随 PC 1.5.0 |
 
 
-AOD 预览构建（`feature/aod` 合入 `preview`；PC 1.8.6 的审计表接受以下版本）：
+AOD 预览构建（`feature/aod` 合入 `preview`；PC 1.8.7 的审计表接受以下版本）：
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
