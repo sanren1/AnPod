@@ -17,8 +17,8 @@ final class PcmWaveformTap {
     private int next;
     private long bucketStartNanos = -1;
     private long lastAcceptNanos = -1;
-    private double leftSum;
-    private double rightSum;
+    private float leftPeak;
+    private float rightPeak;
     private int samples;
     private float lastLeft;
     private float lastRight;
@@ -33,8 +33,8 @@ final class PcmWaveformTap {
             if (base + frameBytes > offset + length) break;
             short leftSample = sample(pcm, base);
             short rightSample = channels > 1 ? sample(pcm, base + 2) : leftSample;
-            leftSum += square(leftSample);
-            rightSum += square(rightSample);
+            leftPeak = Math.max(leftPeak, Math.abs(leftSample) / 32768f);
+            rightPeak = Math.max(rightPeak, Math.abs(rightSample) / 32768f);
             samples++;
         }
         lastAcceptNanos = nowNanos;
@@ -48,8 +48,8 @@ final class PcmWaveformTap {
         next = 0;
         bucketStartNanos = -1;
         lastAcceptNanos = -1;
-        leftSum = 0;
-        rightSum = 0;
+        leftPeak = 0;
+        rightPeak = 0;
         samples = 0;
         lastLeft = 0f;
         lastRight = 0f;
@@ -69,26 +69,21 @@ final class PcmWaveformTap {
     }
 
     private void push(long nowNanos) {
-        float leftLevel = (float) Math.sqrt(leftSum / Math.max(1, samples));
-        float rightLevel = (float) Math.sqrt(rightSum / Math.max(1, samples));
+        float leftLevel = leftPeak;
+        float rightLevel = rightPeak;
         lastLeft = Math.max(leftLevel, lastLeft * DECAY);
         lastRight = Math.max(rightLevel, lastRight * DECAY);
         left[next] = Math.min(1f, lastLeft);
         right[next] = Math.min(1f, lastRight);
         next = (next + 1) % POINTS;
-        leftSum = 0;
-        rightSum = 0;
+        leftPeak = 0;
+        rightPeak = 0;
         samples = 0;
         bucketStartNanos = nowNanos;
     }
 
     private static short sample(byte[] pcm, int index) {
         return (short) ((pcm[index] & 0xff) | (pcm[index + 1] << 8));
-    }
-
-    private static double square(short sample) {
-        double normalized = sample / 32768.0;
-        return normalized * normalized;
     }
 
     static final class Waveform {

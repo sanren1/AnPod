@@ -14,6 +14,7 @@ final class AodMetricsSampler {
     private long acceptedFrames;
     private long concealedFrames;
     private long lastAudioNanos = -1;
+    private Long lastBitsPerSecond;
 
     /** Feeds a monotonically growing cumulative byte counter (UDP payload or USB PCM input). */
     synchronized void recordCumulativeBytes(long totalBytes, long nowNanos) {
@@ -39,11 +40,12 @@ final class AodMetricsSampler {
 
     /** Returns null until the first full window; afterwards 0 is a meaningful "no new bytes". */
     synchronized Long bitsPerSecond(long nowNanos) {
-        if (windowStartNanos < 0 || nowNanos - windowStartNanos < MIN_WINDOW_NANOS) return null;
+        if (windowStartNanos < 0 || nowNanos - windowStartNanos < MIN_WINDOW_NANOS) return lastBitsPerSecond;
         double seconds = (nowNanos - windowStartNanos) / 1_000_000_000.0;
         long bitsPerSecond = Math.round(windowBytes * 8 / seconds);
         windowStartNanos = nowNanos;
         windowBytes = 0;
+        lastBitsPerSecond = bitsPerSecond;
         return bitsPerSecond;
     }
 
@@ -65,6 +67,7 @@ final class AodMetricsSampler {
         acceptedFrames = 0;
         concealedFrames = 0;
         lastAudioNanos = -1;
+        lastBitsPerSecond = null;
     }
 
     /** Buffer latency for the currently observable receive-side frames; null when not measurable. */

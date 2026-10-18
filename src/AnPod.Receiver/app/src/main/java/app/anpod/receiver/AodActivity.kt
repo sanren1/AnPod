@@ -144,35 +144,34 @@ private fun AodScreen(
     }
     val drift = rememberDrift()
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
-        val clockSize = (maxHeight.value * 0.30f).coerceIn(72f, 132f)
-        val waveformHeight = (maxHeight.value * 0.18f).coerceIn(44f, 96f)
-        Column(
-            modifier = Modifier.fillMaxSize().padding(start = 36.dp, top = 18.dp, end = 36.dp, bottom = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(Modifier.weight(0.55f))
-            Text(
-                text = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE)),
-                fontFamily = RubikClock,
-                fontWeight = FontWeight.Black,
-                fontSize = clockSize.sp,
-                letterSpacing = (-4).sp,
-                color = Color(0xFFF5F5F5),
-                modifier = Modifier.offset(x = drift.first.dp, y = drift.second.dp)
-            )
-            Spacer(Modifier.weight(0.30f))
-            WaveformCanvas(
-                waveform,
-                Modifier.fillMaxWidth(0.84f).height(waveformHeight.dp)
-                    .offset(x = drift.first.dp, y = drift.second.dp)
-            )
-            Spacer(Modifier.weight(0.65f))
-            MetricsRow(telemetry, Modifier.fillMaxWidth())
-            Spacer(Modifier.height(10.dp))
-        }
+        val clockSize = (maxHeight.value * 0.38f).coerceIn(84f, 168f)
+        val waveformHeight = (maxHeight.value * 0.22f).coerceIn(60f, 120f)
+        Text(
+            text = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE)),
+            fontFamily = RubikClock,
+            fontWeight = FontWeight.Black,
+            fontSize = clockSize.sp,
+            letterSpacing = (-5).sp,
+            color = Color(0xFFF7F7F7),
+            modifier = Modifier.align(Alignment.TopCenter)
+                .padding(top = (maxHeight.value * 0.10f).dp)
+                .offset(x = drift.first.dp, y = drift.second.dp)
+        )
+        WaveformCanvas(
+            waveform,
+            Modifier.align(Alignment.Center)
+                .fillMaxWidth(0.86f)
+                .height(waveformHeight.dp)
+                .offset(x = drift.first.dp, y = drift.second.dp)
+        )
+        MetricsRow(
+            telemetry,
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .padding(start = 28.dp, end = 28.dp, bottom = 22.dp)
+        )
         TextButton(
             onClick = onExit,
-            modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 12.dp)
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
         ) {
             Text(stringResource(R.string.aod_exit), color = Color(0x55FFFFFF), fontSize = 13.sp)
         }
@@ -197,8 +196,8 @@ private fun DrawScope.drawRibbon(left: FloatArray?, right: FloatArray?, centerY:
     for (index in 0 until count) {
         val x = size.width * index / (count - 1).coerceAtLeast(1)
         val taper = sin(PI * index / (count - 1).coerceAtLeast(1)).toFloat().pow(0.7f)
-        val up = (left[index] * 3.4f).coerceIn(0f, 1f) * taper * amplitude
-        val down = (right[index] * 3.4f).coerceIn(0f, 1f) * taper * amplitude
+        val up = (left[index] * 1.6f).coerceIn(0f, 1f) * taper * amplitude
+        val down = (right[index] * 1.6f).coerceIn(0f, 1f) * taper * amplitude
         if (index == 0) {
             upper.moveTo(x, centerY - up)
             lower.moveTo(x, centerY + down)
@@ -206,8 +205,8 @@ private fun DrawScope.drawRibbon(left: FloatArray?, right: FloatArray?, centerY:
             val previousX = size.width * (index - 1) / (count - 1)
             val controlX = (previousX + x) / 2f
             val previousTaper = sin(PI * (index - 1) / (count - 1)).toFloat().pow(0.7f)
-            val previousUp = (left[index - 1] * 3.4f).coerceIn(0f, 1f) * previousTaper * amplitude
-            val previousDown = (right[index - 1] * 3.4f).coerceIn(0f, 1f) * previousTaper * amplitude
+            val previousUp = (left[index - 1] * 1.6f).coerceIn(0f, 1f) * previousTaper * amplitude
+            val previousDown = (right[index - 1] * 1.6f).coerceIn(0f, 1f) * previousTaper * amplitude
             upper.cubicTo(controlX, centerY - previousUp, controlX, centerY - up, x, centerY - up)
             lower.cubicTo(controlX, centerY + previousDown, controlX, centerY + down, x, centerY + down)
         }
