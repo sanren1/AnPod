@@ -2045,6 +2045,16 @@ fn run_session_owner(
                     }
                     Ok(OwnerCommand::SetMode(mode)) => {
                         parameters.mode = mode;
+                        // The phone applies a playback mode only in a fresh handshake, so this
+                        // restarts the session. Start the recovery window here: without it a failed
+                        // switch could report "reconnecting" forever.
+                        if recovery_started_at.is_none() {
+                            recovery_started_at = Some(Instant::now());
+                            status
+                                .lock()
+                                .expect("P5-D session status lock poisoned")
+                                .recovery_started_at = recovery_started_at;
+                        }
                         restart = true;
                         break;
                     }

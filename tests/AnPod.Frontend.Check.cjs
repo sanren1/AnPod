@@ -26,13 +26,16 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewManagementSlotBusy=()=>reviewReceiverManagementBusy;
   window.reviewChangeUsbDevices=devices=>{snapshot.devices=structuredClone(devices);emit();};
   window.reviewGetUsbStatus=serial=>structuredClone(reviewUsbStatuses[serial]);
-  const emit=()=>{for(const [key,cb]of listeners)if(key==='anpod://snapshot')callbacks.get(cb)?.({event:key,id:cb,payload:structuredClone(snapshot)});};
+  const emitEvent=(event,payload)=>{const listener=listeners.get(event);if(listener)callbacks.get(listener.handler)?.({event,id:listener.id,payload:structuredClone(payload)});};
+  const emit=()=>emitEvent('anpod://snapshot',snapshot);
+  window.reviewEmitReceiverProgress=payload=>emitEvent('anpod://receiver-install-progress',payload);
+  window.reviewProgressListenerCount=()=>listeners.has('anpod://receiver-install-progress')?1:0;
   window.reviewRead=()=>structuredClone(snapshot);
   window.reviewReceiverVersionError=()=>{window.reviewUsbScenario();snapshot.state='error';snapshot.message='连接失败';snapshot.statusDetail='RECEIVER_UPDATE_REQUIRED:模拟版本核验的冗长底层诊断';snapshot.canDisconnect=false;emit();};
   let reviewCandidate={versionCode:9,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null};
   let reviewUsbStatuses={TESTUSB:{installed:true,versionName:'0.8.0',versionCode:8,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}};
   let reviewResetPreview={serial:'TESTUSB',androidUser:'0',bindingReference:'phoneA-abcdef',phoneState:'saved',phoneCommitment:'a'.repeat(64),pcState:'saved',pcCommitment:'b'.repeat(64),receiverBusy:false};let reviewResetResult=null;let reviewResetPreviewError='';let reviewResetError='';let reviewDeferReset=false;
-  let reviewUpgradeError='';let reviewInstallError='';let reviewTargetBindings={TESTUSB:'phoneA-abcdef'};let reviewDeferReceiverStatus=false;let reviewDeferReceiverInterfaces=false;let reviewDeferInstall=false;let reviewReceiverStatusError='';let reviewReceiverInterfacesError='';
+  let reviewUpgradeError='';let reviewInstallError='';let reviewTargetBindings={TESTUSB:'phoneA-abcdef'};let reviewDeferReceiverStatus=false;let reviewDeferReceiverInterfaces=false;let reviewDeferInstall=false;let reviewDeferInstallVerification=false;let reviewManualInstallProgress=false;let reviewReceiverStatusError='';let reviewReceiverInterfacesError='';
   window.reviewUsbScenario=(options={})=>{
    window.reviewCalls={};window.reviewCommandArgs={};reviewReceiverManagementBusy=false;reviewManagementSlotConflicts=0;window.reviewManagementSlotTrace=[];
    reviewCandidate=options.candidate===undefined?{versionCode:9,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null}:options.candidate;
@@ -43,9 +46,10 @@ fs.mkdirSync(out, {recursive:true});
    reviewReceiverInterfaces=options.receiverInterfaces||[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];
    reviewUpgradeError=options.upgradeError||'';reviewInstallError=options.installError||'';reviewTargetBindings=options.targetBindings||{TESTUSB:'phoneA-abcdef'};
    reviewReceiverStatusError=options.receiverStatusError||'';reviewReceiverInterfacesError=options.receiverInterfacesError||'';
-   reviewDeferReceiverStatus=false;reviewDeferReceiverInterfaces=false;reviewDeferInstall=false;
+   reviewDeferReceiverStatus=false;reviewDeferReceiverInterfaces=false;reviewDeferInstall=false;reviewDeferInstallVerification=false;reviewManualInstallProgress=false;
    snapshot={...snapshot,state:options.state|| (options.active?'streaming':'ready'),devices:options.devices||[device],selectedSerial:null,sessionSerial:options.active?(options.sessionSerial||null):null,sessionReceiverBinding:options.active?(options.binding||'phoneA-abcdef'):null,sessionTransport:options.active?(options.sessionSerial?'usb':'lan'):null,sessionConnectionTransport:options.active?(options.sessionSerial?'usb':'wireless'):null,sessionWirelessProtocol:options.active&&!options.sessionSerial?'udp':null,sessionCapabilities:options.active&&!options.sessionSerial?{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:0,versionCode:options.activeVersion||8}:null,canDisconnect:!!options.active,output:options.active?'phone':'computer',busy:false,settings:{...snapshot.settings,preferredTransport:options.active&&!options.sessionSerial?'Wifi':'Usb',wirelessProtocol:'udp'}};emit();
   };
+  window.reviewHoldInstallAndVerification=()=>{reviewDeferInstall=true;reviewDeferInstallVerification=true;reviewManualInstallProgress=true;};
   window.reviewWirelessFlowConfigure=(interfaces,bindings,candidates)=>{reviewInterfaces=structuredClone(interfaces);reviewBindings=[...bindings];reviewCandidates=structuredClone(candidates);reviewOfferAddress=null;reviewListenerError='';snapshot.wirelessConnectionOffers={active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]};emit();};
   window.reviewBackgroundStartFailure=message=>{reviewBackgroundStartError=message||'';};
   window.reviewBackgroundTrust=(status,error='')=>{reviewTrustStatus=structuredClone(status);reviewTrustError=error;};
@@ -81,8 +85,8 @@ fs.mkdirSync(out, {recursive:true});
   window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener() {}};
   window.__TAURI_INTERNALS__={transformCallback(fn){callbacks.set(++id,fn);return id;},unregisterCallback(cb){callbacks.delete(cb);},metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},async invoke(cmd,args){
    window.reviewCalls[cmd]=(window.reviewCalls[cmd]||0)+1;window.reviewCommandArgs[cmd]=args;
-   if(cmd==='plugin:event|listen'){listeners.set(args.event,args.handler);return ++id;}
-   if(cmd==='plugin:event|unlisten')return;
+   if(cmd==='plugin:event|listen'){const eventId=++id;listeners.set(args.event,{handler:args.handler,id:eventId});return eventId;}
+   if(cmd==='plugin:event|unlisten'){if(listeners.get(args.event)?.id===args.eventId)listeners.delete(args.event);return;}
     if(cmd==='receiver_update_candidate')return structuredClone(reviewCandidate);
     if(cmd==='receiver_status'){
      if(reviewReceiverManagementBusy){reviewManagementSlotConflicts++;throw new Error('其他设备操作正在进行');}reviewReceiverManagementBusy=true;window.reviewManagementSlotTrace.push('receiver_status:start');
@@ -104,8 +108,20 @@ fs.mkdirSync(out, {recursive:true});
     try{if(reviewDeferReset){reviewDeferReset=false;await new Promise(resolve=>window.reviewResolveReset=resolve);}if(reviewResetError)throw new Error(reviewResetError);if(reviewResetResult)return structuredClone(reviewResetResult);reviewBindings=reviewBindings.filter(value=>value!==args.preview.bindingReference);return structuredClone({...args.preview,outcome:'reset',reason:'手机和 PC 记录均已清除。',nextAction:'如需配对，请单独启动 USB 首次绑定。'});}
     finally{reviewReceiverManagementBusy=false;window.reviewManagementSlotTrace.push('receiver_reset_binding:end');}
    }
-    if(cmd==='receiver_install'){if(reviewDeferInstall){reviewDeferInstall=false;await new Promise(resolve=>window.reviewResolveInstall=resolve);}if(reviewInstallError)throw new Error(reviewInstallError);reviewUsbStatuses[args.serial]={installed:true,versionName:reviewCandidate.versionName,versionCode:reviewCandidate.versionCode,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'};snapshot.state='ready';snapshot.sessionSerial=null;snapshot.sessionReceiverBinding=null;snapshot.canDisconnect=false;snapshot.output='computer';emit();return structuredClone(reviewUsbStatuses[args.serial]);}
-    if(cmd==='receiver_upgrade_usb'){if(reviewUpgradeError)throw new Error(reviewUpgradeError);if(reviewTargetBindings[args.serial]!==args.bindingReference)throw new Error('USB 设备序列号或 Android 用户与所选 Receiver 绑定不匹配；未执行升级。');reviewUsbStatuses[args.serial]={installed:true,versionName:reviewCandidate.versionName,versionCode:reviewCandidate.versionCode,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已升级'};snapshot.state='ready';snapshot.sessionSerial=null;snapshot.sessionReceiverBinding=null;snapshot.canDisconnect=false;snapshot.output='computer';emit();return structuredClone(reviewUsbStatuses[args.serial]);}
+    if(cmd==='receiver_install'||cmd==='receiver_upgrade_usb'){
+     const event='anpod://receiver-install-progress';window.reviewInstallListenerBeforeInvoke=listeners.has(event);window.reviewLastReceiverOperationId=args.operationId;
+     const progress=stage=>window.reviewEmitReceiverProgress({operationId:args.operationId,serial:args.serial,stage});
+     progress('checking');if(reviewDeferInstall){reviewDeferInstall=false;await new Promise(resolve=>window.reviewResolveInstall=resolve);}
+     if(!reviewManualInstallProgress)progress('transferring');
+     if(cmd==='receiver_upgrade_usb'&&(reviewUpgradeError||reviewTargetBindings[args.serial]!==args.bindingReference)){progress('failed');if(reviewUpgradeError)throw new Error(reviewUpgradeError);throw new Error('USB 设备序列号或 Android 用户与所选 Receiver 绑定不匹配；未执行升级。');}
+     if(cmd==='receiver_install'&&reviewInstallError){progress('failed');throw new Error(reviewInstallError);}
+     reviewUsbStatuses[args.serial]={installed:true,versionName:reviewCandidate.versionName,versionCode:reviewCandidate.versionCode,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:cmd==='receiver_install'?'Receiver 已安装':'Receiver 已升级'};
+     snapshot.state='ready';snapshot.sessionSerial=null;snapshot.sessionReceiverBinding=null;snapshot.canDisconnect=false;snapshot.output='computer';emit();
+     if(!reviewManualInstallProgress)progress('verifying');
+     if(reviewDeferInstallVerification){reviewDeferInstallVerification=false;await new Promise(resolve=>window.reviewResolveInstallVerification=resolve);}
+     if(!reviewManualInstallProgress)progress('completed');
+     return structuredClone(reviewUsbStatuses[args.serial]);
+    }
     if(cmd==='refresh_devices')return structuredClone(snapshot);
    if(cmd==='receiver_binding_references')return [...reviewBindings];
    if(cmd==='network_interfaces')return structuredClone(reviewInterfaces);
@@ -217,6 +233,108 @@ fs.mkdirSync(out, {recursive:true});
   for(const key of ['technicalDetailsStartCollapsed','summaryShowsStateConnectionAndMode','usbFormatAndUnknownValues','bufferSemanticsVisible','modalKeyboardFocusStaysInside','compactMetricsNoHorizontalOverflow','rawDiagnosticDetailsRemainVisible','copiedDiagnosticsUsesAllowlist','udpFormatAndQueueFields','pausedSnapshotNotReportedAsPlaying','oldUdpSummaryKeepsUnknownProgress','oldUdpExplainsMissingDiagnostics','missingProgressIsNotReportedAsPlaying','recoveryUsesReportedRemainingSeconds','underrunIsNotPresentedAsAudibleFailure','underrunMetricKeepsUnknownAndCumulativeSemantics','cleanupFailureIsActionableAndRawErrorStaysCollapsed','cleanupFailureKeepsMainRetryAction','cleanupFailureDetailsRetainOriginalMessage','noSessionExplainsMissingSnapshot','compactNoHorizontalOverflow','diagnosticsEscapeClosesDialog'])assert.equal(results[key],true,key);
   return;
  }
+ if(process.env.ANPOD_RECEIVER_PROGRESS_ONLY){
+  await page.setViewportSize({width:420,height:590});
+  const openManager=async()=>{await page.getByRole('button',{name:'打开设置',exact:true}).click();await page.locator('.settings-advanced > summary').click();await page.getByRole('button',{name:'手机应用',exact:true}).click();await page.getByRole('dialog',{name:'手机应用'}).waitFor();};
+  const closeManager=async()=>{const dialog=page.getByRole('dialog',{name:'手机应用'});await dialog.getByRole('button',{name:'关闭',exact:true}).click();await dialog.waitFor({state:'detached'});};
+  const uninstalled={TESTUSB:{installed:false,versionName:null,versionCode:null,serviceActive:false,foreground:false,healthy:false,audioActive:false,error:null,message:'Receiver 未安装'}};
+  await page.evaluate(({version,uninstalled})=>window.reviewUsbScenario({candidate:{versionCode:version,versionName:`0.${version}.0-usb`,sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],statuses:uninstalled}),{version:12,uninstalled});
+  await openManager();
+  let dialog=page.getByRole('dialog',{name:'手机应用'});
+  let install=dialog.getByRole('button',{name:'安装 Receiver · 12',exact:true});
+  await install.waitFor();await page.waitForFunction(()=>window.reviewCalls.receiver_status===1&&!document.querySelector('.receiver-status-actions button')?.disabled);
+  await page.evaluate(()=>window.reviewHoldInstallAndVerification());
+  await install.click();
+  await dialog.getByText('检查手机',{exact:true}).waitFor();
+  const operationId=await page.evaluate(()=>window.reviewCommandArgs.receiver_install?.operationId);
+  results.progressListenerRegisteredBeforeInvoke=await page.evaluate(()=>!!window.reviewInstallListenerBeforeInvoke&&!!window.reviewCommandArgs.receiver_install?.operationId&&window.reviewProgressListenerCount()===1);
+  results.checkingProgressIsNamedAndIndeterminate=await dialog.getByRole('progressbar',{name:'检查手机'}).count()===1&&await dialog.getByRole('button',{name:'安装 Receiver · 12',exact:true}).isDisabled();
+  await page.screenshot({path:`${out}/receiver-install-checking.png`});
+  await page.evaluate(id=>{
+   window.reviewEmitReceiverProgress({operationId:`${id}-old`,serial:'TESTUSB',stage:'transferring'});
+   window.reviewEmitReceiverProgress({operationId:id,serial:'TESTSECOND',stage:'verifying'});
+  },operationId);
+  await page.waitForTimeout(40);
+  results.oldOperationAndOtherSerialProgressIgnored=await dialog.getByText('检查手机',{exact:true}).count()===1;
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'transferring'}),operationId);
+  await dialog.getByText('推送并安装',{exact:true}).waitFor();
+  results.transferringProgressIsNamed=await dialog.getByRole('progressbar',{name:'推送并安装'}).count()===1;
+  await page.screenshot({path:`${out}/receiver-install-transferring.png`});
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'verifying'}),operationId);
+  await dialog.getByText('核验版本',{exact:true}).waitFor();
+  results.verifyingProgressIsNamed=await dialog.getByRole('progressbar',{name:'核验版本'}).count()===1;
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'transferring'}),operationId);
+  results.progressStageCannotRegress=await dialog.getByText('核验版本',{exact:true}).count()===1;
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'completed'}),operationId);
+  results.commandReturnGatesCompletedStage=await dialog.getByText('核验版本',{exact:true}).count()===1;
+  await page.evaluate(()=>window.reviewResolveInstall());
+  await page.waitForFunction(()=>typeof window.reviewResolveInstallVerification==='function');
+  await page.screenshot({path:`${out}/receiver-install-verifying.png`});
+  await page.evaluate(()=>window.reviewResolveInstallVerification());
+  await dialog.getByText('版本已核验',{exact:true}).waitFor();
+  results.completionFollowsReturnedVersionCheck=await page.evaluate(()=>window.reviewCalls.receiver_install===1&&window.reviewCalls.receiver_status===1&&window.reviewCalls.refresh_devices===1&&window.reviewProgressListenerCount()===0);
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'failed'}),operationId);
+  results.lateEventAfterCleanupIgnored=await dialog.getByText('版本已核验',{exact:true}).count()===1;
+  await closeManager();
+
+  await page.evaluate(({version,uninstalled})=>window.reviewUsbScenario({candidate:{versionCode:version,versionName:`0.${version}.0-usb`,sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],statuses:uninstalled,installError:'ADB 安装已取消'}),{version:13,uninstalled});
+  await openManager();dialog=page.getByRole('dialog',{name:'手机应用'});install=dialog.getByRole('button',{name:'安装 Receiver · 13',exact:true});
+  await install.waitFor();await install.click();
+  await dialog.getByText('安装失败',{exact:true}).waitFor();
+  const errorDetails=dialog.locator('.network-error details');
+  await errorDetails.locator('summary').click();
+  results.failedStageKeepsActualError=(await errorDetails.innerText()).includes('ADB 安装已取消')&&await page.evaluate(()=>window.reviewProgressListenerCount()===0);
+  const failedOperationId=await page.evaluate(()=>window.reviewCommandArgs.receiver_install.operationId);
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'completed'}),failedOperationId);
+  results.failureCannotBeOverwrittenByLateStage=await dialog.getByText('安装失败',{exact:true}).count()===1;
+  await closeManager();
+
+  await page.evaluate(({version,uninstalled})=>window.reviewUsbScenario({candidate:{versionCode:version,versionName:`0.${version}.0-usb`,sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],statuses:uninstalled}),{version:14,uninstalled});
+  await openManager();dialog=page.getByRole('dialog',{name:'手机应用'});install=dialog.getByRole('button',{name:'安装 Receiver · 14',exact:true});
+  await install.waitFor();await page.evaluate(()=>window.reviewHoldInstallAndVerification());await install.click();
+  await dialog.getByText('检查手机',{exact:true}).waitFor();
+  await page.evaluate(()=>{const button=[...document.querySelectorAll('dialog[open] button')].find(el=>el.textContent?.trim()==='安装 Receiver · 14');button?.click();button?.click();});
+  results.busyBlocksRapidInstallClicks=await dialog.getByRole('button',{name:'安装 Receiver · 14',exact:true}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.receiver_install===1);
+  await page.evaluate(()=>window.reviewResolveInstall());await page.waitForFunction(()=>typeof window.reviewResolveInstallVerification==='function');await page.evaluate(()=>window.reviewResolveInstallVerification());
+  await dialog.getByText('版本已核验',{exact:true}).waitFor();await closeManager();
+
+  await page.evaluate(()=>window.reviewUsbScenario({active:true,sessionSerial:'TESTUSB',binding:'phoneA-abcdef',candidate:{versionCode:15,versionName:'0.15.0-usb',sizeBytes:5*1024*1024,currentVersionCode:8,bindingReference:'phoneA-abcdef'},bindings:['phoneA-abcdef'],statuses:{TESTUSB:{installed:true,versionName:'0.8.0',versionCode:8,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}}}));
+  await openManager();dialog=page.getByRole('dialog',{name:'手机应用'});await dialog.getByRole('button',{name:'升级 Receiver · 15',exact:true}).waitFor();
+  await dialog.locator('.receiver-maintenance-details > summary').click();
+  await dialog.locator('.receiver-maintenance-details select').selectOption('phoneA-abcdef');
+  await page.evaluate(()=>window.reviewHoldInstallAndVerification());await dialog.getByRole('button',{name:'升级 Receiver · 15',exact:true}).click();
+  const confirm=page.getByRole('dialog',{name:'停止播放并升级 Receiver？'});
+  if(await confirm.count()===0){console.log('Active upgrade request state:',await page.locator('body').innerText());await page.screenshot({path:`${out}/receiver-upgrade-request.png`});throw new Error('Active upgrade confirmation did not open');}
+  await confirm.getByRole('button',{name:'停止播放并继续',exact:true}).evaluate(button=>{button.click();button.click();});
+  await page.waitForFunction(()=>window.reviewCalls.receiver_upgrade_usb===1&&typeof window.reviewResolveInstall==='function');
+  results.confirmationCannotStartDuplicateCommands=await page.evaluate(()=>window.reviewCalls.receiver_upgrade_usb===1&&window.reviewProgressListenerCount()===1);
+  const upgradeId=await page.evaluate(()=>window.reviewCommandArgs.receiver_upgrade_usb.operationId);
+  await page.evaluate(id=>window.reviewEmitReceiverProgress({operationId:id,serial:'TESTUSB',stage:'verifying'}),upgradeId);
+  await page.evaluate(()=>window.reviewResolveInstall());await page.waitForFunction(()=>typeof window.reviewResolveInstallVerification==='function');await page.evaluate(()=>window.reviewResolveInstallVerification());
+  await page.getByText('版本已核验',{exact:true}).waitFor();
+  results.upgradeReusesReturnedStatus=await page.evaluate(()=>window.reviewCalls.receiver_status===1&&window.reviewCalls.receiver_upgrade_usb===1&&window.reviewCalls.refresh_devices===1&&window.reviewProgressListenerCount()===0);
+  await closeManager();
+
+  await page.evaluate(({version,status})=>window.reviewUsbScenario({candidate:{versionCode:version,versionName:`0.${version}.0-usb`,sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],devices:[{serial:'TESTSECOND',transport:'usb',state:'device',manufacturer:'Google',model:'Pixel 8 Pro',androidVersion:'15',apiLevel:'35',displayName:'Google Pixel 8 Pro',statusText:'可连接',connectable:true}],statuses:{TESTSECOND:status}}),{version:16,status:uninstalled.TESTUSB});
+  await page.locator('.device-select').click();
+  await page.getByRole('dialog').getByRole('button',{name:'首次设置',exact:true}).click();
+  const wizard=page.getByRole('dialog').filter({has:page.locator('.setup-wizard')});
+  await wizard.locator('.setup-wizard-step select').selectOption('TESTSECOND');
+  await wizard.getByRole('button',{name:'下一步',exact:true}).click();
+  const wizardInstall=wizard.getByRole('button',{name:'安装 Receiver · 16',exact:true});
+  if(await wizardInstall.count()===0)console.log('Setup wizard receiver state:',await wizard.innerText());
+  await wizardInstall.waitFor();await page.evaluate(()=>window.reviewHoldInstallAndVerification());await wizardInstall.click();
+  results.setupWizardShowsNamedProgressbar=await wizard.getByRole('progressbar',{name:'检查手机'}).count()===1;
+  await page.evaluate(()=>window.reviewResolveInstall());await page.waitForFunction(()=>typeof window.reviewResolveInstallVerification==='function');await page.evaluate(()=>window.reviewResolveInstallVerification());
+  await wizard.getByText('版本已核验',{exact:true}).waitFor();
+  await wizard.getByRole('button',{name:'关闭',exact:true}).click();
+
+  fs.writeFileSync(`${out}/receiver-progress-result.json`,JSON.stringify(results,null,2));
+  console.log(JSON.stringify({...results,errors}));
+  await browser.close();assert.deepEqual(errors,[]);
+  for(const key of ['progressListenerRegisteredBeforeInvoke','checkingProgressIsNamedAndIndeterminate','oldOperationAndOtherSerialProgressIgnored','transferringProgressIsNamed','verifyingProgressIsNamed','progressStageCannotRegress','commandReturnGatesCompletedStage','completionFollowsReturnedVersionCheck','lateEventAfterCleanupIgnored','failedStageKeepsActualError','failureCannotBeOverwrittenByLateStage','busyBlocksRapidInstallClicks','confirmationCannotStartDuplicateCommands','upgradeReusesReturnedStatus','setupWizardShowsNamedProgressbar'])assert.equal(results[key],true,key);
+  return;
+ }
  if(process.env.ANPOD_SETUP_WIZARD_ONLY){
   await page.setViewportSize({width:375,height:640});
   const openWizard=async()=>{await page.locator('.device-select').click();await page.getByRole('dialog',{name:'选择手机'}).getByRole('button',{name:'首次设置',exact:true}).click();await page.getByRole('dialog',{name:'首次设置'}).waitFor();};
@@ -246,7 +364,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.evaluate(()=>window.reviewClearInstallError());
   await wizard().getByRole('button',{name:'安装 Receiver · 12',exact:true}).click();
   await wizard().getByText('已重新检查并核验版本码 12。').waitFor();
-  results.installRetryReadsBackVerifiedVersion=await page.evaluate(()=>window.reviewCalls.receiver_install===2&&window.reviewCalls.receiver_status>=2&&window.reviewCalls.refresh_devices===1);
+  results.installRetryUsesReturnedVerifiedStatus=await page.evaluate(()=>window.reviewCalls.receiver_install===2&&window.reviewCalls.receiver_status===1&&window.reviewCalls.refresh_devices===1);
   await wizard().getByRole('button',{name:'下一步',exact:true}).click();
   await wizard().getByLabel('电脑网络接口').waitFor();
   results.wizardCanContinueAfterVerifiedInstall=await wizard().getByLabel('电脑网络接口').count()===1&&await wizard().getByRole('button',{name:'建立绑定并连接',exact:true}).isEnabled();
@@ -373,7 +491,7 @@ fs.mkdirSync(out, {recursive:true});
   console.log(JSON.stringify(results));
   await browser.close();
   assert.deepEqual(errors,[]);
-  for(const key of ['wizardEntryVisible','wizardFocusEntersModal','wizardControlsMeet48pxTarget','unauthorizedUsbExplainsPermission','cancelBeforeAuthorizationDoesNotInstallOrConnect','uninstalledReceiverNeedsExplicitInstall','installSignatureFailureKeepsRetry','installRetryReadsBackVerifiedVersion','wizardCanContinueAfterVerifiedInstall','firstBindUsesBootstrapAndLeavesOutputOnComputer','savedBindingOffersAddPhoneEntry','addPhoneReusesUniqueSavedBinding','compatibleOldReceiverCanSkipUpgrade','cancelBeforeBindingDoesNotConnect','unrelatedSavedBindingUsesIndependentUsbMaintenance','multipleUsbDevicesRequireChoice','multipleNetworkInterfacesRequireExplicitMatching','disambiguatedBootstrapUsesChosenPhoneAndInterfaces','noSameSubnetHasActionAndBlocksBinding','lateReceiverStatusAfterNextDoesNotReopenWizard','receiverStatusFailureStaysOnStepTwo','receiverStatusRetryAdvancesOnlyAfterSuccess','receiverInterfacesFailureStaysOnStepTwo','receiverInterfacesRetryAdvancesOnlyAfterSuccess','deviceChangeInvalidatesPendingInterfaceCheck','closedWizardDoesNotCancelOrReopenCommittedInstall','largeTextWizardNoHorizontalOverflow','largeTextWizardCanScrollToPrimaryAction'])assert.equal(results[key],true,key);
+  for(const key of ['wizardEntryVisible','wizardFocusEntersModal','wizardControlsMeet48pxTarget','unauthorizedUsbExplainsPermission','cancelBeforeAuthorizationDoesNotInstallOrConnect','uninstalledReceiverNeedsExplicitInstall','installSignatureFailureKeepsRetry','installRetryUsesReturnedVerifiedStatus','wizardCanContinueAfterVerifiedInstall','firstBindUsesBootstrapAndLeavesOutputOnComputer','savedBindingOffersAddPhoneEntry','addPhoneReusesUniqueSavedBinding','compatibleOldReceiverCanSkipUpgrade','cancelBeforeBindingDoesNotConnect','unrelatedSavedBindingUsesIndependentUsbMaintenance','multipleUsbDevicesRequireChoice','multipleNetworkInterfacesRequireExplicitMatching','disambiguatedBootstrapUsesChosenPhoneAndInterfaces','noSameSubnetHasActionAndBlocksBinding','lateReceiverStatusAfterNextDoesNotReopenWizard','receiverStatusFailureStaysOnStepTwo','receiverStatusRetryAdvancesOnlyAfterSuccess','receiverInterfacesFailureStaysOnStepTwo','receiverInterfacesRetryAdvancesOnlyAfterSuccess','deviceChangeInvalidatesPendingInterfaceCheck','closedWizardDoesNotCancelOrReopenCommittedInstall','largeTextWizardNoHorizontalOverflow','largeTextWizardCanScrollToPrimaryAction'])assert.equal(results[key],true,key);
   return;
  }
  if(process.env.ANPOD_WIRELESS_FLOW_ONLY){
@@ -593,12 +711,12 @@ fs.mkdirSync(out, {recursive:true});
    results.versionMismatchOpensUsbUpgrade=await upgradeManager.getByLabel('已授权且在线的 USB 手机').inputValue()==='TESTUSB';
    await upgradeManager.getByRole('button',{name:'升级 Receiver · 9',exact:true}).click();
    await upgradeManager.locator('.receiver-version-details > summary').click();
-   await upgradeManager.getByText(/USB 操作后已重新读取并核验 TESTUSB 的版本码 9/).waitFor();
-   results.versionMismatchUpgradeReadsBack=await page.evaluate(()=>window.reviewCalls.receiver_install===1&&window.reviewCalls.receiver_status>=2);
+   await upgradeManager.getByText(/USB 操作返回的已核验结果显示 TESTUSB 的版本码为 9/).waitFor();
+   results.versionMismatchUpgradeUsesReturnedVerifiedStatus=await page.evaluate(()=>window.reviewCalls.receiver_install===1&&window.reviewCalls.receiver_status===1);
    await closeManager();
    assert.equal(results.versionMismatchShowsConciseRecovery,true);
    assert.equal(results.versionMismatchOpensUsbUpgrade,true);
-   assert.equal(results.versionMismatchUpgradeReadsBack,true);
+   assert.equal(results.versionMismatchUpgradeUsesReturnedVerifiedStatus,true);
    await page.evaluate(()=>window.reviewUsbScenario({active:true,activeVersion:6,binding:'phoneA-abcdef',candidate:{versionCode:9,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:6,bindingReference:'phoneA-abcdef'},statuses:{TESTUSB:{installed:true,versionName:'0.6.0',versionCode:6,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}}}));
    await openManager();
    await page.getByRole('button',{name:'升级 Receiver · 9',exact:true}).waitFor();
@@ -612,13 +730,14 @@ fs.mkdirSync(out, {recursive:true});
    await page.getByRole('button',{name:'取消',exact:true}).click();
    await page.getByRole('dialog',{name:'手机应用'}).waitFor();
    await page.getByRole('button',{name:'升级 Receiver · 9',exact:true}).click();
+   const statusChecksBeforeConfirmedUpgrade=await page.evaluate(()=>window.reviewCalls.receiver_status);
    await page.getByRole('button',{name:'停止播放并继续',exact:true}).click();
    if(!await page.locator('.receiver-version-details').evaluate(el=>el.open)) await page.locator('.receiver-version-details > summary').click();
-   try { await page.getByText('USB 操作后已重新读取并核验 TESTUSB 的版本码 9。').waitFor({timeout:5000}); }
+   try { await page.getByText('USB 操作返回的已核验结果显示 TESTUSB 的版本码为 9。').waitFor({timeout:5000}); }
    catch(error) { console.log('USB upgrade failure page:', await page.locator('body').innerText()); await page.screenshot({path:`${out}/receiver-usb-upgrade-failure.png`}); throw error; }
-   results.upgradeUsesSelectedBindingAndVerifiesActualStatus=await page.evaluate(()=>window.reviewCommandArgs.receiver_upgrade_usb?.serial==='TESTUSB'&&window.reviewCommandArgs.receiver_upgrade_usb?.bindingReference==='phoneA-abcdef'&&!window.reviewCalls.receiver_install&&window.reviewCalls.receiver_status>=2&&window.reviewCalls.refresh_devices===1);
+   results.upgradeUsesSelectedBindingAndReturnedStatus=await page.evaluate(statusChecks=>window.reviewCommandArgs.receiver_upgrade_usb?.serial==='TESTUSB'&&window.reviewCommandArgs.receiver_upgrade_usb?.bindingReference==='phoneA-abcdef'&&!window.reviewCalls.receiver_install&&window.reviewCalls.receiver_status===statusChecks&&window.reviewCalls.refresh_devices===1,statusChecksBeforeConfirmedUpgrade);
    results.successToastIsNotFailure=await page.locator('.toast').innerText().then(text=>text.includes('Receiver 版本码 9 已核验；请重新认证连接。')&&!text.includes('操作没有完成'));
-   results.successHasNoOldNetworkUpdateState=await page.locator('.status-line').innerText().then(text=>!text.includes('Receiver 更新'))&&await page.getByText('USB 操作后已重新读取并核验 TESTUSB 的版本码 9。').count()===1;
+   results.successHasNoOldNetworkUpdateState=await page.locator('.status-line').innerText().then(text=>!text.includes('Receiver 更新'))&&await page.getByText('USB 操作返回的已核验结果显示 TESTUSB 的版本码为 9。').count()===1;
    await page.locator('.receiver-version-details > summary').click();
    await page.screenshot({path:`${out}/receiver-usb-upgrade.png`});
    await closeManager();
@@ -649,6 +768,7 @@ fs.mkdirSync(out, {recursive:true});
    await page.getByRole('button',{name:'检查状态',exact:true}).waitFor();
    await page.waitForFunction(()=>!document.querySelector('dialog[open] .receiver-status-actions button')?.disabled);
    await page.getByRole('button',{name:'升级 Receiver · 11',exact:true}).click();
+
    await page.getByRole('button',{name:'停止播放并继续',exact:true}).click();
    await page.waitForFunction(()=>{const button=[...document.querySelectorAll('button')].find(value=>value.textContent?.trim()==='升级 Receiver · 11');return window.reviewCalls.receiver_upgrade_usb===1&&button&&!button.disabled;});
    results.wrongUsbTargetIsRejectedAndRetryRemains=await page.getByRole('button',{name:'升级 Receiver · 11',exact:true}).isVisible()&&await page.evaluate(()=>window.reviewGetUsbStatus('TESTSECOND').versionCode===8&&window.reviewCalls.receiver_upgrade_usb===1&&window.reviewRead().state==='streaming'&&window.reviewRead().sessionReceiverBinding==='phoneA-abcdef');
@@ -657,8 +777,8 @@ fs.mkdirSync(out, {recursive:true});
    await page.evaluate(()=>window.reviewUsbScenario({candidate:{versionCode:10,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:['unrelated-phone-abcdef'],statuses:{TESTUSB:{installed:true,versionName:'0.8.0',versionCode:8,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}}}));
    await openManager();await page.getByRole('button',{name:'升级 Receiver · 10',exact:true}).click();
    await page.locator('.receiver-version-details > summary').click();
-   await page.getByText('USB 操作后已重新读取并核验 TESTUSB 的版本码 10。').waitFor();
-   results.unrelatedSavedBindingDoesNotBlockUsbMaintenance=await page.evaluate(()=>window.reviewCommandArgs.receiver_install?.serial==='TESTUSB'&&!window.reviewCalls.receiver_upgrade_usb&&window.reviewCalls.receiver_status>=2&&window.reviewCalls.refresh_devices===1);
+   await page.getByText('USB 操作返回的已核验结果显示 TESTUSB 的版本码为 10。').waitFor();
+   results.unrelatedSavedBindingDoesNotBlockUsbMaintenance=await page.evaluate(()=>window.reviewCommandArgs.receiver_install?.serial==='TESTUSB'&&!window.reviewCalls.receiver_upgrade_usb&&window.reviewCalls.receiver_status===1&&window.reviewCalls.refresh_devices===1);
    await closeManager();
 
    await page.evaluate(()=>window.reviewUsbScenario({candidate:{versionCode:12,versionName:'0.9.2-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],statuses:{TESTUSB:{installed:false,versionName:null,versionCode:null,serviceActive:false,foreground:false,healthy:false,audioActive:false,error:null,message:'Receiver 未安装'}},installError:'ADB 安装已取消'}));
@@ -671,8 +791,8 @@ fs.mkdirSync(out, {recursive:true});
    await page.evaluate(()=>window.reviewUsbScenario({candidate:{versionCode:12,versionName:'0.9.2-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:[],statuses:{TESTUSB:{installed:false,versionName:null,versionCode:null,serviceActive:false,foreground:false,healthy:false,audioActive:false,error:null,message:'Receiver 未安装'}}}));
    await openManager();await page.getByRole('button',{name:'安装 Receiver · 12',exact:true}).click();
    await page.locator('.receiver-version-details > summary').click();
-   await page.getByText('USB 操作后已重新读取并核验 TESTUSB 的版本码 12。').waitFor();
-   results.installReadsBackAndRefreshes=await page.evaluate(()=>window.reviewCommandArgs.receiver_install?.serial==='TESTUSB'&&window.reviewCalls.receiver_status>=2&&window.reviewCalls.refresh_devices===1);
+   await page.getByText('USB 操作返回的已核验结果显示 TESTUSB 的版本码为 12。').waitFor();
+   results.installUsesReturnedVerifiedStatusAndRefreshes=await page.evaluate(()=>window.reviewCommandArgs.receiver_install?.serial==='TESTUSB'&&window.reviewCalls.receiver_status===1&&window.reviewCalls.refresh_devices===1);
    await closeManager();
 
    await page.evaluate(()=>window.reviewUsbScenario({candidate:{versionCode:9,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null},bindings:['unrelated-phone-abcdef'],statuses:{TESTUSB:{installed:true,versionName:'0.6.0',versionCode:6,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}}}));
@@ -694,7 +814,7 @@ fs.mkdirSync(out, {recursive:true});
    await browser.close();
    assert.deepEqual(errors,[]);
    if(!process.env.ANPOD_SKIP_LAYOUT_MATRIX)assert.equal(layouts.filter(x=>x.horizontalOverflow||x.deviceHeight<x.deviceTextHeight||x.width!==x.size[0]).length,0);
-   for(const key of ['managerDefaultIsCompact','sessionUpgradeBindingIsVisible','legacyWithoutNetworkUpdateBitStillOffersUsbUpgrade','activePlaybackRequiresSingleConfirmation','upgradeUsesSelectedBindingAndVerifiesActualStatus','successToastIsNotFailure','successHasNoOldNetworkUpdateState','sameVersionDoesNotOfferUpgrade','newerVersionDoesNotOfferDowngrade','unknownVersionDoesNotAssumeUpdate','noOrUnauthorizedUsbIsNotSelectable','invalidTargetDoesNotOfferOperation','wrongUsbTargetIsRejectedAndRetryRemains','unrelatedSavedBindingDoesNotBlockUsbMaintenance','installFailureKeepsRetryAction','installReadsBackAndRefreshes','compatibleOldReceiverCanConnectWithOptionalUpgrade','oldReceiverStartsFirstBindWithoutUpgrade'])assert.equal(results[key],true,key);
+   for(const key of ['managerDefaultIsCompact','sessionUpgradeBindingIsVisible','legacyWithoutNetworkUpdateBitStillOffersUsbUpgrade','activePlaybackRequiresSingleConfirmation','upgradeUsesSelectedBindingAndReturnedStatus','successToastIsNotFailure','successHasNoOldNetworkUpdateState','sameVersionDoesNotOfferUpgrade','newerVersionDoesNotOfferDowngrade','unknownVersionDoesNotAssumeUpdate','noOrUnauthorizedUsbIsNotSelectable','invalidTargetDoesNotOfferOperation','wrongUsbTargetIsRejectedAndRetryRemains','unrelatedSavedBindingDoesNotBlockUsbMaintenance','installFailureKeepsRetryAction','installUsesReturnedVerifiedStatusAndRefreshes','compatibleOldReceiverCanConnectWithOptionalUpgrade','oldReceiverStartsFirstBindWithoutUpgrade'])assert.equal(results[key],true,key);
   return;
  }
  await page.setViewportSize({width:420,height:590});await page.evaluate(()=>window.reviewSet('ready','wifi'));

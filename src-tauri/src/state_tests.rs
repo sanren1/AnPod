@@ -518,6 +518,23 @@ fn background_operation_does_not_preempt_a_foreground_request() {
 }
 
 #[test]
+fn foreground_receiver_operation_preempts_only_background_monitoring() {
+    let generation = AtomicU64::new(0);
+    let slot = Mutex::new(None);
+    let (background_generation, background_token) =
+        begin_preemptible_background_operation(&generation, &slot).unwrap();
+    let (foreground_generation, foreground_token) =
+        begin_foreground_receiver_operation(&generation, &slot).unwrap();
+    assert!(background_token.is_cancelled());
+    finish_operation_slot(&slot, background_generation);
+    assert!(slot.lock().unwrap().as_ref().is_some_and(|active| {
+        active.generation == foreground_generation && !active.token.is_cancelled()
+    }));
+    assert!(begin_foreground_receiver_operation(&generation, &slot).is_none());
+    assert!(!foreground_token.is_cancelled());
+}
+
+#[test]
 fn native_disconnect_is_detected_when_adb_scan_fails() {
     assert!(session_is_lost(None, false, false));
     assert!(!session_is_lost(None, false, true));
@@ -678,11 +695,13 @@ fn operation_slot_keeps_reset_and_offer_reservations_exclusive() {
     let slot = Mutex::new(None);
     let (reset_generation, reset_token) = begin_operation_slot(&generation, &slot, true).unwrap();
     assert!(begin_operation_slot(&generation, &slot, true).is_none());
+    assert!(begin_foreground_receiver_operation(&generation, &slot).is_none());
     assert!(!reset_token.is_cancelled());
     finish_operation_slot(&slot, reset_generation);
 
     let (offer_generation, offer_token) = begin_operation_slot(&generation, &slot, true).unwrap();
     assert!(begin_operation_slot(&generation, &slot, true).is_none());
+    assert!(begin_foreground_receiver_operation(&generation, &slot).is_none());
     assert!(!offer_token.is_cancelled());
     finish_operation_slot(&slot, offer_generation);
 }

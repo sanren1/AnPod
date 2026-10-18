@@ -16,6 +16,24 @@ const BINDING_URI: &str = "content://app.anpod.receiver.state/binding";
 const INTERFACES_URI: &str = "content://app.anpod.receiver.state/interfaces";
 const NETWORK_URI: &str = "content://app.anpod.receiver.state/network";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallProgressStage {
+    Checking,
+    Transferring,
+    Verifying,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProgress {
+    pub operation_id: String,
+    pub serial: String,
+    pub stage: InstallProgressStage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BindingResetPreview {
@@ -139,6 +157,62 @@ struct AuditedReceiverArtifact {
 // Every shipped APK must be added here after release, or the next version cannot
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "e70c53d1393de3a976becf78d8ab5c3d4b94bcdf5be890e0901aa79fd2e8314e",
+        version_code: 30,
+        version_name: "0.15.5-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "630e24796fc7c5fc07dc78db5ec39a29a84fcfc3bf658fc50037d5e3d283930e",
+        version_code: 29,
+        version_name: "0.15.4-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "e15777fdf1c448b404dec9b7216ea8d6b8ff6c37196fdccbae089cae0336e4bd",
+        version_code: 28,
+        version_name: "0.15.3-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "c9593516c9ec9e81f2f533d8075884f35ab35bd8e501d7fe7ab2175fc4775219",
+        version_code: 27,
+        version_name: "0.15.2-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "a6b7c61b6ad313ed47a9c817ae997f4a4be9f8045bb0053c7a38b288da33272d",
+        version_code: 26,
+        version_name: "0.15.1-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "469b4ef9ec4fd441c1e2cd64ab6423316df402b9f3f6aac0e43442309308662c",
+        version_code: 25,
+        version_name: "0.15.0-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "ce25dab8fc20891b3947369b4165bd2cff89388b9d7c9d99583605addecd4c09",
+        version_code: 24,
+        version_name: "0.14.0-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "ff762492a15c746de025cc84e877354a567dc31d747dbf857e08b9ef03ae189d",
+        version_code: 23,
+        version_name: "0.13.7-v3-flow-candidate",
+        source_commit: "e43cd685e99696b0c6f9618cfc11871043781843",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
     AuditedReceiverArtifact {
         sha256: "1b73f76b98ae2470969531085fc5bd7d5114055a58c5df3beeb0f6ad6602c549",
         version_code: 22,
@@ -1267,6 +1341,15 @@ fn parse_receiver_interfaces(output: &str) -> Vec<ReceiverInterface> {
     interfaces
 }
 
+/// A listener that has bound its UDP port is ready even before the PC authenticates: the P5-C
+/// handshake is started by the caller only after this function returns, so `prepared` must count.
+fn network_listener_ready(state: &str) -> bool {
+    matches!(
+        state,
+        "prepared" | "authenticated" | "receiverRunning" | "streaming" | "paused"
+    )
+}
+
 pub async fn start_network(
     adb: &Path,
     serial: &str,
@@ -1282,48 +1365,52 @@ pub async fn start_network(
         .find(|interface| interface.address == address && interface.prefix_length == prefix_length)
         .ok_or_else(|| "所选手机接口已不可用；请重新读取手机接口列表。".to_string())?;
     let _ = selected;
-    let user = current_android_user(&SystemAdb(adb), serial, cancel).await?;
+    let runner = SystemAdb(adb);
+    let user = current_android_user(&runner, serial, cancel).await?;
+    stop_stale_network_listener(&runner, serial, &user, cancel).await;
     let address = address.to_owned();
     let prefix = prefix_length.to_string();
-    let result = adb_run(
-        adb,
-        Some(serial),
-        &[
-            "shell",
-            "am",
-            "start",
-            "--user",
-            &user,
-            "-W",
-            "-n",
-            "app.anpod.receiver/.BootstrapActivity",
-            "-a",
-            "app.anpod.receiver.action.START_NETWORK_AUDIO",
-            "--es",
-            "networkAddress",
-            &address,
-            "--ei",
-            "networkPrefixLength",
-            &prefix,
-        ],
-        Duration::from_secs(40),
-        Some(cancel),
-    )
-    .await?;
+    let result = runner
+        .run(
+            Some(serial),
+            &[
+                "shell",
+                "am",
+                "start",
+                "--user",
+                &user,
+                "-W",
+                "-n",
+                "app.anpod.receiver/.BootstrapActivity",
+                "-a",
+                "app.anpod.receiver.action.START_NETWORK_AUDIO",
+                "--es",
+                "networkAddress",
+                &address,
+                "--ei",
+                "networkPrefixLength",
+                &prefix,
+            ],
+            Duration::from_secs(40),
+            Some(cancel),
+        )
+        .await?;
     ensure_adb_success(&result)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The installed identity is verified once here; the poll below only re-reads the state row so a
+    // 200 ms cadence does not spawn four extra adb commands per tick and starve the same link the
+    // listener is starting on.
+    let metadata = read_artifact(apk, metadata_path)?;
+    verify_installed_identity(&runner, serial, &user, &metadata, cancel).await?;
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         if cancel.is_cancelled() {
             return Err("操作已取消。".into());
         }
-        let status = network_status(adb, serial, apk, metadata_path, cancel).await?;
+        let status = network_status_rows(&runner, serial, &user, cancel).await?;
         if status.network_audio_version != 1 {
             return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络协议版本不兼容。".into());
         }
-        if matches!(
-            status.network_audio_state.as_str(),
-            "authenticated" | "receiverRunning" | "streaming" | "paused"
-        ) {
+        if network_listener_ready(&status.network_audio_state) {
             if status.network_audio_address != address || status.network_audio_port == 0 {
                 return Err("Receiver 未报告本次 bootstrap 的监听地址和端口。".into());
             }
@@ -1336,11 +1423,14 @@ pub async fn start_network(
             ));
         }
         if Instant::now() >= deadline {
-            return Err("Receiver 未能在临时授权窗口内启动网络监听。".into());
+            return Err(format!(
+                "Receiver 未能在启动窗口内开始网络监听（手机端状态：{}）。请保持手机解锁并允许通知后重试。",
+                status.network_audio_state
+            ));
         }
         tokio::select! {
             _ = cancel.cancelled() => return Err("操作已取消。".into()),
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
 }
@@ -1357,7 +1447,78 @@ pub async fn network_status(
     let user = current_android_user(&runner, serial, cancel).await?;
     let metadata = read_artifact(apk, metadata_path)?;
     verify_installed_identity(&runner, serial, &user, &metadata, cancel).await?;
-    let result = runner.run(Some(serial), &["shell", "content", "query", "--user", &user,
+    network_status_rows(&runner, serial, &user, cancel).await
+}
+
+/// ReceiverService ignores a new bootstrap while its coordinator still exists, so a listener left
+/// over from a failed attempt has to be stopped first or every retry waits on the stale one.
+async fn stop_stale_network_listener(
+    runner: &impl AdbRunner,
+    serial: &str,
+    user: &str,
+    cancel: &CancellationToken,
+) {
+    let Ok(status) = network_status_rows(runner, serial, user, cancel).await else {
+        return;
+    };
+    if !matches!(
+        status.network_audio_state.as_str(),
+        "prepared" | "starting" | "stopping" | "receiverRunning" | "streaming" | "paused"
+    ) {
+        return;
+    }
+    let _ = runner
+        .run(
+            Some(serial),
+            &[
+                "shell",
+                "am",
+                "start",
+                "--user",
+                user,
+                "-n",
+                "app.anpod.receiver/.BootstrapActivity",
+                "-a",
+                "app.anpod.receiver.action.STOP",
+            ],
+            Duration::from_secs(10),
+            Some(cancel),
+        )
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match network_status_rows(runner, serial, user, cancel).await {
+            Ok(state)
+                if !matches!(
+                    state.network_audio_state.as_str(),
+                    "prepared"
+                        | "starting"
+                        | "stopping"
+                        | "receiverRunning"
+                        | "streaming"
+                        | "paused"
+                ) =>
+            {
+                return
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+/// Reads only the network state row; callers that already verified identity use this to poll.
+async fn network_status_rows(
+    runner: &impl AdbRunner,
+    serial: &str,
+    user: &str,
+    cancel: &CancellationToken,
+) -> Result<ReceiverNetworkStatus, String> {
+    let result = runner.run(Some(serial), &["shell", "content", "query", "--user", user,
         "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten:networkAudioAddress:networkAudioPort"],
         Duration::from_secs(8), Some(cancel)).await?;
     if !result.success {
@@ -1442,10 +1603,21 @@ pub async fn install(
     apk: &Path,
     metadata_path: &Path,
     cancel: &CancellationToken,
+    progress: &mut impl FnMut(InstallProgressStage),
 ) -> Result<ReceiverStatus, String> {
-    install_usb_with(&SystemAdb(adb), serial, apk, metadata_path, None, cancel).await
+    install_usb_with(
+        &SystemAdb(adb),
+        serial,
+        apk,
+        metadata_path,
+        None,
+        cancel,
+        progress,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upgrade_usb(
     adb: &Path,
     serial: &str,
@@ -1454,6 +1626,7 @@ pub async fn upgrade_usb(
     apk: &Path,
     metadata_path: &Path,
     cancel: &CancellationToken,
+    progress: &mut impl FnMut(InstallProgressStage),
 ) -> Result<ReceiverStatus, String> {
     install_usb_with(
         &SystemAdb(adb),
@@ -1462,6 +1635,7 @@ pub async fn upgrade_usb(
         metadata_path,
         Some((binding_reference, binding_path)),
         cancel,
+        progress,
     )
     .await
 }
@@ -1473,10 +1647,12 @@ async fn install_usb_with(
     metadata_path: &Path,
     binding: Option<(&str, &Path)>,
     cancel: &CancellationToken,
+    progress: &mut impl FnMut(InstallProgressStage),
 ) -> Result<ReceiverStatus, String> {
     let (user, metadata, _) =
         prepare_usb_install(adb, serial, apk, metadata_path, binding, cancel).await?;
     let apk_text = apk.to_string_lossy().into_owned();
+    progress(InstallProgressStage::Transferring);
     let result = adb
         .run(
             Some(serial),
@@ -1486,6 +1662,7 @@ async fn install_usb_with(
         )
         .await?;
     ensure_adb_success(&result)?;
+    progress(InstallProgressStage::Verifying);
     let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     if !installed.sha256.eq_ignore_ascii_case(&metadata.sha256) {
         return Err(
@@ -1567,7 +1744,7 @@ async fn install_with(
     metadata_path: &Path,
     cancel: &CancellationToken,
 ) -> Result<ReceiverStatus, String> {
-    install_usb_with(adb, serial, apk, metadata_path, None, cancel).await
+    install_usb_with(adb, serial, apk, metadata_path, None, cancel, &mut |_| {}).await
 }
 
 pub async fn start(
@@ -1758,6 +1935,10 @@ async fn stop_with(
         return Err("已安装包名冲突，未执行停止操作。".into());
     }
 
+    if !before.service_active {
+        // Nothing is running, so there is no session to clean up and no activity needs to launch.
+        return Ok(status_from_health(before));
+    }
     let result = adb
         .run(
             Some(serial),

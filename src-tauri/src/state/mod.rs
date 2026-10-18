@@ -303,6 +303,8 @@ pub(crate) struct Session {
 pub(crate) struct ActiveOperation {
     generation: u64,
     token: CancellationToken,
+    background: bool,
+    receiver_preemptible: bool,
 }
 
 pub(crate) struct ActiveQrOperation {
@@ -607,10 +609,10 @@ impl AppState {
             if peer_v4.port() == 0 || !interface.contains(*peer_v4.ip()) { return Err("接收端点不在所选 IPv4 接口的本地网段内。".into()); }
             token_check(&token)?;
             let binding = BindingStore::load(&binding_path).map_err(|_| "本机 DPAPI 绑定材料不可用；请通过授权 USB/bootstrap 建立绑定。".to_string())?;
-            if background_authorization_required
-                && crate::p5c::hex_string(&binding.commitment()) != binding_ref.to_ascii_lowercase() {
-                return Err("所选绑定材料与 bindingReference 不匹配；未请求 Receiver 授权。".into());
-            }
+            // binding_ref is the host-side reference that names this DPAPI file, while the phone's
+            // commitment is a hash of the material itself; comparing them rejected every valid
+            // background start. The saved material is bound to the reference by its path, and the
+            // P5-C handshake still proves the phone holds the same secret.
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
             let mut owner = if background_authorization_required {
@@ -737,6 +739,10 @@ impl AppState {
 
     fn start_background_operation(&self) -> Option<(u64, CancellationToken)> {
         begin_operation_slot(&self.operation_generation, &self.operation, true)
+    }
+
+    fn start_preemptible_background_operation(&self) -> Option<(u64, CancellationToken)> {
+        begin_preemptible_background_operation(&self.operation_generation, &self.operation)
     }
 
     fn cancel_active_operation(&self) {
@@ -1189,7 +1195,7 @@ impl AppState {
         let Some((binding, address, cancellation)) = candidate else {
             return false;
         };
-        let Some(reservation) = self.start_background_operation() else {
+        let Some(reservation) = self.start_preemptible_background_operation() else {
             return false;
         };
         let offer = self
@@ -1359,7 +1365,8 @@ impl AppState {
                 return;
             }
             if receiver_health_needed(installed_receiver, device_present, exited, connected) {
-                let Some((generation, token)) = self.start_background_operation() else {
+                let Some((generation, token)) = self.start_preemptible_background_operation()
+                else {
                     return;
                 };
                 let result = receiver::health(
@@ -1485,7 +1492,8 @@ impl AppState {
         }) {
             if !self.recovering.swap(true, Ordering::AcqRel) {
                 let serial = device.serial.clone();
-                let Some((generation, token)) = self.start_background_operation() else {
+                let Some((generation, token)) = self.start_preemptible_background_operation()
+                else {
                     self.recovering.store(false, Ordering::Release);
                     return;
                 };
@@ -1770,7 +1778,7 @@ impl AppState {
             self.recovering.store(false, Ordering::Release);
             return;
         }
-        let Some((generation, token)) = self.start_background_operation() else {
+        let Some((generation, token)) = self.start_preemptible_background_operation() else {
             self.recovering.store(false, Ordering::Release);
             return;
         };

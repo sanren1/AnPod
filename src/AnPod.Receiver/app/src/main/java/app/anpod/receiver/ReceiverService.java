@@ -196,6 +196,18 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
         if (intent != null && BootstrapActivity.ACTION_STOP.equals(intent.getAction())) {
+            // The invisible trampoline starts us with startForegroundService even when the session
+            // just ended; satisfy the 5 s contract before tearing the service down.
+            try {
+                Notification stopping = serviceNotification("正在停止 AnPod 接收…", "", 0, false);
+                if (Build.VERSION.SDK_INT >= 34) {
+                    startForeground(NOTIFICATION_ID, stopping, ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE);
+                } else {
+                    startForeground(NOTIFICATION_ID, stopping);
+                }
+            } catch (RuntimeException ignored) {
+                // Termination below still runs.
+            }
             int disposition = uiOperation.bootstrapStopDisposition();
             if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_OWNER) {
                 requestTermination(uiOperation.ownerId(), currentOperationGeneration, false, "");
@@ -292,9 +304,20 @@ public final class ReceiverService extends Service {
             if (timeout != null) handler.removeCallbacks(timeout);
             timeout = () -> requestTermination(ownerId, generation, true, "BootstrapTimeout");
             handler.postDelayed(timeout, networkBootstrapTimeoutMs(uiNetworkAudio));
-            startNetworkBootstrap(intent.getStringExtra("networkAddress"),
-                    intent.getIntExtra("networkPrefixLength", 0), generation, ownerId,
-                    backgroundStandbyEnabled, receiveIntentEnabled);
+            // Opening the control listener and the discovery sockets binds sockets, which Android
+            // forbids on the main thread (NetworkOnMainThreadException). Keep the whole bootstrap on
+            // its own thread; it reports state changes through the volatile fields and the handler.
+            final String bootstrapAddress = intent.getStringExtra("networkAddress");
+            final int bootstrapPrefix = intent.getIntExtra("networkPrefixLength", 0);
+            final long bootstrapGeneration = generation;
+            final String bootstrapOwner = ownerId;
+            final boolean bootstrapStandby = backgroundStandbyEnabled;
+            final boolean bootstrapReceiveIntent = receiveIntentEnabled;
+            Thread bootstrap = new Thread(() -> startNetworkBootstrap(bootstrapAddress, bootstrapPrefix,
+                    bootstrapGeneration, bootstrapOwner, bootstrapStandby, bootstrapReceiveIntent),
+                    "AnPod P5-C bootstrap setup");
+            bootstrap.setDaemon(true);
+            bootstrap.start();
             return START_NOT_STICKY;
         }
 
