@@ -140,6 +140,13 @@ struct AuditedReceiverArtifact {
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
     AuditedReceiverArtifact {
+        sha256: "1daf7889d1330d61187c938d2b3591029ff5c8308982e288c0fd5590c10fe732",
+        version_code: 18,
+        version_name: "0.13.2-v3-flow-candidate",
+        source_commit: "f712e20407428adc69c6c25a9176d220aaec4f78",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
         sha256: "b2d501f8a387e1b339dea1f40d153f4beb00545a3f5d8597da6b0c686ca14d35",
         version_code: 16,
         version_name: "0.13.0-v3-flow-candidate",
