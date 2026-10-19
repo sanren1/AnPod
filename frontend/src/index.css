@@ -140,9 +140,10 @@ button:disabled { cursor: default; }
 .dialog-secondary:disabled, .primary-button:disabled { opacity: 0.6; cursor: default; }
 .device-dialog > .dialog-secondary { display: flex; margin: 8px 16px 0 auto; }
 .settings-dialog > h3 { margin: 16px 18px 6px; color: var(--muted); font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
-.settings-advanced { margin-top: 12px; border-top: 1px solid var(--line); }
-.settings-advanced > summary, .background-trust-disclosure > summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-weight: 600; }
-.settings-advanced > summary:focus-visible, .background-trust-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.settings-advanced { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.settings-advanced > h3 { margin: 0 0 8px; }
+.background-trust-disclosure > summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-weight: 600; }
+.background-trust-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .settings-advanced > .select-setting, .settings-advanced > .dialog-footnote, .settings-advanced > .text-button { margin-inline: 0; }
 .setting-toggle { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 18px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); cursor: pointer; }
 .setting-toggle > span { display: grid; gap: 3px; }
@@ -182,6 +183,10 @@ button:disabled { cursor: default; }
 .setup-wizard .network-recovery { align-items: flex-start; }
 .setup-wizard .network-field select, .setup-wizard .network-refresh, .setup-wizard .network-recovery .text-button, .setup-receiver-actions button { min-height: 48px; }
 .network-primary { display: grid; gap: 10px; }
+.connection-entry { display: grid; gap: 12px; }
+.connection-entry > p { margin: 0; line-height: 1.5; color: var(--muted); }
+.connection-entry > button { min-height: 48px; }
+.network-recovery-back { min-height: 44px; justify-self: start; }
 .network-summary { min-width: 0; display: grid; gap: 3px; padding: 2px 1px; overflow-wrap: anywhere; }
 .network-summary span { color: var(--muted); font-size: 12px; line-height: 18px; }
 .network-connect { width: 100%; min-height: 44px; }

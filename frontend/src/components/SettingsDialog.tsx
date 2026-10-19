@@ -10,14 +10,14 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     <h3>{strings.app.settingsConnection}</h3>
     <SettingToggle disabled={snapshot.busy} title={strings.app.autoConnect} description={strings.app.autoConnectDescription} checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
     <SettingToggle disabled={snapshot.busy} title={strings.app.wirelessRecovery} description={strings.app.wirelessRecoveryDescription} checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />
-    <details className="settings-advanced">
-      <summary>{strings.app.advancedConnection}</summary>
+    <section className="settings-advanced" aria-labelledby="settings-advanced-title">
+      <h3 id="settings-advanced-title">{strings.app.advancedConnection}</h3>
       <label className="select-setting"><span>{strings.app.wirelessProtocol}</span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
-      <label className="select-setting"><span>{strings.app.receiverBackend}</span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">Receiver</option></select></label>
+      <label className="select-setting"><span>{strings.app.receiverBackend}</span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
       {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
       {udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
-      <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
-    </details>
+    </section>
+    <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
     <h3>{strings.app.windowAppearance}</h3>
     <SettingToggle disabled={snapshot.busy} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
     <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />

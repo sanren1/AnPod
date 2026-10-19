@@ -1,6 +1,8 @@
 package app.anpod.receiver
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -11,6 +13,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
+import android.net.Uri
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -55,6 +60,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
@@ -118,15 +127,21 @@ class MainActivity : ComponentActivity() {
         val activeAddress = snapshot?.networkAddress.orEmpty()
         val activeInterface = interfaces.singleOrNull { it.address == activeAddress }
         val currentSelection = interfaces.singleOrNull { it.address == selectedAddress && it.prefixLength == selectedPrefix }
+        val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
+        val savedAddress = preferences.getString("network_address", "").orEmpty()
+        val savedPrefix = preferences.getInt("network_prefix", 0)
+        val savedSelection = interfaces.singleOrNull { it.address == savedAddress && it.prefixLength == savedPrefix }
         when {
             snapshot?.operationState == "running" && activeInterface != null -> {
-                selectedAddress = activeInterface.address
-                selectedPrefix = activeInterface.prefixLength
+                selectNetwork(activeInterface)
             }
             currentSelection != null -> Unit
+            savedSelection != null -> {
+                selectedAddress = savedSelection.address
+                selectedPrefix = savedSelection.prefixLength
+            }
             interfaces.size == 1 -> {
-                selectedAddress = interfaces.single().address
-                selectedPrefix = interfaces.single().prefixLength
+                selectNetwork(interfaces.single())
             }
             else -> {
                 selectedAddress = ""
@@ -135,6 +150,31 @@ class MainActivity : ComponentActivity() {
         }
         advancePendingConnection(snapshot)
         maybeEnterAod()
+    }
+
+    private fun selectNetwork(item: UiInterface) {
+        if (selectedAddress == item.address && selectedPrefix == item.prefixLength) return
+        selectedAddress = item.address
+        selectedPrefix = item.prefixLength
+        getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit()
+            .putString("network_address", item.address)
+            .putInt("network_prefix", item.prefixLength)
+            .apply()
+    }
+
+    private fun copyDiagnostics(message: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.diagnostics_label), message))
+        Toast.makeText(this, R.string.diagnostics_copied, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun openNotificationSettings() {
+        val intent = if (Build.VERSION.SDK_INT >= 26) {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        } else {
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+        }
+        startActivity(intent)
     }
 
     private fun maybeEnterAod() {
@@ -198,7 +238,7 @@ class MainActivity : ComponentActivity() {
                     selectedPrefix = selectedPrefix,
                     localMessage = localMessage,
                     connectionPending = pendingConnection != null,
-                    onSelect = { selectedAddress = it.address; selectedPrefix = it.prefixLength },
+                    onSelect = { selectNetwork(it) },
                     onConnectComputer = { connectComputer() },
                     onStartBackgroundStandby = { startBackgroundStandby() },
                     onStopBackgroundStandby = { stopBackgroundStandby() },
@@ -212,7 +252,9 @@ class MainActivity : ComponentActivity() {
                     },
                     aodEnabled = aodEnabled,
                     onToggleAod = { updateAodEnabled(it) },
-                    onOpenAod = { openAod() }
+                    onOpenAod = { openAod() },
+                    onCopyDiagnostics = { copyDiagnostics(it) },
+                    onOpenNotificationSettings = { openNotificationSettings() }
                 )
             }
         }
@@ -370,7 +412,9 @@ private fun ReceiverScreen(
     onStop: () -> Unit,
     aodEnabled: Boolean,
     onToggleAod: (Boolean) -> Unit,
-    onOpenAod: () -> Unit
+    onOpenAod: () -> Unit,
+    onCopyDiagnostics: (String) -> Unit,
+    onOpenNotificationSettings: () -> Unit
 ) {
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
     val currentTrustTarget = snapshot?.takeIf {
@@ -380,10 +424,20 @@ private fun ReceiverScreen(
     LaunchedEffect(trustConfirmationTarget, currentTrustTarget) {
         if (trustConfirmationTarget != null && trustConfirmationTarget != currentTrustTarget) trustConfirmationTarget = null
     }
-    val state = snapshot?.let { stateLabel(it, connectionPending) } ?: stringResource(R.string.reading_receive_status)
+    val diagnostic = localMessage.takeIf { it.isNotEmpty() }
+        ?: snapshot?.error?.takeIf { it.isNotEmpty() }
+        ?: snapshot?.backgroundAuthorizationError?.takeIf { it.isNotEmpty() }.orEmpty()
+    val notificationPermissionDenied = localMessage == stringResource(R.string.notification_permission_required)
+            || localMessage == stringResource(R.string.background_notification_permission_required)
     val bound = snapshot?.bindingState == "saved"
     val running = snapshot?.operationState in setOf("starting", "running", "stopping") ||
             snapshot?.serviceState in setOf("starting", "prepared", "authenticated", "receiverRunning", "streaming", "paused")
+    val selectedNetworkAvailable = interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix }
+    val networkChoiceNeeded = !running && interfaces.size > 1
+            && (!selectedNetworkAvailable || diagnostic.contains("InvalidReceiverInterface"))
+    val needsAttention = diagnostic.isNotEmpty() || snapshot?.backgroundListenerState == "pending"
+            || snapshot?.serviceState == "failed" || snapshot?.operationState == "error"
+            || snapshot?.backgroundGrantKind == "unavailable"
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
@@ -393,18 +447,22 @@ private fun ReceiverScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text("AnPod Receiver", style = MaterialTheme.typography.headlineSmall)
+                Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall)
             }
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(state, style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
-                    Text(stateDetail(snapshot), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (bound) Text(stringResource(R.string.target_bound_computer), style = MaterialTheme.typography.bodyMedium)
-                    if (!bound) Text(
-                        if (snapshot?.bindingState == "unavailable") stringResource(R.string.binding_status_temporarily_unavailable)
-                        else stringResource(R.string.not_bound_use_usb_first_pairing),
-                        style = MaterialTheme.typography.bodyMedium
+                    Text(
+                        stateLabel(snapshot, connectionPending, needsAttention),
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = if (needsAttention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
+                    )
+                    Text(
+                        nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
+                            networkChoiceNeeded, notificationPermissionDenied),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -439,6 +497,7 @@ private fun ReceiverScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
+                        val aodToggleDescription = stringResource(R.string.aod_toggle)
                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(stringResource(R.string.aod_title), style = MaterialTheme.typography.titleMedium)
                             Text(
@@ -447,7 +506,13 @@ private fun ReceiverScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Switch(checked = aodEnabled, onCheckedChange = onToggleAod)
+                        Switch(
+                            checked = aodEnabled,
+                            onCheckedChange = onToggleAod,
+                            modifier = Modifier.semantics {
+                                contentDescription = aodToggleDescription
+                            }
+                        )
                     }
                     TextButton(
                         onClick = onOpenAod,
@@ -508,24 +573,42 @@ private fun ReceiverScreen(
                 }
             }
 
-            if (!running && interfaces.size != 1) {
+            if (!running && (networkChoiceNeeded || interfaces.isEmpty())) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.network_interface), style = MaterialTheme.typography.titleMedium)
-                    InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
-                    if (interfaces.isEmpty()) Text(stringResource(R.string.no_private_ipv4_interfaces_found), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.network_recovery_title), style = MaterialTheme.typography.titleMedium)
+                    if (interfaces.isEmpty()) {
+                        Text(stringResource(R.string.no_private_ipv4_interfaces_found), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        Text(stringResource(R.string.network_recovery_help), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
+                    }
                 }
             }
 
-            val message = localMessage.takeIf { it.isNotEmpty() }
-                ?: snapshot?.error?.takeIf { it.isNotEmpty() }
-                ?: snapshot?.backgroundAuthorizationError?.takeIf { it.isNotEmpty() }.orEmpty()
-            var errorDetailsExpanded by remember(message) { mutableStateOf(false) }
-            if (message.isNotEmpty()) {
-                Text(stringResource(R.string.operation_error_summary), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+            var errorDetailsExpanded by remember(diagnostic) { mutableStateOf(false) }
+            if (diagnostic.isNotEmpty()) {
+                Text(
+                    if (notificationPermissionDenied) stringResource(R.string.notification_permission_next_step)
+                    else if (networkChoiceNeeded) stringResource(R.string.network_choice_next_step)
+                    else if (snapshot?.backgroundGrantKind == "unavailable") stringResource(R.string.background_authorization_failed)
+                    else stringResource(R.string.operation_error_summary),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error
+                )
                 TextButton(onClick = { errorDetailsExpanded = !errorDetailsExpanded }, modifier = Modifier.heightIn(min = 48.dp)) {
                     Text(stringResource(R.string.show_error_details))
                 }
-                if (errorDetailsExpanded) Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (errorDetailsExpanded) {
+                    Text(diagnostic, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(onClick = { onCopyDiagnostics(diagnostic) }, modifier = Modifier.heightIn(min = 48.dp)) {
+                        Text(stringResource(R.string.copy_diagnostics))
+                    }
+                }
+                if (notificationPermissionDenied) {
+                    TextButton(onClick = onOpenNotificationSettings, modifier = Modifier.heightIn(min = 48.dp)) {
+                        Text(stringResource(R.string.open_notification_settings))
+                    }
+                }
             }
 
             Spacer(Modifier.height(8.dp))
@@ -533,10 +616,35 @@ private fun ReceiverScreen(
     }
     val confirmedTarget = trustConfirmationTarget
     if (confirmedTarget != null && confirmedTarget == currentTrustTarget) {
+        var showFullBindingId by remember(confirmedTarget) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { trustConfirmationTarget = null },
             title = { Text(stringResource(R.string.confirm_background_trust_title)) },
-            text = { Text(stringResource(R.string.confirm_background_trust_message, confirmedTarget.bindingFingerprint.chunked(4).joinToString(" "))) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(stringResource(R.string.confirm_background_trust_message))
+                    Text(
+                        stringResource(
+                            R.string.background_binding_fingerprint_short,
+                            confirmedTarget.bindingFingerprint.take(8),
+                            confirmedTarget.bindingFingerprint.takeLast(8)
+                        ),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    TextButton(
+                        onClick = { showFullBindingId = !showFullBindingId },
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text(stringResource(if (showFullBindingId) R.string.hide_paired_computer_id else R.string.show_paired_computer_id))
+                    }
+                    if (showFullBindingId) {
+                        Text(
+                            stringResource(R.string.background_binding_fingerprint, confirmedTarget.bindingFingerprint.chunked(4).joinToString(" ")),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(
                     onClick = { trustConfirmationTarget = null; onTrustBinding(confirmedTarget) },
@@ -581,6 +689,7 @@ private fun backgroundGrantStatus(snapshot: UiSnapshot?): String = when (snapsho
         stringResource(R.string.background_grant_eight_hours, totalMinutes / 60, totalMinutes % 60)
     }
     "untilRevoked" -> stringResource(R.string.background_grant_until_revoked)
+    "unavailable" -> stringResource(R.string.background_authorization_failed)
     else -> stringResource(R.string.background_grant_none)
 }
 
@@ -614,36 +723,67 @@ private fun InterfacePicker(
 }
 
 @Composable
-private fun stateLabel(snapshot: UiSnapshot, connectionPending: Boolean): String = when {
-    connectionPending || snapshot.serviceState == "starting" || snapshot.operationState == "starting" -> stringResource(R.string.connecting_computer)
-    snapshot.operationState == "stopping" -> stringResource(R.string.stopping_receiver)
-    snapshot.operationState == "error" -> stringResource(R.string.operation_failed_retry)
-    snapshot.serviceState == "prepared" -> stringResource(R.string.waiting_for_computer)
-    snapshot.serviceState == "authenticated" -> stringResource(R.string.connected_waiting_for_audio)
-    snapshot.serviceState == "paused" -> stringResource(R.string.paused)
-    snapshot.serviceState == "failed" -> stringResource(R.string.connection_failed_retry)
-    snapshot.serviceState == "stopping" -> stringResource(R.string.stopping_receiver)
-    snapshot.serviceState in setOf("receiverRunning", "streaming") -> playbackAdvancingLabel(snapshot.playbackAdvancing)
-    else -> stringResource(R.string.waiting_for_connection)
+private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean): String = when {
+    needsAttention -> stringResource(R.string.state_needs_attention)
+    snapshot == null || connectionPending || snapshot.serviceState == "starting"
+            || snapshot.operationState == "starting" || snapshot.operationState == "stopping" ->
+        stringResource(R.string.state_connecting)
+    snapshot.serviceState == "receiverRunning" || snapshot.serviceState == "streaming" ->
+        stringResource(R.string.state_receiving)
+    snapshot.serviceState == "paused" -> stringResource(R.string.state_needs_attention)
+    snapshot.backgroundStandbyEnabled || snapshot.serviceState == "prepared" || snapshot.serviceState == "authenticated" ->
+        stringResource(R.string.state_waiting_for_computer)
+    else -> stringResource(R.string.state_not_connected)
 }
 
 @Composable
-private fun stateDetail(snapshot: UiSnapshot?): String = when (snapshot?.serviceState) {
-    null -> stringResource(R.string.reading_receive_status_period)
-    "streaming", "receiverRunning" -> when (snapshot.playbackAdvancing) {
-        true -> stringResource(R.string.receiver_playback_progress_advancing_detail)
-        false -> stringResource(R.string.receiver_playback_progress_still_detail)
-        null -> stringResource(R.string.receiver_playback_progress_unknown_detail)
+private fun nextStep(
+    snapshot: UiSnapshot?,
+    bound: Boolean,
+    connectionPending: Boolean,
+    diagnostic: String,
+    noNetwork: Boolean,
+    networkChoiceNeeded: Boolean,
+    notificationPermissionDenied: Boolean
+): String = when {
+    snapshot == null -> stringResource(R.string.next_step_reading_status)
+    notificationPermissionDenied -> stringResource(R.string.notification_permission_next_step)
+    diagnostic.contains("InvalidReceiverInterface") && networkChoiceNeeded -> stringResource(R.string.network_choice_next_step)
+    diagnostic.isNotEmpty() -> stringResource(R.string.next_step_retry_after_check)
+    connectionPending || snapshot?.serviceState == "starting" -> stringResource(R.string.next_step_wait_connecting)
+    else -> stringResource(chooseMainNextStep(
+        snapshot.serviceState, snapshot.playbackAdvancing, snapshot.backgroundListenerState,
+        snapshot.backgroundStandbyEnabled, snapshot.backgroundGrantKind,
+        bound, noNetwork, networkChoiceNeeded
+    ))
+}
+
+internal fun chooseMainNextStep(
+    serviceState: String,
+    playbackAdvancing: Boolean?,
+    backgroundListenerState: String,
+    backgroundStandbyEnabled: Boolean,
+    backgroundGrantKind: String,
+    bound: Boolean,
+    noNetwork: Boolean,
+    networkChoiceNeeded: Boolean
+): Int = when {
+    backgroundListenerState == "pending" -> R.string.next_step_allow_request
+    serviceState == "receiverRunning" || serviceState == "streaming" -> when (playbackAdvancing) {
+        true -> R.string.next_step_audio_received
+        false -> R.string.next_step_check_computer_playback
+        null -> R.string.next_step_play_on_computer
     }
-    "authenticated" -> stringResource(R.string.computer_connected_waiting_receiver)
-    "paused" -> stringResource(R.string.playback_session_paused)
-    "failed" -> stringResource(R.string.view_error_then_retry_receiving)
-    else -> stringResource(R.string.connected_does_not_mean_playing)
-}
-
-@Composable
-private fun playbackAdvancingLabel(advancing: Boolean?): String = when (advancing) {
-    true -> stringResource(R.string.audio_playback_progress_advancing)
-    false -> stringResource(R.string.audio_received_playback_not_advancing)
-    null -> stringResource(R.string.audio_playback_progress_unknown)
+    serviceState == "paused" -> R.string.next_step_resume_playback
+    serviceState == "authenticated" -> R.string.next_step_play_on_computer
+    serviceState == "prepared" -> R.string.next_step_choose_computer
+    backgroundStandbyEnabled -> when (backgroundGrantKind) {
+        "once" -> R.string.next_step_wait_once
+        "eightHours", "untilRevoked" -> R.string.next_step_wait_auto
+        else -> R.string.next_step_wait_and_allow
+    }
+    !bound -> R.string.next_step_pair_first
+    noNetwork -> R.string.next_step_connect_wifi
+    networkChoiceNeeded -> R.string.next_step_choose_network
+    else -> R.string.next_step_start_receiving
 }

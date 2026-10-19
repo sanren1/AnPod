@@ -7,9 +7,10 @@ import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
 
-export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
+export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, networkRecoveryMode, onNetworkRecoveryChange, onConnect, preferredBindingReference, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, udpMode, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
   snapshot: Snapshot;
   backgroundStartMode: boolean; backgroundChoicePrefill: { localAddress: string; bindingReference: string };
+  networkRecoveryMode: boolean; onNetworkRecoveryChange: (value: boolean) => void; onConnect: (bindingReference?: string) => void; preferredBindingReference: string;
   setupWizard: boolean;
   receiverManagerOnly: boolean;
   initialReceiverSerial: string;
@@ -28,7 +29,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const [localAddress, setLocalAddress] = useState("");
   const [serial, setSerial] = useState("");
   const [receiverAddress, setReceiverAddress] = useState("");
-  const [bindingReference, setBindingReference] = useState("");
+  const [bindingReference, setBindingReference] = useState(preferredBindingReference);
   const [selectedOfferId, setSelectedOfferId] = useState("");
   const [peer, setPeer] = useState("");
   const [loading, setLoading] = useState(false);
@@ -330,7 +331,10 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       if (discoveryGeneration.current !== generation) return;
       const usable = values.filter(value => endpointFitsInterface(value.endpoint, local));
       setCandidates(usable);
-      if (!peerManuallyEdited.current) setPeer(!backgroundStartMode && usable.length === 1 ? usable[0].endpoint : "");
+      if (!peerManuallyEdited.current && usable.length === 1) {
+        peerSelectionSource.current = "candidate";
+        setPeer(usable[0].endpoint);
+      }
       setAddressNotice(usable.length === 1 ? strings.network.oneUnverifiedCandidate
         : usable.length > 1 ? strings.network.manyUnverifiedCandidates
           : strings.network.noCandidateSuggestion);
@@ -468,7 +472,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   };
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
   const mainSummary = receiverManagerOnly ? selectedReceiverDevice?.displayName ?? strings.network.chooseAuthorizedUsb : method === "paired"
-    ? bindingReference ? bindings.length > 1 ? strings.app.pairedDeviceNumber(bindings.indexOf(bindingReference) + 1) : bindingLabel(bindingReference) : strings.network.choosePairedReceiver
+    ? bindingReference ? strings.network.savedPhoneNumber(bindings.indexOf(bindingReference) + 1) : strings.network.choosePairedReceiver
     : selectedReceiverDevice?.displayName ?? strings.network.chooseUsbPhone;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
@@ -504,7 +508,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
               <div className="receiver-status-copy" role="status" aria-live="polite">
                 <strong>{receiverAction === "checking" ? strings.network.checkingReceiver : receiverError ? strings.network.receiverCheckFailed : !receiverStatus ? strings.network.waitingReceiverCheck : !receiverStatus.installed ? strings.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? strings.network.receiverHealthy : strings.network.receiverUnhealthy : strings.network.receiverStopped}</strong>
                 {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : strings.network.versionCode(receiverStatus.versionCode)].filter(Boolean).join(" · ")}</small>}
-                {receiverStatus && !receiverStatus.healthy && <ErrorDetails summary={strings.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
+                {receiverStatus?.installed && !receiverStatus.healthy && <ErrorDetails summary={strings.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
                 {receiverNeedsUpgrade && <small>{strings.network.oldCompatibleCanContinue}</small>}
                 {receiverOperationResult?.serial === serial && <small>{strings.network.recheckedVersion(receiverOperationResult.status.versionCode)}</small>}
                 {updateCandidate && <small>{strings.network.availableVersion(updateCandidate.versionName, updateCandidate.versionCode, (updateCandidate.sizeBytes / (1024 * 1024)).toFixed(1))}</small>}
@@ -547,7 +551,26 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           <div className="setup-wizard-actions"><button className="dialog-secondary" type="button" disabled={busy} onClick={() => setUpStep(2)}>{strings.network.back}</button><button className="primary-button" type="submit" disabled={busy || !canStart}>{strings.network.bindAndConnect}</button></div>
         </div>}
       </section>}
-      {!setupWizard && <>
+      {!setupWizard && !receiverManagerOnly && !networkRecoveryMode && <section className="connection-entry">
+        {audioSessionActive ? <>
+          <p>{strings.network.phoneAlreadyConnected}</p>
+          <button className="dialog-secondary" type="button" onClick={onClose}>{strings.network.done}</button>
+        </> : <>
+          <p>{bindings.length === 0 ? strings.network.firstUseConnectHint : strings.network.connectSavedPhoneHint}</p>
+          {bindings.length > 1 && <label className="network-field">{strings.network.savedPhoneChoice}
+            <select value={bindingReference} onChange={event => setBindingReference(event.target.value)}>
+              <option value="">{strings.network.chooseSavedPhone}</option>
+              {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
+            </select>
+          </label>}
+          <button className="primary-button" type="button" disabled={busy || (bindings.length > 1 && !bindingReference)} onClick={() => onConnect(bindingReference || undefined)}>
+            {bindings.length === 0 ? strings.network.firstSetupAction : strings.app.connectPhone}
+          </button>
+          <button className="text-button" type="button" disabled={busy} onClick={() => onNetworkRecoveryChange(true)}>{strings.network.cannotFindPhone}</button>
+        </>}
+      </section>}
+      {!setupWizard && !receiverManagerOnly && networkRecoveryMode && <button className="text-button network-recovery-back" type="button" onClick={() => onNetworkRecoveryChange(false)}>{strings.network.backToSimpleConnection}</button>}
+      {!setupWizard && (receiverManagerOnly || networkRecoveryMode) && <>
       <div className="network-primary">
         {!receiverManagerOnly && <div className="network-summary"><strong>{mainSummary}</strong></div>}
         {receiverManagerOnly && <section className="receiver-manager receiver-usb-card" aria-label={strings.network.receiverUsbManagementLabel}>
@@ -559,14 +582,14 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           </label>
           <div className="receiver-status-row">
             <div className="receiver-status-copy" role="status" aria-live="polite">
-              <strong>{candidateLoading || receiverAction === "checking" ? strings.network.checkingReceiver : receiverError ? strings.network.receiverCheckFailed : !serial ? strings.network.chooseAuthorizedUsb : !receiverStatus ? strings.network.waitingReceiverCheck : !receiverStatus.installed ? strings.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? strings.network.receiverHealthy : strings.network.receiverUnhealthy : strings.network.receiverStopped}</strong>
-              {receiverStatus?.installed && <small>{receiverAlreadyCurrent ? strings.network.currentVersionIsTarget : receiverNeedsUpgrade ? strings.network.oldCompatibleCanContinue : receiverStatus.versionName ?? strings.network.receiverInstalled}</small>}
+              <strong>{candidateLoading || receiverAction === "checking" ? strings.network.checkingReceiver : receiverError ? strings.network.receiverCheckFailed : !serial ? strings.network.chooseAuthorizedUsb : !receiverStatus ? strings.network.waitingReceiverCheck : !receiverStatus.installed ? strings.network.receiverNotInstalled : receiverNeedsUpgrade ? strings.network.phoneAppUpdateAvailable : receiverAlreadyCurrent ? strings.network.phoneAppCurrent : receiverStatus.serviceActive ? receiverStatus.healthy ? strings.network.receiverHealthy : strings.network.receiverUnhealthy : strings.network.receiverStopped}</strong>
+              {receiverStatus?.installed && !receiverNeedsUpgrade && !receiverAlreadyCurrent && <small>{strings.network.receiverInstalled}</small>}
               {!candidateLoading && !updateCandidate && <small>{updateCandidateError ? strings.app.operationNotCompleted : strings.network.localPackageUnavailable}</small>}
-              {usbDevices.length === 0 && <small>{strings.network.connectAuthorizedUsbToCheck}</small>}
+              {usbDevices.length === 0 && <small>{unauthorizedUsb ? strings.network.usbDetectedUnauthorized : strings.network.noAuthorizedUsb}</small>}
               {updateCandidateError && <ErrorDetails summary={strings.app.operationNotCompleted} details={updateCandidateError} />}
             </div>
             <div className="receiver-status-actions">
-              <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? strings.network.checking : strings.network.checkStatus}</button>
+              <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? strings.network.checkingReceiver : strings.network.checkStatus}</button>
               {canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{strings.network.installReceiver(updateCandidate.versionCode)}</button>}
               {canRequestUsbMaintenance && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{strings.network.usbMaintenanceInstall(updateCandidate.versionCode)}</button>}
               {canRequestUsbUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("upgrade")}>{strings.network.upgradeReceiver(updateCandidate.versionCode)}</button>}
@@ -583,7 +606,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             <label className="network-field receiver-maintenance-binding">{strings.network.requiredSessionBinding}
               <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }}>
                 <option value="">{strings.network.chooseSessionBindingOption}</option>
-                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? strings.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
+                {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
               </select>
             </label>
             {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
@@ -593,7 +616,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             <label className="network-field receiver-maintenance-binding">{strings.network.optionalSavedBinding}
               <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); setLocalError(""); onError(""); }}>
                 <option value="">{strings.network.noBindingUsbMaintenance}</option>
-                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? strings.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
+                {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
               </select>
             </label>
             {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
@@ -770,7 +793,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             <label className="network-field">{strings.network.pairedReceiver}
               <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); backgroundChoiceInvalidated.current.bindingReference = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
                 <option value="">{strings.network.chooseBinding}</option>
-                {bindings.map((value, index) => <option key={value} value={value}>{bindings.length > 1 ? strings.app.pairedDeviceNumber(index + 1) : bindingLabel(value)}</option>)}
+                {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
               </select>
             </label>
             <BindingReferenceList bindings={bindings} />
