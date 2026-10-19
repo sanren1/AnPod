@@ -16,6 +16,73 @@ fn session_queue_discards_audio_that_does_not_match_negotiated_format() {
 }
 
 #[test]
+fn float_queue_bounds_capture_frames_and_preserves_callback_samples() {
+    let queue = Arc::new(FloatPcmQueue::new(true));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let samples = (0..1000)
+        .flat_map(|frame| [frame as f32, -(frame as f32)])
+        .collect::<Vec<_>>();
+    unsafe {
+        crate::audio::on_native_float_pcm(samples.as_ptr(), 1000, 48_000, 2, 120, callback_state);
+    }
+
+    let mut scratch = Vec::with_capacity(1920);
+    let info = queue.pop_wait(&mut scratch).unwrap();
+    assert_eq!(info.frame_count, 960);
+    assert_eq!(info.sample_rate, 48_000);
+    assert_eq!(info.channels, 2);
+    assert_eq!(info.frame_index, 160);
+    assert_eq!(scratch.len(), 1920);
+    assert_eq!(&scratch[..4], &[40.0, -40.0, 41.0, -41.0]);
+    assert_eq!(queue.dropped_frames(), 40);
+}
+
+#[test]
+fn float_queue_rejects_native_callbacks_above_the_advertised_maximum() {
+    let queue = Arc::new(FloatPcmQueue::new(true));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let one_frame = [0.25f32, -0.25];
+    unsafe {
+        crate::audio::on_native_float_pcm(one_frame.as_ptr(), 4097, 48_000, 2, 0, callback_state);
+    }
+    assert_eq!(queue.dropped_frames(), 4097);
+    assert_eq!(queue.state.lock().unwrap().len, 0);
+}
+
+#[test]
+fn legacy_pcm16_capture_callback_remains_sample_exact() {
+    let queue = Arc::new(PcmQueue::new());
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let samples = [i16::MIN, -1, 0, i16::MAX];
+    unsafe {
+        crate::audio::on_native_pcm(samples.as_ptr(), 2, 48_000, 2, 77, callback_state);
+    }
+    let mut scratch = Vec::new();
+    let info = queue
+        .pop_wait(&AtomicBool::new(false), &mut scratch)
+        .unwrap();
+    assert_eq!(info.frame_index, 77);
+    assert_eq!(scratch, samples);
+}
+
+#[test]
+fn stopped_float_queue_wakes_consumer_and_cannot_be_restarted() {
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let waiting_queue = queue.clone();
+    let waiter = std::thread::spawn(move || {
+        let mut scratch = Vec::with_capacity(8192);
+        waiting_queue.pop_wait(&mut scratch)
+    });
+    std::thread::yield_now();
+    queue.stop_and_clear();
+    assert!(waiter.join().unwrap().is_none());
+    assert!(queue.set_expected_format(48_000, 4096).is_err());
+}
+
+#[test]
 fn transient_udp_send_retries_are_bounded_and_never_replay_ciphertext() {
     let mut encoder = PacketEncoder::new(&[7; 32], 9, HOST_TO_RECEIVER);
     let mut attempts = 0;

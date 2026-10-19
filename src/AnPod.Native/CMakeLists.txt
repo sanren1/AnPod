@@ -46,3 +46,26 @@ if(MSVC)
 else()
     target_compile_options(audio_capture PRIVATE -Wall -Wextra)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(anpod_native_float_abi_check
+        ../../tests/AnPod.Native.FloatAbiCheck.cpp
+    )
+    target_include_directories(anpod_native_float_abi_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(anpod_native_float_abi_check PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(MSVC)
+        set_property(TARGET anpod_native_float_abi_check PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+        target_compile_options(anpod_native_float_abi_check PRIVATE /W4 /permissive-)
+    endif()
+    add_test(NAME anpod_native_float_abi_check COMMAND anpod_native_float_abi_check)
+    set_tests_properties(anpod_native_float_abi_check PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+endif()

@@ -4,7 +4,7 @@
 > 制定日期：2026-10-19  
 > 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；实际本地开发基线为 `dev@a406ced`，后续按 `dev` 提交推进并复核差异。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：已在本地开发基线 `dev@a406ced` 完成 **Phase 1 音质配置与 v2 离线协商模拟**；本批不接真实 PCM24，不更改 v1 产品播放与能力广告。Rust `fmt`、严格 `clippy`、离线 locked tests、Java 离线检查和 Android JVM 编译均已通过。用户明确跳过的旧实机前置核查仍为 **NOT_TESTED**，Phase 0 不视为完全验收；Phase 2 及之后尚未实施。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1 音质配置与 v2 离线协商模拟已完成源码与离线验收；Phase 2 Float32 WASAPI/PCM16 兼容路径已完成源码审查及 Rust/Java/Native 离线门禁，记录见 `docs/audio-quality/02-float-capture.md`。**真实 WASAPI capture trace、设备切换、声学精度/延迟与长时稳定性仍为 NOT_TESTED，Phase 2 实机门槛未完成**；Phase 3 隔离代码实现正在进行，继续开发不代表这些实机门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
 
 ## 0. 开发指令与决策摘要
 
@@ -330,6 +330,8 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **交付**：Float32 capture trace 和 bit-exact PCM16 老回归。**通过门槛**：旧功能播放、延迟、稳定性、录音精度没有异常回归；不覆盖原签名。
 
+**源码/离线状态（2026-10-20）**：FloatV2 ABI、Native capture thread、Rust 动态符号/格式检查、独立预分配 Float 队列与 PCM16 量化纯函数已完成源码审查。Native ABI 离线测试、Rust 103 passed/0 failed/1 ignored、Java 离线协议回归通过；详情及边界见 `docs/audio-quality/02-float-capture.md`。测试使用 DLL/合成内存数据，没有运行 WASAPI 初始化/Start 或真实设备，因此没有产生真实 Float capture trace；设备切换、旧 PCM16 声学精度、播放/延迟/长时稳定性仍为 **NOT_TESTED**。源代码与离线门禁可以继续进入 Phase 3 开发；Phase 2 实机验收保持未完成。
+
 ### Phase 3 — 高保真 48kHz / 24-bit 端到端（最优先的实用增量）
 
 **任务**：PCM24 packed encode/decode + 2 包/5ms 的 UDP 切分、Android 24-bit/Float32 输出通道及高精度 PLC/漂移处理；UI 状态和自动回退。
@@ -358,7 +360,7 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **任务**：稳定档默认值策略、混合老/新版本兼容、错误上报、文档和 release APK 精确校验。**交付**：打包日志、签名/制品哈希、版本更新和最终报告。
 
-**阶段停止规则**：Phase N 未达到完成标准，不进入下一阶段；允许保留实验分支，但 `preview` 已有稳定工作路径不回退。
+**阶段推进规则**：Phase 2 之后允许在隔离开发路径中先推进下一阶段的源码和相关离线门禁；这不代表前阶段尚未执行的设备、声学、延迟或稳定性门槛已验收。每个阶段仍须保留 `PASS`、`NOT_TESTED` 与失败证据，不能以源码/合成测试代替真实链路验收。发行、稳定默认值变更和最终验收仍须满足相应设备实测门槛；`preview` 已有稳定工作路径不得回退。
 
 ---
 

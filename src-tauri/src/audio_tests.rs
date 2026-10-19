@@ -4,6 +4,63 @@ use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+unsafe extern "C" fn fake_get_caps(_: *mut super::CapabilitiesV2) -> i32 {
+    1
+}
+
+#[test]
+fn legacy_native_function_table_keeps_pcm16_and_rejects_requested_float_v2_clearly() {
+    let (v2, incomplete) = super::assemble_v2_functions(None, None, None, None);
+    assert!(v2.is_none());
+    assert!(!incomplete);
+    assert!(super::missing_v2_error(incomplete).contains("PCM16 仍可使用"));
+
+    let (v2, incomplete) = super::assemble_v2_functions(Some(fake_get_caps), None, None, None);
+    assert!(v2.is_none());
+    assert!(incomplete);
+    assert!(super::missing_v2_error(incomplete).contains("接口不完整"));
+}
+
+#[test]
+fn float_v2_abi_layout_and_response_version_are_checked() {
+    assert_eq!(std::mem::size_of::<super::CapabilitiesV2>(), 16);
+    assert_eq!(std::mem::size_of::<super::CaptureFormatV2>(), 48);
+
+    let mut format = super::CaptureFormatV2 {
+        size: std::mem::size_of::<super::CaptureFormatV2>() as u32,
+        version: 2,
+        mix_sample_rate: 48_000,
+        mix_channels: 2,
+        mix_sample_format: super::FLOAT_CAPTURE_FORMAT_FLOAT,
+        mix_container_bits: 32,
+        mix_valid_bits: 0,
+        capture_sample_rate: 48_000,
+        capture_channels: 2,
+        capture_sample_format: super::FLOAT_CAPTURE_FORMAT_FLOAT,
+        ..super::CaptureFormatV2::default()
+    };
+    assert!(super::NativeV2Fns::validate_capture_format(&format).is_ok());
+    format.size = 47;
+    assert!(super::NativeV2Fns::validate_capture_format(&format).is_err());
+    format.size = 48;
+    format.version = 3;
+    assert!(super::NativeV2Fns::validate_capture_format(&format).is_err());
+}
+
+#[test]
+fn float_pcm16_quantization_is_symmetric_saturating_and_bit_exact_on_pcm16_grid() {
+    for value in i16::MIN..=i16::MAX {
+        let normalized = value as f32 / 32768.0;
+        assert_eq!(super::float_sample_to_pcm16(normalized), Ok(value));
+    }
+    assert_eq!(super::float_sample_to_pcm16(1.0), Ok(i16::MAX));
+    assert_eq!(super::float_sample_to_pcm16(-1.0), Ok(i16::MIN));
+    assert_eq!(super::float_sample_to_pcm16(0.5 / 32768.0), Ok(1));
+    assert_eq!(super::float_sample_to_pcm16(-0.5 / 32768.0), Ok(-1));
+    assert!(super::float_sample_to_pcm16(f32::NAN).is_err());
+    assert!(super::float_sample_to_pcm16(f32::INFINITY).is_err());
+}
+
 #[test]
 fn marker_write_failure_keeps_endpoint_recoverable() {
     let root = std::env::temp_dir().join(format!("anpod-audio-marker-{}", std::process::id()));

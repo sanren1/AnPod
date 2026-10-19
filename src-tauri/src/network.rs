@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Condvar, Mutex, TryLockError,
     },
     thread::{self, JoinHandle},
@@ -15,6 +15,7 @@ use std::{
 
 const PCM_QUEUE_CAPACITY: usize = 8;
 const MAX_CAPTURE_FRAMES: usize = 4096;
+const FLOAT_QUEUE_CHANNELS: u16 = 2;
 const PCM_CHANNELS: u16 = 2;
 const MAX_JITTER_PACKETS: usize = 4;
 const BALANCED_CAPTURE_QUEUE_MS: u64 = 40;
@@ -56,6 +57,236 @@ pub struct PcmQueue {
     target_format: Option<PcmFormat>,
     max_queue_ms: u64,
     stopped: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FloatPcmBlockInfo {
+    pub(crate) frame_count: u32,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) frame_index: u64,
+    enqueued_at: Instant,
+}
+
+struct FloatPcmSlot {
+    samples: Box<[f32]>,
+    info: FloatPcmBlockInfo,
+}
+
+struct FloatQueueState {
+    slots: Vec<FloatPcmSlot>,
+    head: usize,
+    len: usize,
+    queued_frames: u64,
+}
+
+/// Preallocated, bounded Float32 capture queue for the future high-precision
+/// encoder path. It is deliberately independent of the existing PCM16 sender.
+pub struct FloatPcmQueue {
+    state: Mutex<FloatQueueState>,
+    wake: Condvar,
+    dropped_frames: AtomicU64,
+    sample_rate: AtomicU32,
+    max_callback_frames: AtomicU32,
+    max_queue_ms: u64,
+    stopped: AtomicBool,
+}
+
+impl FloatPcmQueue {
+    pub fn new(low_latency: bool) -> Self {
+        let samples_per_slot = MAX_CAPTURE_FRAMES * FLOAT_QUEUE_CHANNELS as usize;
+        let slots = (0..PCM_QUEUE_CAPACITY)
+            .map(|_| FloatPcmSlot {
+                samples: vec![0.0; samples_per_slot].into_boxed_slice(),
+                info: FloatPcmBlockInfo {
+                    frame_count: 0,
+                    sample_rate: 0,
+                    channels: FLOAT_QUEUE_CHANNELS,
+                    frame_index: 0,
+                    enqueued_at: Instant::now(),
+                },
+            })
+            .collect();
+        Self {
+            state: Mutex::new(FloatQueueState {
+                slots,
+                head: 0,
+                len: 0,
+                queued_frames: 0,
+            }),
+            wake: Condvar::new(),
+            dropped_frames: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+            max_callback_frames: AtomicU32::new(0),
+            max_queue_ms: if low_latency {
+                LOW_LATENCY_CAPTURE_QUEUE_MS
+            } else {
+                BALANCED_CAPTURE_QUEUE_MS
+            },
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_expected_format(
+        &self,
+        sample_rate: u32,
+        max_callback_frames: u32,
+    ) -> Result<(), String> {
+        if sample_rate == 0
+            || max_callback_frames == 0
+            || max_callback_frames as usize > MAX_CAPTURE_FRAMES
+        {
+            return Err("Float32 采集格式或最大回调帧数无效。".into());
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("已停止的 Float32 PCM 队列不能重新启动，请创建新队列。".into());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Float32 PCM 队列锁已损坏。")?;
+        if state.len != 0 {
+            return Err("Float32 PCM 队列开始采集后不能更改格式。".into());
+        }
+        let current = self.sample_rate.load(Ordering::Acquire);
+        let current_max = self.max_callback_frames.load(Ordering::Acquire);
+        if (current != 0 && current != sample_rate)
+            || (current_max != 0 && current_max != max_callback_frames)
+        {
+            return Err("Float32 PCM 队列采样率与采集格式不一致。".into());
+        }
+        self.sample_rate.store(sample_rate, Ordering::Release);
+        self.max_callback_frames
+            .store(max_callback_frames, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn expected_format(&self) -> Option<(u32, u16)> {
+        let sample_rate = self.sample_rate.load(Ordering::Acquire);
+        (sample_rate != 0).then_some((sample_rate, FLOAT_QUEUE_CHANNELS))
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn stop_and_clear(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0.0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn push_raw(
+        &self,
+        samples: *const f32,
+        frame_count: u32,
+        sample_rate: u32,
+        channels: u16,
+        frame_index: u64,
+    ) -> bool {
+        let frames = frame_count as usize;
+        if self.stopped.load(Ordering::Acquire)
+            || samples.is_null()
+            || sample_rate != self.sample_rate.load(Ordering::Acquire)
+            || sample_rate == 0
+            || channels != FLOAT_QUEUE_CHANNELS
+            || frames == 0
+            || frame_count > self.max_callback_frames.load(Ordering::Acquire)
+            || frames > MAX_CAPTURE_FRAMES
+        {
+            self.add_dropped(frame_count as u64);
+            return false;
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
+                self.add_dropped(frame_count as u64);
+                return false;
+            }
+        };
+        if self.stopped.load(Ordering::Acquire) {
+            self.add_dropped(frame_count as u64);
+            return false;
+        }
+        let max_queued_frames = (sample_rate as u64 * self.max_queue_ms / 1000).max(1);
+        let kept_frames = (frames as u64).min(max_queued_frames) as usize;
+        let skipped_frames = frames - kept_frames;
+        let Some(kept_frame_index) = frame_index.checked_add(skipped_frames as u64) else {
+            self.add_dropped(frame_count as u64);
+            return false;
+        };
+        self.add_dropped(skipped_frames as u64);
+        while state.len > 0 {
+            let oldest = state.slots[state.head].info;
+            if oldest.enqueued_at.elapsed() <= Duration::from_millis(self.max_queue_ms)
+                && state.len < PCM_QUEUE_CAPACITY
+                && state.queued_frames + kept_frames as u64 <= max_queued_frames
+            {
+                break;
+            }
+            state.queued_frames -= oldest.frame_count as u64;
+            self.add_dropped(oldest.frame_count as u64);
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+        }
+        let index = (state.head + state.len) % PCM_QUEUE_CAPACITY;
+        let slot = &mut state.slots[index];
+        let sample_count = frames * FLOAT_QUEUE_CHANNELS as usize;
+        let source = unsafe { std::slice::from_raw_parts(samples, sample_count) };
+        let skipped_samples = skipped_frames * FLOAT_QUEUE_CHANNELS as usize;
+        let kept_samples = kept_frames * FLOAT_QUEUE_CHANNELS as usize;
+        slot.samples[..kept_samples].copy_from_slice(&source[skipped_samples..]);
+        slot.info = FloatPcmBlockInfo {
+            frame_count: kept_frames as u32,
+            sample_rate,
+            channels: FLOAT_QUEUE_CHANNELS,
+            frame_index: kept_frame_index,
+            enqueued_at: Instant::now(),
+        };
+        state.len += 1;
+        state.queued_frames += kept_frames as u64;
+        drop(state);
+        self.wake.notify_one();
+        true
+    }
+
+    fn add_dropped(&self, frames: u64) {
+        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    // Phase 3's encoder worker consumes this staged queue API.
+    #[allow(dead_code)]
+    pub(crate) fn pop_wait(&self, scratch: &mut Vec<f32>) -> Option<FloatPcmBlockInfo> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            while state.len == 0 && !self.stopped.load(Ordering::Acquire) {
+                state = self.wake.wait(state).ok()?;
+            }
+            if self.stopped.load(Ordering::Acquire) || state.len == 0 {
+                return None;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
 }
 
 impl PcmQueue {
