@@ -84,6 +84,8 @@ pub struct AppSettings {
     /// next wireless search so a known phone answers without a broadcast.
     #[serde(default)]
     pub last_receiver_endpoint: Option<String>,
+    #[serde(default = "standard")]
+    pub audio_quality: String,
     #[serde(default = "balanced")]
     pub playback_mode: String,
     #[serde(default = "system")]
@@ -104,6 +106,9 @@ fn udp() -> String {
 }
 fn receiver() -> String {
     "receiver".into()
+}
+fn standard() -> String {
+    "standard".into()
 }
 fn balanced() -> String {
     "Balanced".into()
@@ -126,10 +131,46 @@ impl Default for AppSettings {
             auto_reconnect_wifi: true,
             last_wireless_endpoint: None,
             last_receiver_endpoint: None,
+            audio_quality: standard(),
             playback_mode: balanced(),
             appearance_theme: system(),
         }
     }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiatedAudioFormat {
+    pub codec_version: u8,
+    pub sample_format: String,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub valid_bits_per_sample: u8,
+    pub bytes_per_sample: u8,
+    pub frame_bytes: u8,
+}
+
+fn negotiated_audio_format(
+    session_active: bool,
+    output: &str,
+    diagnostics: Option<&PlaybackDiagnostics>,
+) -> Option<NegotiatedAudioFormat> {
+    if !session_active || output != "phone" {
+        return None;
+    }
+    diagnostics
+        .filter(|diagnostics| {
+            diagnostics.sample_rate == Some(48_000) && diagnostics.channels == Some(2)
+        })
+        .map(|_| NegotiatedAudioFormat {
+            codec_version: 1,
+            sample_format: "pcm16le".into(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            valid_bits_per_sample: 16,
+            bytes_per_sample: 2,
+            frame_bytes: 4,
+        })
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +189,7 @@ pub struct AppSnapshot {
     pub session_wireless_protocol: Option<String>,
     pub session_capabilities: Option<ReceiverCapabilities>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
     pub network_recovery_seconds_remaining: Option<u64>,
     pub wireless_connection_offers: HostDiscoverySnapshot,
     pub session_android_version: Option<String>,
@@ -184,6 +226,8 @@ pub struct DiagnosticsExport {
     pub session_wireless_protocol: Option<String>,
     pub output: String,
     pub playback_mode: String,
+    pub audio_quality: String,
+    pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
     pub audio_backend: String,
     pub audio_bitrate_bps: Option<u64>,
     pub session_capabilities: Option<ReceiverCapabilities>,
@@ -203,6 +247,8 @@ fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
         session_wireless_protocol: snapshot.session_wireless_protocol.clone(),
         output: snapshot.output.clone(),
         playback_mode: snapshot.settings.playback_mode.clone(),
+        audio_quality: snapshot.settings.audio_quality.clone(),
+        negotiated_audio_format: snapshot.negotiated_audio_format.clone(),
         audio_backend: snapshot.settings.audio_backend.clone(),
         audio_bitrate_bps: snapshot.audio_bitrate_bps,
         session_capabilities: snapshot.session_capabilities.clone(),
@@ -551,6 +597,7 @@ impl AppState {
         let _gate = self.gate.lock().await;
         let result = async {
             token_check(&token)?;
+            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
             {
                 let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
@@ -825,6 +872,11 @@ impl AppState {
                 .map(str::to_owned),
             session_capabilities: view.session_capabilities.clone(),
             playback_diagnostics: view.playback_diagnostics.clone(),
+            negotiated_audio_format: negotiated_audio_format(
+                view.session_active,
+                &view.output,
+                view.playback_diagnostics.as_ref(),
+            ),
             network_recovery_seconds_remaining: view.network_recovery_seconds_remaining,
             wireless_connection_offers: self.wireless_connection_offers(),
             session_android_version: view.session_android_version.clone(),
@@ -2034,6 +2086,9 @@ impl AppState {
         token: &CancellationToken,
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
+        if play_on_phone {
+            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
+        }
         if !self.operation_is_current(generation, token) {
             return Ok(OperationResult {
                 success: false,
@@ -2909,6 +2964,9 @@ impl AppState {
         output: &str,
         token: &CancellationToken,
     ) -> Result<(), String> {
+        if output == "phone" {
+            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
+        }
         {
             let mut session = self.session.lock().await;
             if let Some(active) = session
@@ -3175,6 +3233,7 @@ impl AppState {
                 | "wirelessProtocol"
                 | "audioBackend"
                 | "playbackMode"
+                | "audioQuality"
         ) && self
             .session
             .try_lock()
@@ -3216,6 +3275,13 @@ impl AppState {
                     value if value.eq_ignore_ascii_case("legacy") => "legacy".into(),
                     _ => return Err("Receiver 后端必须为 receiver 或 legacy。".into()),
                 }
+            }
+            "audioQuality" => {
+                let quality = value
+                    .as_str()
+                    .ok_or("无效音质设置 / Invalid audio quality")?;
+                validate_audio_quality(quality)?;
+                settings.audio_quality = quality.into();
             }
             "playbackMode" => {
                 settings.playback_mode =

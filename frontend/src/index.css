@@ -140,6 +140,13 @@ button:disabled { cursor: default; }
 .dialog-secondary:disabled, .primary-button:disabled { opacity: 0.6; cursor: default; }
 .device-dialog > .dialog-secondary { display: flex; margin: 8px 16px 0 auto; }
 .settings-dialog > h3 { margin: 16px 18px 6px; color: var(--muted); font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
+.audio-quality-settings { margin: 16px 0 0; padding: 0; min-width: 0; border: 0; }
+.audio-quality-settings legend { padding: 0 18px 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.audio-quality-settings label:has(input:disabled) { color: var(--muted); cursor: not-allowed; }
+.audio-quality-status { display: grid; gap: 8px; margin: 12px 18px; font-size: 12px; line-height: 18px; }
+.audio-quality-status div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; overflow-wrap: anywhere; }
+.audio-quality-status dt { color: var(--muted); }
+.audio-quality-status dd { margin: 0; }
 .settings-advanced { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
 .settings-advanced > h3 { margin: 0 0 8px; }
 .background-trust-disclosure > summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-weight: 600; }

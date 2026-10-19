@@ -15,6 +15,7 @@ fn sample_snapshot() -> AppSnapshot {
         session_wireless_protocol: Some("udp".into()),
         session_capabilities: None,
         playback_diagnostics: Some(PlaybackDiagnostics::default()),
+        negotiated_audio_format: None,
         network_recovery_seconds_remaining: None,
         wireless_connection_offers: HostDiscoverySnapshot::default(),
         session_android_version: Some("15".into()),
@@ -30,6 +31,63 @@ fn sample_snapshot() -> AppSnapshot {
         presence: Vec::new(),
         version: "1.4.0".into(),
     }
+}
+
+#[test]
+fn audio_quality_defaults_and_rejects_unavailable_profiles_without_changing_playback_mode() {
+    let old_settings: AppSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(old_settings.audio_quality, "standard");
+
+    for quality in ["hifi", "hires", "unsupported"] {
+        assert!(validate_audio_quality(quality).is_err(), "{quality}");
+    }
+    assert!(validate_audio_quality("standard").is_ok());
+
+    let settings = normalize_settings(AppSettings {
+        audio_quality: "standard".into(),
+        playback_mode: "LowLatency".into(),
+        ..AppSettings::default()
+    });
+    assert_eq!(settings.audio_quality, "standard");
+    assert_eq!(settings.playback_mode, "LowLatency");
+}
+
+#[test]
+fn negotiated_audio_format_requires_active_phone_playback_and_confirmed_48khz_stereo() {
+    let diagnostics = PlaybackDiagnostics {
+        sample_rate: Some(48_000),
+        channels: Some(2),
+        ..PlaybackDiagnostics::default()
+    };
+    assert!(negotiated_audio_format(false, "phone", Some(&diagnostics)).is_none());
+    assert!(negotiated_audio_format(true, "computer", Some(&diagnostics)).is_none());
+    assert!(negotiated_audio_format(true, "phone", None).is_none());
+    assert!(negotiated_audio_format(
+        true,
+        "phone",
+        Some(&PlaybackDiagnostics {
+            channels: Some(1),
+            ..diagnostics.clone()
+        })
+    )
+    .is_none());
+    assert!(negotiated_audio_format(
+        true,
+        "phone",
+        Some(&PlaybackDiagnostics {
+            sample_rate: Some(44_100),
+            ..diagnostics.clone()
+        })
+    )
+    .is_none());
+    assert_eq!(
+        negotiated_audio_format(true, "phone", Some(&diagnostics)).map(|format| (
+            format.sample_rate_hz,
+            format.channels,
+            format.sample_format
+        )),
+        Some((48_000, 2, "pcm16le".into()))
+    );
 }
 
 #[test]

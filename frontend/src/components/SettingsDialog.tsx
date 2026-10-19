@@ -7,6 +7,19 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
   const settings = snapshot.settings;
   const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
   return <Modal title={strings.app.settingsTitle} onClose={onClose} className="settings-dialog">
+    <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
+      <legend>{strings.app.transportQuality}</legend>
+      {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
+        <span>{strings.app.audioQualityLabels[quality]}</span>
+        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={quality !== "standard" || busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
+      </label>)}
+      <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
+      <dl className="audio-quality-status">
+        <div><dt>{strings.app.actualTransportFormat}</dt><dd>{snapshot.negotiatedAudioFormat ? `${snapshot.negotiatedAudioFormat.sampleRateHz / 1000} kHz / PCM16LE / ${snapshot.negotiatedAudioFormat.channels} ch` : strings.app.audioFormatNotConfirmed}</dd></div>
+        <div><dt>{strings.app.windowsMixFormat}</dt><dd>{strings.app.audioFormatUnknown}</dd></div>
+        <div><dt>{strings.app.androidOutputFormat}</dt><dd>{strings.app.audioFormatUnknown}</dd></div>
+      </dl>
+    </fieldset>
     <h3>{strings.app.settingsConnection}</h3>
     <SettingToggle disabled={snapshot.busy} title={strings.app.autoConnect} description={strings.app.autoConnectDescription} checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
     <SettingToggle disabled={snapshot.busy} title={strings.app.wirelessRecovery} description={strings.app.wirelessRecoveryDescription} checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />

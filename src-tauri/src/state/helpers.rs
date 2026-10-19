@@ -760,6 +760,14 @@ pub(crate) fn normalize_mdns_instance(value: &str) -> String {
         .replace("._adb._tcp", "")
 }
 
+pub(crate) fn validate_audio_quality(value: &str) -> Result<(), String> {
+    match value {
+        "standard" => Ok(()),
+        "hifi" | "hires" => Err("音质升级开发中；请选择标准音质后重试。 / Audio quality upgrade is in development; select Standard and retry.".into()),
+        _ => Err("无效音质设置；请选择标准音质。 / Invalid audio quality; select Standard.".into()),
+    }
+}
+
 pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.schema_version = 1;
     settings.preferred_transport = match settings.preferred_transport.to_ascii_lowercase().as_str()

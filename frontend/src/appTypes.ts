@@ -9,6 +9,7 @@ export type Settings = {
   wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
   autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
   lastReceiverEndpoint: string | null;
+  audioQuality: "standard" | "hifi" | "hires";
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
 export type Snapshot = {
@@ -21,6 +22,7 @@ export type Snapshot = {
   presence: PresenceEntry[];
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
   playbackDiagnostics: PlaybackDiagnostics | null;
+  negotiatedAudioFormat: { codecVersion: 1; sampleFormat: "pcm16le"; sampleRateHz: number; channels: number; validBitsPerSample: 16; bytesPerSample: 2; frameBytes: 4 } | null;
   output: "computer" | "phone"; settings: Settings;
   busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
   audioBitrateBps: number | null; networkRecoverySecondsRemaining?: number | null; version: string;

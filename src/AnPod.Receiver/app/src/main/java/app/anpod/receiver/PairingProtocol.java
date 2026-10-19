@@ -502,7 +502,13 @@ final class PairingProtocol {
     }
 
     private static SessionKeys deriveKeys(byte[] secret, byte[] transcript) throws Failure {
-        byte[] saltInput = concat((HKDF_SALT + "\0").getBytes(java.nio.charset.StandardCharsets.US_ASCII), transcript);
+        return deriveKeys(secret, transcript, 1);
+    }
+
+    private static SessionKeys deriveKeys(byte[] secret, byte[] transcript, int version) throws Failure {
+        String suffix = " v" + version;
+        String saltLabel = "AnPod P5-A HKDF-SHA256 salt" + suffix;
+        byte[] saltInput = concat((saltLabel + "\0").getBytes(java.nio.charset.StandardCharsets.US_ASCII), transcript);
         byte[] salt;
         try { salt = MessageDigest.getInstance("SHA-256").digest(saltInput); }
         catch (GeneralSecurityException error) { throw new Failure("SHA-256 unavailable"); }
@@ -514,10 +520,10 @@ final class PairingProtocol {
         byte[] hostControl = null;
         byte[] receiverControl = null;
         try {
-            hostAudio = expand(prk, AUDIO_HOST_TO_RECEIVER);
-            receiverAudio = expand(prk, AUDIO_RECEIVER_TO_HOST);
-            hostControl = expand(prk, CONTROL_HOST_TO_RECEIVER);
-            receiverControl = expand(prk, CONTROL_RECEIVER_TO_HOST);
+            hostAudio = expand(prk, "AnPod P5-A key host-to-receiver audio AES-256-GCM" + suffix);
+            receiverAudio = expand(prk, "AnPod P5-A key receiver-to-host audio AES-256-GCM" + suffix);
+            hostControl = expand(prk, "AnPod P5-A key host-to-receiver control HMAC-SHA256" + suffix);
+            receiverControl = expand(prk, "AnPod P5-A key receiver-to-host control HMAC-SHA256" + suffix);
             SessionKeys keys = new SessionKeys(hostAudio, receiverAudio, hostControl, receiverControl);
             hostAudio = receiverAudio = hostControl = receiverControl = null;
             return keys;
@@ -555,4 +561,179 @@ final class PairingProtocol {
         return bytes.length >= offset + expected.length
                 && MessageDigest.isEqual(Arrays.copyOfRange(bytes, offset, offset + expected.length), expected);
     }
+
+    // Offline Phase 1 v2 negotiation only. Product pairing remains on the v1 classes above.
+    static final class V2 {
+        private static final int HEADER = 8;
+        private static byte[] message(int type, int length, byte[]... parts) {
+            ByteBuffer out = ByteBuffer.allocate(length).order(ByteOrder.BIG_ENDIAN);
+            out.put(MAGIC).put((byte) 2).put((byte) type).putShort((short) length);
+            for (byte[] part : parts) out.put(part);
+            return out.array();
+        }
+        private static byte[] parse(byte[] message, int type, int length) throws Failure {
+            if (message.length != length || !matches(message, 0, MAGIC) || message[4] != 2
+                    || (message[5] & 0xff) != type || (((message[6] & 0xff) << 8) | (message[7] & 0xff)) != length)
+                throw new Failure("malformed P5-A v2 message");
+            return Arrays.copyOfRange(message, HEADER, length);
+        }
+        private static UdpPacketDecoder.AudioFormatV2 parseFormat(byte[] bytes) throws Failure {
+            try { return UdpPacketDecoder.AudioFormatV2.decode(bytes); }
+            catch (IllegalArgumentException error) { throw new Failure("unsupported v2 audio descriptor"); }
+        }
+        private static byte[] transcript(BindingMaterial material, byte[] hostNonce, byte[] receiverNonce,
+                long sessionId, UdpPacketDecoder.AudioFormatV2 requested,
+                UdpPacketDecoder.AudioFormatV2 selected) {
+            ByteBuffer out = ByteBuffer.allocate(143).order(ByteOrder.BIG_ENDIAN);
+            out.put(MAGIC).put((byte) 2).put((byte) HOST).put((byte) RECEIVER)
+                    .put(material.hostId).put(material.receiverId).put(hostNonce).put(receiverNonce)
+                    .putLong(sessionId).put(requested.encode()).put(selected.encode());
+            return out.array();
+        }
+        private static byte[] mac(byte[] secret, String label, byte[] transcript, byte[] extra) {
+            return PairingProtocol.mac(secret, "AnPod P5-A " + label + " v2", transcript, extra);
+        }
+
+        static final class Host implements AutoCloseable {
+            private BindingMaterial material;
+            private final UdpPacketDecoder.AudioFormatV2 format;
+            private final byte[] hostNonce = randomBytes(32);
+            private final long sessionId;
+            private byte[] receiverProof;
+            private byte[] hostProof;
+            private int state = 0;
+            private Host(BindingMaterial material, UdpPacketDecoder.AudioFormatV2 format) {
+                this.material = material.transfer(); this.format = format;
+                byte[] id = randomBytes(8); this.sessionId = ByteBuffer.wrap(id).getLong();
+            }
+            static HostStart start(BindingMaterial material, UdpPacketDecoder.AudioFormatV2 format) {
+                format.encode();
+                Host host = new Host(material, format);
+                byte[] hello = message(HELLO, 96, host.material.hostId, host.material.receiverId,
+                        host.hostNonce, ByteBuffer.allocate(8).putLong(host.sessionId).array(), format.encode());
+                return new HostStart(host, hello);
+            }
+            synchronized HostAwaitReady acceptChallenge(byte[] challenge) throws Failure {
+                if (state != 0) throw new IllegalStateException("v2 host state already consumed");
+                state = 1;
+                try {
+                    byte[] body = parse(challenge, CHALLENGE, 104);
+                    if (!MessageDigest.isEqual(Arrays.copyOfRange(body, 0, 16), material.receiverId))
+                        throw new Failure("wrong v2 receiver identity");
+                    byte[] nonce = Arrays.copyOfRange(body, 16, 48);
+                    UdpPacketDecoder.AudioFormatV2 selected = parseFormat(Arrays.copyOfRange(body, 48, 64));
+                    if (!Arrays.equals(selected.encode(), format.encode())) throw new Failure("v2 selection changed");
+                    byte[] transcript = transcript(material, hostNonce, nonce, sessionId, format, selected);
+                    receiverProof = Arrays.copyOfRange(body, 64, 96);
+                    verify(material.secret, "AnPod P5-A proof receiver v2", transcript, new byte[0], receiverProof);
+                    hostProof = mac(material.secret, "proof host", transcript, new byte[0]);
+                    HostAwaitReady next = new HostAwaitReady(material, format, sessionId, transcript, receiverProof, hostProof);
+                    material = null;
+                    return next;
+                } catch (Failure | RuntimeException error) { close(); throw error; }
+            }
+            @Override public synchronized void close() { if (material != null) material.close(); material = null; state = 2; }
+        }
+        static final class HostStart {
+            final Host host; final byte[] hello;
+            HostStart(Host host, byte[] hello) { this.host = host; this.hello = hello; }
+        }
+        static final class HostAwaitReady implements AutoCloseable {
+            private BindingMaterial material; private final UdpPacketDecoder.AudioFormatV2 format;
+            private final long sessionId; private final byte[] transcript, receiverProof, hostProof;
+            final byte[] finish;
+            private boolean consumed;
+            HostAwaitReady(BindingMaterial material, UdpPacketDecoder.AudioFormatV2 format, long sessionId,
+                    byte[] transcript, byte[] receiverProof, byte[] hostProof) {
+                this.material = material; this.format = format; this.sessionId = sessionId;
+                this.transcript = transcript; this.receiverProof = receiverProof; this.hostProof = hostProof;
+                this.finish = message(FINISH, 40, hostProof);
+            }
+            synchronized AuthenticatedSessionV2 acceptReady(byte[] ready) throws Failure {
+                if (consumed) throw new IllegalStateException("v2 host state already consumed"); consumed = true;
+                try {
+                    byte[] body = parse(ready, READY, 40);
+                    verify(material.secret, "AnPod P5-A ready v2", transcript, concat(hostProof, receiverProof), body);
+                    return new AuthenticatedSessionV2(sessionId, format, deriveKeys(material.secret, transcript, 2));
+                } finally { close(); }
+            }
+            @Override public synchronized void close() { consumed = true; if (material != null) material.close(); material = null; }
+        }
+        static final class Receiver {
+            static ReceiverAwaitFinish acceptHello(BindingMaterial material, byte[] hello) throws Failure {
+                BindingMaterial owned = material.transfer();
+                try {
+                    byte[] body = parse(hello, HELLO, 96);
+                    if (!MessageDigest.isEqual(Arrays.copyOfRange(body, 0, 16), owned.hostId)
+                            || !MessageDigest.isEqual(Arrays.copyOfRange(body, 16, 32), owned.receiverId))
+                        throw new Failure("wrong v2 peer identity");
+                    byte[] hostNonce = Arrays.copyOfRange(body, 32, 64);
+                    long id = ByteBuffer.wrap(body, 64, 8).getLong();
+                    UdpPacketDecoder.AudioFormatV2 requested = parseFormat(Arrays.copyOfRange(body, 72, 88));
+                    byte[] nonce = randomBytes(32);
+                    byte[] transcript = transcript(owned, hostNonce, nonce, id, requested, requested);
+                    byte[] proof = mac(owned.secret, "proof receiver", transcript, new byte[0]);
+                    byte[] challenge = message(CHALLENGE, 104, owned.receiverId, nonce, requested.encode(), proof);
+                    return new ReceiverAwaitFinish(owned, requested, id, transcript, proof, challenge);
+                } catch (Failure | RuntimeException error) { owned.close(); throw error; }
+            }
+        }
+        static final class ReceiverAwaitFinish implements AutoCloseable {
+            private BindingMaterial material; private final UdpPacketDecoder.AudioFormatV2 format;
+            private final long sessionId; private final byte[] transcript, receiverProof;
+            final byte[] challenge;
+            private boolean consumed;
+            ReceiverAwaitFinish(BindingMaterial material, UdpPacketDecoder.AudioFormatV2 format,
+                    long sessionId, byte[] transcript, byte[] receiverProof, byte[] challenge) {
+                this.material = material; this.format = format; this.sessionId = sessionId;
+                this.transcript = transcript; this.receiverProof = receiverProof; this.challenge = challenge;
+            }
+            synchronized FinishResult acceptFinish(byte[] finish) throws Failure {
+                if (consumed) throw new IllegalStateException("v2 receiver state already consumed"); consumed = true;
+                try {
+                    byte[] body = parse(finish, FINISH, 40);
+                    verify(material.secret, "AnPod P5-A proof host v2", transcript, new byte[0], body);
+                    byte[] ready = mac(material.secret, "ready", transcript, concat(body, receiverProof));
+                    byte[] response = message(READY, 40, ready);
+                    AuthenticatedSessionV2 session = new AuthenticatedSessionV2(sessionId, format, deriveKeys(material.secret, transcript, 2));
+                    return new FinishResult(response, session);
+                } finally { close(); }
+            }
+            @Override public synchronized void close() { consumed = true; if (material != null) material.close(); material = null; }
+        }
+        static final class FinishResult { final byte[] ready; final AuthenticatedSessionV2 session;
+            FinishResult(byte[] ready, AuthenticatedSessionV2 session) { this.ready = ready; this.session = session; } }
+        static final class AuthenticatedSessionV2 implements AutoCloseable {
+            final long sessionId; final UdpPacketDecoder.AudioFormatV2 format; private SessionKeys keys;
+            AuthenticatedSessionV2(long id, UdpPacketDecoder.AudioFormatV2 format, SessionKeys keys) {
+                this.sessionId = id; this.format = format; this.keys = keys;
+            }
+            synchronized SessionKeys takeKeys() { if (keys == null) throw new IllegalStateException("keys consumed"); SessionKeys out = keys; keys = null; return out; }
+            @Override public synchronized void close() { if (keys != null) keys.close(); keys = null; }
+        }
+        static byte[] transcriptForVector(byte[] hostId, byte[] receiverId, byte[] hostNonce,
+                byte[] receiverNonce, long sessionId, UdpPacketDecoder.AudioFormatV2 format) {
+            BindingMaterial fixture = new BindingMaterial(hostId, receiverId, new byte[32]);
+            try { return transcript(fixture, hostNonce, receiverNonce, sessionId, format, format); }
+            finally { fixture.close(); }
+        }
+        static byte[] proofForVector(byte[] secret, String role, byte[] transcript) {
+            return mac(secret, "proof " + role, transcript, new byte[0]);
+        }
+        static byte[] readyForVector(byte[] secret, byte[] transcript, byte[] hostProof, byte[] receiverProof) {
+            return mac(secret, "ready", transcript, concat(hostProof, receiverProof));
+        }
+        static byte[] helloForVector(byte[] hostId, byte[] receiverId, byte[] hostNonce,
+                long sessionId, UdpPacketDecoder.AudioFormatV2 format) {
+            return message(HELLO, 96, hostId, receiverId, hostNonce,
+                    ByteBuffer.allocate(8).putLong(sessionId).array(), format.encode());
+        }
+        static byte[] challengeForVector(byte[] receiverId, byte[] receiverNonce,
+                UdpPacketDecoder.AudioFormatV2 format, byte[] proof) {
+            return message(CHALLENGE, 104, receiverId, receiverNonce, format.encode(), proof);
+        }
+        static byte[] proofMessageForVector(int type, byte[] proof) { return message(type, 40, proof); }
+        static SessionKeys deriveForVector(byte[] secret, byte[] transcript) throws Failure { return deriveKeys(secret, transcript, 2); }
+    }
+
 }

@@ -1,3 +1,4 @@
+use crate::protocol::AudioFormatV2;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -817,6 +818,326 @@ fn verify_hmac(
     // Use the crate's constant-time tag verifier rather than ordinary equality.
     mac.verify_slice(received)
         .map_err(|_| SecurityError::InvalidProof)
+}
+
+// Offline Phase 1 v2 simulator. Product pairing deliberately continues to call the v1 API.
+const V2_VERSION: u8 = 2;
+const V2_HEADER_BYTES: usize = 8;
+
+pub(crate) struct HostHandshakeV2 {
+    material: BindingMaterial,
+    format: AudioFormatV2,
+    host_nonce: [u8; 32],
+    session_id: u64,
+}
+
+impl HostHandshakeV2 {
+    pub(crate) fn start(
+        material: BindingMaterial,
+        format: AudioFormatV2,
+    ) -> Result<(Self, Vec<u8>), SecurityError> {
+        format
+            .encode()
+            .map_err(|_| SecurityError::InvalidParameters)?;
+        let mut host_nonce = [0; 32];
+        let mut id = [0; 8];
+        getrandom::fill(&mut host_nonce).map_err(|_| SecurityError::Random)?;
+        getrandom::fill(&mut id).map_err(|_| SecurityError::Random)?;
+        let session_id = u64::from_be_bytes(id);
+        let hello = v2_message(
+            HELLO,
+            96,
+            &[
+                &material.host_id,
+                &material.receiver_id,
+                &host_nonce,
+                &id,
+                &format
+                    .encode()
+                    .map_err(|_| SecurityError::InvalidParameters)?,
+            ],
+        );
+        Ok((
+            Self {
+                material,
+                format,
+                host_nonce,
+                session_id,
+            },
+            hello,
+        ))
+    }
+
+    pub(crate) fn accept_challenge(
+        self,
+        message: &[u8],
+    ) -> Result<(HostAwaitReadyV2, Vec<u8>), SecurityError> {
+        let body = parse_v2(message, CHALLENGE, 104)?;
+        if body[..16] != self.material.receiver_id {
+            return Err(SecurityError::WrongIdentity);
+        }
+        let receiver_nonce: [u8; 32] = body[16..48].try_into().unwrap();
+        let selected =
+            AudioFormatV2::decode(&body[48..64]).map_err(|_| SecurityError::InvalidParameters)?;
+        if selected != self.format {
+            return Err(SecurityError::InvalidParameters);
+        }
+        let transcript = transcript_v2(
+            &self.material,
+            &self.host_nonce,
+            &receiver_nonce,
+            self.session_id,
+            self.format,
+        )?;
+        let receiver_proof: [u8; 32] = body[64..96].try_into().unwrap();
+        verify_hmac(
+            &self.material.secret,
+            b"AnPod P5-A proof receiver v2",
+            &transcript,
+            &[],
+            &receiver_proof,
+        )?;
+        let host_proof = hmac(
+            &self.material.secret,
+            b"AnPod P5-A proof host v2",
+            &transcript,
+            &[],
+        );
+        let finish = v2_message(FINISH, 40, &[&host_proof]);
+        Ok((
+            HostAwaitReadyV2 {
+                material: self.material,
+                format: self.format,
+                session_id: self.session_id,
+                transcript,
+                receiver_proof,
+                host_proof,
+            },
+            finish,
+        ))
+    }
+}
+
+pub(crate) struct HostAwaitReadyV2 {
+    material: BindingMaterial,
+    format: AudioFormatV2,
+    session_id: u64,
+    transcript: Vec<u8>,
+    receiver_proof: [u8; 32],
+    host_proof: [u8; 32],
+}
+
+impl HostAwaitReadyV2 {
+    pub(crate) fn accept_ready(
+        self,
+        message: &[u8],
+    ) -> Result<AuthenticatedSessionV2, SecurityError> {
+        let body = parse_v2(message, READY, 40)?;
+        let mut proofs = [0; 64];
+        proofs[..32].copy_from_slice(&self.host_proof);
+        proofs[32..].copy_from_slice(&self.receiver_proof);
+        let verify = verify_hmac(
+            &self.material.secret,
+            b"AnPod P5-A ready v2",
+            &self.transcript,
+            &proofs,
+            body,
+        );
+        proofs.fill(0);
+        verify?;
+        Ok(AuthenticatedSessionV2 {
+            session_id: self.session_id,
+            format: self.format,
+            keys: Some(derive_v2_keys(&self.material.secret, &self.transcript)),
+        })
+    }
+}
+
+pub(crate) struct ReceiverHandshakeV2;
+
+impl ReceiverHandshakeV2 {
+    pub(crate) fn accept_hello(
+        material: BindingMaterial,
+        message: &[u8],
+    ) -> Result<(ReceiverAwaitFinishV2, Vec<u8>), SecurityError> {
+        let body = parse_v2(message, HELLO, 96)?;
+        if body[..16] != material.host_id || body[16..32] != material.receiver_id {
+            return Err(SecurityError::WrongIdentity);
+        }
+        let host_nonce: [u8; 32] = body[32..64].try_into().unwrap();
+        let session_id = u64::from_be_bytes(body[64..72].try_into().unwrap());
+        let requested =
+            AudioFormatV2::decode(&body[72..88]).map_err(|_| SecurityError::InvalidParameters)?;
+        let mut receiver_nonce = [0; 32];
+        getrandom::fill(&mut receiver_nonce).map_err(|_| SecurityError::Random)?;
+        let transcript = transcript_v2(
+            &material,
+            &host_nonce,
+            &receiver_nonce,
+            session_id,
+            requested,
+        )?;
+        let receiver_proof = hmac(
+            &material.secret,
+            b"AnPod P5-A proof receiver v2",
+            &transcript,
+            &[],
+        );
+        let challenge = v2_message(
+            CHALLENGE,
+            104,
+            &[
+                &material.receiver_id,
+                &receiver_nonce,
+                &requested
+                    .encode()
+                    .map_err(|_| SecurityError::InvalidParameters)?,
+                &receiver_proof,
+            ],
+        );
+        Ok((
+            ReceiverAwaitFinishV2 {
+                material,
+                format: requested,
+                session_id,
+                transcript,
+                receiver_proof,
+            },
+            challenge,
+        ))
+    }
+}
+
+pub(crate) struct ReceiverAwaitFinishV2 {
+    material: BindingMaterial,
+    format: AudioFormatV2,
+    session_id: u64,
+    transcript: Vec<u8>,
+    receiver_proof: [u8; 32],
+}
+
+impl ReceiverAwaitFinishV2 {
+    pub(crate) fn accept_finish(
+        self,
+        message: &[u8],
+    ) -> Result<(Vec<u8>, AuthenticatedSessionV2), SecurityError> {
+        let host_proof = parse_v2(message, FINISH, 40)?;
+        verify_hmac(
+            &self.material.secret,
+            b"AnPod P5-A proof host v2",
+            &self.transcript,
+            &[],
+            host_proof,
+        )?;
+        let ready = hmac(
+            &self.material.secret,
+            b"AnPod P5-A ready v2",
+            &self.transcript,
+            &[host_proof, self.receiver_proof.as_slice()].concat(),
+        );
+        let response = v2_message(READY, 40, &[&ready]);
+        let session = AuthenticatedSessionV2 {
+            session_id: self.session_id,
+            format: self.format,
+            keys: Some(derive_v2_keys(&self.material.secret, &self.transcript)),
+        };
+        Ok((response, session))
+    }
+}
+
+pub(crate) struct AuthenticatedSessionV2 {
+    pub(crate) session_id: u64,
+    pub(crate) format: AudioFormatV2,
+    keys: Option<SessionKeys>,
+}
+
+impl AuthenticatedSessionV2 {
+    pub(crate) fn into_keys(mut self) -> SessionKeys {
+        self.keys.take().expect("session keys consumed once")
+    }
+}
+
+fn v2_message(kind: u8, total_len: u16, parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(total_len as usize);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&[V2_VERSION, kind]);
+    out.extend_from_slice(&total_len.to_be_bytes());
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    debug_assert_eq!(out.len(), total_len as usize);
+    out
+}
+
+fn parse_v2(message: &[u8], kind: u8, len: usize) -> Result<&[u8], SecurityError> {
+    if message.len() != len
+        || &message[..4] != MAGIC
+        || message[4] != V2_VERSION
+        || message[5] != kind
+        || u16::from_be_bytes([message[6], message[7]]) as usize != len
+    {
+        return Err(SecurityError::Malformed);
+    }
+    Ok(&message[V2_HEADER_BYTES..])
+}
+
+fn transcript_v2(
+    material: &BindingMaterial,
+    host_nonce: &[u8; 32],
+    receiver_nonce: &[u8; 32],
+    session_id: u64,
+    format: AudioFormatV2,
+) -> Result<Vec<u8>, SecurityError> {
+    let descriptor = format
+        .encode()
+        .map_err(|_| SecurityError::InvalidParameters)?;
+    let mut out = Vec::with_capacity(143);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&[V2_VERSION, HOST_ROLE, RECEIVER_ROLE]);
+    out.extend_from_slice(&material.host_id);
+    out.extend_from_slice(&material.receiver_id);
+    out.extend_from_slice(host_nonce);
+    out.extend_from_slice(receiver_nonce);
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.extend_from_slice(&descriptor);
+    out.extend_from_slice(&descriptor);
+    Ok(out)
+}
+
+fn derive_v2_keys(secret: &[u8; 32], transcript: &[u8]) -> SessionKeys {
+    let mut salt_input = b"AnPod P5-A HKDF-SHA256 salt v2\0".to_vec();
+    salt_input.extend_from_slice(transcript);
+    let salt = Sha256::digest(&salt_input);
+    salt_input.fill(0);
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), secret);
+    let mut keys = SessionKeys {
+        host_to_receiver_audio: [0; 32],
+        receiver_to_host_audio: [0; 32],
+        host_to_receiver_control: [0; 32],
+        receiver_to_host_control: [0; 32],
+    };
+    for (key, label) in [
+        (
+            &mut keys.host_to_receiver_audio,
+            "AnPod P5-A key host-to-receiver audio AES-256-GCM v2",
+        ),
+        (
+            &mut keys.receiver_to_host_audio,
+            "AnPod P5-A key receiver-to-host audio AES-256-GCM v2",
+        ),
+        (
+            &mut keys.host_to_receiver_control,
+            "AnPod P5-A key host-to-receiver control HMAC-SHA256 v2",
+        ),
+        (
+            &mut keys.receiver_to_host_control,
+            "AnPod P5-A key receiver-to-host control HMAC-SHA256 v2",
+        ),
+    ] {
+        hkdf.expand(label.as_bytes(), key)
+            .expect("32-byte HKDF output");
+    }
+    keys
 }
 
 #[cfg(all(test, windows))]

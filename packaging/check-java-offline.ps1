@@ -24,7 +24,8 @@ $sources = @(
     'tests\AnPod.AndroidServer.PcmCheck.java',
     'tests\AnPodAudioFocusStateCheck.java',
     'tests\BackgroundStartAuthorizationCheck.java',
-    'tests\AnPodDiscoveryAuthCheck.java'
+    'tests\AnPodDiscoveryAuthCheck.java',
+    'tests\AnPodAudioV2Check.java'
 ) | ForEach-Object { Join-Path $repo $_ }
 
 New-Item -ItemType Directory -Path $classes | Out-Null
@@ -37,6 +38,9 @@ try {
 
     & $java -cp $classes app.anpod.receiver.AnPodUdpVectorCheck
     if ($LASTEXITCODE -ne 0) { throw "AnPodUdpVectorCheck failed with exit code $LASTEXITCODE" }
+
+    & $java -cp $classes app.anpod.receiver.AnPodAudioV2Check (Join-Path $repo 'tests\audio-v2-vectors.txt')
+    if ($LASTEXITCODE -ne 0) { throw "AnPodAudioV2Check failed with exit code $LASTEXITCODE" }
 
     & $java -cp $classes com.anpod.server.PcmCheck
     if ($LASTEXITCODE -ne 0) { throw "PcmCheck failed with exit code $LASTEXITCODE" }
