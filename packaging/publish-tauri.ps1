@@ -23,7 +23,7 @@ if (-not $Version) { $Version = $config.version }
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 . (Join-Path $PSScriptRoot 'source-snapshot.ps1')
 if ($ReviewWorkingTree -and (-not $ReviewPackage -or $ReceiverCandidate -ne 'v3')) { throw '-ReviewWorkingTree requires a local V3 review candidate.' }
-$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1')
+$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1', 'packaging/enter-usb-direct.ps1', 'AnPod_AOA_Phase2_Probe/Windows/AoaHost.cs')
 $desktopInputsSha256 = Get-AnPodSourceSnapshot $root $desktopInputPaths
 $deps = Join-Path $root 'deps'
 $artifacts = Join-Path $root 'artifacts'
@@ -150,14 +150,13 @@ if ($IncludeReceiverCandidate) {
         $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
         $receiverCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
         if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
-        $receiverWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
-        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
+        $receiverWorkingChanges = Test-AnPodSourceModified -Root $root -Paths $receiverInputPaths
         if ($ReviewWorkingTree) {
             if ($receiverMetadata.sourceInputsSha256 -notmatch '^[0-9a-f]{64}$' -or
                 $receiverMetadata.sourceInputsSha256 -ne (Get-AnPodSourceSnapshot $root $receiverInputPaths)) {
                 throw 'Receiver source snapshot differs from the built artifact; rebuild it before packaging.'
             }
-        } elseif ($receiverCommittedChanges.Count -or $receiverWorkingChanges.Count) {
+        } elseif ($receiverCommittedChanges.Count -or $receiverWorkingChanges) {
             throw "V$ReceiverCandidate Receiver build inputs changed after source commit $($receiverMetadata.sourceCommit); rebuild the Receiver artifact before packaging."
         }
         if ($ReuseExistingBuild) {
@@ -247,9 +246,8 @@ if ($IncludeReceiverRelease) {
     $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
     $releaseCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
     if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
-    $releaseWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
-    if ($releaseCommittedChanges.Count -or $releaseWorkingChanges.Count) {
+    $releaseWorkingChanges = Test-AnPodSourceModified -Root $root -Paths $receiverInputPaths
+    if ($releaseCommittedChanges.Count -or $releaseWorkingChanges) {
         throw 'Receiver build inputs changed after the release artifact was built; rebuild it before packaging.'
     }
     if (-not $AndroidSdkRoot) { $AndroidSdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME } }
@@ -353,6 +351,10 @@ Copy-Item -LiteralPath (Join-Path $root 'frontend\public\icon.png') -Destination
 Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $packageDir -Recurse
 Copy-Item -LiteralPath (Join-Path $deps 'PLATFORM_TOOLS_NOTICE.txt') -Destination (Join-Path $packageDir 'LICENSES\PLATFORM_TOOLS_NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'upstream') -Destination $packageDir -Recurse
+$usbDirectDir = Join-Path $packageDir 'USB-Direct'
+New-Item -ItemType Directory -Path $usbDirectDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $root 'packaging\enter-usb-direct.ps1') -Destination $usbDirectDir
+Copy-Item -LiteralPath (Join-Path $root 'AnPod_AOA_Phase2_Probe\Windows\AoaHost.cs') -Destination $usbDirectDir
 if ($IncludeReceiverCandidate -or $IncludeReceiverRelease) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }

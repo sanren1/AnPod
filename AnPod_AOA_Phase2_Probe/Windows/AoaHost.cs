@@ -209,20 +209,28 @@ public static class AnPodAoaPhase2
         d.Control(0x40,52,id,raw);
     }
     public static string SwitchAccessory(){
+        return SwitchAccessory(false);
+    }
+    public static string SwitchAnPodReceiver(){
+        return SwitchAccessory(true);
+    }
+    static string SwitchAccessory(bool productIdentity){
         using(var d=new Device(OldPath())){
             d.Timeout(0,3000);
             byte[] b=d.Control(0xC0,51,0,new byte[2]);
             int ver=b[0]|(b[1]<<8);if(ver<1)throw new InvalidOperationException("AOA unavailable");
-            StringId(d,0,"AnPod Lab");
-            StringId(d,1,"AOA Bulk Probe");
-            StringId(d,2,"AnPod compatibility experiment - not a music player");
+            StringId(d,0,productIdentity?"AnPod":"AnPod Lab");
+            StringId(d,1,productIdentity?"AnPod USB Direct":"AOA Bulk Probe");
+            StringId(d,2,productIdentity?"AnPod USB Direct audio receiver":"AnPod compatibility experiment - not a music player");
             StringId(d,3,"1.0");
             StringId(d,4,"https://github.com/sanren1/AnPod");
-            StringId(d,5,"ANPOD-AOA-PROBE");
+            StringId(d,5,productIdentity?"ANPOD-AOA-USB-DIRECT":"ANPOD-AOA-PROBE");
             string result="All AOA identity strings were sent. ";
             try {d.Control(0x40,53,0,new byte[0]);result+="START_ACCESSORY (53) returned successfully.";}
             catch(Exception e){result+="START_ACCESSORY may have disconnected the old interface: "+e.Message;}
-            return result+" Check whether VID_18D1 PID_2D00/2D01 enumerates.";
+            return result+(productIdentity
+                ? " Product identity requested: AnPod / AnPod USB Direct. Check whether VID_18D1 PID_2D00/2D01 enumerates."
+                : " Check whether VID_18D1 PID_2D00/2D01 enumerates.");
         }
     }
     public static string InspectAccessory(){
