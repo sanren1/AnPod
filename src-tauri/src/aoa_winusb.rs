@@ -74,6 +74,30 @@ fn is_accessory_instance_id(id: &str) -> bool {
     is_accessory && is_data_interface
 }
 
+fn is_iqoo_11_pre_aoa_instance_id(id: &str) -> bool {
+    let mut parts = id.split('\\');
+    let bus = parts.next().unwrap_or_default();
+    let hardware_id = parts.next().unwrap_or_default();
+    let tokens: Vec<_> = hardware_id.split('&').collect();
+    bus == "USB"
+        && tokens.contains(&"VID_2D95")
+        && tokens.contains(&"PID_6013")
+        && tokens.contains(&"MI_02")
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AoaSwitchTarget {
+    pub(crate) id: String,
+    instance_id: String,
+    interface_path: String,
+}
+
+impl AoaSwitchTarget {
+    pub(crate) fn label(&self) -> String {
+        "iQOO 11 V2243A".into()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BulkPipes {
     input: u8,
@@ -388,7 +412,7 @@ mod windows_backend {
         SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
     };
     use windows::Win32::Devices::Usb::{
-        UsbdPipeTypeBulk, WinUsb_AbortPipe, WinUsb_Free, WinUsb_Initialize,
+        UsbdPipeTypeBulk, WinUsb_AbortPipe, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_Initialize,
         WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe, WinUsb_SetPipePolicy,
         WinUsb_WritePipe, PIPE_TRANSFER_TIMEOUT, USB_INTERFACE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE,
         WINUSB_PIPE_INFORMATION,
@@ -542,7 +566,7 @@ mod windows_backend {
         Ok(Some((value_type.0, bytes)))
     }
 
-    fn enumerate_nodes() -> io::Result<Vec<DeviceNode>> {
+    fn enumerate_nodes(is_target_instance_id: fn(&str) -> bool) -> io::Result<Vec<DeviceNode>> {
         let set = unsafe {
             SetupDiGetClassDevsW(
                 None,
@@ -571,7 +595,7 @@ mod windows_backend {
             let Ok(instance_id) = device_instance_id(set.0, &devinfo) else {
                 continue;
             };
-            if !is_accessory_instance_id(&instance_id.to_ascii_uppercase()) {
+            if !is_target_instance_id(&instance_id.to_ascii_uppercase()) {
                 continue;
             }
             let Ok(service) = device_service(set.0, &devinfo) else {
@@ -770,10 +794,242 @@ mod windows_backend {
 
     #[allow(dead_code)]
     pub(crate) fn discover_targets() -> io::Result<Vec<AoaTarget>> {
-        Ok(enumerate_nodes()?
+        Ok(enumerate_nodes(is_accessory_instance_id)?
             .into_iter()
             .filter_map(accessory_target)
             .collect())
+    }
+
+    fn switch_target(node: DeviceNode) -> Option<AoaSwitchTarget> {
+        let id = node.instance_id.to_ascii_uppercase();
+        if !is_iqoo_11_pre_aoa_instance_id(&id) || !node.service.eq_ignore_ascii_case("WinUSB") {
+            return None;
+        }
+        let digest = Sha256::digest(
+            [
+                node.instance_id.as_bytes(),
+                node.interface_guid.as_bytes(),
+                node.interface_path.as_bytes(),
+            ]
+            .concat(),
+        );
+        Some(AoaSwitchTarget {
+            id: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            instance_id: node.instance_id,
+            interface_path: node.interface_path,
+        })
+    }
+
+    pub(crate) fn discover_switch_targets() -> io::Result<Vec<AoaSwitchTarget>> {
+        Ok(enumerate_nodes(is_iqoo_11_pre_aoa_instance_id)?
+            .into_iter()
+            .filter_map(switch_target)
+            .collect())
+    }
+
+    struct SwitchDevice {
+        file: HANDLE,
+        interface: WINUSB_INTERFACE_HANDLE,
+    }
+
+    impl Drop for SwitchDevice {
+        fn drop(&mut self) {
+            let _ = unsafe { WinUsb_Free(self.interface) };
+            let _ = unsafe { CloseHandle(self.file) };
+        }
+    }
+
+    fn open_switch_target(target: &AoaSwitchTarget) -> io::Result<SwitchDevice> {
+        let path: Vec<u16> = target
+            .interface_path
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let file = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None,
+            )
+        }
+        .map_err(|error| last_error(error, "open selected iQOO 11 WinUSB interface (MI_02)"))?;
+        let mut interface = WINUSB_INTERFACE_HANDLE::default();
+        if let Err(error) = unsafe { WinUsb_Initialize(file, &mut interface) } {
+            let _ = unsafe { CloseHandle(file) };
+            return Err(last_error(
+                error,
+                "initialize selected iQOO 11 WinUSB interface",
+            ));
+        }
+        Ok(SwitchDevice { file, interface })
+    }
+
+    fn control_transfer(
+        device: &SwitchDevice,
+        request_type: u8,
+        request: u8,
+        index: u16,
+        buffer: &mut [u8],
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<usize> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "AOA switch cancelled",
+            ));
+        }
+        let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(|error| last_error(error, "create USB control-transfer event"))?;
+        struct Event(HANDLE);
+        impl Drop for Event {
+            fn drop(&mut self) {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+        let event = Event(event);
+        #[allow(unused_mut)]
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let setup = windows::Win32::Devices::Usb::WINUSB_SETUP_PACKET {
+            RequestType: request_type,
+            Request: request,
+            Value: 0,
+            Index: index,
+            Length: buffer.len() as u16,
+        };
+        let mut transferred = 0u32;
+        let result = unsafe {
+            WinUsb_ControlTransfer(
+                device.interface,
+                setup,
+                Some(buffer),
+                Some(&mut transferred),
+                Some(&overlapped),
+            )
+        };
+        if result.is_ok() {
+            return Ok(transferred as usize);
+        }
+        let error = result.unwrap_err();
+        if !is_win32_hresult(
+            error.code().0,
+            windows::Win32::Foundation::ERROR_IO_PENDING.0,
+        ) {
+            return Err(last_error(error, "WinUsb_ControlTransfer"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if cancelled() || Instant::now() >= deadline {
+                let _ = unsafe { CancelIoEx(device.file, Some(&overlapped)) };
+                let mut ignored = 0u32;
+                let _ =
+                    unsafe { GetOverlappedResult(device.file, &overlapped, &mut ignored, true) };
+                return Err(if cancelled() {
+                    io::Error::new(io::ErrorKind::Interrupted, "AOA switch cancelled")
+                } else {
+                    io::Error::new(io::ErrorKind::TimedOut, "AOA control transfer timed out")
+                });
+            }
+            let wait = unsafe { WaitForSingleObject(event.0, 50) };
+            if wait == WAIT_TIMEOUT {
+                continue;
+            }
+            if wait != WAIT_OBJECT_0 {
+                let error = unsafe { windows::Win32::Foundation::GetLastError().0 };
+                let _ = unsafe { CancelIoEx(device.file, Some(&overlapped)) };
+                let mut ignored = 0u32;
+                let _ =
+                    unsafe { GetOverlappedResult(device.file, &overlapped, &mut ignored, true) };
+                return Err(io::Error::other(format!(
+                    "wait for USB control transfer failed: {}",
+                    error
+                )));
+            }
+            unsafe { GetOverlappedResult(device.file, &overlapped, &mut transferred, false) }
+                .map_err(|error| last_error(error, "complete WinUsb_ControlTransfer"))?;
+            return Ok(transferred as usize);
+        }
+    }
+
+    pub(crate) fn switch_to_accessory(
+        target_id: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        let target = discover_switch_targets()?
+            .into_iter()
+            .find(|target| target.id == target_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "selected iQOO 11 target is no longer available",
+                )
+            })?;
+        let _identity = &target.instance_id;
+        let device = open_switch_target(&target)?;
+        let mut protocol = [0u8; 2];
+        let transferred = control_transfer(&device, 0xC0, 51, 0, &mut protocol, &cancelled)?;
+        if transferred != protocol.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "AOA GET_PROTOCOL returned an incomplete response",
+            ));
+        }
+        if u16::from_le_bytes(protocol) < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "phone does not support Android Open Accessory mode",
+            ));
+        }
+        for (index, value) in [
+            "AnPod",
+            "AnPod USB Direct",
+            "AnPod USB Direct audio receiver",
+            "1.0",
+            "https://github.com/sanren1/AnPod",
+            "ANPOD-AOA-USB-DIRECT",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut bytes = value.as_bytes().to_vec();
+            bytes.push(0);
+            if bytes.len() > 256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AOA identity string exceeds 256 bytes",
+                ));
+            }
+            let transferred =
+                control_transfer(&device, 0x40, 52, index as u16, &mut bytes, &cancelled)?;
+            if transferred != bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "AOA SEND_STRING {index} transferred {transferred}/{} bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
+        }
+        let mut empty = [];
+        let transferred = control_transfer(&device, 0x40, 53, 0, &mut empty, &cancelled)?;
+        if transferred != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AOA START_ACCESSORY returned unexpected data",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -872,6 +1128,16 @@ pub(crate) fn open_target(target: &AoaTarget) -> io::Result<AoaStream> {
     windows_backend::open_target(target)
 }
 
+#[cfg(windows)]
+pub(crate) fn discover_switch_targets() -> io::Result<Vec<AoaSwitchTarget>> {
+    windows_backend::discover_switch_targets()
+}
+
+#[cfg(windows)]
+pub(crate) fn switch_to_accessory(target_id: &str, cancelled: impl Fn() -> bool) -> io::Result<()> {
+    windows_backend::switch_to_accessory(target_id, cancelled)
+}
+
 #[cfg(not(windows))]
 pub(crate) fn discover_targets() -> io::Result<Vec<AoaTarget>> {
     Err(io::Error::new(
@@ -882,6 +1148,22 @@ pub(crate) fn discover_targets() -> io::Result<Vec<AoaTarget>> {
 
 #[cfg(not(windows))]
 pub(crate) fn open_target(_: &AoaTarget) -> io::Result<AoaStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "AOA WinUSB is Windows-only",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn discover_switch_targets() -> io::Result<Vec<AoaSwitchTarget>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "AOA WinUSB is Windows-only",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn switch_to_accessory(_: &str, _: impl Fn() -> bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "AOA WinUSB is Windows-only",
@@ -932,6 +1214,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(target.label(), "AnPod USB Direct");
+    }
+
+    #[test]
+    fn pre_aoa_switch_filter_accepts_only_the_confirmed_iqoo_interface() {
+        let cases = [
+            ("USB\\VID_2D95&PID_6013&MI_02\\device", true),
+            ("USB\\VID_2D95&PID_6013&MI_01\\adb", false),
+            ("USB\\VID_2D95&PID_6013&MI_03\\other", false),
+            ("USB\\VID_2D95&PID_6013\\parent", false),
+            ("USB\\VID_2D95&PID_60130&MI_02\\wrong-pid", false),
+            ("USB\\VID_2D95&PID_6013&MI_020\\wrong-mi", false),
+            ("USB\\VID_1234&PID_6013&MI_02\\other", false),
+            ("USB\\VID_2D95&PID_6013&MI_02&REV_0001\\rev", true),
+        ];
+        for (instance_id, accepted) in cases {
+            assert_eq!(
+                is_iqoo_11_pre_aoa_instance_id(instance_id),
+                accepted,
+                "{instance_id}"
+            );
+        }
     }
 
     #[test]

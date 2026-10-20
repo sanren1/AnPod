@@ -21,6 +21,25 @@ pub(crate) fn begin_preemptible_background_operation(
     begin_operation_slot_with_preemptibility(generation, slot, true, true)
 }
 
+pub(crate) fn try_begin_exclusive_operation(
+    generation: &AtomicU64,
+    slot: &Mutex<Option<ActiveOperation>>,
+) -> Option<(u64, CancellationToken)> {
+    let mut current = slot.lock().expect("operation lock");
+    if current.is_some() {
+        return None;
+    }
+    let next_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let token = CancellationToken::new();
+    *current = Some(ActiveOperation {
+        generation: next_generation,
+        token: token.clone(),
+        background: false,
+        receiver_preemptible: false,
+    });
+    Some((next_generation, token))
+}
+
 fn begin_operation_slot_with_preemptibility(
     generation: &AtomicU64,
     slot: &Mutex<Option<ActiveOperation>>,

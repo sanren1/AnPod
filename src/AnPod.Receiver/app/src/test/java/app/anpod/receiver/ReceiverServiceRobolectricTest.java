@@ -26,6 +26,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.lang.reflect.Proxy;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -309,6 +311,7 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    @Config(sdk = 35)
     public void aoaDetachBroadcastMustMatchCurrentUsbManagerState() throws Exception {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
         String owner = "aoa-detach-owner";
@@ -337,19 +340,126 @@ public final class ReceiverServiceRobolectricTest {
         register.setAccessible(true);
         try {
             assertTrue((Boolean) register.invoke(service, accessory, owner, generation));
+            android.content.BroadcastReceiver detachReceiver = org.robolectric.util.ReflectionHelpers
+                    .getField(service, "aoaDetachReceiver");
             Intent detach = new Intent(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
                     .putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
-            RuntimeEnvironment.getApplication().sendBroadcast(detach);
+            detachReceiver.onReceive(RuntimeEnvironment.getApplication(), detach);
             assertEquals("a forged/stale detach must not stop a still-attached accessory",
                     ReceiverUiOperation.RUNNING, service.uiOperation.phase());
 
             Shadows.shadowOf(manager).setAttachedUsbAccessory(null);
-            RuntimeEnvironment.getApplication().sendBroadcast(detach);
+            detachReceiver.onReceive(RuntimeEnvironment.getApplication(), detach);
             assertEquals(ReceiverUiOperation.FAILED, service.uiOperation.phase());
             assertFalse(service.isAoaSession());
         } finally {
             service.onDestroy();
         }
+    }
+
+    @Test
+    @Config(sdk = 35)
+    public void uiAoaStartWithRevokedPermissionFailsOwnerBeforeComparingAccessory() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-revoked-start-owner";
+        String requestId = "aoa-revoked-start-request";
+        long generation = 44;
+        AtomicInteger serialReads = new AtomicInteger();
+        UsbAccessory accessory = unauthorizedAccessory(serialReads);
+        UsbManager manager = RuntimeEnvironment.getApplication().getSystemService(UsbManager.class);
+        Shadows.shadowOf(manager).setAttachedUsbAccessory(accessory);
+        assertTrue(service.uiOperation.begin(owner));
+        service.currentOperationGeneration = generation;
+        java.util.concurrent.atomic.AtomicLong operationGeneration = org.robolectric.util.ReflectionHelpers
+                .getField(service, "networkBootstrapGeneration");
+        operationGeneration.set(generation);
+        org.robolectric.util.ReflectionHelpers.setField(service, "pendingAoaRequestId", requestId);
+        org.robolectric.util.ReflectionHelpers.setField(service, "pendingAoaAccessory", accessory);
+
+        Intent start = new Intent(ReceiverService.ACTION_UI_START_AOA_AUDIO)
+                .putExtra("uiOwnerId", owner)
+                .putExtra("uiGeneration", generation)
+                .putExtra("uiRequestId", requestId)
+                .putExtra("aoaAccessory", accessory);
+        try {
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(start, 0, 1));
+            assertEquals("permission loss must fail and clean up the pending owner",
+                    ReceiverUiOperation.FAILED, service.uiOperation.phase());
+            assertEquals("UsbAccessoryPermissionOrAttachmentLost", service.uiOperation.error());
+            assertEquals("permission must be checked before UsbAccessory.equals reads serial",
+                    0, serialReads.get());
+            assertNull(org.robolectric.util.ReflectionHelpers.getField(service, "pendingAoaAccessory"));
+            assertNull(org.robolectric.util.ReflectionHelpers.getField(service, "aoaBootstrapThread"));
+            assertNull(service.aoaCoordinator);
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    @Config(sdk = 35)
+    public void uiAoaStartWithDifferentUnpermittedIntentAccessoryCleansOwner() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-replaced-start-owner";
+        String requestId = "aoa-replaced-start-request";
+        long generation = 45;
+        AtomicInteger serialReads = new AtomicInteger();
+        UsbAccessory pending = org.robolectric.util.ReflectionHelpers.callConstructor(UsbAccessory.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "1"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, ""),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "pending-serial"));
+        UsbAccessory requested = unauthorizedAccessory(serialReads);
+        UsbManager manager = RuntimeEnvironment.getApplication().getSystemService(UsbManager.class);
+        Shadows.shadowOf(manager).setAttachedUsbAccessory(pending);
+        Shadows.shadowOf(manager).grantPermission(pending);
+        assertTrue(service.uiOperation.begin(owner));
+        service.currentOperationGeneration = generation;
+        java.util.concurrent.atomic.AtomicLong operationGeneration = org.robolectric.util.ReflectionHelpers
+                .getField(service, "networkBootstrapGeneration");
+        operationGeneration.set(generation);
+        org.robolectric.util.ReflectionHelpers.setField(service, "pendingAoaRequestId", requestId);
+        org.robolectric.util.ReflectionHelpers.setField(service, "pendingAoaAccessory", pending);
+
+        Intent start = new Intent(ReceiverService.ACTION_UI_START_AOA_AUDIO)
+                .putExtra("uiOwnerId", owner)
+                .putExtra("uiGeneration", generation)
+                .putExtra("uiRequestId", requestId)
+                .putExtra("aoaAccessory", requested);
+        try {
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(start, 0, 1));
+            assertEquals(ReceiverUiOperation.FAILED, service.uiOperation.phase());
+            assertEquals("UsbAccessoryPermissionOrAttachmentLost", service.uiOperation.error());
+            assertNull(org.robolectric.util.ReflectionHelpers.getField(service, "pendingAoaAccessory"));
+            assertNull(service.aoaCoordinator);
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    private static UsbAccessory unauthorizedAccessory(AtomicInteger serialReads) throws Exception {
+        Class<?> serialReader = Class.forName("android.hardware.usb.IUsbSerialReader");
+        Object reader = Proxy.newProxyInstance(serialReader.getClassLoader(), new Class<?>[] { serialReader },
+                (proxy, method, args) -> {
+                    if ("getSerial".equals(method.getName())) {
+                        serialReads.incrementAndGet();
+                        throw new SecurityException("USB accessory permission required");
+                    }
+                    if ("asBinder".equals(method.getName())) return null;
+                    if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
+                    if ("equals".equals(method.getName())) return proxy == args[0];
+                    if ("toString".equals(method.getName())) return "ProtectedUsbSerialReader";
+                    return null;
+                });
+        java.lang.reflect.Constructor<?> constructor = java.util.Arrays.stream(UsbAccessory.class.getDeclaredConstructors())
+                .filter(candidate -> candidate.getParameterCount() > 0
+                        && candidate.getParameterTypes()[candidate.getParameterCount() - 1] == serialReader)
+                .findFirst().orElseThrow();
+        constructor.setAccessible(true);
+        return (UsbAccessory) constructor.newInstance(
+                "AnPod", "AnPod USB Direct", "USB Direct", "1", "", reader);
     }
 
     private static final class DelayedCloseInput implements java.nio.channels.ReadableByteChannel {

@@ -270,9 +270,27 @@ public final class ReceiverService extends Service {
             if (!uiOperation.owns(ownerId) || !ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                     || generation != currentOperationGeneration || generation != networkBootstrapGeneration.get()
                     || !requestIdEqualsPendingAoa(requestId) || requestedAccessory == null
-                    || !requestedAccessory.equals(pendingAoaAccessory)
+                    || pendingAoaAccessory == null
                     || !AoaReceiverCoordinator.isProductAccessory(requestedAccessory)) {
                 stopRejectedStartIfIdle();
+                return START_NOT_STICKY;
+            }
+            UsbManager manager = getSystemService(UsbManager.class);
+            try {
+                if (manager == null || !manager.hasPermission(pendingAoaAccessory)) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return START_NOT_STICKY;
+                }
+                if (!manager.hasPermission(requestedAccessory)) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return START_NOT_STICKY;
+                }
+                if (!requestedAccessory.equals(pendingAoaAccessory)) {
+                    stopRejectedStartIfIdle();
+                    return START_NOT_STICKY;
+                }
+            } catch (SecurityException permissionLost) {
+                requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
                 return START_NOT_STICKY;
             }
         } else if (audio && currentAudio != null && (ReceiverUiOperation.RUNNING.equals(uiOperation.phase())
@@ -460,15 +478,25 @@ public final class ReceiverService extends Service {
                 if (!UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(intent.getAction())
                         || !isCurrentOperation(ownerId, generation)
                         || !ownerId.equals(aoaOwnerId) || aoaOwnerGeneration != generation
-                        || !accessory.equals(aoaAccessory)) return;
-                UsbAccessory detached = usbAccessoryExtra(intent);
-                if (detached == null || !accessory.equals(detached)
-                        || !AoaReceiverCoordinator.isProductAccessory(detached)) return;
+                        || accessory != aoaAccessory) return;
                 UsbManager manager = getSystemService(UsbManager.class);
-                if (manager != null) {
+                if (manager == null) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return;
+                }
+                try {
+                    if (!manager.hasPermission(accessory)) {
+                        requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                        return;
+                    }
                     UsbAccessory[] attached = manager.getAccessoryList();
-                    if (attached != null) for (UsbAccessory current : attached)
-                        if (detached.equals(current) && manager.hasPermission(current)) return;
+                    if (attached != null) for (UsbAccessory current : attached) {
+                        if (!manager.hasPermission(current)) continue;
+                        if (accessory.equals(current) && AoaReceiverCoordinator.isProductAccessory(current)) return;
+                    }
+                } catch (SecurityException permissionLost) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return;
                 }
                 requestTermination(ownerId, generation, true, "AoaAccessoryDetached");
             }
@@ -687,13 +715,20 @@ public final class ReceiverService extends Service {
             return getString(R.string.usb_direct_not_supported);
         if (!AoaReceiverCoordinator.isProductAccessory(accessory)) return getString(R.string.usb_direct_wrong_accessory);
         UsbManager manager = getSystemService(UsbManager.class);
+        if (manager == null)
+            return getString(R.string.usb_direct_detached_or_permission_lost);
         boolean attached = false;
-        if (manager != null) {
+        try {
+            if (!manager.hasPermission(accessory))
+                return getString(R.string.usb_direct_detached_or_permission_lost);
             UsbAccessory[] accessories = manager.getAccessoryList();
             if (accessories != null) for (UsbAccessory current : accessories)
-                if (accessory.equals(current) && AoaReceiverCoordinator.isProductAccessory(current)) attached = true;
+                if (manager.hasPermission(current) && accessory.equals(current)
+                        && AoaReceiverCoordinator.isProductAccessory(current)) attached = true;
+        } catch (SecurityException permissionLost) {
+            return getString(R.string.usb_direct_detached_or_permission_lost);
         }
-        if (manager == null || !manager.hasPermission(accessory) || !attached)
+        if (!attached)
             return getString(R.string.usb_direct_detached_or_permission_lost);
         try {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();

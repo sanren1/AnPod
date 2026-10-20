@@ -5,15 +5,19 @@ AnPod host and Receiver pair. Phase 6a–6c source integration and offline gates
 are complete: AOA uses an isolated binding secret, the existing P5-A v2
 handshake, authenticated P5-C control, ANPD v2 audio, ANPU record framing,
 platform I/O owners, and the product USB permission/state entrypoints. It does
-not reuse the AOA 4096-byte echo probe, ADB TCP, or the LAN UDP context. The release-signed Receiver candidate has passed offline package inspection; the portable package records actual component hashes and registered source provenance in its build metadata. No physical accessory transfer or audio playback has been tested.
+not reuse the AOA 4096-byte echo probe, ADB TCP, or the LAN UDP context. The
+current candidate also supports an explicit, confirmed USB mode switch from
+the PC app for the supported iQOO 11 V2243A; the switch does not start audio.
+The prior 1.10.0 / Receiver code 34 package checks are historical and do not
+cover the current crash fix. No physical accessory transfer or audio playback
+has been tested for the current candidate.
 
 The Receiver must have the matching accessory-mode application installed. The
-first product stage connects only to a target already in AOA accessory mode;
-the Android user explicitly selects USB Direct and the current accessory,
-grants `UsbManager` permission, and starts playback from the foreground UI.
-That action authorizes only the current accessory connection/session. AOA
-vendor requests 51/52/53 for mode switching remain in the separate manual
-probe workflow and are not sent by product code. A detach, permission
+PC app can send AOA vendor requests 51/52/53 to the explicitly selected and
+confirmed supported pre-switch interface. The user then grants
+`UsbManager` permission in the foreground Receiver and explicitly starts the
+PC connection with a selected accessory and saved binding. USB mode switching
+does not grant accessory permission or start audio. A detach, permission
 revocation, or user cancellation ends the current session.
 
 ## Binding and transport separation
@@ -248,12 +252,12 @@ PnP interface, and opens only the accessory interface. AOA accessory IDs
 USB string or ID is not authenticated identity. On composite 2D01 devices,
 only MI_00 is eligible; MI_01 is the ADB interface and is never opened for this
 audio transport. The chosen interface must expose one bulk IN and one bulk OUT
-pipe. Product code does not replace drivers, modify registry entries, or send
-accessory-switch control requests. The existing diagnostic probe retains its
-`AnPod Lab` / `AOA Bulk Probe` accessory strings and echo protocol. A separate
-future manual mode-switch tool may identify the product as manufacturer
-`AnPod`, model `AnPod USB Direct`, but still requires explicit SWITCH
-confirmation; the diagnostic probe identity is not product trust.
+pipe. The mode-switch path separately filters the supported iQOO 11
+V2243A `VID_2D95&PID_6013&MI_02` interface and requires an explicit UI
+confirmation before sending the three accessory requests. Product code does
+not replace drivers or modify registry entries. The existing diagnostic probe
+retains its `AnPod Lab` / `AOA Bulk Probe` accessory strings and echo protocol;
+that identity is not product trust.
 
 The existing Windows `windows` crate can provide SetupAPI, device installation,
 WinUSB, registry-property, and overlapped-I/O declarations by adding only the
@@ -266,9 +270,7 @@ identity.
 The Android playback entry accepts only the product accessory identity
 (manufacturer `AnPod`, model `AnPod USB Direct`) after the foreground user
 grants access. The existing diagnostic echo probe keeps its separate
-`AnPod Lab` / `AOA Bulk Probe` identity. A future manual mode-switch workflow
-uses the product identity and still requires explicit SWITCH confirmation;
-the diagnostic probe identity is not production trust. `UsbManager.requestPermission`,
+`AnPod Lab` / `AOA Bulk Probe` identity. `UsbManager.requestPermission`,
 `openAccessory`, accessory detach, and descriptor close remain explicit
 lifecycle events. AOA does not create an ADB-shell audio path or bypass ANPB
 mutual authentication and the Receiver's single-owner policy. LAN background
@@ -426,9 +428,12 @@ playback but does not join USB I/O workers. The host exposes target listing and
 `start_aoa_audio`, requires an explicit saved binding and target selection, and
 reports the session as `aoa` / `usbDirect`. USB Direct does not alter the
 persistent USB/ADB or LAN preference and does not silently fall back to ADB.
-On Windows it requires an already available WinUSB accessory interface. The
-manual mode-switch helper is separate and restricted to the documented iQOO
-11 V2243A / `VID_2D95&PID_6013&MI_02` pre-switch interface.
+The app also lists only the supported iQOO 11 V2243A /
+`VID_2D95&PID_6013&MI_02` pre-switch interface and sends mode-switch requests
+only after explicit user confirmation. This request does not start audio; the
+user must grant Android accessory permission, wait for re-enumeration, then
+select an accessory and saved binding and start the connection. On Windows the
+product transport requires an available WinUSB accessory interface.
 
 The final Phase 6c offline source gates completed on 2026-10-20:
 
@@ -450,7 +455,7 @@ Windows PnP/WinUSB hardware access, real playback, throughput, acoustic
 latency, and long-duration stability remain `NOT_TESTED`. Source and synthetic
 gates do not establish those results.
 
-The Receiver candidate is `0.17.0-v3-flow-candidate` / code 34, built from
+The previous Receiver candidate was `0.17.0-v3-flow-candidate` / code 34, built from
 source commit `8ca9638db128f99e36769f42de18ed9244f457c2` with
 `sourceModified=false`. Its APK SHA-256 is
 `711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83`; the

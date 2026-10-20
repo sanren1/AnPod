@@ -51,6 +51,22 @@ async fn list_aoa_targets(state: State<'_, AppState>) -> Result<Vec<AoaDeviceTar
 }
 
 #[tauri::command]
+async fn list_aoa_switch_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<AoaDeviceTarget>, String> {
+    state.list_aoa_switch_targets().await
+}
+
+#[tauri::command]
+async fn switch_aoa_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+) -> Result<state::AoaSwitchResult, String> {
+    state.switch_aoa_mode(&app, &target_id).await
+}
+
+#[tauri::command]
 async fn start_aoa_audio(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -445,6 +461,8 @@ fn main() {
             get_snapshot,
             refresh_devices,
             list_aoa_targets,
+            list_aoa_switch_targets,
+            switch_aoa_mode,
             start_aoa_audio,
             select_device,
             connect_device,

@@ -2,9 +2,9 @@
 
 > 版本：1.1（工程执行基线；补充开源项目、官方指南及可复用实现调研）  
 > 制定日期：2026-10-19  
-> 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；本轮开发 HEAD 为 `13d666277e1de4ccf0d41d12836a1e2a945dcb42`。本地便携候选离线验收已完成；这不代表公开发布或生产验收。
+> 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；`13d666277e1de4ccf0d41d12836a1e2a945dcb42` 是 PC 1.10.0 旧候选的源码提交，不是本轮修复基线。本轮 PC 1.10.1 / Receiver 0.17.1 code 35 候选源码提交和最后 doc-only 提交将在复核、构建后补记；当前尚无新版制品。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1–5 源码与相应离线验收已完成，AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。Phase 6a–6c 的 AOA 协议、平台 I/O、共享 ingress、认证 session、Host State/命令与 Android USB permission/UI 产品入口已完成源码审查和离线门禁。Phase 7 文档与本地候选离线验收已完成：Receiver 0.17.0/code 34 发布签名候选 APK 已构建并验签，PC 1.10.0 便携候选的 ZIP、包内 metadata 与文件校验通过。真实 WASAPI capture、手机硬件输出格式/精度、AOA 设备权限与拔插、吞吐、声学/延迟/长时稳定性，以及实机原地升级仍为 **NOT_TESTED**；源码、签名验证和离线门禁不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1–5 源码与相应离线验收已完成，AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。Phase 6a–6c 的 AOA 协议、平台 I/O、共享 ingress、认证 session、Host State/命令与 Android USB permission/UI 产品入口已完成源码审查和离线门禁。此前 Phase 7 已完成 PC 1.10.0 / Receiver 0.17.0 code 34 的本地候选离线验收（历史记录见下文）。本轮修复针对未授权时读取 USB serial 导致的 Receiver 崩溃，并增加显式 USB 模式切换；新版签名 APK 与 portable ZIP 尚待复核后构建。真实 WASAPI capture、手机硬件输出格式/精度、AOA 设备权限与拔插、吞吐、声学/延迟/长时稳定性，以及实机原地升级仍为 **NOT_TESTED**；源码、签名验证和离线门禁不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
 
 ## 0. 开发指令与决策摘要
 
@@ -576,3 +576,9 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 ---
 
 **结论**：先以 **48kHz/24-bit Packed PCM** 为真实可交付音质升级核心；仅在能力条件达成时提供 96kHz/24-bit；Float32 限定为内部高精度处理；保留无线 UDP、AudioTrack 默认与 v1 兼容；以实验性 Oboe 改善潜在稳定性；最终将已验证的 AOA USB Direct 纳入统一音频链路。所有档位必须以**实际采集→传输→输出格式**和真实声学测试为准。第三方库采用**先评测/审查许可证、后锁版本并集成**的原则。
+
+## USB Direct crash-fix candidate (2026-10-20)
+
+Receiver `0.17.0` / code 34 的现场崩溃已由脱敏日志 `artifacts/usb-direct-fix-crash.log` 确认：Compose 对 `UsbAccessory` 做 structural equality 时调用 `getSerial()`；未获 Android USB 权限时抛出 `SecurityException`，点击更新和周期刷新都可触发。修复在 Android accessory equality/可用状态路径处理权限和 detach 竞态，确保失权时清理会话；Receiver 增加 `USB_ACCESSORY_ATTACHED` intent filter，匹配产品身份 `AnPod` / `AnPod USB Direct`，只打开管理界面，不自动请求权限或播放。PC 增加受限 iQOO 11 V2243A `VID_2D95&PID_6013&MI_02` 模式切换入口，需显式选择并确认，取消时收尾；不停止 ADB、不改驱动、不自动播放。README 已将应用内切换作为主要步骤，源码脚本只保留为备用入口。
+
+本轮版本候选为 PC `1.10.1`、Receiver `0.17.1-v3-flow-candidate` / code 35。旧 PC `1.10.0` 与 Receiver code 34 的制品和哈希是历史基线，不能当成本次修复的包级验证。Rust fmt、check 和两个定向 CPU tests 通过；UI TypeScript/Vite build 与 360px smoke 通过。Android 最终定向 suite 9/9 通过（Service 权限失效路径 2 项、accessory permission 3 项、MainActivity USB permission 1 项、serial permission 3 项）。另有 detach 状态回归 1/1 通过：测试直接调用已注册生产 receiver 的 `onReceive`，覆盖 stale accessory 保持 RUNNING、移除后 FAILED/cleanup；Robolectric 未能派发第二次系统 `sendBroadcast`，该测试不代表真实 Android 广播分发或实机拔插。独立代码复核 PASS。签名 APK、portable ZIP 和哈希审计待生成；当前代码尚未在真机安装，未执行 USB 模式切换或音频测试，这些仍为 **NOT_TESTED**。

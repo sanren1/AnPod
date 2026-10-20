@@ -102,7 +102,7 @@ class MainActivity : ComponentActivity() {
     private var aodEnabled by mutableStateOf(false)
     private var aodShownForSession: String? = null
     private var outputEngine by mutableStateOf("audioTrack")
-    private var usbAccessory by mutableStateOf<UsbAccessory?>(null)
+    private var usbDirectAvailable by mutableStateOf(false)
     private var usbPermissionPending by mutableStateOf(false)
     internal data class PendingUsbPermission(val generation: Long, val accessory: UsbAccessory, val action: String)
     private var pendingUsbPermission: PendingUsbPermission? = null
@@ -167,10 +167,10 @@ class MainActivity : ComponentActivity() {
     private fun refreshUsbAccessory() {
         val available = Build.VERSION.SDK_INT >= 24
                 && packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY)
-        usbAccessory = if (available) {
+        usbDirectAvailable = if (available) {
             val manager = getSystemService(UsbManager::class.java)
-            manager?.accessoryList?.firstOrNull { AoaReceiverCoordinator.isProductAccessory(it) }
-        } else null
+            manager?.accessoryList?.any { AoaReceiverCoordinator.isProductAccessory(it) } == true
+        } else false
     }
 
     private fun selectNetwork(item: UiInterface) {
@@ -275,7 +275,7 @@ class MainActivity : ComponentActivity() {
                     onSelect = { selectNetwork(it) },
                     onConnectComputer = { connectComputer() },
                     onConnectUsbDirect = { connectUsbDirect() },
-                    usbDirectAvailable = usbAccessory != null,
+                    usbDirectAvailable = usbDirectAvailable,
                     usbDirectSupported = Build.VERSION.SDK_INT >= 24,
                     usbAccessoryFeatureAvailable = packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY),
                     usbPermissionPending = usbPermissionPending,
@@ -336,11 +336,10 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(UsbManager::class.java)
         val accessory = manager?.accessoryList?.firstOrNull { AoaReceiverCoordinator.isProductAccessory(it) }
         if (accessory == null) {
-            usbAccessory = null
+            usbDirectAvailable = false
             localMessage = getString(R.string.usb_direct_not_attached)
             return
         }
-        usbAccessory = accessory
         val attempt = PendingUsbPermission(discoveryGeneration.incrementAndGet(), accessory,
                 "$packageName.USB_PERMISSION.${discoveryGeneration.get()}")
         pendingUsbPermission = attempt
@@ -386,15 +385,40 @@ class MainActivity : ComponentActivity() {
         pendingUsbPermission = null
         usbPermissionPending = false
         if (!currentAttempt) return
-        if (!granted || returned == null || returned != attempt.accessory) {
+        if (!granted || returned == null) {
             localMessage = getString(R.string.usb_direct_permission_denied)
             return
         }
-        val manager = getSystemService(UsbManager::class.java)
-        val attached = manager?.accessoryList?.firstOrNull {
-            it == attempt.accessory && AoaReceiverCoordinator.isProductAccessory(it)
+        val manager = getSystemService(UsbManager::class.java) ?: run {
+            localMessage = getString(R.string.usb_direct_detached_or_permission_lost)
+            refreshUsbAccessory()
+            return
         }
-        if (manager == null || attached == null || !manager.hasPermission(attached)) {
+        val permissionCurrent = try {
+            manager.hasPermission(returned) && manager.hasPermission(attempt.accessory)
+        } catch (_: SecurityException) {
+            false
+        }
+        if (!permissionCurrent) {
+            localMessage = getString(R.string.usb_direct_detached_or_permission_lost)
+            refreshUsbAccessory()
+            return
+        }
+        val attached = try {
+            if (returned != attempt.accessory) {
+                localMessage = getString(R.string.usb_direct_permission_denied)
+                return
+            }
+            manager.accessoryList?.firstOrNull {
+                manager.hasPermission(it) && it == attempt.accessory
+                        && AoaReceiverCoordinator.isProductAccessory(it)
+            }
+        } catch (_: SecurityException) {
+            null
+        }
+        val attachedStillPermitted = try { attached != null && manager.hasPermission(attached) }
+        catch (_: SecurityException) { false }
+        if (!attachedStillPermitted) {
             localMessage = getString(R.string.usb_direct_detached_or_permission_lost)
             refreshUsbAccessory()
             return

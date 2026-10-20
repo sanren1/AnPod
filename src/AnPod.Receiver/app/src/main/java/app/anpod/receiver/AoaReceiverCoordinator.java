@@ -134,7 +134,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         UsbAccessory[] attached = manager.getAccessoryList();
         if (attached == null) return false;
         for (UsbAccessory candidate : attached)
-            if (expected.equals(candidate) && isProductAccessory(candidate)) return true;
+            if (manager.hasPermission(candidate) && expected.equals(candidate) && isProductAccessory(candidate)) return true;
         return false;
     }
 

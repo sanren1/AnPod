@@ -30,8 +30,10 @@
 - AOA derives a session-only binding secret from the existing ANPB binding;
   it does not change the 69-byte saved ANPB record or reuse the LAN secret as
   an AOA packet key. All AOA audio profiles use the independent ANPU stream
-  envelope and ANPD v2 format. No AOA mode switch is automatic: the product
-  accessory identity is `AnPod` / `AnPod USB Direct`; the separate
+  envelope and ANPD v2 format. The PC app can explicitly switch the supported
+  iQOO 11 V2243A from `VID_2D95&PID_6013&MI_02` into accessory mode after user
+  confirmation; this does not start playback. The product accessory identity
+  is `AnPod` / `AnPod USB Direct`; the separate
   `AnPod Lab` / `AOA Bulk Probe` identity belongs only to the echo probe.
 - The AOA Receiver path requires Android API 24 or later for cancellable
   `FileChannel` I/O; the app's minimum SDK remains 23 and its existing UDP and
@@ -76,7 +78,7 @@ Portable build metadata records the actual packaged component hashes and
 registered source commits. Portable ZIP checks and its checksum are recorded
 in `plan_dev.md`, which is not included in the package.
 
-The Receiver review candidate is version `0.17.0-v3-flow-candidate` / code 34,
+The previous Receiver review candidate was version `0.17.0-v3-flow-candidate` / code 34,
 source commit `8ca9638db128f99e36769f42de18ed9244f457c2`, with
 `sourceModified=false`; its APK SHA-256 is
 `711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83`. Its
@@ -84,7 +86,9 @@ verified release signer is
 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`, and the
 exact APK passed the Rust artifact-read test. This verifies the built
 candidate artifact only; installation and upgrade on a device remain
-`NOT_TESTED`.
+`NOT_TESTED`. The current crash-fix candidate is PC 1.10.1 with Receiver
+`0.17.1-v3-flow-candidate` / code 35; package hashes and offline inspection
+results will be recorded with the generated candidate artifacts.
 
 Real WASAPI capture, physical output format or precision, AOA attach/permission/
 detach behavior on hardware, acoustic quality/latency, hardware routing/focus

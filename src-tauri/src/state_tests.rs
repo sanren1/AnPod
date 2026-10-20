@@ -533,6 +533,16 @@ fn operation_owner_cannot_be_cleared_by_an_older_completion() {
 }
 
 #[test]
+fn aoa_switch_reservation_rejects_existing_operations_without_cancelling_them() {
+    let generation = AtomicU64::new(0);
+    let slot = Mutex::new(None);
+    let (_, current) = begin_operation_slot(&generation, &slot, false).unwrap();
+
+    assert!(try_begin_exclusive_operation(&generation, &slot).is_none());
+    assert!(!current.is_cancelled());
+}
+
+#[test]
 fn cancelled_aoa_start_cannot_publish_over_a_new_operation_generation() {
     let generation = AtomicU64::new(0);
     let slot = Mutex::new(None);

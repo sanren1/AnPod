@@ -67,6 +67,14 @@ pub struct AoaDeviceTarget {
     pub label: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AoaSwitchResult {
+    pub success: bool,
+    pub message: String,
+    pub requires_refresh: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -469,6 +477,7 @@ pub struct AppState {
     host_offer_listener: Mutex<Option<HostOfferListener>>,
     operation: Mutex<Option<ActiveOperation>>,
     operation_generation: AtomicU64,
+    auto_connect_suppressed_after_aoa_switch: AtomicBool,
     recovering: AtomicBool,
     wireless_probe_attempted: AtomicBool,
     failed_auto_connect: Mutex<Option<String>>,
@@ -590,6 +599,7 @@ impl AppState {
             host_offer_listener: Mutex::new(None),
             operation: Mutex::new(None),
             operation_generation: AtomicU64::new(0),
+            auto_connect_suppressed_after_aoa_switch: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             wireless_probe_attempted: AtomicBool::new(false),
             failed_auto_connect: Mutex::new(None),
@@ -634,6 +644,8 @@ impl AppState {
         selected_binding_ref: Option<&str>,
         background_authorization_required: bool,
     ) -> Result<AppSnapshot, String> {
+        self.auto_connect_suppressed_after_aoa_switch
+            .store(false, Ordering::Release);
         let result = self
             .start_network_audio_inner(
                 app,
@@ -910,6 +922,8 @@ impl AppState {
         _selected_binding_ref: Option<&str>,
         _background_authorization_required: bool,
     ) -> Result<AppSnapshot, String> {
+        self.auto_connect_suppressed_after_aoa_switch
+            .store(false, Ordering::Release);
         Err("Windows 网络音频接收仅在 Windows 上可用。".into())
     }
 
@@ -920,6 +934,10 @@ impl AppState {
 
     fn start_background_operation(&self) -> Option<(u64, CancellationToken)> {
         begin_operation_slot(&self.operation_generation, &self.operation, true)
+    }
+
+    fn try_start_exclusive_operation(&self) -> Option<(u64, CancellationToken)> {
+        try_begin_exclusive_operation(&self.operation_generation, &self.operation)
     }
 
     fn start_preemptible_background_operation(&self) -> Option<(u64, CancellationToken)> {
@@ -1259,6 +1277,114 @@ impl AppState {
                 id: target.id,
             })
             .collect())
+    }
+
+    pub async fn list_aoa_switch_targets(&self) -> Result<Vec<AoaDeviceTarget>, String> {
+        let targets = tokio::task::spawn_blocking(aoa_winusb::discover_switch_targets)
+            .await
+            .map_err(|error| format!("AOA 切换目标枚举任务失败：{error}"))?
+            .map_err(|error| format!("无法读取 iQOO 11 WinUSB 接口：{error}"))?;
+        Ok(targets
+            .into_iter()
+            .map(|target| AoaDeviceTarget {
+                label: target.label(),
+                id: target.id,
+            })
+            .collect())
+    }
+
+    pub async fn switch_aoa_mode(
+        &self,
+        app: &AppHandle,
+        target_id: &str,
+    ) -> Result<AoaSwitchResult, String> {
+        let (generation, token) = self
+            .try_start_exclusive_operation()
+            .ok_or_else(|| "AnPod 正在处理其他操作；请稍后再切换 USB 模式。".to_string())?;
+        let result: Result<AoaSwitchResult, String> = async {
+            let _gate = self.gate.lock().await;
+            token_check(&token)?;
+            if self.session.lock().await.is_some() {
+                return Err("AnPod 有活动会话；请先断开后再切换 USB 模式。".into());
+            }
+            if self.wireless_connection_offers().active {
+                return Err(
+                    "当前有待处理的无线连接请求；请先关闭请求监听后再切换 USB 模式。".into(),
+                );
+            }
+            {
+                let mut view = self.view.lock().expect("view lock");
+                if view.busy || view.session_active {
+                    return Err(
+                        "AnPod 正在连接或已有活动会话；请先结束操作后再切换 USB 模式。".into(),
+                    );
+                }
+                view.busy = true;
+                view.state = "connecting".into();
+                view.message = "正在请求手机切换到 USB Direct…".into();
+                view.device_name = Some("iQOO 11 V2243A".into());
+                view.status_detail =
+                    "正在通过已确认的 WinUSB MI_02 接口发送 Android Open Accessory 请求。".into();
+            }
+            self.emit(app);
+            let worker_token = token.clone();
+            let selected_id = target_id.to_owned();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                aoa_winusb::switch_to_accessory(&selected_id, || worker_token.is_cancelled())
+            });
+            let switch_result = tokio::select! {
+                result = &mut worker => result
+                    .map_err(|error| format!("AOA 切换 worker 失败：{error}"))?
+                    .map_err(|error| format!("AOA 切换失败：{error}")),
+                _ = token.cancelled() => {
+                    match worker.await
+                        .map_err(|error| format!("取消 AOA 切换 worker 失败：{error}"))?
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            Err("AOA 切换已取消。".into())
+                        }
+                        Err(error) => Err(format!("AOA 切换失败：{error}")),
+                    }
+                }
+            };
+            switch_result?;
+            self.auto_connect_suppressed_after_aoa_switch
+                .store(true, Ordering::Release);
+            Ok(AoaSwitchResult {
+                success: true,
+                message: "已发送 AOA 切换请求；手机的 ADB/MTP USB 连接将断开，等待手机重新枚举。"
+                    .into(),
+                requires_refresh: true,
+            })
+        }
+        .await;
+        self.finish_operation(generation);
+        if operation_generation_matches(&self.operation_generation, generation) {
+            let mut view = self.view.lock().expect("view lock");
+            if result.is_ok() && view.message == "正在请求手机切换到 USB Direct…" {
+                view.busy = false;
+                view.state = "noDevice".into();
+                view.message = "等待手机重新枚举".into();
+                view.device_name = None;
+                view.status_detail =
+                    "已发送 AOA 切换请求；手机 USB 设备重新出现后可选择 USB Direct。".into();
+            } else if result.is_err() && view.message == "正在请求手机切换到 USB Direct…"
+            {
+                view.busy = false;
+                view.state = if view.devices.is_empty() {
+                    "noDevice"
+                } else {
+                    "ready"
+                }
+                .into();
+                view.message = "USB 模式切换未完成".into();
+                view.device_name = None;
+                view.status_detail = result.as_ref().unwrap_err().clone();
+            }
+        }
+        self.emit(app);
+        result
     }
 
     #[cfg(windows)]
@@ -1612,6 +1738,12 @@ impl AppState {
 
     #[cfg(windows)]
     async fn connect_pending_wireless_offer(&self, app: &AppHandle) -> bool {
+        if self
+            .auto_connect_suppressed_after_aoa_switch
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
         {
             let view = self.view.lock().expect("app view lock");
             if view.session_active
@@ -1881,6 +2013,12 @@ impl AppState {
             return;
         };
         let settings = snapshot.settings.clone();
+        if self
+            .auto_connect_suppressed_after_aoa_switch
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
         let suppressed = self
             .suppressed_auto_connect
             .lock()
@@ -2439,6 +2577,8 @@ impl AppState {
         app: &AppHandle,
         serial: String,
     ) -> Result<OperationResult, String> {
+        self.auto_connect_suppressed_after_aoa_switch
+            .store(false, Ordering::Release);
         let (generation, token) = self.start_operation();
         let _guard = self.gate.lock().await;
         let result = async {
@@ -2568,6 +2708,8 @@ impl AppState {
         serial: String,
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
+        self.auto_connect_suppressed_after_aoa_switch
+            .store(false, Ordering::Release);
         *self
             .failed_auto_connect
             .lock()
@@ -3967,7 +4109,11 @@ impl AppState {
         let mut settings = view.settings.clone();
         match key {
             "autoConnectLastDevice" => {
-                settings.auto_connect_last_device = value.as_bool().ok_or("无效设置值")?
+                settings.auto_connect_last_device = value.as_bool().ok_or("无效设置值")?;
+                if settings.auto_connect_last_device {
+                    self.auto_connect_suppressed_after_aoa_switch
+                        .store(false, Ordering::Release);
+                }
             }
             "minimizeToTray" => settings.minimize_to_tray = value.as_bool().ok_or("无效设置值")?,
             "launchAtLogin" => settings.launch_at_login = value.as_bool().ok_or("无效设置值")?,
