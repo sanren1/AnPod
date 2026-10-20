@@ -34,14 +34,23 @@ bytes against that file. The Java P5-C loopback fixture exposes the authenticate
 probe/fresh-session path to the Rust host and uses synthetic playback. Focused
 Rust↔Java upgrade/rejection and two-generation owner pause/restart checks pass;
 the fixture's final PCM24 low-bit result is true only if every requested session
-decoded the Q.23 samples before its own PAUSE. Java offline checks, Android
-offline checks, all 44 Android Receiver JVM tests, and the targeted Frontend
-build/Playwright check pass. The Phase 4 profile-3 Rust↔Java loopback and owner
-pause/stop/mode fresh-session checks pass. `cargo fmt -- --check`, normal strict
-Clippy, and the locked offline single-thread Rust suite pass; Rust reported 114
+decoded the Q.23 samples before its own PAUSE.
+
+Offline Receiver JVM counts are phase-specific: Phase 3 had 44 passing tests,
+Phase 4 had 47, and the Phase 5 Oboe integration has 55 passing tests (0
+failures, errors, or skips). The Phase 4 profile-3 Rust↔Java loopback and owner
+pause/stop/mode fresh-session checks passed. Its `cargo fmt -- --check`, normal
+strict Clippy, and locked offline single-thread Rust suite passed with 114
 passed, 0 failed, 1 ignored, and 2 filtered in 93.89 seconds. The filtered cases
-are the manual PowerShell artifact check and explicitly requested real-USB
-Receiver test. These checks do not establish real 96 kHz WASAPI capture, device
-AudioTrack 96 kHz output, physical precision, acoustic quality, or long-duration
-stability; all remain
-`NOT_TESTED` pending device validation.
+were the manual PowerShell artifact check and explicitly requested real-USB
+Receiver test. Phase 5 keeps the existing wire formats and transport paths; the
+experimental output engine is a local Receiver preference, defaults to
+AudioTrack, and only affects a new session. Oboe XRun counts remain separate
+from AudioTrack underruns; unsupported/open failures use same-format AudioTrack
+fallback, while runtime failures are reflected on the next audio generation.
+
+Phase 5 source and offline build/JVM acceptance does not establish hardware
+playback. Real WASAPI capture, physical output format or precision, acoustic
+quality/latency, hardware routing/focus behavior, and long-duration stability
+remain `NOT_TESTED`. The verified APK is debug-signed and does not verify a
+release-signed upgrade.

@@ -7,6 +7,8 @@ import java.util.List;
         public final String operationId, operationState, error;
         public final String bindingFingerprint, backgroundListenerState, backgroundGrantKind, backgroundGrantPersistence;
         public final String pendingAuthorizationRequestId, backgroundAuthorizationError;
+        public final String requestedOutputEngine, actualOutputEngine, outputFallbackReason;
+        public final int oboeXrunCount;
         public final int versionCode, networkPort;
         public final long operationGeneration, backgroundGrantRemainingMs, pendingAuthorizationDeadlineElapsedMs;
         public final Boolean playbackAdvancing;
@@ -21,7 +23,9 @@ import java.util.List;
                 String backgroundListenerState, String backgroundGrantKind, String backgroundGrantPersistence,
                 long backgroundGrantRemainingMs,
                 String pendingAuthorizationRequestId, long pendingAuthorizationDeadlineElapsedMs,
-                String backgroundAuthorizationError, P5cDiscovery.SearchSnapshot search) {
+                String backgroundAuthorizationError, P5cDiscovery.SearchSnapshot search,
+                String requestedOutputEngine, String actualOutputEngine, String outputFallbackReason,
+                int oboeXrunCount) {
             this.serviceState = serviceState; this.bindingState = bindingState;
             this.bindingFingerprint = bindingFingerprint;
             this.connectionMethod = connectionMethod; this.playbackMode = playbackMode;
@@ -38,6 +42,10 @@ import java.util.List;
             this.pendingAuthorizationRequestId = pendingAuthorizationRequestId;
             this.pendingAuthorizationDeadlineElapsedMs = pendingAuthorizationDeadlineElapsedMs;
             this.backgroundAuthorizationError = backgroundAuthorizationError;
+            this.requestedOutputEngine = requestedOutputEngine;
+            this.actualOutputEngine = actualOutputEngine;
+            this.outputFallbackReason = outputFallbackReason;
+            this.oboeXrunCount = oboeXrunCount;
             this.searchActive = search.active; this.searchCandidates = search.candidates;
             this.connectionRequestStatus = search.lastRequestStatus;
         }

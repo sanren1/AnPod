@@ -4,7 +4,7 @@
 > 制定日期：2026-10-19  
 > 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；实际本地开发基线为 `dev@a406ced`，后续按 `dev` 提交推进并复核差异。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1 音质配置与 v2 离线协商模拟已完成源码与离线验收；Phase 2 Float32 WASAPI/PCM16 兼容路径已完成源码审查及 Rust/Java/Native 离线门禁，记录见 `docs/audio-quality/02-float-capture.md`。Phase 3 48k/24 已完成源码与离线验收；Phase 4 96k/24 条件路径已完成本轮源码及离线门禁，**真实 96 kHz WASAPI capture、设备 AudioTrack 96 kHz 打开、物理输出有效精度、声学/长时稳定性仍为 NOT_TESTED**。继续推进后续阶段不代表这些实机门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1 音质配置与 v2 离线协商模拟已完成源码与离线验收；Phase 2 Float32 WASAPI/PCM16 兼容路径已完成源码审查及 Rust/Java/Native 离线门禁，记录见 `docs/audio-quality/02-float-capture.md`。Phase 3 48k/24 与 Phase 4 条件式 96k/24 已完成源码及离线验收。Phase 5 Oboe 可选输出实现已通过源码审查和离线构建/JVM 验收；AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。**真实 WASAPI capture、手机硬件输出格式/精度、声学/延迟/长时稳定性，以及 release 签名升级仍为 NOT_TESTED**；后续阶段推进不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
 
 ## 0. 开发指令与决策摘要
 
@@ -350,9 +350,11 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 ### Phase 5 — Oboe Native 可选输出后端（与音质档兼容）
 
-**任务**：Java AudioTrack 接口抽象、实验 Oboe/AAudio Shared 输出、预分配薄 SPSC、格式/缓冲共管及崩溃恢复。按第 14 章对照 Google Oboe `hello-oboe`、`MinimalOboe`、`SoundBoard` 与 `OboeTester`；若采用 ReaderWriterQueue，须验证队列预分配、无回调线程分配和唯一生产者/消费者约束。
+**任务**：抽象 `PlaybackOutput`，提供默认 AudioTrack 与本地设置选择的 Oboe/AAudio Shared Float32 实验后端；用预分配 SPSC ring，并将 ring 与实际 stream buffer 放入既有 15/50 ms 总预算。请求格式不匹配或首次打开失败时同格式使用 AudioTrack；运行中 Oboe 错误 fail-close 当前 audio generation，并在下一次用户请求 Oboe 的新会话中使用 AudioTrack，保留可诊断原因。不得热切换正在播放的会话、静默改用户偏好或引入 SRC。
 
-**交付**：同源 PCM 对照、无线/USB ADB 的 A/B 测试报告。**通过门槛**：Oboe 未被证明胜出前默认仍为 AudioTrack；音频焦点、AOD、通知、暂停恢复和签名升级不回归。
+**交付**：源码与 CPU/离线构建、生命周期及回归门禁；同源 PCM、真机延迟/XRun/声学 A/B 是后续设备验收，不由合成数据代替。Oboe 未经设备实测证明胜出前，AudioTrack 继续作为默认。焦点、AOD、通知和升级行为的设备验证仍须单独完成。
+
+**离线验收状态（2026-10-20）**：Android Receiver `assembleDebug` 与 JVM 测试通过，55/55；四 ABI CMake targets 重建通过，APK 四 ABI 各含 9 个匹配 JNI exports。`libanpod_oboe_output.so` 与 `liboboe.so` 的 ELF LOAD 对齐在四 ABI 均为 0x4000；这不代表所有依赖 ELF 均为 16 KiB 对齐，32 位 `libc++_shared.so` 仍为 0x1000。手动 MSVC Release SPSC CPU 测试通过；Windows MSVC CMake/CTest 因 C1902 未通过，不声称 CTest 通过。APK 中 16 个 `.so` 的 ZIP 数据偏移均可被离线脚本验证为 16 KiB 对齐；Build Tools 34 不支持 `zipalign -P 16`，故此项不是 zipalign 检查结果。Debug APK SHA-256：`96101F5451004E039778196E5CBFF7ECB08B88EEB1547EC9EEB29C5BA2C8DA40`；签名仅为 debug，未验证 release 签名升级。Rust 未在 Phase 5 改动，沿用 Phase 4 离线证据，不计作 Phase 5 新运行门禁。Android UI 视觉检查、真实设备安装/播放、硬件采样率与精度、A/B 声学/延迟/XRun、路由/焦点和长时稳定性仍为 **NOT_TESTED**。复现命令与日志见 `docs/audio-quality/05-oboe-output.md`。
 
 ### Phase 6 — USB Direct AOA 正式接入（已承诺的后续路径）
 

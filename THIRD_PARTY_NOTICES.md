@@ -97,6 +97,17 @@ copyright notices and MIT license texts are included in `LICENSES/` as
 `subtle` 2.6.1 is included as `subtle-BSD-3-Clause.txt`. Shared Apache-2.0
 terms are in `LICENSES/Apache-2.0.txt`.
 
+The optional Android experimental output engine uses the published Oboe
+Prefab AAR, `com.google.oboe:oboe:1.10.0`, licensed under Apache-2.0. Its POM
+declares no transitive dependencies; the AAR supplies the Oboe headers and
+native libraries for four Android ABIs. No Oboe source is copied into AnPod.
+The pinned release and package contents are recorded in
+`upstream/SOURCE_VERSIONS.md`; the license text is included in
+`LICENSES/Apache-2.0.txt` and, for the Receiver APK, in
+`src/AnPod.Receiver/app/src/main/assets/licenses/Oboe-Apache-2.0.txt`. The
+APK's `Oboe-ATTRIBUTION.txt` records the upstream version and copyright owner;
+the upstream release does not contain a separate NOTICE file.
+
 The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
 queue and applies a short fade when trimming backlog. This is AnPod-owned code
 and adds no dependency or change to the Native DLL protocol.

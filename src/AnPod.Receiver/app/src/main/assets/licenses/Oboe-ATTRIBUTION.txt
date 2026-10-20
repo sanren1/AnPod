@@ -1,0 +1,8 @@
+Oboe 1.10.0
+Copyright 2015 The Android Open Source Project
+
+Oboe is distributed under the Apache License, Version 2.0. The corresponding
+license text is in Oboe-Apache-2.0.txt.
+
+Upstream: https://github.com/google/oboe/tree/1.10.0
+Maven artifact: com.google.oboe:oboe:1.10.0

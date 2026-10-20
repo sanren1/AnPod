@@ -107,6 +107,13 @@ final class ReceiverUiState {
         String operationError = service.uiOperation.error();
         if (operationError.isEmpty()) operationError = ReceiverService.networkAudioFailure;
         boolean canRevokeBackgroundTrust = service.canRevokeBackgroundTrust(binding, fingerprint, grantKind);
+        ReceiverService.AudioSession audio = ReceiverService.currentAudio;
+        String requestedEngine = audio == null ? service.requestedOutputEnginePreference()
+                : audio.requestedOutputEngine;
+        String fallbackReason = audio == null
+                ? ("oboeExperimental".equals(requestedEngine)
+                        ? ReceiverService.pendingOboeFallbackReasonForUi() : "")
+                : audio.outputFallbackReason;
         return new UiSnapshot(state, binding, fingerprint, method, mode, BuildConfig.VERSION_NAME,
                 BuildConfig.VERSION_CODE, service.uiOperation.ownerId(), service.uiOperation.phase(), operationError,
                 service.currentOperationGeneration, ReceiverService.networkAudioAddress, ReceiverService.networkAudioPort, service.backgroundStandbyEnabled,
@@ -114,7 +121,10 @@ final class ReceiverUiState {
                 listenerState, grantKind, grantPersistence, grantRemainingMs, pendingRequestId,
                 pendingDeadlineElapsedMs, authorizationError,
                 service.networkCoordinator == null ? new P5cDiscovery.SearchSnapshot(false, Collections.emptyList(), "idle")
-                        : service.networkCoordinator.searchSnapshot());
+                        : service.networkCoordinator.searchSnapshot(),
+                requestedEngine,
+                audio == null ? "unknown" : audio.actualOutputEngine,
+                fallbackReason, audio == null ? -1 : audio.oboeXrunCount);
     }
 
     List<UiInterface> interfaces() {

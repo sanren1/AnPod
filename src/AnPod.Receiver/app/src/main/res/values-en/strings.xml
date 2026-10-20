@@ -1,6 +1,15 @@
 <resources>
     <string name="app_name">AnPod</string>
     <string name="audio_output">Audio output</string>
+    <string name="output_engine_title">Playback engine</string>
+    <string name="output_engine_description">Applies to the next playback session. The current session will not switch.</string>
+    <string name="output_engine_audio_track">AudioTrack (default)</string>
+    <string name="output_engine_oboe">Oboe (experimental)</string>
+    <string name="output_engine_unknown">Unknown</string>
+    <string name="output_engine_actual">Actual engine for this session: %1$s</string>
+    <string name="output_engine_oboe_xruns">Oboe XRuns: %1$d</string>
+    <string name="output_engine_oboe_xruns_unknown">Oboe XRuns: unknown</string>
+    <string name="output_engine_fallback">Fell back to AudioTrack: %1$s</string>
     <string name="audio_playback_progress_advancing">Playback is active</string>
     <string name="audio_playback_progress_unknown">Playback status is unknown</string>
     <string name="audio_received_playback_not_advancing">Playback has not advanced</string>

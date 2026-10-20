@@ -318,6 +318,22 @@ falls behind and applies a short fade at the trim boundary. This is new AnPod
 code in the shared Android protocol helper; it adds no dependency and does not
 change the Native DLL protocol or the legacy Android service wire format.
 
+### B14. Optional Oboe output adapter *(P5, experimental)*
+
+`AudioTrackPlaybackOutput.java` extracts the existing AudioShare-adapted
+`AudioTrack` writes and release path from the installed Receiver service; the
+default engine and legacy PCM16 byte path remain `AudioTrack`. The optional
+Oboe selection is a local Receiver preference for a new playback session. Its
+Java/native implementation—`OboeNativeBridge.java`, `OboePlaybackOutput.java`,
+`OboeOutputException.java`, `PlaybackOutput.java`, `OboeNativeBridge.cpp`, and
+`SpscFloatRing.h`—including the preallocated Float32 SPSC ring, is AnPod code.
+No Oboe source is copied: the build consumes the pinned
+`com.google.oboe:oboe:1.10.0` Apache-2.0 Prefab AAR described in
+`THIRD_PARTY_NOTICES.md` and `SOURCE_VERSIONS.md`. Runtime Oboe failure closes
+the active audio generation; a later session reports a one-shot same-format
+AudioTrack fallback rather than hot-switching the current stream. An initial
+open failure can use same-format AudioTrack in that session.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.

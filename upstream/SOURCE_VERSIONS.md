@@ -22,6 +22,7 @@ are deliberately not used (plan §2.2.1) — a rebuild must produce the same cod
 | *(new)* | `src/AnPod.Native/audio_capture.h` | New public ABI header (upstream had none) |
 | `server/src/main/java/com/ysbing/audioshare/Main.java` | `src/AnPod.AndroidServer/src/main/java/com/anpod/server/Main.java` | Package renamed, header validation added |
 | `server/src/main/java/com/ysbing/audioshare/Main.java` | `src/AnPod.Receiver/app/src/main/java/app/anpod/receiver/ReceiverService.java` | AudioTrack playback path adapted for an installed Android service; lifecycle and diagnostics are AnPod changes, see `PATCHES.md` |
+| `server/src/main/java/com/ysbing/audioshare/Main.java` | `src/AnPod.Receiver/app/src/main/java/app/anpod/receiver/AudioTrackPlaybackOutput.java` | Extracted from the Receiver's AudioShare-adapted playback path; see `PATCHES.md` B14 |
 | `server/src/main/java/com/ysbing/audioshare/Options.java` | `src/AnPod.AndroidServer/src/main/java/com/anpod/server/Options.java` | Package renamed, length limits added |
 | `server/build.gradle` | `src/AnPod.AndroidServer/build.gradle` | Payload copy target changed to `deps/server` |
 | *(new Android app)* | `src/AnPod.Receiver/` | AnPod Receiver APK, service lifecycle, protected health provider and build entry; includes the AudioShare-derived playback adaptation above |
@@ -89,3 +90,23 @@ must be copied into `deps/` are `adb.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll`.
 > and confirm the redistribution clause permits bundling (plan §7.3/§P5.4).
 > The version is now pinned; the terms review is a human step and is tracked in
 > `LICENSES/ADB-NOTICE.txt`.
+
+---
+
+## 4. google/oboe — Android native audio output
+
+| Field | Value |
+|---|---|
+| Maven artifact | `com.google.oboe:oboe:1.10.0` (AAR with Prefab package) |
+| Upstream repository | <https://github.com/google/oboe> |
+| Upstream release | `1.10.0` (tag `1.10.0`, release commit `a81bb9f`) |
+| License | Apache-2.0 (see `LICENSES/Apache-2.0.txt`) |
+| Retrieved | 2026-10-20 |
+
+AnPod consumes the published Prefab AAR; it does not copy Oboe source into the
+repository. The AAR contains the Oboe headers and `liboboe.so` for Android
+`x86`, `x86_64`, `armeabi-v7a` and `arm64-v8a`. The Maven POM declares no
+transitive dependencies. The Apache-2.0 license text is already included in
+`LICENSES/Apache-2.0.txt`; the upstream tag has no separate `NOTICE` file.
+The Receiver APK includes that license text and a short attribution record in
+`app/src/main/assets/licenses/`.

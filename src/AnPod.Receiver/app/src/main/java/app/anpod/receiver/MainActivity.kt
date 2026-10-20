@@ -96,6 +96,7 @@ class MainActivity : ComponentActivity() {
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
     private var aodEnabled by mutableStateOf(false)
     private var aodShownForSession: String? = null
+    private var outputEngine by mutableStateOf("audioTrack")
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -227,7 +228,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        aodEnabled = getSharedPreferences("anpod_receiver", MODE_PRIVATE).getBoolean("aod_enabled", false)
+        val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
+        aodEnabled = preferences.getBoolean("aod_enabled", false)
+        outputEngine = when (preferences.getString("output_engine", "audioTrack")) {
+            "oboeExperimental" -> "oboeExperimental"
+            else -> "audioTrack"
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             ReceiverTheme {
@@ -252,6 +258,13 @@ class MainActivity : ComponentActivity() {
                     },
                     aodEnabled = aodEnabled,
                     onToggleAod = { updateAodEnabled(it) },
+                    outputEngine = outputEngine,
+                    onOutputEngineChange = { value ->
+                        outputEngine = value
+                        getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit()
+                            .putString("output_engine", value)
+                            .apply()
+                    },
                     onOpenAod = { openAod() },
                     onCopyDiagnostics = { copyDiagnostics(it) },
                     onOpenNotificationSettings = { openNotificationSettings() }
@@ -412,6 +425,8 @@ private fun ReceiverScreen(
     onStop: () -> Unit,
     aodEnabled: Boolean,
     onToggleAod: (Boolean) -> Unit,
+    outputEngine: String,
+    onOutputEngineChange: (String) -> Unit,
     onOpenAod: () -> Unit,
     onCopyDiagnostics: (String) -> Unit,
     onOpenNotificationSettings: () -> Unit
@@ -490,6 +505,8 @@ private fun ReceiverScreen(
                 })
             }
 
+
+            OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -661,6 +678,72 @@ private fun ReceiverScreen(
         )
     }
 }
+
+@Composable
+private fun OutputEnginePicker(snapshot: UiSnapshot?, outputEngine: String, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = outputEngineLabel(outputEngine)
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.output_engine_title), style = MaterialTheme.typography.titleMedium)
+            Text(
+                stringResource(R.string.output_engine_description),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = { expanded = true },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+            ) { Text(selectedLabel) }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.output_engine_audio_track)) },
+                    onClick = { onSelect("audioTrack"); expanded = false }
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.output_engine_oboe)) },
+                    onClick = { onSelect("oboeExperimental"); expanded = false }
+                )
+            }
+            val sessionActive = snapshot?.serviceState in setOf(
+                "prepared", "authenticated", "receiverRunning", "streaming", "paused"
+            )
+            if (sessionActive) {
+                Text(
+                    stringResource(R.string.output_engine_actual, outputEngineLabel(snapshot?.actualOutputEngine.orEmpty())),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (snapshot?.actualOutputEngine == "oboeExperimental") {
+                    Text(
+                        if (snapshot.oboeXrunCount >= 0)
+                            stringResource(R.string.output_engine_oboe_xruns, snapshot.oboeXrunCount)
+                        else stringResource(R.string.output_engine_oboe_xruns_unknown),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            val fallbackReason = snapshot?.outputFallbackReason.orEmpty()
+            if (fallbackReason.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.output_engine_fallback, fallbackReason),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun outputEngineLabel(engine: String): String = stringResource(
+    when (engine) {
+        "audioTrack" -> R.string.output_engine_audio_track
+        "oboeExperimental" -> R.string.output_engine_oboe
+        else -> R.string.output_engine_unknown
+    }
+)
 
 @Composable
 private fun backgroundStandbyStatus(

@@ -60,6 +60,9 @@ import java.util.UUID;
  * with the app_process implementation; see upstream/PATCHES.md for changes.
  */
 public final class ReceiverService extends Service {
+    private static final Object OBOE_OUTPUT_LOCK = new Object();
+    private static String pendingOboeFallbackReason = "";
+    private static OboePlaybackOutput deferredOboeClose;
     public static final String ACTION_UI_START_NETWORK_AUDIO = "app.anpod.receiver.action.UI_START_NETWORK_AUDIO";
     private static final String ACTION_NOTIFICATION_STOP = "app.anpod.receiver.action.NOTIFICATION_STOP";
     static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
@@ -747,6 +750,8 @@ public final class ReceiverService extends Service {
         }
         AudioSession session = new AudioSession(NEXT_AUDIO_ID.incrementAndGet(), request,
                 uiOperation.ownerId(), networkBootstrapGeneration.get());
+        session.requestedOutputEngine = requestedOutputEnginePreference();
+        session.actualOutputEngine = "unknown";
         currentAudio = session;
         synchronized (STATUS_LOCK) {
             statusAudioId = session.id;
@@ -1265,37 +1270,47 @@ public final class ReceiverService extends Service {
     private void setUdpAudioPaused(AudioSession session, boolean paused) throws IOException {
         if (session == null || currentAudio != session || session.request.udpContext == null)
             throw new IOException("NetworkAudioSessionNotOwned");
-        IOException failure = null;
+        PlaybackOutput output;
+        boolean shouldPause = false;
+        boolean shouldResume = false;
+        Exception pauseRequestFailure = null;
         synchronized (session) {
             ensureRunning(session);
             AudioFocusState.Action action = session.focusState.setUserPaused(paused);
             if (session.udpQueue != null) session.udpQueue.setPaused(!session.focusState.canPlay());
             if (session.floatQueue != null) session.floatQueue.setPaused(!session.focusState.canPlay());
-            if (action == AudioFocusState.Action.PAUSE && session.audioTrack != null
+            output = session.playbackOutput;
+            if (action == AudioFocusState.Action.PAUSE && output != null
                     && (session.trackPlaying || !session.trackReady)) {
-                try { pauseAndFlushTrack(session, session.audioTrack); }
-                catch (RuntimeException error) {
-                    session.focusState.cancel();
-                    failure = new IOException("AudioPauseFailed: " + describeFailure(error), error);
+                shouldPause = true;
+                if (session.playbackOutput == output) {
+                    try { output.requestPause(); }
+                    catch (IOException | RuntimeException error) { pauseRequestFailure = error; }
                 }
             } else if (!paused && session.trackReady && !session.trackPlaying
-                    && session.audioTrack != null && session.focusState.canPlay()) {
-                try {
-                    session.audioTrack.play();
-                    session.trackPlaying = true;
-                    session.focusState.markTrackPlaying();
-                    session.driftPlaybackHead.reset(session.audioTrack.getPlaybackHeadPosition(), System.nanoTime());
-                    session.driftResetGeneration++;
-                    synchronized (STATUS_LOCK) {
-                        if (statusAudioId == session.id) audioActive = true;
-                    }
-                } catch (IllegalStateException error) {
-                    throw new IOException("AudioTrack resume failed", error);
-                }
+                    && output != null && session.focusState.canPlay()) {
+                shouldResume = true;
             }
             session.notifyAll();
         }
-        if (failure != null) {
+        try {
+            if (shouldPause) {
+                if (pauseRequestFailure instanceof IOException) throw (IOException) pauseRequestFailure;
+                if (pauseRequestFailure instanceof RuntimeException) throw (RuntimeException) pauseRequestFailure;
+                pauseAndFlushOutput(session, output);
+            } else if (shouldResume) {
+                synchronized (session) {
+                    if (session.playbackOutput == output && session.focusState.canPlay())
+                        {
+                            String failure = resumeFocusedOutput(session, output);
+                            if (!failure.isEmpty()) throw new IOException(failure);
+                        }
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            if (!noteOboeRuntimeFailureIfActive(session, output, error)) return;
+            session.focusState.cancel();
+            IOException failure = new IOException("Audio pause/resume failed: " + describeFailure(error), error);
             cancelAudio(session, failure.getMessage());
             throw failure;
         }
@@ -1304,6 +1319,7 @@ public final class ReceiverService extends Service {
     private void receiveFloatAudio(AudioSession session) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
+        PlaybackOutput output = null;
         AudioManager manager = null;
         AudioFocusRequest focusRequest = null;
         AudioManager.OnAudioFocusChangeListener focusListener = null;
@@ -1340,60 +1356,93 @@ public final class ReceiverService extends Service {
                 networkThread.start();
             }
 
-            OpenedV2Track openedTrack = openV2AudioTrack(sourceFormat.sampleRate,
-                    AudioFormat.CHANNEL_OUT_STEREO);
-            track = openedTrack.track;
+            output = openOboeOutputIfRequested(session, sourceFormat.sampleRate, sourceFormat.channels,
+                    lowLatency, Math.max(1, sourceFormat.sampleRate / 200));
+            OpenedV2Track openedTrack = null;
+            if (output == null) {
+                openedTrack = openV2AudioTrack(sourceFormat.sampleRate, AudioFormat.CHANNEL_OUT_STEREO);
+                output = new AudioTrackPlaybackOutput(openedTrack.track, openedTrack.formatCode, openedTrack.frameBytes);
+                recordOutputOpened(session, output);
+            }
+            track = output.audioTrack();
             synchronized (session) {
                 ensureRunning(session);
+                session.playbackOutput = output;
                 session.audioTrack = track;
                 session.trackWrittenFrames = 0;
-                session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
-                session.openedTrackFormatV2 = openedTrack.formatCode;
-                session.openedTrackChannelsV2 = track.getChannelCount();
-                session.openedTrackSampleRateV2 = track.getSampleRate();
+                if (track != null) session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+                session.openedTrackFormatV2 = output.formatCode();
+                session.openedTrackChannelsV2 = output.channels();
+                session.openedTrackSampleRateV2 = output.sampleRate();
             }
 
-            int capacityFrames = Build.VERSION.SDK_INT >= 24
-                    ? track.getBufferCapacityInFrames() : track.getBufferSizeInFrames();
-            int requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
-                    sourceFormat.sampleRate, Math.max(1, capacityFrames), lowLatency);
-            int acceptedBufferFrames = Build.VERSION.SDK_INT >= 24
-                    ? track.setBufferSizeInFrames(requestedBufferFrames) : -1;
-            int effectiveFrames = track.getBufferSizeInFrames();
-            int requestedStartFrames = 0;
-            int thresholdFrames = -1;
-            boolean thresholdLimited = false;
-            if (Build.VERSION.SDK_INT >= 31 && lowLatency && acceptedBufferFrames >= 0) {
-                requestedStartFrames = Math.min(acceptedBufferFrames, Math.max(1,
-                        sourceFormat.sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
-                int acceptedStartFrames = track.setStartThresholdInFrames(requestedStartFrames);
-                thresholdLimited = acceptedStartFrames < 0 || acceptedStartFrames != requestedStartFrames;
-                thresholdFrames = track.getStartThresholdInFrames();
+            int capacityFrames;
+            int requestedBufferFrames;
+            int acceptedBufferFrames;
+            int effectiveFrames;
+            int thresholdFrames;
+            String configuredMode;
+            if (track != null) {
+                capacityFrames = output.capacityFrames();
+                requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                        sourceFormat.sampleRate, Math.max(1, capacityFrames), lowLatency);
+                acceptedBufferFrames = Build.VERSION.SDK_INT >= 24
+                        ? track.setBufferSizeInFrames(requestedBufferFrames) : -1;
+                effectiveFrames = output.effectiveBufferFrames();
+                int requestedStartFrames = 0;
+                boolean thresholdLimited = false;
+                thresholdFrames = -1;
+                if (Build.VERSION.SDK_INT >= 31 && lowLatency && acceptedBufferFrames >= 0) {
+                    requestedStartFrames = Math.min(acceptedBufferFrames, Math.max(1,
+                            sourceFormat.sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
+                    int acceptedStartFrames = track.setStartThresholdInFrames(requestedStartFrames);
+                    thresholdLimited = acceptedStartFrames < 0 || acceptedStartFrames != requestedStartFrames;
+                    thresholdFrames = output.startThresholdFrames();
+                }
+                configuredMode = acceptedBufferFrames < 0 ? "balanced-fallback"
+                        : acceptedBufferFrames == requestedBufferFrames && !thresholdLimited
+                                ? (lowLatency ? "low-latency" : "balanced")
+                                : (lowLatency ? "low-latency-limited" : "balanced-limited");
+                if (lowLatency && requestedStartFrames > 0 && thresholdFrames != requestedStartFrames)
+                    configuredMode = "low-latency-limited";
+            } else {
+                int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                        : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+                requestedBufferFrames = sourceFormat.sampleRate * budgetMs / 1000;
+                capacityFrames = output.capacityFrames();
+                acceptedBufferFrames = output.effectiveBufferFrames();
+                effectiveFrames = output.effectiveBufferFrames();
+                thresholdFrames = -1;
+                configuredMode = lowLatency ? "low-latency" : "balanced";
             }
-            String configuredMode = acceptedBufferFrames < 0 ? "balanced-fallback"
-                    : acceptedBufferFrames == requestedBufferFrames && !thresholdLimited
-                            ? (lowLatency ? "low-latency" : "balanced")
-                            : (lowLatency ? "low-latency-limited" : "balanced-limited");
-            if (lowLatency && requestedStartFrames > 0 && thresholdFrames != requestedStartFrames)
-                configuredMode = "low-latency-limited";
             publishMode(session, configuredMode);
-            int minBufferFrames = Math.max(1, (openedTrack.minBufferBytes + openedTrack.frameBytes - 1)
-                    / openedTrack.frameBytes);
+            int minBufferFrames = openedTrack == null ? Math.max(1, sourceFormat.sampleRate / 200)
+                    : Math.max(1, (openedTrack.minBufferBytes + openedTrack.frameBytes - 1)
+                            / openedTrack.frameBytes);
             int preRollFrames = lowLatency && thresholdFrames > 0
                     ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
-            publishMetrics(session, track.getSampleRate(), track.getChannelCount(), capacityFrames,
+            if (output instanceof OboePlaybackOutput) {
+                preRollFrames = Math.min(preRollFrames, output.ringCapacityFrames());
+                if (preRollFrames < output.framesPerBurst())
+                    throw new IOException("Oboe ring cannot hold one callback burst of pre-roll");
+                requestedBufferFrames = output.info()[11];
+                acceptedBufferFrames = output.effectiveBufferFrames();
+                effectiveFrames = output.effectiveBufferFrames();
+            }
+            publishMetrics(session, output.sampleRate(), output.channels(), capacityFrames,
                     requestedBufferFrames, acceptedBufferFrames, effectiveFrames, thresholdFrames,
-                    Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, preRollFrames, configuredMode);
+                    output.underrunCount(), preRollFrames, configuredMode);
+            session.oboeXrunCount = output.oboeXrunCount();
 
             int chunkFrames = Math.max(1, sourceFormat.sampleRate / 200);
             float[] samples = new float[(chunkFrames + 1) * sourceFormat.channels];
-            byte[] packed = openedTrack.formatCode == 2
+            byte[] packed = openedTrack != null && openedTrack.formatCode == 2
                     ? new byte[(chunkFrames + 1) * openedTrack.frameBytes] : null;
             manager = getSystemService(AudioManager.class);
             final AudioSession focusSession = session;
-            final AudioTrack focusTrack = track;
+            final PlaybackOutput focusOutput = output;
             focusListener = change -> handler.post(() ->
-                    handleAudioFocusChange(focusSession, focusTrack, change));
+                    handleAudioFocusChange(focusSession, focusOutput, change));
             boolean focusRequested = false;
             while (true) {
                 V2PreRollProgress preRoll = new V2PreRollProgress(session.focusState.writeGeneration());
@@ -1404,7 +1453,7 @@ public final class ReceiverService extends Service {
                     int count = readFloatFrames(queue, samples,
                             Math.min(chunkFrames, preRollFrames - preRoll.completedFrames()));
                     if (count < 0) throw new IOException("FloatAudioStreamEndedBeforePlayback");
-                    boolean complete = writeV2Frames(session, track, openedTrack, samples, count, packed,
+                    boolean complete = writeV2Frames(session, output, samples, count, packed,
                             blockGeneration);
                     long currentGeneration = session.focusState.writeGeneration();
                     preRoll.recordWrite(blockGeneration, currentGeneration, count, complete);
@@ -1430,8 +1479,8 @@ public final class ReceiverService extends Service {
                     ensureRunning(session);
                     session.trackReady = true;
                     if (session.focusState.canPlay()) {
-                        track.play();
-                        if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                        output.play();
+                        if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
                         session.focusState.markTrackPlaying();
@@ -1447,13 +1496,15 @@ public final class ReceiverService extends Service {
                     queue.initialTargetFrames());
             long driftNow = System.nanoTime();
             drift.reset(driftNow);
-            session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), driftNow);
+            long initialPlaybackHead = output.playbackHeadPosition();
+            if (initialPlaybackHead >= 0) session.driftPlaybackHead.reset((int) initialPlaybackHead, driftNow);
             long observedDriftResetGeneration = session.driftResetGeneration;
             long observedConcealedFrames = queue.concealedFrames();
             long observedDroppedFrames = queue.droppedFrames();
             long observedExpiredFrames = queue.expiredFrames();
             long observedOversizedGapSkips = queue.oversizedGapSkips();
-            int observedUnderruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+            int observedUnderruns = output.discontinuityCount();
+            session.oboeXrunCount = output.oboeXrunCount();
 
             while (true) {
                 ensureRunning(session);
@@ -1466,13 +1517,15 @@ public final class ReceiverService extends Service {
                 }
                 if (!session.focusState.acceptsWrite(blockGeneration)) continue;
                 long nowNanos = System.nanoTime();
-                int playbackPosition = track.getPlaybackHeadPosition();
-                long playedFrames = session.driftPlaybackHead.update(playbackPosition, nowNanos);
+                long playbackPosition = output.playbackHeadPosition();
+                long playedFrames = playbackPosition < 0 ? 0
+                        : session.driftPlaybackHead.update((int) playbackPosition, nowNanos);
                 long concealedFrames = queue.concealedFrames();
                 long droppedFrames = queue.droppedFrames();
                 long expiredFrames = queue.expiredFrames();
                 long oversizedGapSkips = queue.oversizedGapSkips();
-                int underrunsBefore = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+                int underrunsBefore = output.discontinuityCount();
+                session.oboeXrunCount = output.oboeXrunCount();
                 boolean discontinuity = concealedFrames != observedConcealedFrames
                         || droppedFrames != observedDroppedFrames
                         || expiredFrames != observedExpiredFrames
@@ -1481,9 +1534,9 @@ public final class ReceiverService extends Service {
                                 && observedUnderruns != underrunsBefore)
                         || observedDriftResetGeneration != session.driftResetGeneration;
                 boolean playing = session.trackPlaying
-                        && session.driftPlaybackHead.isAdvancing(nowNanos)
+                        && (playbackPosition < 0 || session.driftPlaybackHead.isAdvancing(nowNanos))
                         && concealedFrames == observedConcealedFrames;
-                long pendingFrames = Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, playedFrames);
+                long pendingFrames = output.pendingFrames(session.trackWrittenFrames, playedFrames);
                 long waterlineFrames = (long) queue.queuedFrames() + count + pendingFrames;
                 int adjustment = drift.observe(nowNanos, waterlineFrames, playing, discontinuity);
                 int outputFrames = count;
@@ -1491,32 +1544,46 @@ public final class ReceiverService extends Service {
                     outputFrames = queue.adjustDrift(samples, count, chunkFrames + 1, adjustment);
                     drift.commit(adjustment);
                 }
-                writeV2Frames(session, track, openedTrack, samples, outputFrames, packed, blockGeneration);
+                writeV2Frames(session, output, samples, outputFrames, packed, blockGeneration);
                 observedDriftResetGeneration = session.driftResetGeneration;
                 observedConcealedFrames = concealedFrames;
                 observedDroppedFrames = droppedFrames;
                 observedExpiredFrames = expiredFrames;
                 observedOversizedGapSkips = oversizedGapSkips;
                 observedUnderruns = underrunsBefore;
-                if (Build.VERSION.SDK_INT >= 24) {
-                    int underruns = track.getUnderrunCount();
+                int reportedUnderruns = output.underrunCount();
+                if (reportedUnderruns >= 0) {
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) {
-                            underrunIncrement = underrunCount < 0 || underruns < underrunCount
-                                    ? -1 : underruns - underrunCount;
-                            underrunCount = underruns;
+                            underrunIncrement = underrunCount < 0 || reportedUnderruns < underrunCount
+                                    ? -1 : reportedUnderruns - underrunCount;
+                            underrunCount = reportedUnderruns;
                         }
                     }
                 }
             }
         } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
             failure = session.cancelled ? session.stopReason : describeFailure(error);
         } finally {
             session.trackPlaying = false;
-            String trackReleaseFailure;
+            String trackReleaseFailure = "";
             synchronized (session) {
+                if (output != null) {
+                    try { output.close(); }
+                    catch (IOException | RuntimeException error) {
+                        noteOboeRuntimeFailure(session, error);
+                        try { output.close(); }
+                        catch (IOException | RuntimeException retryError) {
+                            error.addSuppressed(retryError);
+                            noteOboeRuntimeFailure(session, retryError);
+                            retainDeferredOboeClose(output);
+                            trackReleaseFailure = "Audio output close failed: " + describeFailure(error);
+                        }
+                    }
+                }
                 if (session.audioTrack == track) session.audioTrack = null;
-                trackReleaseFailure = releaseTrack(track);
+                if (session.playbackOutput == output) session.playbackOutput = null;
                 session.openedTrackFormatV2 = 0;
                 session.openedTrackChannelsV2 = 0;
                 session.openedTrackSampleRateV2 = 0;
@@ -1553,6 +1620,95 @@ public final class ReceiverService extends Service {
                 || format.profile == 3 && format.sampleRate == 96_000)
                 && format.channels == 2 && format.sampleFormat == 2 && format.validBits == 24
                 && format.bytesPerSample == Pcm24PackedCodec.BYTES_PER_SAMPLE && format.frameBytes == 6;
+    }
+
+    String requestedOutputEnginePreference() {
+        String value = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
+                .getString("output_engine", "audioTrack");
+        return "oboeExperimental".equals(value) ? "oboeExperimental" : "audioTrack";
+    }
+
+    PlaybackOutput openOboeOutputIfRequested(AudioSession session, int sampleRate, int channels,
+            boolean lowLatency, int maxWriteFrames) {
+        if (!"oboeExperimental".equals(session.requestedOutputEngine)) return null;
+        boolean previousClosed = retryDeferredOboeClose();
+        String nextSessionReason;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            nextSessionReason = pendingOboeFallbackReason;
+            pendingOboeFallbackReason = "";
+        }
+        if (!nextSessionReason.isEmpty()) {
+            session.outputFallbackReason = nextSessionReason;
+            return null;
+        }
+        if (!previousClosed) {
+            session.outputFallbackReason = "Previous Oboe stream has not closed; using AudioTrack";
+            return null;
+        }
+        int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+        int totalBudgetFrames = sampleRate * budgetMs / 1000;
+        try {
+            PlaybackOutput output = OboePlaybackOutput.open(sampleRate, channels, totalBudgetFrames, maxWriteFrames);
+            session.playbackOutput = output;
+            session.actualOutputEngine = output.engine();
+            session.outputFallbackReason = "";
+            return output;
+        } catch (IOException | RuntimeException | UnsatisfiedLinkError error) {
+            session.outputFallbackReason = describeFailure(error);
+            return null;
+        }
+    }
+
+    private static boolean retryDeferredOboeClose() {
+        OboePlaybackOutput deferred;
+        synchronized (OBOE_OUTPUT_LOCK) { deferred = deferredOboeClose; }
+        if (deferred == null) return true;
+        try {
+            deferred.close();
+            synchronized (OBOE_OUTPUT_LOCK) {
+                if (deferredOboeClose == deferred) deferredOboeClose = null;
+            }
+            return true;
+        } catch (IOException | RuntimeException error) {
+            return false;
+        }
+    }
+
+    static void retainDeferredOboeClose(PlaybackOutput output) {
+        if (!(output instanceof OboePlaybackOutput)) return;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            if (deferredOboeClose == null) deferredOboeClose = (OboePlaybackOutput) output;
+        }
+    }
+
+    static void noteOboeRuntimeFailure(AudioSession session, Throwable error) {
+        if (!(error instanceof OboeOutputException)
+                || !"oboeExperimental".equals(session.actualOutputEngine)) return;
+        String reason = describeFailure((Exception) error);
+        session.outputFallbackReason = reason;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            if (pendingOboeFallbackReason.isEmpty()) pendingOboeFallbackReason = reason;
+        }
+    }
+
+    private static boolean noteOboeRuntimeFailureIfActive(AudioSession session, PlaybackOutput output,
+            Throwable error) {
+        synchronized (session) {
+            if (currentAudio != session || session.cancelled || session.playbackOutput != output) return false;
+            noteOboeRuntimeFailure(session, error);
+            return true;
+        }
+    }
+
+    static String pendingOboeFallbackReasonForUi() {
+        synchronized (OBOE_OUTPUT_LOCK) { return pendingOboeFallbackReason; }
+    }
+
+    static void recordOutputOpened(AudioSession session, PlaybackOutput output) {
+        session.playbackOutput = output;
+        session.audioTrack = output.audioTrack();
+        session.actualOutputEngine = output.engine();
     }
 
     static OpenedV2Track openV2AudioTrack(int sampleRate, int channelMask) throws IOException {
@@ -1671,6 +1827,54 @@ public final class ReceiverService extends Service {
         });
     }
 
+    boolean writeV2Frames(AudioSession session, PlaybackOutput output, float[] samples,
+            int frameCount, byte[] packed, long generation) throws IOException {
+        if (frameCount <= 0) return true;
+        if (output instanceof OboePlaybackOutput) {
+            int offset = 0;
+            while (offset < frameCount) {
+                ensureRunning(session);
+                if (!session.focusState.acceptsWrite(generation)) return false;
+                int written = output.writeFloatFrames(samples, offset, frameCount - offset, packed);
+                if (written < 0 || written > frameCount - offset)
+                    throw new IOException("Oboe returned an invalid partial frame count: " + written);
+                if (written == 0) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(250_000L);
+                    if (Thread.currentThread().isInterrupted())
+                        throw new IOException("Oboe output write interrupted");
+                    continue;
+                }
+                synchronized (session) {
+                    if (!session.focusState.acceptsWrite(generation)) return false;
+                    ensureRunning(session);
+                    session.trackWrittenFrames += written;
+                    PCM_BYTES_WRITTEN.addAndGet(written * output.channels() * Float.BYTES);
+                    session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+                }
+                WAVEFORM.accept(samples, offset * output.channels(), written, output.channels(), System.nanoTime());
+                offset += written;
+                if (!session.focusState.acceptsWrite(generation)) return false;
+            }
+            return true;
+        }
+        return writeV2WithGeneration(session.focusState, generation, frameCount, (offsetFrames, remainingFrames) -> {
+            ensureRunning(session);
+            int writtenFrames = output.writeFloatFrames(samples, offsetFrames, remainingFrames, packed);
+            if (writtenFrames <= 0) throw new IOException("AudioTrack V2 write failed: " + writtenFrames);
+            synchronized (session) {
+                if (!session.focusState.acceptsWrite(generation)) return writtenFrames;
+                ensureRunning(session);
+                session.trackWrittenFrames += writtenFrames;
+                PCM_BYTES_WRITTEN.addAndGet(writtenFrames * output.channels()
+                        * (output.formatCode() == 2 ? 3 : Float.BYTES));
+                session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+            }
+            WAVEFORM.accept(samples, offsetFrames * output.channels(), writtenFrames,
+                    output.channels(), System.nanoTime());
+            return writtenFrames;
+        });
+    }
+
     interface V2PartialFrameWriter {
         int write(int offsetFrames, int remainingFrames) throws IOException;
     }
@@ -1726,12 +1930,15 @@ public final class ReceiverService extends Service {
     }
 
     private void receiveAudio(AudioSession session) {
+        if (!retryDeferredOboeClose())
+            session.outputFallbackReason = "Previous Oboe stream has not closed; retaining AudioTrack output";
         if (session.request.udpContext != null && session.request.udpContext.formatV2 != null) {
             receiveFloatAudio(session);
             return;
         }
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
+        PlaybackOutput output = null;
         AudioManager manager = null;
         AudioFocusRequest focusRequest = null;
         AudioManager.OnAudioFocusChangeListener focusListener = null;
@@ -1793,6 +2000,9 @@ public final class ReceiverService extends Service {
                 int minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
                 if (minBuffer <= 0) throw new IOException("Unsupported AudioTrack format");
                 int frameBytes = channels * 2;
+                boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.playbackMode);
+                int maxWriteFrames = Math.max(1, sampleRate / 50);
+                output = openOboeOutputIfRequested(session, sampleRate, channels, lowLatency, maxWriteFrames);
                 int capacityFrames;
                 int requestedBufferFrames = -1;
                 int acceptedBufferFrames = -1;
@@ -1800,7 +2010,7 @@ public final class ReceiverService extends Service {
                 boolean startThresholdRequestLimited = false;
                 String configuredMode;
                 int minBufferFrames = Math.max(1, (minBuffer + frameBytes - 1) / frameBytes);
-                synchronized (session) {
+                if (output == null) synchronized (session) {
                     ensureRunning(session);
                     AudioTrack.Builder builder = new AudioTrack.Builder()
                             .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
@@ -1812,6 +2022,8 @@ public final class ReceiverService extends Service {
                     track = builder.build();
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("AudioTrack initialization failed");
                     session.audioTrack = track;
+                    output = new AudioTrackPlaybackOutput(track, 1, frameBytes);
+                    recordOutputOpened(session, output);
                     session.trackWrittenFrames = 0;
                     session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
                     capacityFrames = Build.VERSION.SDK_INT >= 24
@@ -1856,6 +2068,16 @@ public final class ReceiverService extends Service {
                         configuredMode = "balanced-limited";
                     }
                     publishMode(session, configuredMode);
+                } else {
+                    recordOutputOpened(session, output);
+                    session.trackWrittenFrames = 0;
+                    capacityFrames = output.capacityFrames();
+                    int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                            : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+                    requestedBufferFrames = sampleRate * budgetMs / 1000;
+                    acceptedBufferFrames = output.effectiveBufferFrames();
+                    configuredMode = lowLatency ? "low-latency" : "balanced";
+                    publishMode(session, configuredMode);
                 }
 
                 int driftReserveFrames = Pcm16FrameStream.driftReserveFrames(sampleRate);
@@ -1866,27 +2088,36 @@ public final class ReceiverService extends Service {
                 Pcm16FrameStream pcm = new Pcm16FrameStream(channels);
                 boolean lowLatencyBacklog = currentMode(session).startsWith("low-latency");
                 int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
-                        track.getSampleRate(), lowLatencyBacklog);
+                        output.sampleRate(), lowLatencyBacklog);
                 int driftReadTargetFrames = udpQueue == null ? backlogTargetFrames
-                        : Math.max(1, track.getSampleRate() / 200);
+                        : Math.max(1, output.sampleRate() / 200);
                 int driftReadLimitBytes = Math.min(buffer.length - driftReserveBytes,
                         driftReadTargetFrames * frameBytes);
                 driftReadLimitBytes -= driftReadLimitBytes % frameBytes;
                 driftReadLimitBytes = Math.max(frameBytes, driftReadLimitBytes);
-                int effectiveFrames = track.getBufferSizeInFrames();
-                int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
+                int effectiveFrames = output.effectiveBufferFrames();
+                int thresholdFrames = output.startThresholdFrames();
                 int preRollFrames = currentMode(session).startsWith("low-latency") && thresholdFrames > 0
                         ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
-                publishMetrics(session, track.getSampleRate(), track.getChannelCount(), capacityFrames, requestedBufferFrames,
+                if (output instanceof OboePlaybackOutput) {
+                    preRollFrames = Math.min(preRollFrames, output.ringCapacityFrames());
+                    if (preRollFrames < output.framesPerBurst())
+                        throw new IOException("Oboe ring cannot hold one callback burst of pre-roll");
+                    requestedBufferFrames = output.info()[11];
+                    acceptedBufferFrames = output.effectiveBufferFrames();
+                    effectiveFrames = output.effectiveBufferFrames();
+                }
+                publishMetrics(session, output.sampleRate(), output.channels(), capacityFrames, requestedBufferFrames,
                         acceptedBufferFrames, effectiveFrames, thresholdFrames,
-                        Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, preRollFrames, currentMode(session));
+                        output.underrunCount(), preRollFrames, currentMode(session));
+                session.oboeXrunCount = output.oboeXrunCount();
                 if (udpQueue != null) {
                     udpQueue.configureAudioTrack(preRollFrames);
                 } else {
                     int backlogTriggerFrames = Pcm16FrameStream.backlogTriggerFrames(
-                            track.getSampleRate(), lowLatencyBacklog);
+                            output.sampleRate(), lowLatencyBacklog);
                     pcm.setBacklogLimit(backlogTargetFrames, backlogTriggerFrames,
-                            (track.getSampleRate() * 3 + 999) / 1000);
+                            (output.sampleRate() * 3 + 999) / 1000);
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) tcpDroppedBacklogFrames = 0;
                     }
@@ -1895,19 +2126,22 @@ public final class ReceiverService extends Service {
                 int preRolled = 0;
                 while (preRolled < preRollBytes) {
                     ensureRunning(session);
+                    long blockGeneration = session.focusState.writeGeneration();
                     int count = pcm.readFrames(input, buffer, Math.min(buffer.length, preRollBytes - preRolled));
                     if (count < 0) throw new IOException("AudioStreamEndedBeforePlayback");
+                    if (!session.focusState.acceptsWrite(blockGeneration)) { preRolled = 0; continue; }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
-                    writeFrames(session, track, pcm, buffer, count, frameBytes);
-                    preRolled += count;
+                    if (writeFrames(session, output, pcm, buffer, count, frameBytes, blockGeneration))
+                        preRolled += count;
+                    else preRolled = 0;
                 }
                 publishPreRollFrames(session, preRolled / frameBytes);
 
                 manager = getSystemService(AudioManager.class);
                 final AudioSession focusSession = session;
-                final AudioTrack focusTrack = track;
+                final PlaybackOutput focusOutput = output;
                 focusListener = change -> handler.post(() ->
-                        handleAudioFocusChange(focusSession, focusTrack, change));
+                        handleAudioFocusChange(focusSession, focusOutput, change));
                 boolean driftStarted = false;
                 synchronized (session) {
                     ensureRunning(session);
@@ -1927,9 +2161,10 @@ public final class ReceiverService extends Service {
                     session.trackReady = true;
                     if (session.focusState.canPlay()) {
                         long driftStartNanos = System.nanoTime();
-                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), driftStartNanos);
-                        track.play();
-                        if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                        long playbackHead = output.playbackHeadPosition();
+                        if (playbackHead >= 0) session.driftPlaybackHead.reset((int) playbackHead, driftStartNanos);
+                        output.play();
+                        if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
                         session.focusState.markTrackPlaying();
@@ -1937,9 +2172,8 @@ public final class ReceiverService extends Service {
                     session.driftResetGeneration++;
                     if (session.trackPlaying) {
                         long driftStartNanos = System.nanoTime();
-                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
-                                ? track.getUnderrunCount() : -1;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        session.driftLastOutputDiscontinuities = output.discontinuityCount();
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), driftStartNanos);
                         driftStarted = true;
                     }
@@ -1960,11 +2194,11 @@ public final class ReceiverService extends Service {
                     long driftResetGeneration = session.driftResetGeneration;
                     long nowNanos = System.nanoTime();
                     if (driftResetGeneration != observedDriftResetGeneration) {
-                        driftObservedPlayedFrames = session.driftPlaybackHead.update(
-                                track.getPlaybackHeadPosition(), nowNanos);
-                        int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                        session.driftLastUnderruns = underruns;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        long head = output.playbackHeadPosition();
+                        if (head >= 0) driftObservedPlayedFrames = session.driftPlaybackHead.update((int) head, nowNanos);
+                        int underruns = output.discontinuityCount();
+                        session.driftLastOutputDiscontinuities = underruns;
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
                         observedDriftResetGeneration = driftResetGeneration;
                         driftNeedsRealAudio = false;
@@ -1972,11 +2206,11 @@ public final class ReceiverService extends Service {
                     }
                     if (!driftStarted) {
                         nowNanos = System.nanoTime();
-                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), nowNanos);
+                        long head = output.playbackHeadPosition();
+                        if (head >= 0) session.driftPlaybackHead.reset((int) head, nowNanos);
                         driftObservedPlayedFrames = 0;
-                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
-                                ? track.getUnderrunCount() : -1;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        session.driftLastOutputDiscontinuities = output.discontinuityCount();
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
                         driftStarted = true;
                     }
@@ -1995,17 +2229,20 @@ public final class ReceiverService extends Service {
                                     || udpExpiredBefore != observedUdpExpired
                                     || udpOversizedGapBefore != observedUdpOversizedGaps
                                     || udpPayloadGenerationBefore != observedUdpPayloadGeneration);
-                    session.driftPlaybackHead.update(track.getPlaybackHeadPosition(), nowNanos);
-                    int previousUnderruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                    boolean headAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
-                    boolean underrunBeforeRead = session.driftLastUnderruns >= 0 && previousUnderruns >= 0
-                            && previousUnderruns != session.driftLastUnderruns;
+                    long readHead = output.playbackHeadPosition();
+                    if (readHead >= 0) session.driftPlaybackHead.update((int) readHead, nowNanos);
+                    int previousUnderruns = output.discontinuityCount();
+                    boolean headAdvancing = readHead >= 0 && session.driftPlaybackHead.isAdvancing(nowNanos);
+                    boolean underrunBeforeRead = session.driftLastOutputDiscontinuities >= 0 && previousUnderruns >= 0
+                            && previousUnderruns != session.driftLastOutputDiscontinuities;
                     int sourceReadAdjustmentFrames = headAdvancing && !underrunBeforeRead
                             && !driftNeedsRealAudio
                                     ? pcm.driftReadFrameAdjustment(nowNanos) : 0;
                     int sourceReadLimitBytes = driftReadLimitBytes
                             + sourceReadAdjustmentFrames * frameBytes;
+                    long blockGeneration = session.focusState.writeGeneration();
                     int count = pcm.readFrames(input, buffer, sourceReadLimitBytes);
+                    if (!session.focusState.acceptsWrite(blockGeneration)) continue;
                     if ((sourceReadAdjustmentFrames != 0 || udpQueue != null) && count >= 0) {
                         int totalRead = count;
                         while (totalRead < sourceReadLimitBytes) {
@@ -2024,10 +2261,14 @@ public final class ReceiverService extends Service {
                     }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
                     nowNanos = System.nanoTime();
-                    int playbackPosition = track.getPlaybackHeadPosition();
-                    long playedFrames = session.driftPlaybackHead.update(playbackPosition, nowNanos);
-                    int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                    boolean playbackAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
+                    long playbackPosition = output.playbackHeadPosition();
+                    long playedFrames = playbackPosition < 0 ? driftObservedPlayedFrames
+                            : session.driftPlaybackHead.update((int) playbackPosition, nowNanos);
+                    int underruns = output.discontinuityCount();
+                    int trackUnderruns = output.underrunCount();
+                    session.oboeXrunCount = output.oboeXrunCount();
+                    boolean playbackAdvancing = playbackPosition >= 0
+                            && session.driftPlaybackHead.isAdvancing(nowNanos);
                     boolean headAdvanced = playedFrames > driftObservedPlayedFrames;
                     if (headAdvanced) driftObservedPlayedFrames = playedFrames;
                     boolean underrunChanged = previousUnderruns >= 0 && underruns >= 0
@@ -2064,11 +2305,17 @@ public final class ReceiverService extends Service {
                             ? backlogTargetFrames : udpQueue.targetFrames();
                     long sourceBufferedFrames = udpQueue == null
                             ? Math.max(0, input.available() / frameBytes) : udpQueue.sourceBufferedFrames();
-                    outputBytes = pcm.correctDrift(buffer, count, sourceBufferedFrames,
-                            Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, playedFrames),
-                            driftSourceTargetFrames, nowNanos, playbackAdvancing,
-                            discontinuity || syntheticUdpBlock || driftNeedsRealAudio,
-                            readAdjustmentApplied ? sourceReadAdjustmentFrames : 0, headAdvanced);
+                    long pendingOutputFrames = output.pendingFrames(session.trackWrittenFrames, playedFrames);
+                    if (pendingOutputFrames < 0) {
+                        pcm.resetDriftCorrection();
+                        driftStarted = false;
+                        outputBytes = count;
+                    } else {
+                        outputBytes = pcm.correctDrift(buffer, count, sourceBufferedFrames,
+                                pendingOutputFrames, driftSourceTargetFrames, nowNanos, playbackAdvancing,
+                                discontinuity || syntheticUdpBlock || driftNeedsRealAudio,
+                                readAdjustmentApplied ? sourceReadAdjustmentFrames : 0, headAdvanced);
+                    }
                     if (udpQueue != null) {
                         observedUdpDropped = udpDroppedAfter;
                         observedUdpExpired = udpExpiredAfter;
@@ -2076,10 +2323,10 @@ public final class ReceiverService extends Service {
                         observedUdpPayloadGeneration = udpPayloadGenerationAfter;
                     }
                     if (resumeAfterSynthetic) driftNeedsRealAudio = false;
-                    session.driftLastUnderruns = underruns;
-                    writeFrames(session, track, pcm, buffer, outputBytes, frameBytes);
-                    if (Build.VERSION.SDK_INT >= 24) {
-                        int reportedUnderruns = track.getUnderrunCount();
+                    session.driftLastOutputDiscontinuities = underruns;
+                    writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, blockGeneration);
+                    if (trackUnderruns >= 0) {
+                        int reportedUnderruns = output.underrunCount();
                         if (udpQueue != null) udpQueue.reportTrackUnderruns(reportedUnderruns);
                         synchronized (STATUS_LOCK) {
                             if (statusAudioId == session.id) {
@@ -2092,13 +2339,28 @@ public final class ReceiverService extends Service {
                 }
             }
         } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
             failure = session.cancelled ? session.stopReason : describeFailure(error);
         } finally {
             session.trackPlaying = false;
             String trackReleaseFailure;
             synchronized (session) {
+                trackReleaseFailure = "";
+                if (output != null) {
+                    try { output.close(); }
+                    catch (IOException | RuntimeException error) {
+                        noteOboeRuntimeFailure(session, error);
+                        try { output.close(); }
+                        catch (IOException | RuntimeException retryError) {
+                            error.addSuppressed(retryError);
+                            noteOboeRuntimeFailure(session, retryError);
+                            retainDeferredOboeClose(output);
+                            trackReleaseFailure = "Audio output close failed: " + describeFailure(error);
+                        }
+                    }
+                }
                 if (session.audioTrack == track) session.audioTrack = null;
-                trackReleaseFailure = releaseTrack(track);
+                if (session.playbackOutput == output) session.playbackOutput = null;
             }
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
@@ -2138,33 +2400,53 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private void writeFrames(AudioSession session, AudioTrack track, Pcm16FrameStream pcm, byte[] buffer, int count, int frameBytes) throws IOException {
+    private boolean writeFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
+            byte[] buffer, int count, int frameBytes, long writeGeneration) throws IOException {
+        boolean[] completed = {true};
         pcm.writeFramesForChannels((data, offset, length) -> {
             ensureRunning(session);
-            long writeGeneration = session.focusState.writeGeneration();
-            if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+            if (!session.focusState.acceptsWrite(writeGeneration)) {
+                completed[0] = false;
+                return length;
+            }
             if (session.udpQueue == null) session.inputPcmBytes += length;
-            WAVEFORM.accept(data, offset, length, frameBytes, System.nanoTime());
-            int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
+            int written = output.writePcm16(data, offset, length);
+            if (written == 0 && output instanceof OboePlaybackOutput) {
+                if (!session.focusState.acceptsWrite(writeGeneration)) {
+                    completed[0] = false;
+                    return length;
+                }
+                return 0;
+            }
             synchronized (session) {
-                if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+                if (!session.focusState.acceptsWrite(writeGeneration)) {
+                    completed[0] = false;
+                    return length;
+                }
                 ensureRunning(session);
-                if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
+                if (written <= 0) throw new IOException("Audio output write failed: " + written);
+                if (written % frameBytes != 0) throw new IOException("Audio output returned a partial PCM frame");
                 session.trackWrittenFrames += written / frameBytes;
                 if (session.request.udpContext != null) {
                     PCM_BYTES_WRITTEN.addAndGet(written);
                     session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
                 }
+                WAVEFORM.accept(data, offset, written, frameBytes, System.nanoTime());
                 return written;
             }
         }, buffer, count);
         if (count % frameBytes != 0) throw new IOException("PCM frame alignment failed");
+        return completed[0] && session.focusState.acceptsWrite(writeGeneration);
     }
 
-    private void handleAudioFocusChange(AudioSession session, AudioTrack track, int change) {
+    private void handleAudioFocusChange(AudioSession session, PlaybackOutput output, int change) {
         String failure = "";
+        boolean pauseOutput = false;
+        boolean resumeOutput = false;
+        float volume = -1f;
+        Exception outputControlFailure = null;
         synchronized (session) {
-            if (currentAudio != session || session.audioTrack != track
+            if (currentAudio != session || session.playbackOutput != output
                     || session.cancelled || !isCurrentOperation(session.ownerId, session.networkGeneration)) return;
             AudioFocusState.Change focusChange;
             if (change == AudioManager.AUDIOFOCUS_LOSS) focusChange = AudioFocusState.Change.LOSS;
@@ -2175,50 +2457,66 @@ public final class ReceiverService extends Service {
             else return;
 
             AudioFocusState.Action action = session.focusState.onFocusChange(focusChange);
-            try {
-                if (action == AudioFocusState.Action.STOP) {
-                    failure = "AudioFocusLost";
-                } else if (action == AudioFocusState.Action.PAUSE) {
-                    if (session.udpQueue != null) session.udpQueue.setPaused(true);
-                    if (session.floatQueue != null) session.floatQueue.setPaused(true);
-                    if (session.trackPlaying || !session.trackReady) pauseAndFlushTrack(session, track);
-                    else synchronized (STATUS_LOCK) {
-                        if (statusAudioId == session.id) audioActive = false;
-                    }
-                } else if (action == AudioFocusState.Action.DUCK) {
-                    track.setVolume(0.2f);
-                } else if (action == AudioFocusState.Action.RESTORE_VOLUME
-                        || action == AudioFocusState.Action.RESTORE_AND_HOLD
-                        || action == AudioFocusState.Action.RESTORE_AND_RESUME) {
-                    track.setVolume(1.0f);
-                    if (action == AudioFocusState.Action.RESTORE_AND_RESUME) failure = resumeFocusedTrack(session, track);
-                    else if (action == AudioFocusState.Action.RESTORE_AND_HOLD) session.trackPlaying = false;
-                } else if (action == AudioFocusState.Action.RESUME) {
-                    failure = resumeFocusedTrack(session, track);
-                } else if (action == AudioFocusState.Action.HOLD) {
-                    session.trackPlaying = false;
-                }
-            } catch (RuntimeException error) {
-                failure = "AudioFocusTransitionFailed: " + describeFailure(error);
+            if (action == AudioFocusState.Action.STOP) failure = "AudioFocusLost";
+            else if (action == AudioFocusState.Action.PAUSE) {
+                if (session.udpQueue != null) session.udpQueue.setPaused(true);
+                if (session.floatQueue != null) session.floatQueue.setPaused(true);
+                pauseOutput = session.trackPlaying || !session.trackReady;
+            } else if (action == AudioFocusState.Action.DUCK) volume = 0.2f;
+            else if (action == AudioFocusState.Action.RESTORE_VOLUME
+                    || action == AudioFocusState.Action.RESTORE_AND_HOLD
+                    || action == AudioFocusState.Action.RESTORE_AND_RESUME) {
+                volume = 1.0f;
+                if (action == AudioFocusState.Action.RESTORE_AND_RESUME) resumeOutput = true;
+                else if (action == AudioFocusState.Action.RESTORE_AND_HOLD) session.trackPlaying = false;
+            } else if (action == AudioFocusState.Action.RESUME) resumeOutput = true;
+            else if (action == AudioFocusState.Action.HOLD) session.trackPlaying = false;
+            if (pauseOutput && session.playbackOutput == output) {
+                try { output.requestPause(); }
+                catch (IOException | RuntimeException error) { outputControlFailure = error; }
             }
-            if (!failure.isEmpty() && !"AudioFocusLost".equals(failure)) {
-                session.focusState.cancel();
+            if (volume >= 0 && session.playbackOutput == output) {
+                try { output.setVolume(volume); }
+                catch (IOException | RuntimeException error) {
+                    if (outputControlFailure == null) outputControlFailure = error;
+                    else outputControlFailure.addSuppressed(error);
+                }
             }
             session.notifyAll();
+        }
+        try {
+            if (outputControlFailure instanceof IOException) throw (IOException) outputControlFailure;
+            if (outputControlFailure instanceof RuntimeException)
+                throw (RuntimeException) outputControlFailure;
+            if (pauseOutput) {
+                pauseAndFlushOutput(session, output);
+            } else if (resumeOutput) {
+                synchronized (session) {
+                    if (session.playbackOutput == output && session.focusState.canPlay())
+                        failure = resumeFocusedOutput(session, output);
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            if (!noteOboeRuntimeFailureIfActive(session, output, error)) return;
+            failure = "AudioFocusTransitionFailed: " + describeFailure(error);
+        }
+        if (!failure.isEmpty() && !"AudioFocusLost".equals(failure)) {
+            synchronized (session) { session.focusState.cancel(); }
         }
         if (!failure.isEmpty()) cancelAudio(session, failure);
     }
 
     /** Called with the session control monitor held. */
-    private String resumeFocusedTrack(AudioSession session, AudioTrack track) {
+    private String resumeFocusedOutput(AudioSession session, PlaybackOutput output) {
         if (!session.focusState.canPlay()) return "";
         UdpPcmQueue queue = session.udpQueue;
         if (queue != null) queue.setPaused(false);
         FloatPcmFrameQueue floatQueue = session.floatQueue;
         if (floatQueue != null) floatQueue.setPaused(false);
         try {
-            session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), System.nanoTime());
-            track.play();
+            long head = output.playbackHeadPosition();
+            if (head >= 0) session.driftPlaybackHead.reset((int) head, System.nanoTime());
+            output.play();
             session.trackPlaying = true;
             session.focusState.markTrackPlaying();
             session.driftResetGeneration++;
@@ -2226,25 +2524,30 @@ public final class ReceiverService extends Service {
                 if (statusAudioId == session.id) audioActive = true;
             }
             return "";
-        } catch (RuntimeException error) {
+        } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
             return "AudioFocusResumeFailed: " + describeFailure(error);
         }
     }
 
-    /** Called with the session control monitor held for a user or focus pause. */
-    private void pauseAndFlushTrack(AudioSession session, AudioTrack track) {
-        track.pause();
-        track.flush();
-        session.trackWrittenFrames = 0;
-        int playbackPosition = track.getPlaybackHeadPosition();
-        long resetAtNanos = System.nanoTime();
-        session.playbackActivity.resetPlaybackHead(playbackPosition);
-        session.driftPlaybackHead.reset(playbackPosition, resetAtNanos);
-        session.driftResetGeneration++;
-        PCM_BYTES_WRITTEN.set(0);
-        session.trackPlaying = false;
-        synchronized (STATUS_LOCK) {
-            if (statusAudioId == session.id) audioActive = false;
+    /** The generation is invalidated before this control call; it never holds the session monitor while waiting for the worker. */
+    private void pauseAndFlushOutput(AudioSession session, PlaybackOutput output) throws IOException {
+        output.pauseAndFlush();
+        synchronized (session) {
+            if (session.playbackOutput != output) return;
+            session.trackWrittenFrames = 0;
+            long playbackPosition = output.playbackHeadPosition();
+            if (playbackPosition >= 0) {
+                long resetAtNanos = System.nanoTime();
+                session.playbackActivity.resetPlaybackHead((int) playbackPosition);
+                session.driftPlaybackHead.reset((int) playbackPosition, resetAtNanos);
+            }
+            session.driftResetGeneration++;
+            PCM_BYTES_WRITTEN.set(0);
+            session.trackPlaying = false;
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) audioActive = false;
+            }
         }
     }
 
@@ -2341,11 +2644,13 @@ public final class ReceiverService extends Service {
 
     private void cancelAudio(AudioSession session, String reason) {
         String stopFailure = "";
+        IOException outputPauseFailure = null;
         LocalSocket socket;
         UdpReceiver receiver;
         UdpPcmQueue queue;
         FloatPcmFrameQueue floatQueue;
         Thread networkThread;
+        PlaybackOutput output;
         synchronized (session) {
             if (!session.cancelled) {
                 session.cancelled = true;
@@ -2357,6 +2662,14 @@ public final class ReceiverService extends Service {
             if (track != null) {
                 try { track.stop(); }
                 catch (RuntimeException error) { stopFailure = "AudioTrackStopFailed: " + describeFailure(error); }
+            }
+            output = session.playbackOutput;
+            if (output instanceof OboePlaybackOutput) {
+                // The worker closes and clears this output under the same session monitor.
+                // Keep the short mute request in that critical section so stop cannot pause
+                // an adapter that the worker has already closed.
+                try { output.requestPause(); }
+                catch (IOException error) { outputPauseFailure = error; }
             }
             socket = session.socket;
             receiver = session.udpReceiver;
@@ -2371,6 +2684,13 @@ public final class ReceiverService extends Service {
             }
         }
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) audioActive = false; }
+        if (outputPauseFailure != null) {
+            noteOboeRuntimeFailure(session, outputPauseFailure);
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) startFailure = appendFailure(startFailure,
+                        "Oboe pause request failed: " + describeFailure(outputPauseFailure));
+            }
+        }
         Thread thread = session.thread;
         if (thread != null) thread.interrupt();
         if (socket != null) try { socket.close(); } catch (IOException ignored) {}
@@ -2420,6 +2740,17 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private static long outputPendingFrames(AudioSession session, PlaybackOutput output) {
+        if (output == null) return -1;
+        try {
+            long position = output.playbackHeadPosition();
+            long played = position < 0 ? 0 : session.playbackActivity.playedFrames((int) position);
+            return output.pendingFrames(session.trackWrittenFrames, played);
+        } catch (IOException | RuntimeException unavailable) {
+            return -1;
+        }
+    }
+
     private void publishMode(AudioSession session, String mode) {
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) actualMode = mode; }
     }
@@ -2433,17 +2764,22 @@ public final class ReceiverService extends Service {
         if (session == null) return PlaybackMetrics.unknown();
         UdpPcmQueue queue = session.udpQueue;
         AudioTrack track = session.audioTrack;
+        PlaybackOutput output = session.playbackOutput;
         int jitter = queue == null ? -1 : queue.targetFrames();
         long expired = queue == null ? -1 : queue.expiredFrames();
         long queued = queue == null ? -1 : queue.queuedFrames();
-        long pending = trackPendingFrames(session, track);
+        long pending = output != null ? outputPendingFrames(session, output) : trackPendingFrames(session, track);
         Boolean advancing = null;
-        if (track != null) {
-            try { advancing = session.playbackActivity.recentlyAdvanced(System.nanoTime(), track.getPlaybackHeadPosition()); }
+        if (output != null) {
+            try {
+                long position = output.playbackHeadPosition();
+                if (position >= 0) advancing = session.playbackActivity.recentlyAdvanced(System.nanoTime(), (int) position);
+            }
             catch (RuntimeException unavailable) { advancing = null; }
+            catch (IOException unavailable) { advancing = null; }
         }
         synchronized (STATUS_LOCK) {
-            if (currentAudio != session || statusAudioId != session.id || session.audioTrack != track)
+            if (currentAudio != session || statusAudioId != session.id || session.playbackOutput != output)
                 return PlaybackMetrics.unknown();
             return new PlaybackMetrics(actualSampleRate, actualChannels, jitter,
                     expired, queued, pending, underrunCount, tcpDroppedBacklogFrames,
@@ -2478,14 +2814,14 @@ public final class ReceiverService extends Service {
         synchronized (STATUS_LOCK) { return statusAudioId == session.id ? actualMode : ""; }
     }
 
-    static String describeFailure(Exception error) {
+    static String describeFailure(Throwable error) {
         String message = error.getMessage();
         if (message == null || message.isEmpty()) return error.getClass().getSimpleName();
         String description = (error.getClass().getSimpleName() + ": " + message).replace('\r', ' ').replace('\n', ' ');
         return description.substring(0, Math.min(description.length(), 180));
     }
 
-    private static String releaseTrack(AudioTrack track) {
+    static String releaseTrack(AudioTrack track) {
         if (track == null) return "";
         String failure = "";
         try { track.pause(); } catch (RuntimeException error) { failure = appendFailure(failure, describeFailure(error)); }
@@ -2507,7 +2843,7 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private static String appendFailure(String previous, String next) {
+    static String appendFailure(String previous, String next) {
         if (previous == null || previous.isEmpty()) return next;
         return previous + "; " + next;
     }
@@ -2576,8 +2912,13 @@ public final class ReceiverService extends Service {
         final Pcm16FrameStream.PlaybackHeadTracker driftPlaybackHead =
                 new Pcm16FrameStream.PlaybackHeadTracker();
         volatile long driftResetGeneration;
-        volatile int driftLastUnderruns = -1;
+        volatile int driftLastOutputDiscontinuities = -1;
+        volatile int oboeXrunCount = -1;
         volatile AudioTrack audioTrack;
+        volatile PlaybackOutput playbackOutput;
+        volatile String requestedOutputEngine = "audioTrack";
+        volatile String actualOutputEngine = "unknown";
+        volatile String outputFallbackReason = "";
         volatile int openedTrackFormatV2;
         volatile int openedTrackChannelsV2;
         volatile int openedTrackSampleRateV2;
@@ -2601,20 +2942,21 @@ public final class ReceiverService extends Service {
             UdpPcmQueue queue = udpQueue;
             FloatPcmFrameQueue floatQueue = this.floatQueue;
             UdpReceiver receiver = udpReceiver;
-            AudioTrack track = audioTrack;
-            if ((queue == null && floatQueue == null) || track == null) return false;
-            int playbackHead;
+            PlaybackOutput output = playbackOutput;
+            if ((queue == null && floatQueue == null) || output == null) return false;
+            long playbackHead;
             try {
-                playbackHead = track.getPlaybackHeadPosition();
-            } catch (IllegalStateException error) {
-                if (audioTrack != track || cancelled) return false;
-                throw new IOException("AudioTrack playback position unavailable", error);
+                playbackHead = output.playbackHeadPosition();
+            } catch (IOException | RuntimeException error) {
+                if (!noteOboeRuntimeFailureIfActive(this, output, error)) return false;
+                throw new IOException("Audio output progress unavailable", error);
             }
+            if (playbackHead < 0) return false;
             boolean hasAudio = queue != null ? queue.hasAuthenticatedAudio()
                     : receiver != null && receiver.hasAuthenticatedAudio();
             long lastAudioAt = queue != null ? queue.lastAuthenticatedAudioAtNanos()
                     : receiver == null ? 0 : receiver.lastAuthenticatedAudioAtNanos();
-            return playbackActivity.isActive(nowNanos, playbackHead, hasAudio,
+            return playbackActivity.isActive(nowNanos, (int) playbackHead, hasAudio,
                     lastAudioAt, focusState.isUserPaused());
         }
     }
