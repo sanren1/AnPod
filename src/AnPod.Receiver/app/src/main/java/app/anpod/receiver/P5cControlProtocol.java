@@ -45,7 +45,10 @@ final class P5cControlProtocol {
     static final int CAP_BACKGROUND_START_AUTH = 0x00000020;
     static final int CAP_BACKGROUND_TRUST_MANAGEMENT = 0x00000040;
     static final int CAP_AUDIO_V2 = 0x00000080;
-    static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
+    static final int CAP_TERMINAL_CAUSE = 0x00000100;
+    static final int CAP_AOA_SESSION_RESTART = 0x00000200;
+    static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS
+            | CAP_TERMINAL_CAUSE;
     static final int AUTH_PENDING = 0;
     static final int AUTH_ONCE = 1;
     static final int AUTH_EIGHT_HOURS = 2;

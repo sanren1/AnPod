@@ -48,7 +48,8 @@ public final class ReceiverStateProvider extends ContentProvider {
             "bufferCapacityFrames", "requestedBufferFrames", "acceptedBufferFrames",
             "effectiveBufferFrames", "startThresholdFrames", "preRollFrames", "trackPendingFrames", "underrunCount", "underrunIncrement",
             "udpJitterTargetFrames", "udpQueuedFrames", "udpExpiredFrames", "tcpDroppedBacklogFrames", "playbackAdvancing",
-            "startedAtElapsedMs", "error"
+            "startedAtElapsedMs", "error", "operationOwnerId", "operationGeneration",
+            "terminalCause", "terminalOwnerId", "terminalGeneration"
     };
     private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
     private final Object bindingStateLock = new Object();
@@ -139,6 +140,11 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "playbackAdvancing": values[i] = metrics.advancing; break;
                 case "startedAtElapsedMs": values[i] = ReceiverService.startedAtElapsedMs; break;
                 case "error": values[i] = ReceiverService.startFailure; break;
+                case "operationOwnerId": values[i] = ReceiverService.operationOwnerId; break;
+                case "operationGeneration": values[i] = ReceiverService.operationGeneration; break;
+                case "terminalCause": values[i] = ReceiverService.terminalCause; break;
+                case "terminalOwnerId": values[i] = ReceiverService.terminalOwnerId; break;
+                case "terminalGeneration": values[i] = ReceiverService.terminalGeneration; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");
             }
         }

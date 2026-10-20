@@ -25,6 +25,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     private static final long FINISH_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(3);
     private static final long HEARTBEAT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long WRITE_TIMEOUT_MILLIS = 3_000;
+    private static final int RESULT_USER_STOPPED = 3;
     private static AoaReceiverCoordinator owner;
 
     private final AoaAccessoryIo io;
@@ -49,9 +50,14 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     private volatile long startupDeadlineNanos;
     private volatile boolean authenticated;
     private volatile boolean playbackStarted;
+    private volatile boolean playbackEverStarted;
+    private volatile boolean hostStopped;
     private volatile IOException failure;
     private volatile IOException cleanupFailure;
     private volatile int state = P5cReceiverCoordinator.STATE_AUTHENTICATED;
+    private volatile int supportedCapabilities;
+    private volatile boolean userStopRequested;
+    private volatile boolean restartRequested;
 
     static AoaReceiverCoordinator start(AoaAccessoryIo io, PairingProtocol.BindingMaterial savedBinding,
             PlaybackEndpoint playback, String ownerId, long generation) throws IOException {
@@ -213,6 +219,26 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         cleanup.start();
     }
 
+    boolean requestUserStop() {
+        if (cancelled || !authenticated) return false;
+        userStopRequested = true;
+        return true;
+    }
+
+    boolean restartRequested() { return restartRequested; }
+
+    boolean shouldRecoverUnexpectedFailure() {
+        return shouldRecoverUnexpectedFailure(playbackEverStarted, userStopRequested,
+                hostStopped, restartRequested, failure != null);
+    }
+
+    static boolean shouldRecoverUnexpectedFailure(boolean playbackEverStarted,
+            boolean userStopRequested, boolean hostStopped, boolean restartRequested,
+            boolean failureObserved) {
+        return playbackEverStarted && !userStopRequested && !hostStopped
+                && !restartRequested && failureObserved;
+    }
+
     private void readLoop() {
         try {
             if (!playback.isCurrent(ownerId, generation)) throw new IOException("AOA owner generation expired");
@@ -283,7 +309,9 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 int required = readInt(command.payload, 4);
                 int supported = P5cControlProtocol.CAP_AUTHENTICATED_STATUS
                         | (playback.supportsAudio(format) ? P5cControlProtocol.CAP_AUDIO_V2 : 0)
-                        | P5cControlProtocol.CAP_PLAYBACK_PROGRESS;
+                        | P5cControlProtocol.CAP_PLAYBACK_PROGRESS
+                        | P5cControlProtocol.CAP_TERMINAL_CAUSE
+                        | P5cControlProtocol.CAP_AOA_SESSION_RESTART;
                 boolean compatible = requestedControl == P5cControlProtocol.MANAGEMENT_CONTROL_MAJOR
                         && requestedAudio == P5cControlProtocol.AUDIO_PROTOCOL_MAJOR
                         && (required & ~supported) == 0 && playback.supportsAudio(format);
@@ -295,6 +323,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                         P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                         P5cControlProtocol.CAPABILITIES_INFO, info));
                 if (!compatible) throw new IOException("AOA capabilities rejected");
+                supportedCapabilities = supported;
                 capabilitiesAccepted = true;
                 state = P5cReceiverCoordinator.STATE_AUTHENTICATED;
                 continue;
@@ -303,7 +332,12 @@ final class AoaReceiverCoordinator implements AutoCloseable {
             byte[] extra = new byte[0];
             int port = 0;
             boolean terminate = false;
-            switch (command.type) {
+            int result = P5cReceiverCoordinator.RESULT_OK;
+            if (userStopRequested) {
+                result = RESULT_USER_STOPPED;
+                state = P5cReceiverCoordinator.STATE_STOPPED;
+                terminate = true;
+            } else switch (command.type) {
                 case P5cControlProtocol.BIND:
                     if (bound || command.payload.length != 2 || command.payload[0] != 0 || command.payload[1] != 0)
                         throw new IOException("AOA BIND must contain zero port");
@@ -327,6 +361,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                         throw error instanceof IOException ? (IOException) error : new IOException("AOA playback start failed", error);
                     }
                     synchronized (lifecycle) { playbackStarted = true; }
+                    playbackEverStarted = true;
                     if (cancelled) throw new IOException("AOA session cancelled during playback start");
                     state = P5cReceiverCoordinator.STATE_RECEIVER_RUNNING;
                     break;
@@ -360,7 +395,12 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                     extra = playback.playbackProgressPayloadV2();
                     break;
                 case P5cControlProtocol.STOP:
-                    if (command.payload.length != 0) throw new IOException("invalid AOA STOP");
+                    if (command.payload.length == 1 && command.payload[0] == 1) {
+                        if ((supportedCapabilities & P5cControlProtocol.CAP_AOA_SESSION_RESTART) == 0)
+                            throw new IOException("AOA restart capability was not negotiated");
+                        restartRequested = true;
+                    } else if (command.payload.length != 0) throw new IOException("invalid AOA STOP");
+                    else hostStopped = true;
                     state = P5cReceiverCoordinator.STATE_STOPPED;
                     terminate = true;
                     break;
@@ -369,7 +409,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
             byte[] ack = P5cControlProtocol.encode(keysSnapshot.receiverToHostControl,
                     P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++, P5cControlProtocol.ACK,
                     P5cControlProtocol.ackPayload(command.type, command.sequence,
-                            P5cReceiverCoordinator.RESULT_OK, state, port, extra));
+                            result, state, port, extra));
             writeRecord(AnpuRecordCodec.CONTROL, ack);
             if (terminate) {
                 stopAfterAck = true;

@@ -87,6 +87,7 @@ final class UdpReceiver implements Runnable, AutoCloseable {
     boolean hasAuthenticatedAudio() { return ingress.hasAuthenticatedAudio(); }
     long lastAuthenticatedAudioAtNanos() { return ingress.lastAuthenticatedAudioAtNanos(); }
     long droppedFrames() { return ingress.droppedFrames(); }
+    long authenticatedAudioPayloadBytes() { return ingress.authenticatedAudioPayloadBytes(); }
 
     @Override
     public void close() {

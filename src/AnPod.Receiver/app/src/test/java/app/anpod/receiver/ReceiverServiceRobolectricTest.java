@@ -1049,6 +1049,103 @@ public final class ReceiverServiceRobolectricTest {
         assertFalse(snapshot.receivedAudioRecently);
     }
 
+    @Test
+    public void aodSnapshotHandlesUdpFloatQueueWithoutPcmLossCounters() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        byte[] key = new byte[32];
+        UdpSessionContext context = new UdpSessionContext(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 12345), 601, key, "balanced");
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(601,
+                ReceiverService.AudioRequest.udp(context), "udp-float-test", 1);
+        session.floatQueue = new com.anpod.server.FloatPcmFrameQueue(48_000, false);
+        float[] samples = new float[48];
+        assertTrue(session.floatQueue.offer(0, samples, 24));
+        ReceiverService.currentAudio = session;
+        setStaticField("statusAudioId", 601L);
+        try {
+            AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
+            assertEquals(AodTelemetrySnapshot.Transport.WIFI_UDP, snapshot.transport);
+            assertNull(snapshot.udpLossPercent);
+            assertEquals(24, ReceiverService.playbackMetricsSnapshot().queuedFrames);
+        } finally {
+            ReceiverService.currentAudio = null;
+            session.floatQueue.stop();
+            context.destroy();
+        }
+    }
+
+    @Test
+    public void aodSnapshotHandlesAoaFloatQueueAndReportsUsbDirect() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        AoaSessionContext context = new AoaSessionContext(602, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(602,
+                ReceiverService.AudioRequest.aoa(context), "aoa-float-test", 1);
+        float[] samples = new float[48];
+        assertTrue(context.floatQueue.offer(0, samples, 24));
+        ReceiverService.currentAudio = session;
+        setStaticField("statusAudioId", 602L);
+        try {
+            AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
+            assertEquals(AodTelemetrySnapshot.Transport.USB_DIRECT, snapshot.transport);
+            assertNull(snapshot.udpLossPercent);
+            assertEquals(24, ReceiverService.playbackMetricsSnapshot().queuedFrames);
+        } finally {
+            ReceiverService.currentAudio = null;
+            context.destroy();
+        }
+    }
+
+    @Test
+    public void aoaRecoverySchedulesSameOwnerAndSuccessfulStartResetsItsWindow() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-recovery-owner";
+        long generation = 77;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation));
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        service.aoaAccessory = org.robolectric.util.ReflectionHelpers.callConstructor(UsbAccessory.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "1"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, ""),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "test-serial"));
+        long deadline = android.os.SystemClock.elapsedRealtime() + 10_000;
+        setInstanceField(service, "aoaRecoveryDeadlineElapsedMs", deadline);
+        setInstanceField(service, "aoaRecoveryAttempt", 0);
+
+        service.scheduleAoaRecovery(owner, generation, "injected transport failure");
+        Shadows.shadowOf(Looper.getMainLooper()).idle();
+        assertEquals(1, getInstanceField(service, "aoaRecoveryAttempt"));
+        long attemptDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (((Integer) getInstanceField(service, "aoaRecoveryAttempt")) < 2
+                && System.nanoTime() < attemptDeadline) {
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS);
+            Thread.sleep(5);
+        }
+        assertTrue("failed reopen schedules a bounded follow-up attempt",
+                ((Integer) getInstanceField(service, "aoaRecoveryAttempt")) >= 2);
+
+        service.noteAoaPlaybackStarted(owner, generation);
+        assertEquals(0L, getInstanceField(service, "aoaRecoveryDeadlineElapsedMs"));
+        assertEquals(0, getInstanceField(service, "aoaRecoveryAttempt"));
+
+        long nextDeadline = android.os.SystemClock.elapsedRealtime() + 10_000;
+        setInstanceField(service, "aoaRecoveryDeadlineElapsedMs", nextDeadline);
+        service.currentOperationGeneration = generation + 1;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation + 1));
+        service.noteAoaPlaybackStarted(owner, generation);
+        assertEquals(nextDeadline, getInstanceField(service, "aoaRecoveryDeadlineElapsedMs"));
+        service.onDestroy();
+    }
+
 
     @Test
     public void idleWaveformIsFlat() {
@@ -1068,6 +1165,24 @@ public final class ReceiverServiceRobolectricTest {
         Field field = ReceiverService.class.getDeclaredField("WAVEFORM");
         field.setAccessible(true);
         ((PcmWaveformTap) field.get(null)).reset();
+    }
+
+    private static void setStaticField(String name, Object value) throws Exception {
+        Field field = ReceiverService.class.getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(null, value);
+    }
+
+    private static void setInstanceField(Object receiver, String name, Object value) throws Exception {
+        Field field = receiver.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(receiver, value);
+    }
+
+    private static Object getInstanceField(Object receiver, String name) throws Exception {
+        Field field = receiver.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(receiver);
     }
 
     private static ReceiverService activeService() throws Exception {

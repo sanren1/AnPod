@@ -34,15 +34,18 @@ final class ReceiverUiState {
             aodSessionId = session.id;
             aodSampler.reset(now);
         }
-        boolean udp = session.udpQueue != null;
-        long totalBytes = udp ? session.udpQueue.audioPayloadBytes() : session.inputPcmBytes;
+        boolean aoa = session.request.aoaContext != null;
+        boolean udp = session.request.udpContext != null;
+        long totalBytes = aoa ? session.request.aoaContext.ingress.authenticatedAudioPayloadBytes()
+                : udp ? session.udpReceiver == null ? 0 : session.udpReceiver.authenticatedAudioPayloadBytes()
+                : session.inputPcmBytes;
         aodSampler.recordCumulativeBytes(totalBytes, now);
         PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
         Long bitsPerSecond = aodSampler.bitsPerSecond(now);
-        Float bufferMs = AodMetricsSampler.bufferMs(udp ? metrics.queuedFrames : 0,
+        Float bufferMs = AodMetricsSampler.bufferMs(udp || aoa ? metrics.queuedFrames : 0,
                 metrics.pendingFrames, metrics.sampleRate);
         Float lossPercent = null;
-        if (udp) {
+        if (udp && session.udpQueue != null) {
             aodSampler.updateFrameTotals(session.udpQueue.acceptedAudioFrames(),
                     session.udpQueue.concealedFrames());
             lossPercent = aodSampler.lossPercent();
@@ -53,8 +56,9 @@ final class ReceiverUiState {
                 : AodTelemetrySnapshot.DisplayStatus.CONNECTED;
         if (udp && "reconnecting".equals(ReceiverService.networkAudioState))
             status = AodTelemetrySnapshot.DisplayStatus.RECONNECTING;
-        AodTelemetrySnapshot.Transport transport = udp
-                ? AodTelemetrySnapshot.Transport.WIFI_UDP
+        AodTelemetrySnapshot.Transport transport = aoa
+                ? AodTelemetrySnapshot.Transport.USB_DIRECT
+                : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP
                 : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
                 lossPercent, receivedRecently, now);

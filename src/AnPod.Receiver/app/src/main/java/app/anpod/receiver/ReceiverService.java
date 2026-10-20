@@ -90,6 +90,8 @@ public final class ReceiverService extends Service {
     static final String EXTRA_AUTH_DEADLINE = "authDeadline";
     static final String EXTRA_AUTH_DECISION = "authDecision";
     private static final long MAX_RUN_MS = 120_000L;
+    private static final long AOA_RECOVERY_WINDOW_MS = 30_000L;
+    private static final long[] AOA_RECOVERY_DELAYS_MS = {0, 1_000, 2_000, 5_000};
     private static final Object STATUS_LOCK = new Object();
     private static volatile ReceiverService activeService;
     private static final AtomicLong NEXT_AUDIO_ID = new AtomicLong();
@@ -116,6 +118,11 @@ public final class ReceiverService extends Service {
     static volatile String networkAudioFailure = "";
     static volatile String networkAudioAddress = "";
     static volatile int networkAudioPort;
+    static volatile String operationOwnerId = "";
+    static volatile long operationGeneration = -1;
+    static volatile String terminalCause = "";
+    static volatile String terminalOwnerId = "";
+    static volatile long terminalGeneration = -1;
     private static long statusAudioId;
 
 
@@ -148,6 +155,9 @@ public final class ReceiverService extends Service {
     volatile String aoaOwnerId = "";
     volatile long aoaOwnerGeneration;
     private volatile Thread aoaBootstrapThread;
+    private volatile long aoaRecoveryDeadlineElapsedMs;
+    private volatile int aoaRecoveryAttempt;
+    private volatile String aoaRecoveryFailure = "";
     private BroadcastReceiver aoaDetachReceiver;
     final ReceiverBackgroundAuthorization authorization = new ReceiverBackgroundAuthorization(this);
     private final ReceiverUiBinder uiBinder = new ReceiverUiBinder(this);
@@ -211,8 +221,10 @@ public final class ReceiverService extends Service {
         if (intent != null && ACTION_NOTIFICATION_STOP.equals(intent.getAction())) {
             String ownerId = intent.getStringExtra(EXTRA_UI_OWNER_ID);
             long generation = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
-            if (uiOperation.owns(ownerId, generation, currentOperationGeneration))
+            if (uiOperation.owns(ownerId, generation, currentOperationGeneration)) {
+                recordManualStop(ownerId, generation);
                 requestTermination(ownerId, generation, false, "");
+            }
             return START_NOT_STICKY;
         }
         if (intent != null && BootstrapActivity.ACTION_STOP.equals(intent.getAction())) {
@@ -230,7 +242,12 @@ public final class ReceiverService extends Service {
             }
             int disposition = uiOperation.bootstrapStopDisposition();
             if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_OWNER) {
-                requestTermination(uiOperation.ownerId(), currentOperationGeneration, false, "");
+                String ownerId = uiOperation.ownerId();
+                long generation = currentOperationGeneration;
+                if (uiOperation.owns(ownerId, generation, networkBootstrapGeneration.get())) {
+                    recordManualStop(ownerId, generation);
+                    requestTermination(ownerId, generation, false, "");
+                }
             } else if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_IDLE) {
                 stopSelf(startId);
             }
@@ -303,6 +320,7 @@ public final class ReceiverService extends Service {
             if (!uiOperation.begin(ownerId)) return START_NOT_STICKY;
             generation = networkBootstrapGeneration.incrementAndGet();
             currentOperationGeneration = generation;
+            beginHealthOperation(ownerId, generation);
             backgroundStandbyEnabled = false;
             receiveIntentEnabled = false;
             networkAudioState = "stopped";
@@ -387,6 +405,9 @@ public final class ReceiverService extends Service {
             aoaAccessory = accessory;
             aoaOwnerId = ownerId;
             aoaOwnerGeneration = generation;
+            aoaRecoveryDeadlineElapsedMs = 0;
+            aoaRecoveryAttempt = 0;
+            aoaRecoveryFailure = "";
             networkAudioState = "starting";
             networkAudioFailure = "";
             if (!registerAoaDetachReceiver(accessory, ownerId, generation)) return START_NOT_STICKY;
@@ -442,8 +463,11 @@ public final class ReceiverService extends Service {
                 if (binding != null) binding.close();
                 String failure = error instanceof IOException && error.getMessage() != null
                         ? error.getMessage() : error.getClass().getSimpleName();
-                if (isCurrentOperation(ownerId, generation)) requestTermination(ownerId, generation, true,
-                        describeAoaFailure(failure));
+                if (isCurrentOperation(ownerId, generation)) {
+                    if (aoaRecoveryDeadlineElapsedMs > 0) {
+                        scheduleAoaRecovery(ownerId, generation, describeAoaFailure(failure));
+                    } else requestTermination(ownerId, generation, true, describeAoaFailure(failure));
+                }
             } finally {
                 synchronized (networkCoordinatorLock) {
                     if (aoaBootstrapThread == Thread.currentThread()) aoaBootstrapThread = null;
@@ -467,8 +491,76 @@ public final class ReceiverService extends Service {
         String failure = coordinator.failureMessage();
         handler.post(() -> {
             if (aoaCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            boolean restartRequested = failure.isEmpty() && coordinator.restartRequested();
+            boolean unexpectedFailure = coordinator.shouldRecoverUnexpectedFailure();
+            if ((restartRequested || unexpectedFailure) && aoaAccessory != null) {
+                aoaCoordinator = null;
+                if (aoaRecoveryDeadlineElapsedMs == 0) {
+                    aoaRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime()
+                            + AOA_RECOVERY_WINDOW_MS;
+                    aoaRecoveryAttempt = 0;
+                }
+                scheduleAoaRecovery(ownerId, generation, failure);
+                return;
+            }
             requestTermination(ownerId, generation, !failure.isEmpty(), failure);
         });
+    }
+
+    void scheduleAoaRecovery(String ownerId, long generation, String failure) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> scheduleAoaRecovery(ownerId, generation, failure));
+            return;
+        }
+        if (!isCurrentOperation(ownerId, generation) || !ownerId.equals(aoaOwnerId)
+                || aoaOwnerGeneration != generation) return;
+        aoaRecoveryFailure = failure == null ? "" : failure;
+        long now = android.os.SystemClock.elapsedRealtime();
+        long remaining = aoaRecoveryDeadlineElapsedMs - now;
+        if (remaining <= 0) {
+            aoaRecoveryDeadlineElapsedMs = 0;
+            requestTermination(ownerId, generation, true,
+                    aoaRecoveryFailure.isEmpty() ? "USB Direct 恢复窗口已结束" : aoaRecoveryFailure);
+            return;
+        }
+        UsbAccessory accessory = aoaAccessory;
+        if (accessory == null || !shouldAttemptAoaRecovery(
+                isCurrentOperation(ownerId, generation), isManualStop(ownerId, generation),
+                now, aoaRecoveryDeadlineElapsedMs)) {
+            aoaRecoveryDeadlineElapsedMs = 0;
+            return;
+        }
+        int delayIndex = Math.min(aoaRecoveryAttempt, AOA_RECOVERY_DELAYS_MS.length - 1);
+        long delay = Math.min(AOA_RECOVERY_DELAYS_MS[delayIndex], remaining);
+        aoaRecoveryAttempt++;
+        handler.postDelayed(() -> {
+            long callbackNow = android.os.SystemClock.elapsedRealtime();
+            if (!isCurrentOperation(ownerId, generation) || aoaAccessory != accessory) return;
+            if (isManualStop(ownerId, generation)) {
+                aoaRecoveryDeadlineElapsedMs = 0;
+                return;
+            }
+            if (callbackNow >= aoaRecoveryDeadlineElapsedMs) {
+                aoaRecoveryDeadlineElapsedMs = 0;
+                requestTermination(ownerId, generation, true,
+                        aoaRecoveryFailure.isEmpty() ? "USB Direct 恢复窗口已结束" : aoaRecoveryFailure);
+                return;
+            }
+            startAoaBootstrap(accessory, ownerId, generation);
+        }, delay);
+    }
+
+    static boolean shouldAttemptAoaRecovery(boolean currentOperation, boolean manualStop,
+            long nowElapsedMs, long deadlineElapsedMs) {
+        return currentOperation && !manualStop && nowElapsedMs < deadlineElapsedMs;
+    }
+
+    void noteAoaPlaybackStarted(String ownerId, long generation) {
+        if (!isCurrentOperation(ownerId, generation) || generation != aoaOwnerGeneration
+                || !ownerId.equals(aoaOwnerId)) return;
+        aoaRecoveryDeadlineElapsedMs = 0;
+        aoaRecoveryAttempt = 0;
+        aoaRecoveryFailure = "";
     }
 
     private boolean registerAoaDetachReceiver(UsbAccessory accessory, String ownerId, long generation) {
@@ -676,6 +768,7 @@ public final class ReceiverService extends Service {
                     return "已有接收会话正在运行。";
                 generation = networkBootstrapGeneration.incrementAndGet();
                 currentOperationGeneration = generation;
+                beginHealthOperation(ownerId, generation);
                 backgroundStandbyEnabled = backgroundStandby;
                 receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
                 pendingUiStartRequestId = requestId;
@@ -744,6 +837,7 @@ public final class ReceiverService extends Service {
                     || !uiOperation.begin(ownerId)) return getString(R.string.usb_direct_busy);
             generation = networkBootstrapGeneration.incrementAndGet();
             currentOperationGeneration = generation;
+            beginHealthOperation(ownerId, generation);
             backgroundStandbyEnabled = false;
             receiveIntentEnabled = false;
             pendingAoaRequestId = requestId;
@@ -775,12 +869,14 @@ public final class ReceiverService extends Service {
     boolean stopFromUi(String ownerId) {
         if (!uiOperation.owns(ownerId) || !(ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                 || ReceiverUiOperation.RUNNING.equals(uiOperation.phase()))) return false;
+        recordManualStop(ownerId, currentOperationGeneration);
         requestTermination(ownerId, currentOperationGeneration, false, "");
         return true;
     }
 
     boolean stopFromUi(String ownerId, long generation) {
         if (!isCurrentOperation(ownerId, generation)) return false;
+        recordManualStop(ownerId, generation);
         requestTermination(ownerId, generation, false, "");
         return true;
     }
@@ -883,6 +979,25 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private static synchronized void beginHealthOperation(String ownerId, long generation) {
+        operationOwnerId = ownerId;
+        operationGeneration = generation;
+        terminalCause = "";
+        terminalOwnerId = "";
+        terminalGeneration = -1;
+    }
+
+    private static synchronized void recordManualStop(String ownerId, long generation) {
+        terminalCause = "USER_STOP";
+        terminalOwnerId = ownerId;
+        terminalGeneration = generation;
+    }
+
+    private static synchronized boolean isManualStop(String ownerId, long generation) {
+        return "USER_STOP".equals(terminalCause) && ownerId.equals(terminalOwnerId)
+                && generation == terminalGeneration;
+    }
+
     void requestTermination(String ownerId, long generation, boolean failed, String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() -> beginTermination(ownerId, generation, failed, reason));
@@ -890,6 +1005,22 @@ public final class ReceiverService extends Service {
     }
 
     private void beginTermination(String ownerId, long generation, boolean failed, String reason) {
+        if (!failed && (reason == null || reason.isEmpty()) && isManualStop(ownerId, generation)) {
+            AoaReceiverCoordinator activeAoa;
+            P5cReceiverCoordinator activeNetwork;
+            synchronized (networkCoordinatorLock) {
+                activeAoa = ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation
+                        ? aoaCoordinator : null;
+                activeNetwork = ownerId.equals(networkCoordinatorOwnerId)
+                        && generation == currentOperationGeneration ? networkCoordinator : null;
+            }
+            if (activeAoa != null) {
+                if (activeAoa.requestUserStop()) return;
+            }
+            if (activeNetwork != null) {
+                if (activeNetwork.requestUserStop()) return;
+            }
+        }
         synchronized (networkCoordinatorLock) {
             if (!uiOperation.owns(ownerId) || generation != currentOperationGeneration
                     || generation != networkBootstrapGeneration.get() || !uiOperation.stop(ownerId)) return;
@@ -1216,6 +1347,7 @@ public final class ReceiverService extends Service {
                 if (!current()) throw new IOException("AoaOwnerStopped");
                 AudioSession accepted = startAoaAudio(context, ownerId, generation);
                 ownedSession = accepted;
+                noteAoaPlaybackStarted(ownerId, generation);
             }
 
             @Override public void pause() throws IOException {
@@ -3246,11 +3378,13 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         if (session == null) return PlaybackMetrics.unknown();
         UdpPcmQueue queue = session.udpQueue;
+        FloatPcmFrameQueue floatQueue = session.floatQueue;
         AudioTrack track = session.audioTrack;
         PlaybackOutput output = session.playbackOutput;
         int jitter = queue == null ? -1 : queue.targetFrames();
         long expired = queue == null ? -1 : queue.expiredFrames();
-        long queued = queue == null ? -1 : queue.queuedFrames();
+        long queued = queue != null ? queue.queuedFrames()
+                : floatQueue != null ? floatQueue.queuedFrames() : -1;
         long pending = output != null ? outputPendingFrames(session, output) : trackPendingFrames(session, track);
         Boolean advancing = null;
         if (output != null) {

@@ -19,8 +19,28 @@ import javax.crypto.spec.SecretKeySpec;
 import org.junit.Test;
 
 public class AoaReceiverCoordinatorTest {
+    @Test public void unexpectedRecoveryRequiresStartedSessionAndNoTerminalStop() {
+        assertTrue(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(true, false, false, false, true));
+        assertFalse(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(false, false, false, false, true));
+        assertFalse(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(true, true, false, false, true));
+        assertFalse(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(true, false, true, false, true));
+        assertFalse(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(true, false, false, true, false));
+        assertFalse(AoaReceiverCoordinator.shouldRecoverUnexpectedFailure(true, false, false, false, false));
+    }
+
+    @Test public void scheduledRecoveryStopsForManualStopStaleOwnerOrExpiredWindow() {
+        assertTrue(ReceiverService.shouldAttemptAoaRecovery(true, false, 100, 200));
+        assertFalse(ReceiverService.shouldAttemptAoaRecovery(false, false, 100, 200));
+        assertFalse(ReceiverService.shouldAttemptAoaRecovery(true, true, 100, 200));
+        assertFalse(ReceiverService.shouldAttemptAoaRecovery(true, false, 200, 200));
+    }
+
     @Test public void authenticatedProfilesRegisterBeforeStartAckAndStopAfterAck() throws Exception {
         for (int profile = 1; profile <= 3; profile++) runProfile(profile);
+    }
+
+    @Test public void phoneStopIsReportedOnNextNonHeartbeatAck() throws Exception {
+        runProfile(1, true);
     }
 
     @Test public void noHelloTimesOutAndReleasesTheSingleConnectionOwner() throws Exception {
@@ -54,6 +74,10 @@ public class AoaReceiverCoordinatorTest {
     }
 
     private static void runProfile(int profile) throws Exception {
+        runProfile(profile, false);
+    }
+
+    private static void runProfile(int profile, boolean stopFromPhone) throws Exception {
         byte[] hostId = sequence(0x10, 16), receiverId = sequence(0x20, 16), secret = sequence(0, 32);
         PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
         PairingProtocol.BindingMaterial hostBinding = saved.deriveAoa();
@@ -116,9 +140,23 @@ public class AoaReceiverCoordinatorTest {
                 sendControl(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME, new byte[0]);
                 assertAck(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME,
                         P5cReceiverCoordinator.STATE_RECEIVER_RUNNING);
-                sendControl(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP, new byte[0]);
-                assertAck(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP,
-                        P5cReceiverCoordinator.STATE_STOPPED);
+                if (stopFromPhone) {
+                    assertTrue(coordinator.requestUserStop());
+                    assertFalse("phone stop waits for an authenticated ACK before stopping playback",
+                            endpoint.stopped);
+                    sendControl(io, keys, hostSession.sessionId, 6,
+                            P5cControlProtocol.PLAYBACK_PROGRESS_QUERY, new byte[0]);
+                    P5cControlProtocol.Frame stopped = receiveControl(io, keys, hostSession.sessionId,
+                            P5cControlProtocol.ACK);
+                    assertEquals(P5cControlProtocol.PLAYBACK_PROGRESS_QUERY, stopped.payload[0] & 0xff);
+                    assertEquals(6, P5cControlProtocol.getLong(stopped.payload, 1));
+                    assertEquals(3, stopped.payload[9] & 0xff);
+                    assertEquals(P5cReceiverCoordinator.STATE_STOPPED, stopped.payload[10] & 0xff);
+                } else {
+                    sendControl(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP, new byte[0]);
+                    assertAck(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP,
+                            P5cReceiverCoordinator.STATE_STOPPED);
+                }
                 assertTrue(coordinator.awaitTermination(3, TimeUnit.SECONDS));
                 assertTrue(endpoint.stopped);
                 assertTrue(io.ownerClosed);

@@ -36,6 +36,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     static final int RESULT_OK = 0;
     static final int RESULT_REJECTED = 1;
     static final int RESULT_FAILED = 2;
+    static final int RESULT_USER_STOPPED = 3;
     private static final long HEARTBEAT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long HANDSHAKE_DEADLINE_NANOS = TimeUnit.SECONDS.toNanos(2);
     private static final int MAX_PREAUTH_CONNECTIONS = 2;
@@ -146,12 +147,14 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     });
     private volatile Socket activeSocket;
     private volatile Socket authenticatedSocket;
+    private volatile boolean terminalCauseNegotiated;
     private volatile Thread worker;
     private volatile P5cDiscovery discovery;
     private P5cDiscovery.SocketBinder discoverySocketBinder;
     private byte[] bindingSecret;
     private volatile String failure = "";
     private volatile boolean shutdownRequested;
+    private volatile boolean userStopRequested;
     private boolean loopbackConnectionAccepted;
     private boolean discoveryResumePending;
     private boolean discoveryDisabledForTest;
@@ -431,6 +434,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     String failure() { return failure; }
 
+    boolean requestUserStop() {
+        // Defer service teardown only while an authenticated host can receive the
+        // terminal ACK. A listening or not-yet-negotiated owner must clean up locally.
+        if (shutdownRequested || finished.getCount() == 0 || authenticatedSocket == null
+                || !terminalCauseNegotiated) return false;
+        userStopRequested = true;
+        return true;
+    }
+
     private void serve() {
         try {
             while (!listener.isClosed()) {
@@ -511,6 +523,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 ownedSession = authenticatedSocket == socket;
                 if (ownedSession) {
                     authenticatedSocket = null;
+                    terminalCauseNegotiated = false;
                     discoveryResumePending = true;
                 }
                 preAuthSockets.remove(socket);
@@ -543,6 +556,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         preAuthSockets.remove(socket);
         authenticatedSocket = socket;
         activeSocket = socket;
+        terminalCauseNegotiated = false;
         discoveryResumePending = false;
         stopDiscovery();
         return true;
@@ -652,7 +666,14 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 byte[] responseExtra = new byte[0];
                 boolean stopAfterAck = false;
                 try {
-                    switch (command.type) {
+                    if (userStopRequested) {
+                        if (playbackStarted) playback.stop();
+                        else if (context != null) context.destroy();
+                        playbackStarted = false;
+                        state = STATE_STOPPED;
+                        result = RESULT_USER_STOPPED;
+                        stopAfterAck = true;
+                    } else switch (command.type) {
                         case P5cControlProtocol.CAPABILITIES_QUERY:
                             if (state != STATE_AUTHENTICATED || command.payload.length != 8
                                     || command.payload[3] != 0)
@@ -687,6 +708,8 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             if ("incompatible".equals(capabilityTestMode)) audioMajor++;
                             if ("missing-capability".equals(capabilityTestMode))
                                 implemented &= ~P5cControlProtocol.CAP_AUTHENTICATED_STATUS;
+                            if ("legacy-terminal-cause".equals(capabilityTestMode))
+                                implemented &= ~P5cControlProtocol.CAP_TERMINAL_CAUSE;
                             boolean compatible = requestedControl == controlMajor && requestedAudio == audioMajor
                                     && (formatV2 == null || playback.supportsAudioFormatV2(formatV2))
                                     && (requiredCapabilities & ~implemented) == 0;
@@ -698,6 +721,8 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                                     P5cControlProtocol.CAPABILITIES_INFO, info);
                             P5cControlProtocol.write(output, response);
+                            terminalCauseNegotiated = (implemented
+                                    & P5cControlProtocol.CAP_TERMINAL_CAUSE) != 0;
                             lastCommand = command.raw; lastAck = response; expectedCommandSequence++;
                             continue;
                         case P5cControlProtocol.CONNECTION_INTENT:

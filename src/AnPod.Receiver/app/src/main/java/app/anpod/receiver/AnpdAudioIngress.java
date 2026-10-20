@@ -5,6 +5,7 @@ import com.anpod.server.Pcm24PackedCodec;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Shared authenticated ANPD decoder and bounded queue ingress for UDP and AOA transports. */
 final class AnpdAudioIngress implements AutoCloseable {
@@ -19,6 +20,7 @@ final class AnpdAudioIngress implements AutoCloseable {
     private volatile boolean hasAuthenticatedAudio;
     private volatile long lastAuthenticatedAudioAtNanos;
     private volatile long droppedFloatFrames;
+    private final AtomicLong authenticatedAudioPayloadBytes = new AtomicLong();
 
     private AnpdAudioIngress(long sessionId, byte[] key, UdpPacketDecoder.AudioFormatV2 formatV2,
             UdpPcmQueue pcmQueue, FloatPcmFrameQueue floatQueue, boolean requireFormatBeforeAudio) {
@@ -61,6 +63,7 @@ final class AnpdAudioIngress implements AutoCloseable {
                 acceptFloat(packet);
             }
             if (packet.type == UdpPacketDecoder.FORMAT) formatSeen = true;
+            else authenticatedAudioPayloadBytes.addAndGet(packet.payload.length);
             return packet.type == UdpPacketDecoder.FORMAT ? Result.FORMAT : Result.AUDIO;
         } catch (UdpPacketDecoder.ProtocolException error) {
             return resultFor(error.reason);
@@ -74,6 +77,7 @@ final class AnpdAudioIngress implements AutoCloseable {
         return pcmQueue == null ? lastAuthenticatedAudioAtNanos : pcmQueue.lastAuthenticatedAudioAtNanos();
     }
     long droppedFrames() { return pcmQueue == null ? droppedFloatFrames : pcmQueue.droppedFrames(); }
+    long authenticatedAudioPayloadBytes() { return authenticatedAudioPayloadBytes.get(); }
 
     void fail(IOException error) {
         if (pcmQueue != null) pcmQueue.fail(error); else floatQueue.fail(error);

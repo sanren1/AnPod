@@ -4,7 +4,7 @@ package app.anpod.receiver;
 final class AodTelemetrySnapshot {
     enum DisplayStatus { DISCONNECTED, CONNECTED, RECEIVING, RECONNECTING }
 
-    enum Transport { UNKNOWN, USB_ADB, WIFI_UDP, WIFI_ADB }
+    enum Transport { UNKNOWN, USB_DIRECT, USB_ADB, WIFI_UDP, WIFI_ADB }
 
     final long sessionGeneration;
     final DisplayStatus status;
