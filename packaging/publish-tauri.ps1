@@ -367,6 +367,19 @@ New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { $source = if ($name -eq 'audio_capture.dll') { $nativeSource } elseif ($name -eq 'server') { $legacyPayloadSource } else { $deps }; Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $packageDir $name) }
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
+$readmeSupportFiles = @(
+    'docs\aod-preview.jpg',
+    'docs\AOD.md',
+    'packaging\publish-tauri.ps1',
+    'packaging\SIGNING.md',
+    'tools\AnPod.TestBench\README.md'
+)
+foreach ($relativePath in $readmeSupportFiles) {
+    $source = Join-Path $root $relativePath
+    $destination = Join-Path $packageDir $relativePath
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination
+}
 $audioQualityDocsDir = Join-Path $packageDir 'docs\audio-quality'
 New-Item -ItemType Directory -Path $audioQualityDocsDir -Force | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $root 'docs\audio-quality') -Filter '*.md' -File | Copy-Item -Destination $audioQualityDocsDir
