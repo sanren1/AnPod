@@ -75,6 +75,19 @@ pub struct AoaSwitchResult {
     pub requires_refresh: bool,
 }
 
+const ADB_SERVER_KILL_ARGS: &[&str] = &["kill-server"];
+
+async fn with_confirmed_adb_release<F, Fut>(confirmed: bool, run: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if !confirmed {
+        return Err("请确认停止本机 ADB server 后再切换 USB 模式。".into());
+    }
+    run().await
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -285,10 +298,18 @@ pub struct AppSnapshot {
     pub busy: bool,
     pub can_disconnect: bool,
     pub can_change_modes: bool,
+    pub can_change_playback_mode: bool,
     pub status_detail: String,
     pub audio_bitrate_bps: Option<u64>,
     pub presence: Vec<PresenceView>,
     pub version: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbDirectConfiguration {
+    pub snapshot: AppSnapshot,
+    pub configuration_id: u64,
 }
 
 /// Sanitised snapshot written by `export_diagnostics`.
@@ -478,6 +499,8 @@ pub struct AppState {
     operation: Mutex<Option<ActiveOperation>>,
     operation_generation: AtomicU64,
     auto_connect_suppressed_after_aoa_switch: AtomicBool,
+    usb_direct_configuration_id: AtomicU64,
+    usb_direct_configuration_sequence: AtomicU64,
     recovering: AtomicBool,
     wireless_probe_attempted: AtomicBool,
     failed_auto_connect: Mutex<Option<String>>,
@@ -600,6 +623,8 @@ impl AppState {
             operation: Mutex::new(None),
             operation_generation: AtomicU64::new(0),
             auto_connect_suppressed_after_aoa_switch: AtomicBool::new(false),
+            usb_direct_configuration_id: AtomicU64::new(0),
+            usb_direct_configuration_sequence: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
             wireless_probe_attempted: AtomicBool::new(false),
             failed_auto_connect: Mutex::new(None),
@@ -690,11 +715,21 @@ impl AppState {
             return Err("背景授权仅允许在明确选择已保存绑定、LAN 接口和 Receiver 目标时请求；USB/bootstrap 与手机 offer 使用原连接流程。".into());
         }
         use crate::security::{AudioParameters, BindingStore};
+        let automatic_offer = intent.as_ref().is_some_and(|(_, automatic, _)| *automatic);
         let (generation, token) = reservation.unwrap_or_else(|| self.start_operation());
         let mut audio_initialized = false;
         let _gate = self.gate.lock().await;
         let result = async {
             token_check(&token)?;
+            if intent.is_some()
+                && network_offer_suppressed(
+                    self.usb_direct_configuration_active(),
+                    self.auto_connect_suppressed_after_aoa_switch.load(Ordering::Acquire),
+                    automatic_offer,
+                )
+            {
+                return Err("USB Direct 配置期间已暂停自动无线连接。".into());
+            }
             let audio_quality = self.view.lock().expect("view lock").settings.audio_quality.clone();
             validate_audio_quality(&audio_quality)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
@@ -953,8 +988,119 @@ impl AppState {
             && !token.is_cancelled()
     }
 
+    fn automatic_connections_suppressed(&self) -> bool {
+        self.usb_direct_configuration_active()
+            || self
+                .auto_connect_suppressed_after_aoa_switch
+                .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn usb_direct_configuration_active(&self) -> bool {
+        self.usb_direct_configuration_id.load(Ordering::Acquire) != 0
+    }
+
     fn finish_operation(&self, generation: u64) {
         finish_operation_slot(&self.operation, generation);
+    }
+
+    fn prepare_usb_direct_configuration_operation(&self) -> Result<(), String> {
+        let mut current = self.operation.lock().expect("operation lock");
+        match current.as_ref() {
+            Some(operation) if !operation.background && !operation.token.is_cancelled() => {
+                Err("AnPod 正在执行前台操作；请完成或取消后再配置 USB Direct。".into())
+            }
+            Some(operation) if operation.background => {
+                operation.token.cancel();
+                self.operation_generation.fetch_add(1, Ordering::AcqRel);
+                *current = None;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn begin_usb_direct_configuration(
+        &self,
+        disconnect_current: bool,
+    ) -> Result<UsbDirectConfiguration, String> {
+        let configuration_id = loop {
+            let id = self
+                .usb_direct_configuration_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
+                .max(1);
+            if self
+                .usb_direct_configuration_id
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break id;
+            }
+            return Err("USB Direct 配置窗口已处于打开状态。".into());
+        };
+        let result = async {
+            self.prepare_usb_direct_configuration_operation()?;
+            let _gate = self.gate.lock().await;
+            self.prepare_usb_direct_configuration_operation()?;
+            let session_active = self.session.lock().await.is_some();
+            if session_active && !disconnect_current {
+                return Err("AnPod 有活动会话；请先确认断开后再配置 USB Direct。".into());
+            }
+            if session_active {
+                let cleanup = self.teardown(None).await;
+                let mut view = self.view.lock().expect("app view lock");
+                view.output = "computer".into();
+                view.busy = false;
+                view.device_name = None;
+                if let Err(error) = cleanup {
+                    view.state = "error".into();
+                    view.message = format!("已断开，但清理连接失败：{error}");
+                    view.status_detail = "USB Direct 配置未启动；连接清理需要处理。".into();
+                    return Err(format!("已断开，但清理连接失败：{error}"));
+                }
+                view.state = if view.devices.is_empty() {
+                    "noDevice".into()
+                } else {
+                    "ready".into()
+                };
+                view.message = "已断开连接；正在配置 USB Direct".into();
+                view.status_detail =
+                    "当前自动连接已暂停。关闭配置窗口后，未触发 AOA 切换的情况下会恢复自动连接。"
+                        .into();
+            }
+            let view = self.view.lock().expect("app view lock");
+            if view.busy || view.session_active {
+                return Err(
+                    "AnPod 正在连接或已有活动会话；请先结束操作后再配置 USB Direct。".into(),
+                );
+            }
+            drop(view);
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = self.usb_direct_configuration_id.compare_exchange(
+                configuration_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Err(error);
+        }
+        Ok(UsbDirectConfiguration {
+            snapshot: self.snapshot(),
+            configuration_id,
+        })
+    }
+
+    pub fn end_usb_direct_configuration(&self, configuration_id: u64) -> AppSnapshot {
+        let _ = self.usb_direct_configuration_id.compare_exchange(
+            configuration_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.snapshot()
     }
 
     fn start_qr_operation(&self) -> (u64, CancellationToken) {
@@ -1003,6 +1149,12 @@ impl AppState {
             || view.session_active
             || (view.state == "error" && view.device_name.is_some());
         let can_change_modes = !view.busy && !can_disconnect;
+        let can_change_playback_mode = view.session_active
+            && !view.busy
+            && matches!(
+                view.session_transport.as_deref(),
+                Some("usb" | "wifi" | "lan")
+            );
         AppSnapshot {
             state: view.state.clone(),
             message: view.message.clone(),
@@ -1052,6 +1204,7 @@ impl AppState {
             busy: view.busy,
             can_disconnect,
             can_change_modes,
+            can_change_playback_mode,
             status_detail: view.status_detail.clone(),
             audio_bitrate_bps: view.audio_bitrate_bps,
             presence: self.presence.lock().expect("presence lock").view(),
@@ -1253,6 +1406,9 @@ impl AppState {
     }
 
     pub async fn refresh_devices(&self) -> Result<AppSnapshot, String> {
+        if self.usb_direct_configuration_active() {
+            return Ok(self.snapshot());
+        }
         if self
             .session
             .lock()
@@ -1260,6 +1416,14 @@ impl AppState {
             .as_ref()
             .is_some_and(|session| session.aoa_owner.is_some())
         {
+            return Ok(self.snapshot());
+        }
+        self.refresh_devices_with_cancel(None).await
+    }
+
+    pub async fn refresh_devices_from_ui(&self) -> Result<AppSnapshot, String> {
+        let _gate = self.gate.lock().await;
+        if self.usb_direct_configuration_active() {
             return Ok(self.snapshot());
         }
         self.refresh_devices_with_cancel(None).await
@@ -1297,20 +1461,25 @@ impl AppState {
         &self,
         app: &AppHandle,
         target_id: &str,
+        release_adb_server: bool,
     ) -> Result<AoaSwitchResult, String> {
+        if !self.usb_direct_configuration_active() {
+            return Err("USB Direct 配置窗口未处于活动状态；请重新打开后再切换。".into());
+        }
+        if !release_adb_server {
+            return Err("请确认停止本机 ADB server 后再切换 USB 模式。".into());
+        }
         let (generation, token) = self
             .try_start_exclusive_operation()
             .ok_or_else(|| "AnPod 正在处理其他操作；请稍后再切换 USB 模式。".to_string())?;
         let result: Result<AoaSwitchResult, String> = async {
             let _gate = self.gate.lock().await;
             token_check(&token)?;
+            if !self.usb_direct_configuration_active() {
+                return Err("USB Direct 配置窗口已关闭；请重新打开后再切换。".into());
+            }
             if self.session.lock().await.is_some() {
                 return Err("AnPod 有活动会话；请先断开后再切换 USB 模式。".into());
-            }
-            if self.wireless_connection_offers().active {
-                return Err(
-                    "当前有待处理的无线连接请求；请先关闭请求监听后再切换 USB 模式。".into(),
-                );
             }
             {
                 let mut view = self.view.lock().expect("view lock");
@@ -1321,14 +1490,46 @@ impl AppState {
                 }
                 view.busy = true;
                 view.state = "connecting".into();
-                view.message = "正在请求手机切换到 USB Direct…".into();
+                view.message = "正在停止 ADB server 并请求切换 USB 模式…".into();
                 view.device_name = Some("iQOO 11 V2243A".into());
-                view.status_detail =
-                    "正在通过已确认的 WinUSB MI_02 接口发送 Android Open Accessory 请求。".into();
+                view.status_detail = "正在停止本机 ADB server（会影响该服务上的全部调试连接），随后通过已确认的 WinUSB MI_02 接口发送 Android Open Accessory 请求。".into();
             }
             self.emit(app);
-            let worker_token = token.clone();
+
             let selected_id = target_id.to_owned();
+            let fresh_targets = tokio::task::spawn_blocking(aoa_winusb::discover_switch_targets)
+                .await
+                .map_err(|error| format!("重新检查 iQOO 11 WinUSB 接口失败：{error}"))?
+                .map_err(|error| format!("重新检查 iQOO 11 WinUSB 接口失败：{error}"))?;
+            if !fresh_targets.iter().any(|target| target.id == selected_id) {
+                return Err("所选 iQOO 11 WinUSB 接口已不可用或发生变化；请刷新设备列表后重试。".into());
+            }
+
+            self.auto_connect_suppressed_after_aoa_switch
+                .store(true, Ordering::Release);
+
+            with_confirmed_adb_release(release_adb_server, || async {
+                let stopped = adb_run(
+                    &self.adb_path,
+                    None,
+                    ADB_SERVER_KILL_ARGS,
+                    Duration::from_secs(5),
+                    Some(&token),
+                )
+                .await?;
+                if stopped.success {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "无法停止本机 ADB server，未尝试打开 WinUSB 接口。请检查 ADB server 状态后重试。{}{}",
+                        stopped.stderr.trim(),
+                        stopped.stdout.trim()
+                    ))
+                }
+            })
+            .await?;
+
+            let worker_token = token.clone();
             let mut worker = tokio::task::spawn_blocking(move || {
                 aoa_winusb::switch_to_accessory(&selected_id, || worker_token.is_cancelled())
             });
@@ -1348,13 +1549,14 @@ impl AppState {
                     }
                 }
             };
-            switch_result?;
-            self.auto_connect_suppressed_after_aoa_switch
-                .store(true, Ordering::Release);
+            switch_result.map_err(|error| {
+                format!(
+                    "{error}。请确认该接口仍使用 WinUSB 驱动，并关闭其他正在使用此 USB 接口的工具后重试。"
+                )
+            })?;
             Ok(AoaSwitchResult {
                 success: true,
-                message: "已发送 AOA 切换请求；手机的 ADB/MTP USB 连接将断开，等待手机重新枚举。"
-                    .into(),
+                message: "已发送 AOA 切换请求；手机的 USB 连接将断开，等待手机重新枚举。".into(),
                 requires_refresh: true,
             })
         }
@@ -1362,14 +1564,15 @@ impl AppState {
         self.finish_operation(generation);
         if operation_generation_matches(&self.operation_generation, generation) {
             let mut view = self.view.lock().expect("view lock");
-            if result.is_ok() && view.message == "正在请求手机切换到 USB Direct…" {
+            if result.is_ok() && view.message == "正在停止 ADB server 并请求切换 USB 模式…"
+            {
                 view.busy = false;
                 view.state = "noDevice".into();
                 view.message = "等待手机重新枚举".into();
                 view.device_name = None;
                 view.status_detail =
                     "已发送 AOA 切换请求；手机 USB 设备重新出现后可选择 USB Direct。".into();
-            } else if result.is_err() && view.message == "正在请求手机切换到 USB Direct…"
+            } else if result.is_err() && view.message == "正在停止 ADB server 并请求切换 USB 模式…"
             {
                 view.busy = false;
                 view.state = if view.devices.is_empty() {
@@ -1618,6 +1821,9 @@ impl AppState {
         &self,
         cancel: Option<&CancellationToken>,
     ) -> Result<AppSnapshot, String> {
+        if self.usb_direct_configuration_active() {
+            return Ok(self.snapshot());
+        }
         let result = adb_run(
             &self.adb_path,
             None,
@@ -1631,6 +1837,9 @@ impl AppState {
         }
         let mut devices = parse_devices(&result.stdout);
         for device in &mut devices {
+            if self.usb_direct_configuration_active() {
+                break;
+            }
             if device.transport == "unknown"
                 || device.model.is_empty()
                 || device.manufacturer.is_empty()
@@ -1738,10 +1947,7 @@ impl AppState {
 
     #[cfg(windows)]
     async fn connect_pending_wireless_offer(&self, app: &AppHandle) -> bool {
-        if self
-            .auto_connect_suppressed_after_aoa_switch
-            .load(Ordering::Acquire)
-        {
+        if self.automatic_connections_suppressed() {
             return false;
         }
         {
@@ -1781,6 +1987,10 @@ impl AppState {
         let Some(reservation) = self.start_preemptible_background_operation() else {
             return false;
         };
+        if self.automatic_connections_suppressed() {
+            self.finish_operation(reservation.0);
+            return false;
+        }
         let offer = self
             .host_offer_listener
             .lock()
@@ -1830,6 +2040,9 @@ impl AppState {
     }
 
     pub async fn monitor_once(&self, app: &AppHandle) {
+        if self.usb_direct_configuration_active() {
+            return;
+        }
         #[cfg(windows)]
         if self.connect_pending_wireless_offer(app).await {
             return;
@@ -1837,6 +2050,9 @@ impl AppState {
         let Ok(_gate) = self.gate.try_lock() else {
             return;
         };
+        if self.usb_direct_configuration_active() {
+            return;
+        }
         if self
             .operation
             .lock()
@@ -2013,10 +2229,7 @@ impl AppState {
             return;
         };
         let settings = snapshot.settings.clone();
-        if self
-            .auto_connect_suppressed_after_aoa_switch
-            .load(Ordering::Acquire)
-        {
+        if self.automatic_connections_suppressed() {
             return;
         }
         let suppressed = self
@@ -2089,6 +2302,11 @@ impl AppState {
                     self.recovering.store(false, Ordering::Release);
                     return;
                 };
+                if self.automatic_connections_suppressed() {
+                    self.finish_operation(generation);
+                    self.recovering.store(false, Ordering::Release);
+                    return;
+                }
                 let result = self
                     .connect_locked(app, &serial, generation, &token, false)
                     .await;

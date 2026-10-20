@@ -17,7 +17,7 @@ import { ErrorDetails } from "./components/Modal";
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "receiver" | "setup" | "aoa" | "help" | "diagnostics" | null>(null);
-  const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "device" | "network" | "receiverUsb"; value: string } | null>(null);
+  const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "device" | "network" | "receiverUsb" | "aoa"; value: string } | null>(null);
   const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
   const [pendingReceiverOperation, setPendingReceiverOperation] = useState<ReceiverUsbOperation | null>(null);
   const [receiverOperationBusy, setReceiverOperationBusy] = useState(false);
@@ -28,6 +28,9 @@ function App() {
   const receiverConfirmationStarted = useRef(false);
   const appMounted = useRef(true);
   const receiverOperationUnlisten = useRef<(() => void) | null>(null);
+  const aoaConfigurationActive = useRef<number | null>(null);
+  const aoaConfigurationOpening = useRef(false);
+  const aoaConfigurationClosing = useRef(false);
   const panelRef = useRef(panel);
   panelRef.current = panel;
   const [networkDialogError, setNetworkDialogError] = useState("");
@@ -49,6 +52,9 @@ function App() {
       appMounted.current = false;
       receiverOperationUnlisten.current?.();
       receiverOperationUnlisten.current = null;
+      const configurationId = aoaConfigurationActive.current;
+      aoaConfigurationActive.current = null;
+      if (configurationId !== null) void invokeApp("end_usb_direct_configuration", { configurationId });
     };
   }, []);
   const snapshotRefreshGeneration = useRef(0);
@@ -153,16 +159,56 @@ function App() {
     setPanel("network");
   };
   const openConnectionFlow = () => openNetworkDialog(true, { localAddress: "", bindingReference: "" }, !!snapshot?.wirelessConnectionOffers.active);
-  const openAoaDialog = () => {
-    if (active || controlsDisabled || snapshot?.wirelessConnectionOffers.active) return;
-    setPanel("aoa");
+  const openAoaDialog = async (disconnectCurrent = false) => {
+    if (aoaConfigurationOpening.current || aoaConfigurationClosing.current || controlsDisabled) return;
+    if (active && !disconnectCurrent) { setConfirm({ kind: "aoa", value: "" }); return; }
+    aoaConfigurationOpening.current = true;
+    setWorking(true);
+    try {
+      const configuration = await invokeApp<{ snapshot: Snapshot; configurationId: number }>("begin_usb_direct_configuration", { disconnectCurrent });
+      aoaConfigurationActive.current = configuration.configurationId;
+      if (!appMounted.current) {
+        aoaConfigurationActive.current = null;
+        await invokeApp("end_usb_direct_configuration", { configurationId: configuration.configurationId });
+        return;
+      }
+      apply(configuration.snapshot);
+      setPanel("aoa");
+    } catch (error) { notify(String(error)); }
+    finally { aoaConfigurationOpening.current = false; setWorking(false); }
+  };
+  const closeAoaDialog = async () => {
+    if (aoaConfigurationClosing.current) return;
+    aoaConfigurationClosing.current = true;
+    const configurationId = aoaConfigurationActive.current;
+    try {
+      if (configurationId !== null) {
+        const next = await invokeApp<Snapshot>("end_usb_direct_configuration", { configurationId });
+        if (aoaConfigurationActive.current === configurationId) {
+          aoaConfigurationActive.current = null;
+          apply(next);
+        }
+      }
+      if (panelRef.current === "aoa") setPanel(null);
+    } catch (error) {
+      notify(String(error));
+    } finally {
+      aoaConfigurationClosing.current = false;
+    }
   };
   const startAoa = async (targetId: string, bindingReference: string) => {
-    if (!snapshot || active || controlsDisabled || snapshot.wirelessConnectionOffers.active) return;
+    const configurationId = aoaConfigurationActive.current;
+    if (!snapshot || active || configurationId === null) return;
     setWorking(true);
     try {
       apply(await invokeApp<Snapshot>("start_aoa_audio", { targetId, bindingReference }));
-      setPanel(null);
+      if (aoaConfigurationActive.current === configurationId && !aoaConfigurationClosing.current) {
+        apply(await invokeApp<Snapshot>("end_usb_direct_configuration", { configurationId }));
+        if (aoaConfigurationActive.current === configurationId) {
+          aoaConfigurationActive.current = null;
+          setPanel(null);
+        }
+      }
     } finally { setWorking(false); }
   };
   const cancelAoaStart = async () => apply(await invokeApp<Snapshot>("cancel_operation"));
@@ -180,13 +226,13 @@ function App() {
     if (kind === "audioBackend" && ((snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp")
       || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp")
       || aoaSession)) return;
-    if (kind === "playback" && active && !snapshot.canChangeModes) return;
+    if (kind === "playback" && active && !snapshot.canChangePlaybackMode) return;
     const current = kind === "transport" ? snapshot.connectionTransport
       : kind === "wirelessProtocol" ? snapshot.settings.wirelessProtocol
         : kind === "audioBackend" ? snapshot.settings.audioBackend
           : snapshot.settings.playbackMode === "LowLatency" ? "lowLatency" : "balanced";
     if (value === current) return;
-    if (active && kind === "playback" && lanSession) {
+    if (active && kind === "playback" && (lanSession || snapshot.canChangePlaybackMode)) {
       setWorking(true);
       try { apply(await invokeApp<Snapshot>("reconfigure_session", { kind, value })); }
       catch (error) {
@@ -324,6 +370,16 @@ function App() {
         setConfirm(null); setPendingReceiverOperation(null);
         setPanel(operation.returnPanel);
         await performReceiverUsbOperation(operation);
+      } else if (confirm.kind === "aoa") {
+        const configuration = await invokeApp<{ snapshot: Snapshot; configurationId: number }>("begin_usb_direct_configuration", { disconnectCurrent: true });
+        aoaConfigurationActive.current = configuration.configurationId;
+        if (!appMounted.current) {
+          aoaConfigurationActive.current = null;
+          await invokeApp("end_usb_direct_configuration", { configurationId: configuration.configurationId });
+          return;
+        }
+        apply(configuration.snapshot);
+        setPanel("aoa");
       } else if (confirm.kind === "device") {
         const result = await invokeApp<OperationResult>("switch_device", { serial: confirm.value });
         apply(result.snapshot);
@@ -345,7 +401,7 @@ function App() {
       }
       else {
         let message = String(error);
-        if (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" || confirm.kind === "playback") {
+        if (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" || confirm.kind === "playback" || confirm.kind === "aoa") {
           try { apply(await invokeApp<Snapshot>("get_snapshot")); }
           catch (refreshError) { message += strings.app.refreshFailureSuffix(String(refreshError)); }
         }
@@ -646,7 +702,7 @@ function App() {
           <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} aria-hidden="true" />{strings.app.usb}</button>
           <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</button>
         </div>
-        <button className="text-button aoa-entry" type="button" disabled={controlsDisabled || active || snapshot.wirelessConnectionOffers.active} onClick={openAoaDialog}>
+        <button className="text-button aoa-entry" type="button" disabled={controlsDisabled} onClick={() => void openAoaDialog()}>
           <Usb size={15} aria-hidden="true" />{strings.aoaDialog.experimental}
         </button>
       </section>
@@ -668,8 +724,8 @@ function App() {
 
       <section className="mode-section" aria-label={strings.app.playbackMode}>
         <div className="mode-row"><h2>{strings.app.playbackMode}</h2><div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
-          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled || !snapshot.canChangeModes} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
-          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || !snapshot.canChangeModes} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
         </div></div>
         <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
       </section>
@@ -687,17 +743,18 @@ function App() {
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
-    {panel === "aoa" && <AoaDialog disabled={controlsDisabled || active || snapshot.wirelessConnectionOffers.active} onStart={startAoa} onCancelStart={cancelAoaStart} onClose={() => setPanel(null)} />}
+    {panel === "aoa" && <AoaDialog disabled={false} onStart={startAoa} onCancelStart={cancelAoaStart} onClose={() => void closeAoaDialog()} />}
     {confirm && <ConfirmDialog
-      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? strings.app.switchReceiverUpgradeTitle : strings.app.switchReceiverInstallTitle : confirm.kind === "network" ? strings.app.switchNetworkTitle : confirm.kind === "device" ? strings.app.switchDeviceTitle : confirm.kind === "transport" ? strings.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? strings.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? strings.app.switchAudioBackendTitle : strings.app.switchPlaybackTitle}
+      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? strings.app.switchReceiverUpgradeTitle : strings.app.switchReceiverInstallTitle : confirm.kind === "network" ? strings.app.switchNetworkTitle : confirm.kind === "aoa" ? strings.app.aoaInterruptTitle : confirm.kind === "device" ? strings.app.switchDeviceTitle : confirm.kind === "transport" ? strings.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? strings.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? strings.app.switchAudioBackendTitle : strings.app.switchPlaybackTitle}
       body={confirm.kind === "receiverUsb" ? pendingReceiverOperation ? strings.app.receiverInstallOrCheck(pendingReceiverOperation.targetVersionCode) : strings.app.receiverOperation
         : confirm.kind === "network" ? strings.app.networkConfirmation
+        : confirm.kind === "aoa" ? strings.app.aoaInterruptBody
         : confirm.kind === "device" && lanSession ? strings.app.switchLanDevice(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone)
           : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? strings.app.switchConnectionSettings
             : confirm.kind === "audioBackend" ? strings.app.switchBackend
             : confirm.kind === "device" ? strings.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone, snapshot.output === "phone")
               : strings.app.switchPlayback}
-      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
+      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "aoa" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 

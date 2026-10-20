@@ -8,9 +8,11 @@ platform I/O owners, and the product USB permission/state entrypoints. It does
 not reuse the AOA 4096-byte echo probe, ADB TCP, or the LAN UDP context. The
 current candidate also supports an explicit, confirmed USB mode switch from
 the PC app for the supported iQOO 11 V2243A; the switch does not start audio.
-The prior 1.10.0 / Receiver code 34 package checks are historical and do not
-cover the current crash fix. No physical accessory transfer or audio playback
-has been tested for the current candidate.
+The 1.10.1 crash-fix package is historical; PC 1.10.2 adds owner suppression
+around USB Direct configuration, a separately confirmed option to stop the
+local ADB server before one fresh, identity-checked WinUSB attempt, and
+latency-mode availability for connected USB/ADB sessions. No physical
+accessory transfer or audio playback has been tested for the current candidate.
 
 The Receiver must have the matching accessory-mode application installed. The
 PC app can send AOA vendor requests 51/52/53 to the explicitly selected and
@@ -19,6 +21,23 @@ confirmed supported pre-switch interface. The user then grants
 PC connection with a selected accessory and saved binding. USB mode switching
 does not grant accessory permission or start audio. A detach, permission
 revocation, or user cancellation ends the current session.
+
+Opening the USB Direct configuration flow establishes a temporary owner
+suppression before showing the window. Closing the window releases this
+temporary suppression. Before a switch attempt, the user must explicitly opt
+in to stopping the local ADB server;
+this affects every ADB debugging connection on the PC. After consent, the PC
+rereads and validates the selected `VID_2D95&PID_6013&MI_02` interface, runs
+`adb kill-server`, and makes one WinUSB switch attempt. At that point
+suppression becomes sticky and remains after a failed attempt and window
+closure. Failure is surfaced as an error; there is no fallback or automatic
+retry. The window's temporary suppression and sticky suppression have separate
+lifetimes. Closing the window always releases the temporary owner; once a
+switch attempt begins, sticky suppression survives an AOA connection and its
+later disconnection. Only an explicit normal USB/LAN connection or re-enabling
+automatic connection clears sticky suppression. During the flow, the wireless
+offer listener stays running but pauses accepting offers; the saved wireless
+preference is retained.
 
 ## Binding and transport separation
 
@@ -435,6 +454,12 @@ user must grant Android accessory permission, wait for re-enumeration, then
 select an accessory and saved binding and start the connection. On Windows the
 product transport requires an available WinUSB accessory interface.
 
+Already connected standard USB/ADB and LAN sessions permit switching between
+balanced and low-latency playback modes; AOA playback mode remains locked.
+Audio quality profile and format changes remain locked to a new session. USB
+Direct setup and ADB-server consent behavior are described at the start of this
+document.
+
 The final Phase 6c offline source gates completed on 2026-10-20:
 
 - Host Rust full locked/offline suite: 137 passed, 0 failed, 0 ignored, 2
@@ -454,6 +479,10 @@ The signed Receiver APK build is verified. Portable package checks and its final
 Windows PnP/WinUSB hardware access, real playback, throughput, acoustic
 latency, and long-duration stability remain `NOT_TESTED`. Source and synthetic
 gates do not establish those results.
+
+PC 1.10.2 control-flow changes are being prepared for package review. The
+portable audit will not establish hardware mode switching, ADB-server impact
+on devices, physical playback, or acoustic quality.
 
 The previous Receiver candidate was `0.17.0-v3-flow-candidate` / code 34, built from
 source commit `8ca9638db128f99e36769f42de18ed9244f457c2` with

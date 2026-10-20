@@ -37,7 +37,7 @@ export type Snapshot = {
   negotiatedAudioFormat: NegotiatedAudioFormat | null;
   windowsMixFormat: WindowsMixFormat | null; androidOutputFormat: AndroidOutputFormat | null;
   output: "computer" | "phone"; settings: Settings;
-  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
+  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; canChangePlaybackMode: boolean; statusDetail: string;
   audioBitrateBps: number | null; networkRecoverySecondsRemaining?: number | null; version: string;
 };
 export type Credentials = { instanceName: string; password: string; payload: string };

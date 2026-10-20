@@ -516,6 +516,9 @@ impl AppState {
         offer_id: &str,
         binding_ref: &str,
     ) -> Result<AppSnapshot, String> {
+        if self.usb_direct_configuration_active() {
+            return Err("USB Direct 配置期间不能接受无线连接请求。".into());
+        }
         if !valid_binding_reference(binding_ref) {
             return Err("必须明确选择已保存的 Receiver 绑定。".into());
         }
@@ -539,6 +542,10 @@ impl AppState {
         let Some(reservation) = self.start_background_operation() else {
             return Err("AnPod 正在处理连接操作；请稍后再接受连接请求。".into());
         };
+        if self.usb_direct_configuration_active() {
+            self.finish_operation(reservation.0);
+            return Err("USB Direct 配置期间不能接受无线连接请求。".into());
+        }
         let offer_result = (|| {
             let listener = self
                 .host_offer_listener
@@ -569,6 +576,8 @@ impl AppState {
                 return Err(error);
             }
         };
+        self.auto_connect_suppressed_after_aoa_switch
+            .store(false, Ordering::Release);
         self.start_network_audio_inner(
             app,
             &address.to_string(),

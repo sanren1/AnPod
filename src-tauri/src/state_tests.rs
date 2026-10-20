@@ -1,5 +1,70 @@
 use super::*;
 
+#[tokio::test]
+async fn usb_direct_configuration_suppression_is_owned_by_its_configuration_id() {
+    let state = AppState::new();
+    let configuration = state.begin_usb_direct_configuration(false).await.unwrap();
+    let configuration_id = configuration.configuration_id;
+    assert!(state.usb_direct_configuration_active());
+    assert!(state
+        .begin_usb_direct_configuration(false)
+        .await
+        .err()
+        .is_some());
+
+    state.end_usb_direct_configuration(configuration_id.wrapping_add(1));
+    assert!(state.usb_direct_configuration_active());
+    state.end_usb_direct_configuration(configuration_id);
+    state.end_usb_direct_configuration(configuration_id);
+    assert!(!state.usb_direct_configuration_active());
+}
+
+#[test]
+fn playback_mode_capability_excludes_usb_direct_and_quality_lock_remains_separate() {
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.session_active = true;
+        view.session_transport = Some("usb".into());
+    }
+    let standard_usb = state.snapshot();
+    assert!(standard_usb.can_change_playback_mode);
+    assert!(!standard_usb.can_change_modes);
+
+    state.view.lock().unwrap().session_transport = Some("aoa".into());
+    assert!(!state.snapshot().can_change_playback_mode);
+}
+
+#[test]
+fn wireless_offer_suppression_blocks_all_offers_during_configuration_but_only_auto_after_aoa() {
+    assert!(network_offer_suppressed(true, false, false));
+    assert!(network_offer_suppressed(true, true, true));
+    assert!(network_offer_suppressed(false, true, true));
+    assert!(!network_offer_suppressed(false, true, false));
+    assert!(!network_offer_suppressed(false, false, false));
+}
+
+#[tokio::test]
+async fn adb_server_release_requires_confirmation_and_uses_kill_server() {
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let declined = with_confirmed_adb_release(false, || async {
+        called.store(true, Ordering::Release);
+        Ok(())
+    })
+    .await;
+    assert!(declined.unwrap_err().contains("确认停止本机 ADB server"));
+    assert!(!called.load(Ordering::Acquire));
+
+    let args = std::sync::Mutex::new(Vec::new());
+    with_confirmed_adb_release(true, || async {
+        *args.lock().unwrap() = ADB_SERVER_KILL_ARGS.to_vec();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(*args.lock().unwrap(), ["kill-server"]);
+}
+
 fn sample_snapshot() -> AppSnapshot {
     AppSnapshot {
         state: "connected".into(),
@@ -28,6 +93,7 @@ fn sample_snapshot() -> AppSnapshot {
         busy: false,
         can_disconnect: true,
         can_change_modes: false,
+        can_change_playback_mode: true,
         status_detail: "192.168.50.2 已连接".into(),
         audio_bitrate_bps: Some(1_536_000),
         presence: Vec::new(),

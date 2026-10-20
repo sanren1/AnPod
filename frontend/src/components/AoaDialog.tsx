@@ -70,7 +70,7 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
     setErrorDetails("");
     setSwitchListError("");
     try {
-      const result = await invokeApp<{ success: boolean; message: string; requiresRefresh: boolean }>("switch_aoa_mode", { targetId: switchTargetId });
+      const result = await invokeApp<{ success: boolean; message: string; requiresRefresh: boolean }>("switch_aoa_mode", { targetId: switchTargetId, releaseAdbServer: switchConfirmed });
       if (!result.success) throw new Error(result.message);
       try {
         const nextTargets = await invokeApp<AoaTarget[]>("list_aoa_targets");
@@ -89,8 +89,9 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
       setSwitchConfirmed(false);
       setSwitchComplete(true);
     } catch (error) {
-      setErrorSummary(strings.aoaDialog.switchFailed);
-      setErrorDetails(String(error));
+      const details = String(error);
+      setErrorSummary(/0x80070005|E_ACCESSDENIED|Access is denied/i.test(details) ? strings.aoaDialog.switchAccessDenied : strings.aoaDialog.switchFailed);
+      setErrorDetails(details);
     } finally { setSwitching(false); }
   };
 

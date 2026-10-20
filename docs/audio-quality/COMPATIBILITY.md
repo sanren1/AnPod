@@ -40,6 +40,19 @@
   ADB routes remain available there. Windows accessory access is restricted to
   the selected WinUSB accessory interface; on composite 18D1:2D01 devices,
   MI_01 remains ADB and is not opened by the audio path.
+- PC 1.10.2 USB Direct setup suppresses automatic connection before its
+  configuration window opens. Closing the window releases this temporary
+  owner. Once a confirmed switch attempt begins, a separate sticky suppression
+  survives failure and AOA connection/disconnection; only an explicit normal
+  USB/LAN connection or re-enabling automatic connection clears it. Before an
+  attempt, stopping the local ADB server requires explicit consent and affects every ADB debugging connection
+  on that PC. After consent, the app rereads and validates the iQOO 11
+  `VID_2D95&PID_6013&MI_02`, runs `adb kill-server`, then makes one WinUSB
+  attempt. Failure is surfaced and retains suppression. Existing USB/ADB and
+  LAN sessions allow balanced/low-latency switching; AOA remains locked.
+  Quality/format changes still require a new session. The wireless offer
+  listener stays running and pauses accepting offers during this flow; the
+  saved preference is retained.
 - Source and offline loopback work does not claim hardware playback, quality,
   long-duration stability or APK upgrade verification. These remain
   `NOT_TESTED` pending real-device validation.
@@ -86,7 +99,7 @@ verified release signer is
 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`, and the
 exact APK passed the Rust artifact-read test. This verifies the built
 candidate artifact only; installation and upgrade on a device remain
-`NOT_TESTED`. The current crash-fix candidate is PC 1.10.1 with Receiver
+`NOT_TESTED`. The prior crash-fix package was PC 1.10.1 with Receiver
 `0.17.1-v3-flow-candidate` / code 35. Its release-signed APK SHA-256 is
 `8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f`, built
 from source `2bd998d65fe650bb225c09d7353c5c2ba39febfc` with
