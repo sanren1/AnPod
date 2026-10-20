@@ -1,4 +1,4 @@
-# AOA direct audio transport (Phase 6a offline protocol implemented)
+# AOA direct audio transport (Phase 6a protocol and 6b1 I/O foundation)
 
 This specification defines the accepted accessory-mode byte-stream transport
 for an AnPod host and Receiver pair. Phase 6a implements its offline record
@@ -6,9 +6,10 @@ codec, transport-specific binding derivation, and shared-vector checks. It
 reuses the existing ANPB binding,
 P5-A v2 handshake, P5-C authenticated control messages and ANPD v2 encrypted
 audio packets. It does not reuse the AOA 4096-byte echo probe, ADB TCP, or the
-LAN UDP transport context. Phase 6a implements only the offline protocol and
-framing layer described here; device I/O and product integration remain later
-phases.
+LAN UDP transport context. Phase 6a protocol codecs and the 6b1 platform I/O
+owners are implemented as offline foundations. They do not yet integrate a
+complete AOA session into the product audio path, and no physical accessory
+transfer has been tested.
 
 The Receiver must have the matching accessory-mode application installed. The
 first product stage connects only to a target already in AOA accessory mode;
@@ -97,7 +98,9 @@ either codec is fatal to that stream session; after partial record input/output,
 the caller must close the session and must not retry at the next byte or scan
 for another `ANPU` header. Transport adapters absorb only transient no-data
 conditions before returning bytes to the codec: EAGAIN/EINTR and USB zero-length
-packets are handled inside bounded polling, not treated as record boundaries.
+packets are handled inside bounded platform I/O/deadline handling, not treated
+as record boundaries. Windows may use its bounded pipe timeout/abort policy;
+Android uses interruptible channel close rather than polling.
 Rust's `read_exact`/`write_all` retry `Interrupted`; therefore an adapter must
 not use `ErrorKind::Interrupted` to report cancellation, and must return a fatal
 error kind when the session has been cancelled.
@@ -154,15 +157,55 @@ advancing replay state or queueing samples.
 
 ## Bounded byte-stream I/O and teardown
 
-There is one reader for USB IN and one writer for USB OUT. On Android both use
-the accessory file descriptor opened by the foreground session. Before starting
-workers, the owner sets `O_NONBLOCK` with `Os.fcntlInt` and performs bounded
-`Os.poll`/`Os.read`/`Os.write` operations (poll slices at most 100 ms), checking
-cancellation and the session generation after each poll. `EAGAIN` and
-`EINTR` return to the bounded poll loop. If nonblocking setup fails, the
-connection fails visibly before workers start; it must not fall back to an
-unbounded blocking read. The `ParcelFileDescriptor` stays owned and open until
-both workers exit, then is closed exactly once.
+There is one reader for USB IN and one writer for USB OUT. Android's AOA
+accessory endpoint is a blocking character device: the AOSP `android_f_accessory`
+file operations do not provide `poll`, and its read path waits for USB data
+without honoring `O_NONBLOCK`. Therefore `fcntl(O_NONBLOCK)` plus `poll` is not
+a cancellation contract for `/dev/usb_accessory`.
+
+The Android AOA product path requires API 24 or later. It uses one standard
+`FileChannel` for USB IN and one for USB OUT, each backed by a non-owning
+`FileInputStream`/`FileOutputStream` over the session's
+`ParcelFileDescriptor`. Closing a channel from the cleanup worker signals and
+waits for its active native I/O threads; the supplied streams do not own or
+close the PFD's descriptor. The I/O owner closes both channels on its cleanup
+worker, waits for its in-flight record operations to quiesce, and only then
+closes the PFD exactly once. The coordinator separately joins its reader and
+writer workers before discarding or reusing session state. API 23 does not
+provide this channel-level native-thread signaling for externally owned
+descriptors, so USB Direct is unavailable there; do not silently switch that
+request to ADB. The app's existing UDP/ADB paths and minimum SDK remain
+unchanged.
+
+Waiting for the first byte of a new record may wait for the PC to send; the
+three-second absolute AOA record-completion deadline starts only after its
+first byte. Startup/owner and authenticated heartbeat deadlines remain
+separate.
+
+When a record deadline expires, schedule channel close on the cleanup worker;
+never close a channel or join a worker on the main thread. Use a fixed 16 KiB
+transfer buffer for record I/O; it is protocol buffering only and does not add
+audio pre-roll.
+
+The version boundary is based on the tagged AOSP implementations:
+[Android 6.0.1 `FileChannelImpl`](https://android.googlesource.com/platform/libcore/+/refs/tags/android-6.0.1_r81/luni/src/main/java/java/nio/FileChannelImpl.java)
+only closes its parent stream, while [Android 7.0 `FileChannelImpl`](https://android.googlesource.com/platform/libcore/+/refs/tags/android-7.0.0_r1/ojluni/src/main/java/sun/nio/ch/FileChannelImpl.java)
+signals registered native threads before closing its parent. The signal path is
+implemented by [Android 7.0 `NativeThreadSet`](https://android.googlesource.com/platform/libcore/+/refs/tags/android-7.0.0_r1/ojluni/src/main/java/sun/nio/ch/NativeThreadSet.java)
+and [`NativeThread.c`](https://android.googlesource.com/platform/libcore/+/refs/tags/android-7.0.0_r1/ojluni/src/main/native/NativeThread.c);
+the channel's read path stops retrying once closed. The [Android 15 AOA driver](https://android.googlesource.com/kernel/common/+/refs/heads/android15-6.6/drivers/usb/gadget/function/android_f_accessory.c)
+confirms that accessory reads wait on USB request completion and that the file
+operations have no `poll` callback.
+
+For a PC-requested stop, use the existing authenticated ANPC STOP/ACK exchange
+and then close the transport. For a local Android user stop, invalidate the
+session generation and stop PCM immediately, then close both channels on the
+cleanup worker; the Host observes the resulting I/O failure or heartbeat
+timeout. There is no new receiver-to-host STOP event in this protocol. Channel
+close may wait for blocked reads/writes to return, so it must never run on the
+main thread. The PFD is not considered closed until record I/O is quiescent and
+its owner has closed it; the coordinator also joins its stream workers before
+discarding session state.
 
 The reader reads exactly the eight-byte ANPU header, validates it before
 allocation, then reads exactly the bounded body. Short transfers accumulate
@@ -263,9 +306,40 @@ The first full Rust attempt ran its Java fixture with an unintended JDK 16 and
 failed 16 fixture checks; the same suite passed after selecting the approved
 JDK 17. No source assertion was changed to make that environment failure pass.
 
-The offline checks do not implement or establish AOA device I/O. A fake USB
-interface can verify only that a future adapter opens the selected MI_00
-candidate and cancels workers on detach. Real AOA mode switching, Android
-permission behavior, Windows PnP/WinUSB access, USB throughput, 96 kHz
-compatibility, latency, and audible quality remain `NOT_TESTED` pending the
-later device-I/O and product-integration phases.
+## 6b1 platform I/O foundation status
+
+The Android `AoaAccessoryIo` owner and Windows `aoa_winusb` transport owner
+have offline implementations. Android's focused `AoaAccessoryIoTest` passed
+5/5 using fake channels with the production ANPU record codec. It ran with
+JDK 17 and SDK 35 using:
+
+```powershell
+:app:testDebugUnitTest --tests app.anpod.receiver.AoaAccessoryIoTest --offline --no-daemon -PreceiverBuildDir=F:\Program\AnPod\artifacts\phase6b1-android-build
+```
+
+The XML result is
+`artifacts/phase6b1-android-build/test-results/testDebugUnitTest/TEST-app.anpod.receiver.AoaAccessoryIoTest.xml`.
+Windows focused AOA I/O checks passed 7/7 (124 filtered); Rust formatting,
+strict Clippy, and the Windows MSVC-target check also passed. Exact Windows
+commands and raw logs:
+
+```powershell
+cargo test --manifest-path src-tauri\Cargo.toml --locked --offline aoa_winusb::tests -- --nocapture
+cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri\Cargo.toml --locked --offline -- -D warnings
+cargo check --manifest-path src-tauri\Cargo.toml --locked --offline --target x86_64-pc-windows-msvc
+```
+
+Logs: `artifacts/phase6b-focused-tests.log`, `artifacts/phase6b-fmt-check.log`,
+`artifacts/phase6b-clippy.log`, and `artifacts/phase6b-windows-check.log`;
+each reports exit code 0. The focused test log contains unrelated test-build
+warnings, while strict Clippy passed. These checks cover record-stream
+cancellation, deadlines, short transfers, interface discovery logic and
+handle ownership; they do not prove behavior on OEM Android accessory drivers
+or a physical Windows/USB connection.
+
+This milestone supplies only platform I/O owners. It does not establish the
+authenticated session/ingress wiring in 6b2 or the UI/state product wiring in
+6c. Real AOA mode switching, Android permission behavior on OEM devices,
+Windows PnP/WinUSB access with hardware, USB throughput, 96 kHz compatibility,
+latency, and audible quality remain `NOT_TESTED`.
