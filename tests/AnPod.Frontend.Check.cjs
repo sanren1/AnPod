@@ -19,6 +19,7 @@ fs.mkdirSync(out, {recursive:true});
   const secondDevice={...device,serial:'TESTSECOND',transport:'usb',displayName:'Long Google Pixel Wireless Device Name',androidVersion:'14'};
   let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewBackgroundStartError='';let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
   let reviewReceiverManagementBusy=false;let reviewManagementSlotConflicts=0;
+  let reviewAoaStartResolve=null;
   let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
@@ -77,6 +78,7 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewSetManagementOnly=()=>{snapshot={...snapshot,state:'managementOnly',message:'管理连接已认证，音频不兼容',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:false,compatible:false,capabilityBits:4,versionCode:7},canDisconnect:true,busy:false,output:'computer',connectionTransport:'wireless',transport:'wifi',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();};
   window.reviewSetBusy=(busy=true)=>{snapshot.busy=busy;emit();};
   window.reviewSetAudioFormats=(negotiatedAudioFormat,windowsMixFormat,androidOutputFormat)=>{snapshot={...snapshot,negotiatedAudioFormat,windowsMixFormat,androidOutputFormat,output:'phone'};emit();};
+  window.reviewActivateAoa=()=>{snapshot={...snapshot,state:'streaming',message:'USB Direct 已连接',deviceName:'AnPod 配件模式设备',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'aoa',sessionConnectionTransport:'usbDirect',sessionWirelessProtocol:null,sessionCapabilities:null,canDisconnect:true,canChangeModes:false,busy:false,output:'phone',connectionTransport:'usb',settings:{...snapshot.settings,audioBackend:'receiver'}};emit();};
   window.reviewSetAudioQualityFailure=()=>{snapshot={...snapshot,state:'error',message:'Hi-Res 请求失败',statusDetail:'Hi-Res 需要 96 kHz Windows 混音源与 Receiver 支持；当前混音源为 48 kHz。请选择其他档位并重新连接。',canDisconnect:false};emit();};
   window.reviewRecoverySeconds=seconds=>{snapshot={...snapshot,state:'reconnecting',networkRecoverySecondsRemaining:seconds,busy:true,canDisconnect:true,sessionSerial:'TESTUSB',sessionTransport:'wifi',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'adb',sessionAndroidVersion:'15',sessionCapabilities:null,output:'computer'};emit();};
   window.reviewSetActiveError=()=>{window.reviewSet('connected','usb');snapshot.state='error';snapshot.message='模拟播放失败详情';snapshot.statusDetail='电脑声音保持输出';emit();};
@@ -126,6 +128,8 @@ fs.mkdirSync(out, {recursive:true});
     }
     if(cmd==='refresh_devices')return structuredClone(snapshot);
    if(cmd==='receiver_binding_references')return [...reviewBindings];
+   if(cmd==='list_aoa_targets')return [{id:'opaque-target-a',label:'AnPod 配件设备'}];
+   if(cmd==='start_aoa_audio'){window.reviewAoaStartArgs=args;return new Promise(resolve=>{reviewAoaStartResolve=resolve;});}
    if(cmd==='network_interfaces')return structuredClone(reviewInterfaces);
    if(cmd==='start_network_audio'){if(reviewBackgroundStartError&&args.backgroundAuthorizationRequired){const message=reviewBackgroundStartError;reviewBackgroundStartError='';throw new Error(message);}if(args.backgroundAuthorizationRequired&&(!args.bindingReference||args.bootstrapSerial))throw new Error('后台授权目标缺少有效绑定');if(args.bootstrapSerial&&!reviewBindings.includes('new-phone-binding'))reviewBindings.push('new-phone-binding');snapshot={...snapshot,state:'connected',message:'Receiver 已认证',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:args.bindingReference||'new-phone-binding',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:44,versionCode:reviewUsbStatuses[args.bootstrapSerial]?.versionCode??null},canDisconnect:true,connectionTransport:'wireless',transport:'wifi',output:'computer',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();return structuredClone(snapshot);}
    if(cmd==='query_background_trust'){if(reviewDeferTrust){reviewDeferTrust=false;await new Promise(resolve=>window.reviewResolveBackgroundTrust=resolve);}if(reviewTrustError)throw new Error(reviewTrustError);return {target:args.target.target,bindingReference:args.target.bindingReference,sessionGeneration:args.target.sessionGeneration??null,...structuredClone(reviewTrustStatus)};}
@@ -142,7 +146,7 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='connect_device_only'){window.reviewSet('connected',snapshot.transport,args.serial);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='switch_device'){if(window.reviewSwitchMode==='failure')return {success:false,message:'模拟切换失败，已恢复原连接',snapshot:structuredClone(snapshot)};window.reviewSet(snapshot.output==='phone'?'streaming':'connected',snapshot.transport,args.serial);snapshot.selectedSerial=args.serial;return {success:true,message:'已切换',snapshot:structuredClone(snapshot)};}
    if(cmd==='select_device'){snapshot.selectedSerial=args.serial;return structuredClone(snapshot);}
-   if(cmd==='cancel_operation'){window.reviewSet('ready',snapshot.transport);return structuredClone(snapshot);}
+   if(cmd==='cancel_operation'){const current={...snapshot,state:'ready',message:'已取消 USB Direct 连接',sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionReceiverBinding:null,sessionGeneration:null,canDisconnect:false,canChangeModes:true,busy:false,output:'computer'};snapshot=current;emit();if(reviewAoaStartResolve){const resolve=reviewAoaStartResolve;reviewAoaStartResolve=null;resolve(structuredClone(snapshot));}return structuredClone(snapshot);}
    if(cmd==='disconnect'){window.reviewSet('ready',snapshot.transport);return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
    if(cmd==='set_output'){snapshot.output=args.output;snapshot.state=args.output==='phone'?'streaming':'connected';emit();return structuredClone(snapshot);}
    if(cmd==='reconfigure_session'){snapshot.settings[args.kind==='playback'?'playbackMode':'preferredTransport']=args.kind==='playback'?(args.value==='balanced'?'Balanced':'LowLatency'):(args.value==='usb'?'Usb':'Wifi');snapshot.transport=snapshot.settings.preferredTransport==='Wifi'?'wifi':'usb';window.reviewSet(snapshot.state,snapshot.transport);}
@@ -152,6 +156,39 @@ fs.mkdirSync(out, {recursive:true});
  await page.goto(process.env.ANPOD_UI_URL || 'http://127.0.0.1:1420');
  await page.locator('.app-shell').waitFor();
  const results={errors,layouts:[],focusStable:null};
+ if(process.env.ANPOD_AOA_ONLY){
+  await page.setViewportSize({width:360,height:640});
+  await page.getByRole('button',{name:'USB Direct（实验）',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
+  await dialog.waitFor();
+  const target=dialog.getByLabel('USB Direct 设备');
+  const binding=dialog.getByLabel('已配对接收端');
+  results.aoaNeedsExplicitChoices=await target.inputValue()===''&&await binding.inputValue()===''&&await dialog.getByRole('button',{name:'开始连接'}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===undefined);
+  await target.selectOption('opaque-target-a');
+  await binding.selectOption('phoneB-abcdef');
+  await dialog.getByRole('button',{name:'开始连接'}).click();
+  await page.waitForFunction(()=>window.reviewAoaStartArgs!==undefined);
+  results.explicitTargetAndBindingReachBackend=await page.evaluate(()=>window.reviewAoaStartArgs?.targetId==='opaque-target-a'&&window.reviewAoaStartArgs?.bindingReference==='phoneB-abcdef'&&window.reviewCalls.start_aoa_audio===1);
+  results.opaqueTargetIdIsNotDisplayed=!(await page.locator('body').innerText()).includes('opaque-target-a');
+  await dialog.getByRole('button',{name:'取消连接'}).click();
+  await page.waitForFunction(()=>window.reviewCalls.cancel_operation===1&&document.querySelector('dialog[open]')===null);
+  results.cancelUsesExistingOperation=await page.evaluate(()=>window.reviewCalls.cancel_operation===1&&window.reviewRead().sessionTransport===null);
+  await page.evaluate(()=>window.reviewActivateAoa());
+  results.actualAoaConnectionIsVisible=await page.locator('.device-select').innerText().then(text=>text.includes('USB Direct'));
+  await page.getByRole('button',{name:'打开设置'}).click();
+  const settings=page.getByRole('dialog');
+  const backend=settings.getByLabel('手机接收方式');
+  results.activeAoaLocksBackendAndMode=await backend.isDisabled()
+    &&await settings.getByText(/USB Direct 会话使用 Receiver；请先断开 USB Direct，再更改接收后端。/).isVisible()
+    &&!(await settings.innerText()).includes('UDP 使用 Receiver 后端')
+    &&await page.getByRole('button',{name:'均衡'}).isDisabled()
+    &&await page.getByRole('button',{name:'低延迟'}).isDisabled();
+  fs.writeFileSync(`${out}/aoa-result.json`,JSON.stringify(results,null,2));
+  console.log(JSON.stringify({aoaNeedsExplicitChoices:results.aoaNeedsExplicitChoices,explicitTargetAndBindingReachBackend:results.explicitTargetAndBindingReachBackend,opaqueTargetIdIsNotDisplayed:results.opaqueTargetIdIsNotDisplayed,cancelUsesExistingOperation:results.cancelUsesExistingOperation,actualAoaConnectionIsVisible:results.actualAoaConnectionIsVisible,activeAoaLocksBackendAndMode:results.activeAoaLocksBackendAndMode,errors}));
+  await browser.close();assert.deepEqual(errors,[]);
+  for(const key of ['aoaNeedsExplicitChoices','explicitTargetAndBindingReachBackend','opaqueTargetIdIsNotDisplayed','cancelUsesExistingOperation','actualAoaConnectionIsVisible','activeAoaLocksBackendAndMode'])assert.equal(results[key],true,key);
+  return;
+ }
  if(process.env.ANPOD_AUDIO_QUALITY_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});

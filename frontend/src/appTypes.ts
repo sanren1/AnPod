@@ -3,6 +3,7 @@ export type Device = {
   manufacturer: string; model: string; androidVersion: string; apiLevel: string;
   displayName: string; statusText: string; connectable: boolean;
 };
+export type AoaTarget = { id: string; label: string };
 export type Settings = {
   schemaVersion: number; autoConnectLastDevice: boolean; lastDeviceId: string | null;
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
@@ -26,9 +27,9 @@ export type AndroidOutputFormat = {
 export type Snapshot = {
   state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "managementOnly" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
-  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null;
+  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | "aoa" | null;
   sessionGeneration: number | null;
-  sessionConnectionTransport: "usb" | "wireless" | null; sessionWirelessProtocol: "udp" | "adb" | null;
+  sessionConnectionTransport: "usb" | "wireless" | "usbDirect" | null; sessionWirelessProtocol: "udp" | "adb" | null;
   sessionAndroidVersion: string | null; connectionTransport: "usb" | "wireless"; transport: "usb" | "wifi";
   presence: PresenceEntry[];
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;

@@ -3,7 +3,7 @@ import type { Settings, Snapshot } from "../appTypes";
 import { Modal } from "./Modal";
 import { SettingToggle } from "./SettingToggle";
 
-export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
+export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
   const settings = snapshot.settings;
   const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
   const negotiated = snapshot.negotiatedAudioFormat;
@@ -41,7 +41,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <label className="select-setting"><span>{strings.app.wirelessProtocol}</span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
       <label className="select-setting"><span>{strings.app.receiverBackend}</span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
       {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
-      {udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
+      {aoaSession ? <p className="dialog-footnote">{strings.app.aoaReceiverBackendFixed}</p> : udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
     </section>
     <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
     <h3>{strings.app.windowAppearance}</h3>

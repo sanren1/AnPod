@@ -12,8 +12,9 @@ export const byTransport = (snapshot: Snapshot) => {
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];
 };
 export const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
-export const connectionLabel = (transport: Snapshot["connectionTransport"] | null, protocol: Snapshot["sessionWirelessProtocol"] | null) =>
-  transport === "usb" ? strings.connection.usb : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
+export const connectionLabel = (transport: Snapshot["connectionTransport"] | Snapshot["sessionConnectionTransport"], protocol: Snapshot["sessionWirelessProtocol"] | null) =>
+  transport === "usb" ? strings.connection.usb : transport === "usbDirect" ? strings.connection.usbDirect
+    : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
 export const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
   snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
 export const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);

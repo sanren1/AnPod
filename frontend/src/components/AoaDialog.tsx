@@ -1,0 +1,110 @@
+import { useEffect, useState } from "react";
+import { RefreshCw, Usb } from "lucide-react";
+import { strings } from "../strings";
+import { bindingReferenceLabel, invokeApp } from "../appRuntime";
+import type { AoaTarget } from "../appTypes";
+import { ErrorDetails, Modal } from "./Modal";
+
+export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
+  disabled: boolean;
+  onStart: (targetId: string, bindingReference: string) => Promise<void>;
+  onCancelStart: () => Promise<void>;
+  onClose: () => void;
+}) {
+  const [targets, setTargets] = useState<AoaTarget[]>([]);
+  const [bindings, setBindings] = useState<string[]>([]);
+  const [targetId, setTargetId] = useState("");
+  const [bindingReference, setBindingReference] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [errorSummary, setErrorSummary] = useState("");
+  const [errorDetails, setErrorDetails] = useState("");
+
+  const refresh = async () => {
+    setLoading(true);
+    setErrorSummary("");
+    setErrorDetails("");
+    setTargetId("");
+    setBindingReference("");
+    try {
+      const [nextTargets, nextBindings] = await Promise.all([
+        invokeApp<AoaTarget[]>("list_aoa_targets"),
+        invokeApp<string[]>("receiver_binding_references"),
+      ]);
+      setTargets(nextTargets);
+      setBindings(nextBindings);
+    } catch (error) {
+      setTargets([]);
+      setBindings([]);
+      setErrorSummary(strings.aoaDialog.loadFailed);
+      setErrorDetails(String(error));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void refresh(); }, []);
+
+  const start = async () => {
+    if (disabled || loading || starting || !targetId || !bindingReference) return;
+    setStarting(true);
+    setErrorSummary("");
+    setErrorDetails("");
+    try { await onStart(targetId, bindingReference); }
+    catch (error) {
+      setErrorSummary(strings.aoaDialog.startFailed);
+      setErrorDetails(String(error));
+    }
+    finally { setStarting(false); }
+  };
+
+  const cancelStart = async () => {
+    if (!starting || cancelling) return;
+    setCancelling(true);
+    setErrorSummary("");
+    setErrorDetails("");
+    try {
+      await onCancelStart();
+      onClose();
+    } catch (error) {
+      setErrorSummary(strings.aoaDialog.cancelFailed);
+      setErrorDetails(String(error));
+    } finally { setCancelling(false); }
+  };
+
+  const busy = disabled || loading || starting || cancelling;
+  return <Modal title={strings.aoaDialog.title} onClose={() => { if (starting) void cancelStart(); else onClose(); }} className="aoa-dialog">
+    <p className="dialog-description">{strings.aoaDialog.description}</p>
+    {errorSummary && <ErrorDetails className="aoa-error" summary={errorSummary} details={errorDetails} />}
+    {starting && <p className="dialog-description" role="status" aria-live="polite">{cancelling ? strings.aoaDialog.cancelling : strings.aoaDialog.starting}</p>}
+    <label className="aoa-field">
+      <span>{strings.aoaDialog.target}</span>
+      <select value={targetId} onChange={event => setTargetId(event.target.value)} disabled={busy}>
+        <option value="">{loading ? strings.aoaDialog.loading : strings.aoaDialog.chooseTarget}</option>
+        {targets.map(target => <option key={target.id} value={target.id}>{target.label}</option>)}
+      </select>
+    </label>
+    {!loading && targets.length === 0 && !errorSummary && <p className="empty-note">{strings.aoaDialog.noTargets}</p>}
+    <label className="aoa-field">
+      <span>{strings.aoaDialog.pairedReceiver}</span>
+      <select value={bindingReference} onChange={event => setBindingReference(event.target.value)} disabled={busy}>
+        <option value="">{loading ? strings.aoaDialog.loading : strings.aoaDialog.chooseBinding}</option>
+        {bindings.map(reference => <option key={reference} value={reference}>{bindingReferenceLabel(reference)}</option>)}
+      </select>
+    </label>
+    {!loading && bindings.length === 0 && !errorSummary && <p className="empty-note">{strings.aoaDialog.noBindings}</p>}
+    <div className="dialog-actions">
+      {starting ? <button className="dialog-secondary" type="button" onClick={() => void cancelStart()} disabled={cancelling}>
+        {cancelling ? strings.aoaDialog.cancelling : strings.aoaDialog.cancelConnection}
+      </button> : <>
+        <button className="dialog-secondary" type="button" onClick={() => void refresh()} disabled={busy}>
+          <RefreshCw size={15} aria-hidden="true" />{strings.aoaDialog.refresh}
+        </button>
+        <button className="primary-button" type="button" onClick={() => void start()} disabled={busy || !targetId || !bindingReference}>
+          <Usb size={16} aria-hidden="true" />{strings.aoaDialog.start}
+        </button>
+      </>}
+    </div>
+  </Modal>;
+}
