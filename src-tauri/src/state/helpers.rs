@@ -292,9 +292,10 @@ pub(crate) fn session_audio_queue_identity_changed(
         (Some(SessionAudioQueue::Pcm16(current)), Some(SessionAudioQueue::Pcm16(next))) => {
             !Arc::ptr_eq(current, next)
         }
-        (Some(SessionAudioQueue::Float32(current)), Some(SessionAudioQueue::Float32(next))) => {
-            !Arc::ptr_eq(current, next)
-        }
+        (
+            Some(SessionAudioQueue::Float32(current, current_format)),
+            Some(SessionAudioQueue::Float32(next, next_format)),
+        ) => !Arc::ptr_eq(current, next) || current_format != next_format,
         (None, None) => false,
         _ => true,
     }
@@ -779,9 +780,8 @@ pub(crate) fn normalize_mdns_instance(value: &str) -> String {
 
 pub(crate) fn validate_audio_quality(value: &str) -> Result<(), String> {
     match value {
-        "standard" | "hifi" => Ok(()),
-        "hires" => Err("Hi-Res 96 kHz is not available yet; select Standard or HiFi.".into()),
-        _ => Err("Invalid audio quality; select Standard or HiFi.".into()),
+        "standard" | "hifi" | "hires" => Ok(()),
+        _ => Err("Invalid audio quality; select Standard, HiFi, or Hi-Res.".into()),
     }
 }
 

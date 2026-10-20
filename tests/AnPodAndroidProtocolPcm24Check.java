@@ -10,6 +10,7 @@ public final class AnPodAndroidProtocolPcm24Check {
         checkPackedVectors();
         checkInvalidSamplesAndFragments();
         checkFrameQueueAndPlc();
+        check96KhzFrameBudgetAndFragments();
         checkFrameDriftAndFades();
         checkFrameDriftController();
         System.out.println("PCM24 codec and Float32 frame checks passed.");
@@ -136,6 +137,54 @@ public final class AnPodAndroidProtocolPcm24Check {
         checkFloatQueueWaitAndStop();
     }
 
+    private static void check96KhzFrameBudgetAndFragments() {
+        FloatPcmFrameQueue lowLatency = new FloatPcmFrameQueue(96_000, true);
+        FloatPcmFrameQueue balanced = new FloatPcmFrameQueue(96_000, false);
+        if (lowLatency.initialTargetFrames() != 1_920 || balanced.initialTargetFrames() != 3_840
+                || lowLatency.audioTrackBufferFrames(9_600, true) != 1_440
+                || balanced.audioTrackBufferFrames(9_600, false) != 4_800
+                || lowLatency.packetCapacity() != 5_760 || balanced.packetCapacity() != 14_400) {
+            throw new AssertionError("96k Float32 queue or AudioTrack budget changed");
+        }
+
+        FloatPcmFrameQueue fragments = new FloatPcmFrameQueue(96_000, true);
+        int[] fragmentFrames = { 191, 191, 98 };
+        float[] actual = new float[480 * 2];
+        int outputOffset = 0;
+        long frameIndex = 0;
+        for (int frames : fragmentFrames) {
+            float[] packet = new float[frames * 2];
+            for (int frame = 0; frame < frames; frame++) {
+                packet[frame * 2] = frameIndex + frame;
+                packet[frame * 2 + 1] = -(frameIndex + frame);
+            }
+            if (!fragments.offer(frameIndex, packet, frames)
+                    || fragments.poll(actual, outputOffset, frames) != frames) {
+                throw new AssertionError("96k PCM24 191+191+98 fragment was not consumed whole");
+            }
+            frameIndex += frames;
+            outputOffset += frames;
+        }
+        if (frameIndex != 480 || fragments.playoutFrame() != 480
+                || actual[0] != 0f || actual[1] != 0f
+                || actual[382] != 191f || actual[383] != -191f
+                || actual[958] != 479f || actual[959] != -479f) {
+            throw new AssertionError("96k PCM24 fragment frame indices were not contiguous");
+        }
+
+        FloatPcmFrameQueue fullWindow = new FloatPcmFrameQueue(96_000, false);
+        int accepted = 0;
+        for (int packet = 0; packet < 150; packet++) {
+            if (fullWindow.offer(packet * 96L, new float[96 * 2], 96, 1_000_000_000L)) accepted++;
+        }
+        boolean replacedOldest = fullWindow.offer(14_400, new float[2], 1, 1_001_000_000L);
+        if (accepted != 150 || fullWindow.packetCount() != 150 || !replacedOldest
+                || fullWindow.packetCapacity() != 14_400 || fullWindow.queuedFrames() != 14_305
+                || fullWindow.expiredFrames() != 96 || fullWindow.playoutFrame() != 96) {
+            throw new AssertionError("96k Float32 queue did not honor the 150ms time budget");
+        }
+    }
+
     private static void checkFloatQueueWaitAndStop() {
         FloatPcmFrameQueue queue = new FloatPcmFrameQueue(48_000, true);
         float[] readBuffer = new float[191 * 2];
@@ -222,6 +271,14 @@ public final class AnPodAndroidProtocolPcm24Check {
         checkDriftCase(-100, 1_920, 900, 2_000, 5_500);
         checkDriftCase(1_000, 1_920, 180, 4_000, 9_000);
         checkDriftCase(-1_000, 1_920, 180, 4_000, 9_000);
+        checkDriftCase(96_000, 100, 1_920, 300, 1_200, 3_600);
+        checkDriftCase(96_000, -100, 1_920, 300, 1_200, 3_600);
+        checkDriftCase(96_000, 1_000, 1_920, 120, 6_000, 14_000);
+        checkDriftCase(96_000, -1_000, 1_920, 120, 6_000, 14_000);
+        checkDriftCase(96_000, 100, 3_840, 900, 4_000, 11_000);
+        checkDriftCase(96_000, -100, 3_840, 900, 4_000, 11_000);
+        checkDriftCase(96_000, 1_000, 3_840, 180, 8_000, 18_000);
+        checkDriftCase(96_000, -1_000, 3_840, 180, 8_000, 18_000);
 
         com.anpod.server.FloatPcmDriftController jitter =
                 new com.anpod.server.FloatPcmDriftController(48_000, 240);
@@ -239,10 +296,15 @@ public final class AnPodAndroidProtocolPcm24Check {
 
     private static void checkDriftCase(int ppm, int targetFrames, int seconds,
             int minimumEdits, int maximumSpan) {
-        DriftSimulation simulation = simulateDrift(ppm, targetFrames, seconds);
+        checkDriftCase(48_000, ppm, targetFrames, seconds, minimumEdits, maximumSpan);
+    }
+
+    private static void checkDriftCase(int sampleRate, int ppm, int targetFrames, int seconds,
+            int minimumEdits, int maximumSpan) {
+        DriftSimulation simulation = simulateDrift(sampleRate, ppm, targetFrames, seconds);
         int edits = ppm > 0 ? simulation.deleted : simulation.inserted;
         int wrongDirection = ppm > 0 ? simulation.inserted : simulation.deleted;
-        long maximumEdits = (long) seconds * 48_000 * Math.abs(ppm) / 1_000_000 + 30;
+        long maximumEdits = (long) seconds * sampleRate * Math.abs(ppm) / 1_000_000 + 30;
         if (edits < minimumEdits || edits > maximumEdits
                 || wrongDirection != 0 || simulation.span > maximumSpan) {
             throw new AssertionError("Float32 drift exceeded ppm/waterline budget for target "
@@ -251,12 +313,13 @@ public final class AnPodAndroidProtocolPcm24Check {
         }
     }
 
-    private static DriftSimulation simulateDrift(int ppm, int targetFrames, int seconds) {
+    private static DriftSimulation simulateDrift(int sampleRate, int ppm, int targetFrames, int seconds) {
         com.anpod.server.FloatPcmDriftController drift =
-                new com.anpod.server.FloatPcmDriftController(48_000, targetFrames);
+                new com.anpod.server.FloatPcmDriftController(sampleRate, targetFrames);
         long now = 0;
         drift.reset(now);
-        long pendingTrackFrames = 720;
+        int trackBufferMs = targetFrames <= sampleRate * 20 / 1000 ? 15 : 50;
+        long pendingTrackFrames = (long) sampleRate * trackBufferMs / 1000;
         long queuedFrames = targetFrames;
         long waterline = pendingTrackFrames + queuedFrames;
         long min = waterline;
@@ -267,7 +330,8 @@ public final class AnPodAndroidProtocolPcm24Check {
         int steps = seconds * 200;
         for (int step = 0; step < steps; step++) {
             now += 5_000_000L;
-            incomingRemainder += 240.0 * (1.0 + ppm / 1_000_000.0);
+            int framesPerStep = sampleRate / 200;
+            incomingRemainder += framesPerStep * (1.0 + ppm / 1_000_000.0);
             long incomingFrames = (long) incomingRemainder;
             incomingRemainder -= incomingFrames;
             int adjustment = drift.observe(now, pendingTrackFrames + queuedFrames, true, false);
@@ -276,7 +340,7 @@ public final class AnPodAndroidProtocolPcm24Check {
                 if (adjustment > 0) deleted++;
                 else inserted++;
             }
-            queuedFrames += incomingFrames - 240 - adjustment;
+            queuedFrames += incomingFrames - framesPerStep - adjustment;
             waterline = pendingTrackFrames + queuedFrames;
             min = Math.min(min, waterline);
             max = Math.max(max, waterline);

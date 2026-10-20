@@ -207,13 +207,13 @@ impl Drop for SessionKeys {
 #[derive(Clone)]
 pub(crate) enum SessionAudioQueue {
     Pcm16(Arc<PcmQueue>),
-    Float32(Arc<FloatPcmQueue>),
+    Float32(Arc<FloatPcmQueue>, AudioFormatV2),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostAudioProfile {
     Standard,
-    Hifi48(AudioFormatV2),
+    Pcm24(AudioFormatV2),
 }
 
 pub(crate) struct HostSession {
@@ -403,8 +403,18 @@ impl HostSession {
         format
             .encode()
             .map_err(|_| "Unsupported P5-C PCM24 format.".to_string())?;
-        if format.profile != 2 || format.sample_rate != 48_000 || format.channels != 2 {
-            return Err("Only 48 kHz stereo PCM24 is supported for HiFi.".into());
+        if !matches!(
+            (format.profile, format.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        ) || format.channels != 2
+            || format.sample_format != 2
+            || format.valid_bits != 24
+            || format.bytes_per_sample != 3
+            || format.frame_bytes != 6
+        {
+            return Err(
+                "Only 48 kHz HiFi or 96 kHz Hi-Res stereo packed PCM24 is supported.".into(),
+            );
         }
         endpoint.validate()?;
         let cancellation = parent_cancel.child_token();
@@ -500,7 +510,7 @@ impl HostSession {
         initial_float_queue: &mut Option<Arc<FloatPcmQueue>>,
         cancellation: CancellationToken,
     ) -> Result<Self, String> {
-        let HostAudioProfile::Hifi48(format) = profile else {
+        let HostAudioProfile::Pcm24(format) = profile else {
             return Self::authenticate_on_network(
                 endpoint,
                 binding.duplicate_for_session(),
@@ -509,10 +519,26 @@ impl HostSession {
             );
         };
 
+        if AudioFormatV2::for_profile(format.profile, format.mode).ok() != Some(format)
+            || !matches!(
+                (format.profile, format.sample_rate),
+                (2, 48_000) | (3, 96_000)
+            )
+            || parameters.sample_rate != format.sample_rate
+            || parameters.channels != format.channels
+            || parameters.mode != format.mode
+        {
+            return Err("Requested PCM24 audio profile does not match the authenticated session parameters.".into());
+        }
+
         let mut probe = Self::authenticate_on_network(
             endpoint,
             binding.duplicate_for_session(),
-            parameters,
+            AudioParameters {
+                sample_rate: 48_000,
+                channels: 2,
+                mode: format.mode,
+            },
             cancellation.clone(),
         )?;
         probe.negotiate_capabilities_probe()?;
@@ -931,7 +957,8 @@ impl HostSession {
     pub(crate) fn audio_queue(&self) -> SessionAudioQueue {
         self.float_queue
             .as_ref()
-            .map(|queue| SessionAudioQueue::Float32(queue.clone()))
+            .zip(self.format_v2)
+            .map(|(queue, format)| SessionAudioQueue::Float32(queue.clone(), format))
             .unwrap_or_else(|| SessionAudioQueue::Pcm16(self.queue.clone()))
     }
 
@@ -2014,19 +2041,27 @@ impl SessionOwner {
             .expect("P5-D Float32 queue lock poisoned")
             .clone()
         {
-            Some(SessionAudioQueue::Float32(queue))
+            let format = self
+                .status
+                .lock()
+                .expect("P5-D session status lock poisoned")
+                .negotiated_format?;
+            Some(SessionAudioQueue::Float32(queue, format))
         } else {
             self.pcm_queue().map(SessionAudioQueue::Pcm16)
         }
     }
 
-    pub(crate) fn uses_hifi48(&self) -> bool {
+    pub(crate) fn matches_audio_quality(&self, quality: &str) -> bool {
+        let profile = self
+            .status
+            .lock()
+            .expect("P5-D session status lock poisoned")
+            .negotiated_format
+            .map(|format| format.profile);
         matches!(
-            self.status
-                .lock()
-                .expect("P5-D session status lock poisoned")
-                .negotiated_format,
-            Some(format) if format.profile == 2
+            (quality, profile),
+            ("standard", None) | ("hifi", Some(2)) | ("hires", Some(3))
         )
     }
 
@@ -2446,9 +2481,9 @@ fn run_session_owner(
                     }
                     Ok(OwnerCommand::SetMode(mode)) => {
                         parameters.mode = mode;
-                        if matches!(profile, HostAudioProfile::Hifi48(_)) {
-                            profile = match AudioFormatV2::for_profile(2, mode) {
-                                Ok(format) => HostAudioProfile::Hifi48(format),
+                        if let HostAudioProfile::Pcm24(current) = profile {
+                            profile = match AudioFormatV2::for_profile(current.profile, mode) {
+                                Ok(format) => HostAudioProfile::Pcm24(format),
                                 Err(error) => {
                                     management_error = Some(error.to_string());
                                     restart = true;
@@ -2667,7 +2702,7 @@ fn run_session_owner(
                     .lock()
                     .expect("P5-D Float32 queue lock poisoned") = None;
             }
-            SessionAudioQueue::Float32(session_queue) => {
+            SessionAudioQueue::Float32(session_queue, _) => {
                 *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
                 *float_queue
                     .lock()
@@ -2722,7 +2757,7 @@ fn run_session_owner(
                                     SessionAudioQueue::Pcm16(queue) => {
                                         (queue.dropped_frames(), queue.queued_frames())
                                     }
-                                    SessionAudioQueue::Float32(queue) => {
+                                    SessionAudioQueue::Float32(queue, _) => {
                                         (queue.dropped_frames(), queue.queued_frames())
                                     }
                                 };
@@ -2829,9 +2864,9 @@ fn run_session_owner(
                         continue;
                     }
                     parameters.mode = mode;
-                    if matches!(profile, HostAudioProfile::Hifi48(_)) {
-                        match AudioFormatV2::for_profile(2, mode) {
-                            Ok(format) => profile = HostAudioProfile::Hifi48(format),
+                    if let HostAudioProfile::Pcm24(current) = profile {
+                        match AudioFormatV2::for_profile(current.profile, mode) {
+                            Ok(format) => profile = HostAudioProfile::Pcm24(format),
                             Err(error) => {
                                 last_error = Some(error.to_string());
                                 break;

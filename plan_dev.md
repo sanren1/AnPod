@@ -4,7 +4,7 @@
 > 制定日期：2026-10-19  
 > 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；实际本地开发基线为 `dev@a406ced`，后续按 `dev` 提交推进并复核差异。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1 音质配置与 v2 离线协商模拟已完成源码与离线验收；Phase 2 Float32 WASAPI/PCM16 兼容路径已完成源码审查及 Rust/Java/Native 离线门禁，记录见 `docs/audio-quality/02-float-capture.md`。**真实 WASAPI capture trace、设备切换、声学精度/延迟与长时稳定性仍为 NOT_TESTED，Phase 2 实机门槛未完成**；Phase 3 隔离代码实现正在进行，继续开发不代表这些实机门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1 音质配置与 v2 离线协商模拟已完成源码与离线验收；Phase 2 Float32 WASAPI/PCM16 兼容路径已完成源码审查及 Rust/Java/Native 离线门禁，记录见 `docs/audio-quality/02-float-capture.md`。Phase 3 48k/24 已完成源码与离线验收；Phase 4 96k/24 条件路径已完成本轮源码及离线门禁，**真实 96 kHz WASAPI capture、设备 AudioTrack 96 kHz 打开、物理输出有效精度、声学/长时稳定性仍为 NOT_TESTED**。继续推进后续阶段不代表这些实机门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
 
 ## 0. 开发指令与决策摘要
 
@@ -178,7 +178,7 @@ Android Audio HAL / DSP / 内置扬声器
 2. 推荐以 Windows **实际共享混音格式**获取 loopback 数据；若其为 Float32，直接在 Float32 表示中处理。若设备返回整型 PCM，使用正确有效位深转换到 Float32（包含符号扩展与声道映射）；不可把 16-bit 数据左移/补零并称作真实 24-bit。
 3. 不默认把 Windows 系统输出采样率改为 96kHz；不自动修改默认音频设备、音量、增强或独占设置。
 4. 若请求 48kHz，源 mix 并非 48kHz，则使用具有可测试频响、抗混叠和有界延迟的重采样；显示转换标记。
-5. **Hi-Res 96kHz 处理规则**：第一版必须检测源 mix 是否为 96kHz 或更高且可合理转换；若低于 96kHz，默认拒绝“原生 Hi-Res”选择并解释“当前 Windows 混音格式仅 48kHz”。未来若加入用户主动选择的升采样实验，须明确标注 `96kHz（升采样）`，不能显示成原生高解析度音源。
+5. **Hi-Res 96kHz 处理规则**：Hi-Res 可作为实验请求选项，但只有 Windows mix 实际为 96 kHz、且 Receiver 支持所选的准确 descriptor 时才建立该档会话。mix 低于 96 kHz 时明确报告当前格式并要求用户选择其他档位后新建会话；不升采样并冒称原生 Hi-Res，也不在同一会话静默改采样率。若未来加入用户主动选择的升采样实验，须明确标注 `96kHz（升采样）`。
 6. 即使 Windows mix 为 96kHz，也可能播放源本身只是升采样内容，因此 UI 只声称 `Windows 混音采样率 96kHz`，不声称识别到音乐文件的原始采样率或 bit-perfect。
 
 ### 5.2 Float32 内部流程
@@ -217,7 +217,7 @@ Android Audio HAL / DSP / 内置扬声器
 - **v1**：只用于 PCM16LE、既有 7 字节 AudioParameters 与原有 FORMAT；保留原入口、解析、单元测试和安全属性。
 - **v2**：新增显式协商的采样格式（如 `PCM24_PACKED_LE`）、样本率、通道、实际载荷每帧字节数、可选能力位；独立版本号和消息长度；身份验证、会话密钥衍生与新 transcript 必须覆盖全部格式字段。
 - 使用现有受信版本/认证控制链路决定是否允许 v2；不能仅相信未经认证的广播/网络发现信息。
-- 连接到只支持 v1 的 Receiver：用户请求高保真或 Hi-Res 时应**先提示并请求自动降至标准档**，然后开启一个干净的 v1 会话；禁止在发送加密音频后突然改变字节表示。
+- 连接到只支持 v1 的 Receiver：用户请求高保真或 Hi-Res 时明确报不支持，由用户选择标准档并重新建立干净的 v1 会话；不自动改档，也禁止在发送加密音频后突然改变字节表示。
 - 任何未识别的版本/codec、非法组合、帧不对齐、超长或错序会话应明确拒绝，且不影响同机其它绑定设备。
 - 后续需要由 Rust/Java 双端的已知十六进制测试向量覆盖：握手字段、AAD、nonce、密钥派生、认证错误、重放窗口、格式变更、丢包与边界大小。
 
@@ -338,13 +338,15 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **交付**：48/24 真机可用版本、格式一致性 golden vectors、30–60 分钟实测。**通过门槛**：从 PC 采集到 Android 输出前无暗中 16-bit 量化；无新增不稳定行为。
 
-**开发状态（2026-10-20）**：P5-C Java coordinator 已加入仅查询的 v1 `0x82` 能力探测、等待 EOF 后的新 v2 会话、认证 descriptor 锁定、现有连接意图/后台授权状态机复用、格式级 BIND 门控及 v2 78-byte 实际输出进度扩展。当前产品格式策略由 playback endpoint 单点控制，只接受 48 kHz 双声道 packed PCM24；profile 1/3 不进入解码/播放。JDK 17 P5-C 编译、自检向量、discovery-recovery、Rust↔Java fresh-session/拒绝测试及两代 Owner pause/恢复 loopback 已通过；Android Receiver JVM 44 项、Java offline checks、Frontend build 与目标 Playwright 场景也已通过。Host normal Clippy、V2/Float 定向测试通过；Rust 锁定离线单线程全量门禁 **111 passed / 0 failed / 1 ignored / 2 filtered**（93.98 秒）。筛除的两项是人工 PowerShell artifact 检查与显式真机 USB Receiver 测试。验证依赖提升权限以通过 DPAPI/fakeADB 环境检查；额外 `--all-targets` Clippy 仍有既有 test/bin 配置 dead-code 警告，不计作通过门禁。以上仅是源码、mock 与合成离线检查，不表示真实链路验收；用户授权跳过设备核查，真实 WASAPI capture、设备 AudioTrack 打开、物理输出有效精度、30–60 分钟稳定性和声学测量均为 **NOT_TESTED**。
+**Phase 3 离线状态（2026-10-20）**：P5-C coordinator 加入仅查询的 v1 `0x82` 能力探测、等待 EOF 后的新 v2 会话、认证 descriptor 锁定、既有连接意图/后台授权复用、格式级 BIND 门控和 78-byte 实际输出进度；该阶段产品格式仅为 48 kHz stereo packed PCM24。JDK 17 P5-C 与 discovery-recovery 检查、Rust↔Java fresh-session/拒绝及两代 owner pause/恢复测试通过；当时 Android Receiver JVM 44 项及 Java、Frontend 离线检查通过。Phase 3 的真实设备验收仍未完成。
 
 ### Phase 4 — Hi-Res 96kHz / 24-bit（设备能力有条件启用）
 
-**任务**：Windows mix 96k 识别、按测量结果选择的软件重采样与明确标记、按 ANPD v2 payload 上限进行帧对齐分包、Android 48/96 输出能力适配。96 kHz 双声道 PCM24 每包最多 191 帧；480 帧（5 ms）按 191+191+98 分包。握手 descriptor 必须与选定格式完全一致；不支持时向用户说明并允许选择新建 48/24 会话，不能在当前会话静默改采样率。按第 14 章优先评估 Rust Rubato、必要时评估 SpeexDSP；只有在真实需要且延迟/频响/失真已测量后才引入 SRC，保持 48k/24 直通。
+**任务**：在设置页提供明确标为实验的 Hi-Res 请求；仅 Windows mix 实际为 96 kHz 且 Receiver 支持精确 profile-3/96 kHz/PCM24 descriptor 时建立会话。48 kHz source 不升采样冒充 96 kHz；mix 率或 Receiver 能力不符时明确失败，由用户选择其他档位并新建会话。按 ANPD v2 payload 上限进行帧对齐分包：96 kHz 双声道 PCM24 每包最多 191 帧；480 帧（5 ms）按 191+191+98 分包。descriptor 必须与已认证的选定格式完全一致；不在同会话静默改率。只有证明确有重采样需要、且延迟/频响/失真已测量后才按第 14 章评估 Rubato/SpeexDSP；先保持 48k/24 直通。
 
 **交付**：真实 Windows mix 为 96k 时的链路报告；48k→96k 的误导性 UI 被禁止。**通过门槛**：实际采样率真实展示，必要重采样的延迟、频响/失真和稳定性经测试；不支持时提示并由用户选择启动新的 48k/24 会话，不在已认证会话内改格式。
+
+**离线开发状态（2026-10-20）**：设置页开放实验性 Hi-Res 请求；只有实际 Windows mix/capture 为 96 kHz 且 Receiver 接受精确 profile-3/96 kHz/packed-24 descriptor 时才开始会话。48 kHz mix 不升采样冒充原生 Hi-Res；整数或多声道 mix 可由 Native 转成同速 stereo Float32 capture，UI 仍显示 mix 实际格式与当前会话实际传输/手机软件输出格式。unsupported/mix mismatch 明确失败，需用户选其他档并新建会话；不在同一会话改率。96 kHz PCM24 Rust↔Java fresh-session/UDP/Q23 低位 loopback、profile3 owner pause-stop-mode fresh-session、Java offline checks、Android Receiver JVM **47/47**、Rust fmt 与 normal strict Clippy 均通过。锁定 offline 单线程 Rust 全量门禁 **114 passed / 0 failed / 1 ignored / 2 filtered**（93.89 秒）；两项人工过滤为 PowerShell artifact 检查和显式真机 USB Receiver 检查。Frontend production build 与目标 Playwright 场景通过，覆盖 Hi-Res 请求、未知与实际格式分离、明确错误、窄屏/键盘。真实 96 kHz WASAPI capture、实际设备 AudioTrack 96 kHz 打开、物理输出精度、声学测量和 30–60 分钟稳定性仍为 **NOT_TESTED**；本轮没有引入重采样器。
 
 ### Phase 5 — Oboe Native 可选输出后端（与音质档兼容）
 
@@ -431,7 +433,7 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 | 风险 | 发生条件 | 缓解和停止条件 |
 |---|---|---|
 | 假高保真 | 16-bit 已量化的 WASAPI 数据被零填充成 PCM24 | 精度账本 + 低位有效信号测试；不满足不得报告无损精度升级 |
-| 假 Hi-Res | 48k mix 被无提示升为 96k | 源 mix 前置条件 + `已重采样` 标记；默认不提供原生 Hi-Res 选项 |
+| 假 Hi-Res | 48k mix 被无提示升为 96k | Hi-Res 实验请求仅接受真实 96k Windows mix 与 Receiver 的精确 96k descriptor；不支持时明确失败并由用户选择新会话 |
 | v1 兼容性破坏 | 直接改变 7 字节认证参数或 FORMAT 标签 | 并行 v2 协议与黄金向量；老设备回退 v1 |
 | 无线断音增加 | 高位深每 5ms 拆成 2–3 包，队列不适配 | 1200B UDP 上限不变，逐帧片段可入队；真实丢包压力测试 |
 | 音频精度回退 | Android 24-bit 轨道失败时静默降 PCM16 | 明确报告实际输出格式；支持 Float32 输出转换，不支持时明确失败并由用户选择新格式会话 |

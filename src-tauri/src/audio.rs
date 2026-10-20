@@ -1,5 +1,5 @@
 use crate::network::{FloatPcmQueue, PcmQueue};
-use crate::protocol::PcmFormat;
+use crate::protocol::{AudioFormatV2, PcmFormat};
 use libloading::Library;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
@@ -34,9 +34,9 @@ enum Request {
     ProbeFloatFormat(mpsc::SyncSender<Result<CaptureFormatV2, String>>),
     StartFloatSink(
         Arc<FloatPcmQueue>,
+        AudioFormatV2,
         mpsc::SyncSender<Result<CaptureFormatV2, String>>,
     ),
-    StopFloatSink(mpsc::SyncSender<Result<(), String>>),
     StopPcmSink(mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
     StopAndCleanup(mpsc::SyncSender<Result<(), String>>),
@@ -161,6 +161,33 @@ impl NativeV2Fns {
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_float_format_for_session(
+    format: &CaptureFormatV2,
+    expected: AudioFormatV2,
+) -> Result<(), String> {
+    if AudioFormatV2::for_profile(expected.profile, expected.mode).ok() != Some(expected)
+        || !matches!(
+            (expected.profile, expected.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        )
+        || expected.sample_format != 2
+        || expected.channels != 2
+        || expected.valid_bits != 24
+        || expected.bytes_per_sample != 3
+        || expected.frame_bytes != 6
+    {
+        return Err("Authenticated session does not describe a supported PCM24 format.".into());
+    }
+    if format.mix_sample_rate != expected.sample_rate
+        || format.capture_sample_rate != expected.sample_rate
+        || format.capture_channels != u32::from(expected.channels)
+        || format.capture_sample_format != FLOAT_CAPTURE_FORMAT_FLOAT
+    {
+        return Err(format!("Windows mix/capture format does not match the authenticated PCM24 session (expected {} Hz stereo Float32; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
+    }
+    Ok(())
 }
 
 impl NativeFns {
@@ -430,12 +457,14 @@ impl AudioActor {
                             .and_then(NativeFns::pcm_format);
                         let _ = reply.send(result);
                     }
-                    Request::StartFloatSink(queue, reply) => {
+                    Request::StartFloatSink(queue, expected_format, reply) => {
                         let result = if let Some(native) = native.as_ref() {
                             match native.float_capabilities() {
                                 Err(error) => Err(error),
                                 Ok(_capabilities) if can_reuse_float_sink(float_sink.as_ref(), &queue) => {
-                                    float_capture_format.ok_or_else(|| "Float32 采集格式尚未缓存。".to_string())
+                                    float_capture_format
+                                        .filter(|format| validate_float_format_for_session(format, expected_format).is_ok())
+                                        .ok_or_else(|| format!("Cached Float32 sink does not match the authenticated {} Hz session.", expected_format.sample_rate))
                                 }
                                 Ok(capabilities) => {
                                     cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
@@ -446,11 +475,7 @@ impl AudioActor {
                                                 return Err(native.describe_error("无法初始化 WASAPI Float32 采集"));
                                             }
                                             let format = native.float_capture_format()?;
-                                            if format.capture_sample_rate != format.mix_sample_rate
-                                                || format.capture_channels != 2
-                                            {
-                                                return Err("Native DLL 的 Float32 回调格式与 mix 格式不一致。".into());
-                                            }
+                                            validate_float_format_for_session(&format, expected_format)?;
                                             queue.set_expected_format(
                                                 format.capture_sample_rate,
                                                 capabilities.max_callback_frames,
@@ -506,14 +531,6 @@ impl AudioActor {
                         } else {
                             Err("音频采集组件尚未初始化。".into())
                         };
-                        let _ = reply.send(result);
-                    }
-                    Request::StopFloatSink(reply) => {
-                        let result = if let Some(native) = native.as_ref() {
-                            let result = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
-                            float_capture_format = None;
-                            result
-                        } else { Ok(()) };
                         let _ = reply.send(result);
                     }
                     Request::StopPcmSink(reply) => {
@@ -609,11 +626,9 @@ impl AudioActor {
     pub(crate) fn start_float_sink(
         &self,
         queue: Arc<FloatPcmQueue>,
+        expected_format: AudioFormatV2,
     ) -> Result<CaptureFormatV2, String> {
-        self.call(|reply| Request::StartFloatSink(queue, reply))
-    }
-    pub(crate) fn stop_float_sink(&self) -> Result<(), String> {
-        self.call(Request::StopFloatSink)
+        self.call(|reply| Request::StartFloatSink(queue, expected_format, reply))
     }
     pub fn stop_pcm_sink(&self) -> Result<(), String> {
         self.call(Request::StopPcmSink)

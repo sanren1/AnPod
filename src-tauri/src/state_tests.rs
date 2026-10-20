@@ -41,7 +41,8 @@ fn audio_quality_defaults_and_rejects_unavailable_profiles_without_changing_play
     assert_eq!(old_settings.audio_quality, "standard");
 
     assert!(validate_audio_quality("hifi").is_ok());
-    for quality in ["hires", "unsupported"] {
+    assert!(validate_audio_quality("hires").is_ok());
+    for quality in ["unsupported"] {
         assert!(validate_audio_quality(quality).is_err(), "{quality}");
     }
     assert!(validate_audio_quality("standard").is_ok());

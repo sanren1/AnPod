@@ -5,6 +5,8 @@ import java.io.InputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -239,6 +241,13 @@ public final class P5cLoopbackEndpoint {
                 .map(value -> Integer.parseInt(value.substring("--audio-v2-profile=".length())))
                 .findFirst().orElse(2);
         playback.expectedAudioV2Profile = profile;
+        String supportedProfiles = Arrays.stream(args)
+                .filter(value -> value.startsWith("--audio-v2-supported-profiles="))
+                .map(value -> value.substring("--audio-v2-supported-profiles=".length()))
+                .findFirst().orElse("2");
+        playback.supportedAudioV2Profiles = new HashSet<>();
+        for (String value : supportedProfiles.split(","))
+            playback.supportedAudioV2Profiles.add(Integer.parseInt(value));
         P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openLoopbackAudioV2Test(binding, playback);
         java.lang.reflect.Method beginIntent = P5cReceiverCoordinator.class
                 .getDeclaredMethod("beginConnectionIntent", byte[].class);
@@ -816,6 +825,7 @@ public final class P5cLoopbackEndpoint {
         volatile boolean audioV2Support;
         volatile int expectedAudioV2Profile = 2;
         volatile int expectedAudioV2Sessions = 1;
+        volatile Set<Integer> supportedAudioV2Profiles = Set.of(2);
         final AtomicInteger backgroundAuthRequests = new AtomicInteger();
         final AtomicInteger backgroundAuthQueries = new AtomicInteger();
         final AtomicInteger backgroundAuthEnds = new AtomicInteger();
@@ -851,10 +861,12 @@ public final class P5cLoopbackEndpoint {
         @Override public boolean supportsPlaybackProgress() { return true; }
         @Override public boolean supportsAudioV2() { return audioV2Support; }
         @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
-            return audioV2Support && format != null && expectedAudioV2Profile == 2
-                    && format.profile == 2 && format.sampleFormat == 2 && format.sampleRate == 48_000
-                    && format.channels == 2 && format.validBits == 24 && format.bytesPerSample == 3
-                    && format.frameBytes == 6;
+            if (!audioV2Support || format == null || format.profile != expectedAudioV2Profile
+                    || !supportedAudioV2Profiles.contains(format.profile) || format.sampleFormat != 2
+                    || format.channels != 2 || format.validBits != 24 || format.bytesPerSample != 3
+                    || format.frameBytes != 6) return false;
+            return format.profile == 2 && format.sampleRate == 48_000
+                    || format.profile == 3 && format.sampleRate == 96_000;
         }
         @Override public boolean supportsBackgroundTrustManagement() {
             if (delayBackgroundTrustCapability) {
@@ -965,10 +977,7 @@ public final class P5cLoopbackEndpoint {
             if (context.formatV2 != null) {
                 if (startNumber > expectedAudioV2Sessions)
                     throw new IOException("more V2 formal sessions than this fixture allows");
-                if (!audioV2Support || context.parameters != null
-                        || context.formatV2.profile != expectedAudioV2Profile || context.formatV2.profile != 2
-                        || context.formatV2.sampleRate != 48_000 || context.formatV2.validBits != 24
-                        || context.formatV2.channels != 2)
+                if (context.parameters != null || !supportsAudioFormatV2(context.formatV2))
                     throw new IOException("unexpected authenticated v2 capture format");
                 stopped.set(false);
                 paused.set(false);

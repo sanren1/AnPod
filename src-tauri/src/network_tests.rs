@@ -173,6 +173,73 @@ fn float_udp_sender_splits_24bit_packets_on_frame_boundaries() {
 }
 
 #[test]
+fn float_udp_sender_splits_96khz_profile3_and_preserves_low_q23_samples_and_indices() {
+    let format = crate::protocol::AudioFormatV2::for_profile(3, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(96_000, 4096).unwrap();
+    let mut samples = vec![0.0f32; 480 * 2];
+    samples[..4].copy_from_slice(&[
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ]);
+    let key = [0x72; 32];
+    let session_id = 0x1112_1314_1516_1718;
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut sender = FloatUdpSender::spawn_authenticated(
+        receiver.local_addr().unwrap(),
+        queue.clone(),
+        UdpSocket::bind(("127.0.0.1", 0)).unwrap(),
+        UdpSessionMaterial { session_id, key },
+        format,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+
+    let mut decoder = PacketDecoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format).unwrap();
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+    let format_packet = decoder.open(&datagram[..length]).unwrap();
+    decoder.commit(format_packet.header.sequence);
+    assert_eq!(format_packet.header.packet_type, PacketType::Format);
+    assert!(queue.push_raw(samples.as_ptr(), 480, 96_000, 2, 7));
+    let mut audio = Vec::new();
+    for _ in 0..3 {
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let packet = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(packet.header.sequence);
+        audio.push(packet);
+    }
+    sender.expect_queue_stop();
+    queue.stop_and_clear();
+    let stats = sender.stop().unwrap();
+
+    assert_eq!(stats.packets_sent, 4);
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.header.sample_frame_index)
+            .collect::<Vec<_>>(),
+        [7, 198, 389]
+    );
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.payload.len())
+            .collect::<Vec<_>>(),
+        [1146, 1146, 588]
+    );
+    assert_eq!(
+        &audio[0].payload[..12],
+        &[1, 0, 0, 255, 255, 255, 1, 128, 0, 255, 127, 255]
+    );
+}
+
+#[test]
 fn float_udp_sender_reports_an_unplanned_active_queue_stop() {
     let format = crate::protocol::AudioFormatV2::for_profile(2, 0).unwrap();
     let queue = Arc::new(FloatPcmQueue::new(false));

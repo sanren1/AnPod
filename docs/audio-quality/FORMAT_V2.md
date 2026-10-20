@@ -5,8 +5,10 @@ Receiver coordinator now has an additive P5-C v2 capability and a fresh-session
 v2 authentication path. Product format support is still decided by the playback
 endpoint; current Phase 3 work targets only stereo 48 kHz packed PCM24. Source
 integration and synthetic loopback checks do not establish real playback quality
-or device compatibility. All integer fields are unsigned big endian; PCM sample
-bytes are little endian.
+or device compatibility. Phase 4 adds an experimental exact 96 kHz descriptor
+path under the same policy: the Windows mix/capture rate and Receiver session
+must match; a 48 kHz source is not upsampled and presented as native 96 kHz. All
+integer fields are unsigned big endian; PCM sample bytes are little endian.
 
 ## P5-C negotiation and output reporting
 
@@ -25,8 +27,11 @@ authenticated handshake transcript. It then uses the existing P5-C control and
 background authorization lifecycle. Each receiver endpoint checks the session
 descriptor before BIND; descriptors it does not support are rejected without
 entering the audio decoder. The descriptor schema permits standard PCM16, hifi
-48 kHz PCM24 and hires 96 kHz PCM24, while current Phase 3 product policy supports
-only hifi 48 kHz stereo PCM24. A 96 kHz session remains unavailable until Phase 4.
+48 kHz PCM24 and hires 96 kHz PCM24. Phase 3 enabled only hifi 48 kHz stereo
+PCM24. Phase 4 enables profile 3 only when the actual Windows mix/capture is
+96 kHz and the Receiver accepts that exact stereo packed-PCM24 descriptor; the
+current 48 kHz source path does not resample to 96 kHz. Unsupported combinations
+fail explicitly and require a user-selected fresh session.
 
 Legacy playback progress remains exactly 70 bytes. A v2 session appends an
 8-byte extension: schema `1`, actual opened output encoding (`0` unknown, `1`
@@ -39,13 +44,15 @@ effective precision.
 **Implementation status (2026-10-20):** Java coordinator and synthetic loopback
 fixture cover capability probing, fresh v2 authentication, per-format endpoint
 gating, the 78-byte progress layout, and per-session PCM24 low-bit decode checks.
-P5-C javac, protocol self-checks, Rust↔Java upgrade/rejection loopbacks, and the
-two-generation owner pause/restart test pass. Java offline checks, 44 Android
-Receiver JVM tests, and the focused frontend build/Playwright check pass. The
-locked, offline, single-thread Rust suite passed **111 tests, 0 failed, 1
-ignored, 2 filtered** (93.98 seconds); the filtered tests are the manual
-PowerShell artifact check and explicitly requested real-USB Receiver test.
-Real WASAPI capture, device AudioTrack opening, physical playback, and
+The Phase 4 profile-3 loopback authenticates 96 kHz, sends Q.23 samples through
+the real Rust sender and Java decoder/queue, and verifies low-bit retention;
+the owner test covers pause/stop/mode restart with a fresh 96 kHz queue. JDK 17
+offline checks, 47 Android Receiver JVM tests, and focused frontend build/
+Playwright checks pass. `cargo fmt -- --check` and normal strict Clippy pass; the
+locked offline single-thread Rust suite passed **114 tests, 0 failed, 1 ignored,
+2 filtered** (93.89 seconds). The filtered tests are the manual PowerShell
+artifact check and explicitly requested real-USB Receiver test. Real 96 kHz
+WASAPI capture, device AudioTrack 96 kHz opening, physical playback, and
 acoustic/long-duration measurements remain `NOT_TESTED`.
 
 ## Descriptor (16 bytes)

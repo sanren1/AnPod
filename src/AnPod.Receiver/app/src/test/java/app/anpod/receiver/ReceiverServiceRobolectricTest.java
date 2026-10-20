@@ -13,6 +13,7 @@ import android.media.AudioFormat;
 import android.media.AudioTrack;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.lang.reflect.Field;
 
 import org.junit.Test;
@@ -39,6 +40,19 @@ public final class ReceiverServiceRobolectricTest {
             System.arraycopy(audioData, offsetInFloats, captured, 0, sizeInFloats);
             LAST_FLOAT_WRITE.set(captured);
             return sizeInFloats;
+        }
+    }
+
+    private static final AtomicBoolean MISMATCH_TRACK_RELEASED = new AtomicBoolean();
+
+    @Implements(value = AudioTrack.class)
+    public static final class WrongSampleRateShadow extends ShadowAudioTrack {
+        @Implementation
+        protected int getSampleRate() { return 48_000; }
+
+        @Implementation
+        protected void release() {
+            MISMATCH_TRACK_RELEASED.set(true);
         }
     }
 
@@ -135,6 +149,54 @@ public final class ReceiverServiceRobolectricTest {
             assertEquals("Neither packed PCM24 nor Float32 AudioTrack is supported", expected.getMessage());
             assertEquals(1, expected.getSuppressed().length);
         }
+    }
+
+    @Test
+    public void v2PolicyAcceptsOnlyTheExact48And96KhzPacked24Profiles() {
+        assertTrue(ReceiverService.supportsPcm24AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0)));
+        assertTrue(ReceiverService.supportsPcm24AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(3, 1)));
+        assertFalse(ReceiverService.supportsPcm24AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(1, 0)));
+    }
+
+    @Test
+    public void phase4OpensAtTheRequested96KhzOrFailsInsteadOfChangingRate() throws Exception {
+        ReceiverService.OpenedV2Track opened = ReceiverService.openV2AudioTrack(
+                96_000, AudioFormat.CHANNEL_OUT_STEREO);
+        try {
+            assertEquals(96_000, opened.track.getSampleRate());
+            assertEquals(2, opened.track.getChannelCount());
+            assertEquals(opened.formatCode == 2 ? AudioFormat.ENCODING_PCM_24BIT_PACKED
+                    : AudioFormat.ENCODING_PCM_FLOAT, opened.track.getAudioFormat());
+        } finally {
+            opened.track.release();
+        }
+
+        int[] attemptedRate = {0};
+        ReceiverService.OpenedV2Track fallback = ReceiverService.chooseV2AudioTrack(30, 96_000,
+                AudioFormat.CHANNEL_OUT_STEREO, (sampleRate, channelMask, encoding, formatCode) -> {
+                    attemptedRate[0] = sampleRate;
+                    assertEquals(AudioFormat.ENCODING_PCM_FLOAT, encoding);
+                    return new ReceiverService.OpenedV2Track(null, formatCode, 1, 8);
+                });
+        assertEquals(96_000, attemptedRate[0]);
+        assertEquals(3, fallback.formatCode);
+    }
+
+    @Test
+    @Config(sdk = 34, shadows = WrongSampleRateShadow.class)
+    public void phase4RejectsAndReleasesA96KhzTrackOpenedAt48Khz() throws Exception {
+        MISMATCH_TRACK_RELEASED.set(false);
+        try {
+            ReceiverService.openV2AudioTrack(96_000, AudioFormat.CHANNEL_OUT_STEREO);
+            throw new AssertionError("AudioTrack silently opened 96k PCM at 48k");
+        } catch (IOException expected) {
+            assertTrue(expected.getMessage().contains("Neither packed PCM24 nor Float32"));
+        }
+        assertTrue("mismatched AudioTracks must be released", MISMATCH_TRACK_RELEASED.get());
+        MISMATCH_TRACK_RELEASED.set(false);
     }
 
     @Test

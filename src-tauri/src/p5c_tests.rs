@@ -530,6 +530,22 @@ fn spawn_audio_v2_upgrade_fixture(
     profile: Option<u8>,
     sessions: Option<u8>,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+    spawn_audio_v2_upgrade_fixture_with_profiles(
+        classes,
+        background_auth_mode,
+        profile,
+        sessions,
+        None,
+    )
+}
+
+fn spawn_audio_v2_upgrade_fixture_with_profiles(
+    classes: &Path,
+    background_auth_mode: Option<&str>,
+    profile: Option<u8>,
+    sessions: Option<u8>,
+    supported_profiles: Option<&str>,
+) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
     let (_, java) = java_paths();
     let mut command = Command::new(java);
     command
@@ -545,6 +561,9 @@ fn spawn_audio_v2_upgrade_fixture(
     }
     if let Some(sessions) = sessions {
         command.arg(format!("--audio-v2-upgrade-sessions={sessions}"));
+    }
+    if let Some(profiles) = supported_profiles {
+        command.arg(format!("--audio-v2-supported-profiles={profiles}"));
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -2611,7 +2630,7 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
             channels: 2,
             mode: 0,
         },
-        HostAudioProfile::Hifi48(format),
+        HostAudioProfile::Pcm24(format),
         &mut initial_queue,
         CancellationToken::new(),
     )
@@ -2700,15 +2719,78 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
 }
 
 #[test]
+fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) =
+        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), None, Some("2,3"));
+    let mut endpoint = SessionEndpoint::loopback(peer);
+    endpoint.connection_intent = Some(([0x5a; 16], true));
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(96_000, 4096).unwrap();
+    let mut initial_queue = Some(queue.clone());
+    let mut session = HostSession::authenticate_for_profile(
+        endpoint,
+        &test_binding_material(),
+        AudioParameters {
+            sample_rate: 96_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::Pcm24(format),
+        &mut initial_queue,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(session.is_v2_audio());
+    session.negotiate_capabilities().unwrap();
+    assert!(session.capabilities().unwrap().compatible);
+    session.bind_audio().unwrap();
+    session.select_mode().unwrap();
+    session.start().unwrap();
+
+    let samples = [
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ];
+    assert!(queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.pcm_payload_bytes_sent() < 12 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(session.pcm_payload_bytes_sent() >= 12);
+    session.pause().unwrap();
+    queue.stop_and_clear();
+    session.stop().unwrap();
+    drop(session);
+
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(fields.len(), 7, "unexpected PCM24/96 result: {result}");
+    assert_eq!(fields[0], "", "96 kHz v2 session failed: {result}");
+    assert_eq!(fields[1..5], ["1", "1", "0", "1"]);
+    assert_eq!(fields[5], "true");
+    assert_eq!(
+        fields[6], "true",
+        "96 kHz PCM24 Q23 decode failed: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
 fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
     let classes = compile_java_endpoint();
     let (mut child, stdout, peer) =
-        spawn_audio_v2_upgrade_fixture(&classes, None, Some(2), Some(2));
+        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), Some(2), Some("2,3"));
     let mut endpoint = SessionEndpoint::loopback(peer);
     endpoint.connection_intent = Some(([0x5a; 16], true));
-    let format = AudioFormatV2::for_profile(2, 0).unwrap();
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
     let initial_queue = Arc::new(FloatPcmQueue::new(false));
-    initial_queue.set_expected_format(48_000, 4096).unwrap();
+    initial_queue.set_expected_format(96_000, 4096).unwrap();
     let timing = SessionTiming {
         heartbeat_interval: Duration::from_millis(20),
         reconnect_delays: [Duration::from_millis(20); 4],
@@ -2718,11 +2800,11 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
         endpoint,
         test_binding_material(),
         AudioParameters {
-            sample_rate: 48_000,
+            sample_rate: 96_000,
             channels: 2,
             mode: 0,
         },
-        HostAudioProfile::Hifi48(format),
+        HostAudioProfile::Pcm24(format),
         Some(initial_queue.clone()),
         CancellationToken::new(),
         timing,
@@ -2732,8 +2814,11 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
     let first = wait_for_owner(&owner, |status| {
         status.state == SessionLifecycleState::ReceiverRunning && status.negotiated_format.is_some()
     });
+    assert_eq!(first.negotiated_format.unwrap().profile, 3);
+    assert!(owner.matches_audio_quality("hires"));
+    assert!(!owner.matches_audio_quality("hifi"));
     let first_queue = match owner.audio_queue().unwrap() {
-        SessionAudioQueue::Float32(queue) => queue,
+        SessionAudioQueue::Float32(queue, _) => queue,
         SessionAudioQueue::Pcm16(_) => panic!("PCM24 owner must publish a Float32 queue"),
     };
     assert!(Arc::ptr_eq(&first_queue, &initial_queue));
@@ -2743,7 +2828,7 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
         32_769.0 / 8_388_608.0,
         -32_769.0 / 8_388_608.0,
     ];
-    assert!(first_queue.push_raw(samples.as_ptr(), 2, 48_000, 2, 0));
+    assert!(first_queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
     let first_send_deadline = Instant::now() + Duration::from_secs(2);
     while owner.pcm_payload_bytes_sent() < 12 && Instant::now() < first_send_deadline {
         thread::yield_now();
@@ -2785,12 +2870,13 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
                 .negotiated_format
                 .is_some_and(|format| format.mode == 1)
     });
+    assert_eq!(second.negotiated_format.unwrap().profile, 3);
     assert_ne!(second.session_id, first.session_id);
     let second_queue = match owner.audio_queue().unwrap() {
-        SessionAudioQueue::Float32(queue) => queue,
+        SessionAudioQueue::Float32(queue, _) => queue,
         SessionAudioQueue::Pcm16(_) => panic!("reconnected PCM24 owner must keep Float32"),
     };
-    second_queue.set_expected_format(48_000, 4096).unwrap();
+    second_queue.set_expected_format(96_000, 4096).unwrap();
     assert!(!Arc::ptr_eq(&first_queue, &second_queue));
     assert!(!second_queue.is_stopped());
 
@@ -2800,8 +2886,10 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
             && status.session_id == second.session_id
             && status.state == SessionLifecycleState::ReceiverRunning
     });
-    assert_eq!(resumed.negotiated_format.unwrap().mode, 1);
-    assert!(second_queue.push_raw(samples.as_ptr(), 2, 48_000, 2, 0));
+    let resumed_format = resumed.negotiated_format.unwrap();
+    assert_eq!(resumed_format.mode, 1);
+    assert_eq!(resumed_format.profile, 3);
+    assert!(second_queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
     let second_send_deadline = Instant::now() + Duration::from_secs(2);
     while owner.pcm_payload_bytes_sent() < 24 && Instant::now() < second_send_deadline {
         thread::yield_now();
@@ -2848,7 +2936,7 @@ fn pcm24_upgrade_rejects_receiver_unsupported_v2_descriptor_before_bind() {
                 channels: 2,
                 mode: 0,
             },
-            HostAudioProfile::Hifi48(format),
+            HostAudioProfile::Pcm24(format),
             &mut initial_queue,
             CancellationToken::new(),
         )

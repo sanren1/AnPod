@@ -827,7 +827,7 @@ public final class ReceiverService extends Service {
                 @Override public boolean supportsPlaybackProgress() { return true; }
                 @Override public boolean supportsAudioV2() { return true; }
                 @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
-                    return supportsPhase3AudioFormatV2(format);
+                    return supportsPcm24AudioFormatV2(format);
                 }
                 @Override public int openedTrackFormatV2() {
                     AudioSession session = ownedSession;
@@ -1314,8 +1314,8 @@ public final class ReceiverService extends Service {
         String failure = "";
         try {
             UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.udpContext.formatV2;
-            if (!supportsPhase3AudioFormatV2(sourceFormat))
-                throw new IOException("Unsupported audio format for Phase 3 high-resolution playback");
+            if (!supportsPcm24AudioFormatV2(sourceFormat))
+                throw new IOException("Unsupported audio format for high-resolution playback");
             ensureRunning(session);
             WifiManager wifi = getSystemService(WifiManager.class);
             if (wifi == null) throw new IOException("WiFi service unavailable");
@@ -1548,8 +1548,9 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private static boolean supportsPhase3AudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
-        return format != null && format.profile == 2 && format.sampleRate == 48_000
+    static boolean supportsPcm24AudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+        return format != null && (format.profile == 2 && format.sampleRate == 48_000
+                || format.profile == 3 && format.sampleRate == 96_000)
                 && format.channels == 2 && format.sampleFormat == 2 && format.validBits == 24
                 && format.bytesPerSample == Pcm24PackedCodec.BYTES_PER_SAMPLE && format.frameBytes == 6;
     }

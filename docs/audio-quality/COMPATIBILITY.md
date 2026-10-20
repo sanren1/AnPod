@@ -13,9 +13,11 @@
   v2 session, so the receiver never has two authenticated owners.
 - A v2 session binds the format descriptor to fresh authentication proofs and
   uses the existing P5-C bind, mode, start/stop and background authorization
-  lifecycle. The endpoint checks each descriptor before BIND. Phase 3 enables
-  only 48 kHz stereo packed PCM24; profile 1 PCM16 and profile 3 96 kHz remain
-  rejected by the product endpoint until their paths are explicitly supported.
+  lifecycle. The endpoint checks each descriptor before BIND. Phase 3 enabled
+  48 kHz stereo packed PCM24; Phase 4 adds experimental profile 3 at exactly
+  96 kHz stereo packed PCM24. Both host and Receiver require exact profile/rate/
+  representation agreement. A 48 kHz mix is not upsampled to satisfy Hi-Res;
+  unsupported requests fail and require the user to select a new session format.
 - A v2 playback progress response preserves the original 70-byte payload and
   appends the 8-byte actual-output schema. V1 sessions and older hosts retain the
   70-byte shape.
@@ -34,10 +36,12 @@ Rust↔Java upgrade/rejection and two-generation owner pause/restart checks pass
 the fixture's final PCM24 low-bit result is true only if every requested session
 decoded the Q.23 samples before its own PAUSE. Java offline checks, Android
 offline checks, all 44 Android Receiver JVM tests, and the targeted Frontend
-build/Playwright check pass. The locked offline single-thread Rust suite passed
-111 tests, 0 failed, 1 ignored, and 2 filtered in 93.98 seconds. The filtered
-cases are the manual PowerShell artifact check and explicitly requested real-
-USB Receiver test. These checks do not establish real WASAPI capture, device
-AudioTrack output, physical precision, acoustic quality, or long-duration
+build/Playwright check pass. The Phase 4 profile-3 Rust↔Java loopback and owner
+pause/stop/mode fresh-session checks pass. `cargo fmt -- --check`, normal strict
+Clippy, and the locked offline single-thread Rust suite pass; Rust reported 114
+passed, 0 failed, 1 ignored, and 2 filtered in 93.89 seconds. The filtered cases
+are the manual PowerShell artifact check and explicitly requested real-USB
+Receiver test. These checks do not establish real 96 kHz WASAPI capture, device
+AudioTrack 96 kHz output, physical precision, acoustic quality, or long-duration
 stability; all remain
 `NOT_TESTED` pending device validation.

@@ -23,7 +23,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <legend>{strings.app.transportQuality}</legend>
       {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
         <span>{strings.app.audioQualityLabels[quality]}</span>
-        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={quality === "hires" || busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
+        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
       </label>)}
       <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
       <dl className="audio-quality-status">

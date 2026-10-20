@@ -48,6 +48,38 @@ fn float_v2_abi_layout_and_response_version_are_checked() {
 }
 
 #[test]
+fn authenticated_pcm24_format_is_checked_against_each_actual_native_mix_before_start() {
+    let mut actual = super::CaptureFormatV2 {
+        size: 48,
+        version: 2,
+        mix_sample_rate: 96_000,
+        mix_channels: 6,
+        mix_sample_format: super::FLOAT_CAPTURE_FORMAT_INTEGER,
+        mix_container_bits: 32,
+        mix_valid_bits: 24,
+        capture_sample_rate: 96_000,
+        capture_channels: 2,
+        capture_sample_format: super::FLOAT_CAPTURE_FORMAT_FLOAT,
+        ..super::CaptureFormatV2::default()
+    };
+    let hires = crate::protocol::AudioFormatV2::for_profile(3, 0).unwrap();
+    let hifi = crate::protocol::AudioFormatV2::for_profile(2, 0).unwrap();
+    assert!(super::validate_float_format_for_session(&actual, hires).is_ok());
+    assert!(super::validate_float_format_for_session(&actual, hifi).is_err());
+
+    actual.mix_sample_rate = 48_000;
+    actual.capture_sample_rate = 48_000;
+    assert!(super::validate_float_format_for_session(&actual, hires).is_err());
+    assert!(super::validate_float_format_for_session(&actual, hifi).is_ok());
+
+    actual.capture_channels = 1;
+    assert!(super::validate_float_format_for_session(&actual, hifi).is_err());
+    actual.capture_channels = 2;
+    actual.capture_sample_format = super::FLOAT_CAPTURE_FORMAT_INTEGER;
+    assert!(super::validate_float_format_for_session(&actual, hifi).is_err());
+}
+
+#[test]
 fn stopped_float_queue_is_not_reused_by_audio_sink_fast_path() {
     let queue = std::sync::Arc::new(crate::network::FloatPcmQueue::new(false));
     assert!(super::can_reuse_float_sink(Some(&queue), &queue));

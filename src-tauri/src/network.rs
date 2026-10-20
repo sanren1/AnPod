@@ -597,12 +597,13 @@ impl FloatUdpSender {
         pcm_payload_bytes_sent: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         format.encode().map_err(|error| error.to_string())?;
-        if format.profile != 2
-            || format.sample_format != 2
+        if !matches!(
+            (format.profile, format.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        ) || format.sample_format != 2
             || format.channels != 2
             || format.valid_bits != 24
             || format.bytes_per_sample != 3
-            || format.sample_rate != 48_000
             || format.frame_bytes != 6
             || !remote.is_ipv4()
             || !socket

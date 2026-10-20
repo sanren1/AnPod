@@ -689,22 +689,23 @@ impl AppState {
             audio_initialized = true;
             self.audio.initialize()?;
             let playback_mode = if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 };
-            let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality == "hifi" {
+            let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality != "standard" {
+                let profile_id = if audio_quality == "hifi" { 2 } else { 3 };
+                let format = AudioFormatV2::for_profile(profile_id, playback_mode)
+                    .map_err(|_| "Unable to construct the authenticated PCM24 format.".to_string())?;
                 let native = self.audio.probe_float_format()?;
-                if native.mix_sample_rate != 48_000
-                    || native.capture_sample_rate != 48_000
-                    || native.capture_channels != 2
-                    || native.capture_sample_format != 2
-                {
-                    return Err("HiFi requires a 48 kHz stereo Float32 Windows mix; select Standard or use a 48 kHz mix.".into());
+                let expected_rate = if profile_id == 2 { 48_000 } else { 96_000 };
+                if let Err(error) = crate::audio::validate_float_format_for_session(&native, format) {
+                    if native.mix_sample_rate != expected_rate {
+                    return Err(format!("{} requires an actual {expected_rate} Hz Windows mix that Native can capture as stereo Float32; no resampling is enabled. Select Standard or use a matching Windows mix rate.", if profile_id == 2 { "HiFi" } else { "Hi-Res" }));
+                    }
+                    return Err(error);
                 }
                 let mix_format = windows_mix_format(native);
                 let queue = Arc::new(FloatPcmQueue::new(playback_mode == 1));
-                let format = AudioFormatV2::for_profile(2, playback_mode)
-                    .map_err(|_| "Unable to construct the authenticated PCM24 format.".to_string())?;
                 (
                     PcmFormat { sample_rate: native.capture_sample_rate, channels: native.capture_channels as u16 },
-                    HostAudioProfile::Hifi48(format),
+                    HostAudioProfile::Pcm24(format),
                     Some(queue),
                     Some(mix_format),
                 )
@@ -798,7 +799,7 @@ impl AppState {
                 let queue_ref = queue.as_ref().expect("audio-compatible session queue");
                 let sink_result = match queue_ref {
                     SessionAudioQueue::Pcm16(queue) => self.audio.start_pcm_sink(queue.clone()).map(|()| None),
-                    SessionAudioQueue::Float32(_) => self.start_session_audio_sink(queue_ref),
+                    SessionAudioQueue::Float32(_, _) => self.start_session_audio_sink(queue_ref),
                 };
                 match sink_result {
                     Ok(Some(format)) => mix_format = Some(format),
@@ -1737,16 +1738,8 @@ impl AppState {
             SessionAudioQueue::Pcm16(queue) => {
                 self.audio.start_pcm_sink(queue.clone()).map(|()| None)
             }
-            SessionAudioQueue::Float32(queue) => {
-                let format = self.audio.start_float_sink(queue.clone())?;
-                if format.mix_sample_rate != 48_000
-                    || format.capture_sample_rate != 48_000
-                    || format.capture_channels != 2
-                    || format.capture_sample_format != 2
-                {
-                    let _ = self.audio.stop_float_sink();
-                    return Err("HiFi capture format changed outside the authenticated 48 kHz PCM24 session.".into());
-                }
+            SessionAudioQueue::Float32(queue, expected) => {
+                let format = self.audio.start_float_sink(queue.clone(), *expected)?;
                 Ok(Some(windows_mix_format(format)))
             }
         }
@@ -2269,8 +2262,8 @@ impl AppState {
                 .audio_quality
                 .clone();
             validate_audio_quality(&quality)?;
-            if quality == "hifi" {
-                return Err("HiFi is available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
+            if quality != "standard" {
+                return Err("HiFi and Hi-Res are available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
             }
         }
         if !self.operation_is_current(generation, token) {
@@ -3162,15 +3155,16 @@ impl AppState {
                 .audio_quality
                 .clone();
             validate_audio_quality(&quality)?;
-            let hifi_network = self
+            let requested_quality_matches_session = self
                 .session
                 .lock()
                 .await
                 .as_ref()
                 .and_then(|session| session.network_owner.as_ref())
-                .is_some_and(SessionOwner::uses_hifi48);
-            if quality == "hifi" && !hifi_network {
-                return Err("HiFi is available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
+                .map(|owner| owner.matches_audio_quality(&quality))
+                .unwrap_or(quality == "standard");
+            if !requested_quality_matches_session {
+                return Err("The active session does not match the requested audio quality; reconnect to negotiate the selected format. USB/ADB TCP playback supports Standard only.".into());
             }
         }
         {
