@@ -1,4 +1,4 @@
-# AOA direct audio transport (Phase 6a protocol and 6b1 I/O foundation)
+# AOA direct audio transport (Phase 6 implementation foundations)
 
 This specification defines the accepted accessory-mode byte-stream transport
 for an AnPod host and Receiver pair. Phase 6a implements its offline record
@@ -6,10 +6,11 @@ codec, transport-specific binding derivation, and shared-vector checks. It
 reuses the existing ANPB binding,
 P5-A v2 handshake, P5-C authenticated control messages and ANPD v2 encrypted
 audio packets. It does not reuse the AOA 4096-byte echo probe, ADB TCP, or the
-LAN UDP transport context. Phase 6a protocol codecs and the 6b1 platform I/O
-owners are implemented as offline foundations. They do not yet integrate a
-complete AOA session into the product audio path, and no physical accessory
-transfer has been tested.
+LAN UDP transport context. Phase 6a protocol codecs, the 6b1 platform I/O
+owners, and the 6b2 authenticated session cores have offline implementations.
+The 6b2 host owner and Android coordinator are not yet opened through the
+product USB permission/state entrypoints, and no physical accessory transfer
+has been tested.
 
 The Receiver must have the matching accessory-mode application installed. The
 first product stage connects only to a target already in AOA accessory mode;
@@ -369,3 +370,55 @@ These tests verify shared software ingress and Service worker behavior with
 synthetic/fake inputs. They do not establish a complete AOA connection or test
 USB permission, detach, Windows device I/O, physical playback, throughput,
 latency, or acoustics; those remain `NOT_TESTED`.
+
+## 6b2b authenticated-session core status
+
+The host has an authenticated AOA owner that consumes the shared PCM16/Float32
+queues, validates each queue against its locked descriptor, runs P5-C control,
+and emits ANPD v2 records over the ANPU writer. Pause clears pending source
+audio; a stopped source queue requires a fresh session. The Receiver has an
+isolated coordinator that authenticates P5-A v2, requires the AOA capability
+query first, validates raw P5-C frames, registers the descriptor-matched
+ingress before acknowledging START, and owns transport/context teardown. Its
+Service endpoint reuses the existing audio workers and playback controls. The
+production `UsbManager.openAccessory` permission/state entrypoint and
+coordinator creation/retention are still pending 6c; the current Java
+coordinator tests use fake channels and an in-memory endpoint. This milestone
+is session-core verification, not a complete product USB Direct path.
+
+Offline verification on 2026-10-20:
+
+- Receiver `AoaReceiverCoordinatorTest` focused checks passed 3/3. The full
+  Receiver JVM suite passed 64/64 (10 XML suites; 0 failures, errors, or
+  skipped tests), and `packaging/check-java-offline.ps1` passed all 7 checks.
+  Logs: `artifacts/phase6b2b-focused.log`,
+  `artifacts/phase6b2b-android-jvm.log`, and
+  `artifacts/phase6b2b-java-offline.log`.
+- Rust focused owner checks passed 6/6, covering three profiles, wrong binding
+  domain, queue/descriptor mismatch, owner drop/join, active queue stop, and
+  expired pending frames after a fake write stall. WinUSB focused checks passed
+  7/7; P5-C raw control vector passed 1/1. Rust formatting and normal strict
+  Clippy passed. The final elevated locked/offline Rust suite passed 135 tests,
+  with 0 failures, 0 ignored, and 2 filtered in 95.81 seconds. The filters were
+  `adb_stdin_child_helper` and
+  `p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested`.
+  Logs: `artifacts/phase6b2-final-owner.log`,
+  `artifacts/phase6b2-final-winusb.log`, `artifacts/phase6b2-p5c-vector.log`,
+  `artifacts/phase6b2-final-fmt.log`, `artifacts/phase6b2-final-clippy.log`,
+  and `artifacts/phase6b2-full-rust-elevated.log`.
+
+The full-suite command was the locked, offline, single-thread Cargo test run
+with `adb_stdin_child_helper` and the explicitly opted-in real-USB receiver
+health test filtered. `reads_the_artifact_written_by_windows_powershell_when_requested`
+was not filtered, but `ANPOD_RECEIVER_ARTIFACT_DIR` was unset, so that test took
+its no-artifact early-return path; Windows artifact consumption is not verified
+by this run.
+
+These checks exercise synthetic handshakes, fake byte-stream I/O, queue
+lifecycles, and the existing audio worker. They do not exercise the Android
+permission dialog, accessory attachment/detachment, Windows PnP/WinUSB hardware,
+complete product session recovery, physical playback, throughput, latency, or
+acoustics. Those remain `NOT_TESTED`. The production accessory descriptor must
+be opened while reserving the single coordinator owner slot; a separate
+`isAvailable` check before `UsbManager.openAccessory` is not sufficient. That
+product entrypoint is outside the 6b2b core and remains pending 6c.

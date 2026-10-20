@@ -732,8 +732,12 @@ public final class ReceiverService extends Service {
     }
 
     private AudioSession startAudio(AudioRequest request) {
+        return startAudio(request, uiOperation.ownerId(), networkBootstrapGeneration.get());
+    }
+
+    private AudioSession startAudio(AudioRequest request, String ownerId, long generation) {
         WAVEFORM.reset();
-        if (destroyed) return null;
+        if (destroyed || !isCurrentOperation(ownerId, generation)) return null;
         AudioSession existing = currentAudio;
         if (existing != null) {
             if (pendingAudio != null) pendingAudio.destroy();
@@ -749,7 +753,7 @@ public final class ReceiverService extends Service {
             return null;
         }
         AudioSession session = new AudioSession(NEXT_AUDIO_ID.incrementAndGet(), request,
-                uiOperation.ownerId(), networkBootstrapGeneration.get());
+                ownerId, generation);
         session.requestedOutputEngine = requestedOutputEnginePreference();
         session.actualOutputEngine = "unknown";
         currentAudio = session;
@@ -804,10 +808,8 @@ public final class ReceiverService extends Service {
     }
 
     /** Starts one already-authenticated AOA session before START is ACKed; the caller retains context ownership. */
-    AudioSession startAoaAudio(AoaSessionContext context) throws IOException {
+    AudioSession startAoaAudio(AoaSessionContext context, String ownerId, long generation) throws IOException {
         if (context == null) throw new NullPointerException("context");
-        String ownerId = networkCoordinatorOwnerId;
-        long generation = currentOperationGeneration;
         AudioStartTicket ticket = new AudioStartTicket();
         Runnable start = () -> {
             synchronized (ticket) {
@@ -817,7 +819,7 @@ public final class ReceiverService extends Service {
                         context.stopQueue();
                         return;
                     }
-                    AudioSession accepted = startAudio(AudioRequest.aoa(context));
+                    AudioSession accepted = startAudio(AudioRequest.aoa(context), ownerId, generation);
                     if (accepted == null || accepted.request.aoaContext != context || currentAudio != accepted)
                         throw new IOException("AoaAudioSessionNotAccepted");
                     ticket.accepted = accepted;
@@ -866,6 +868,61 @@ public final class ReceiverService extends Service {
         if (ticket.accepted == null || currentAudio != ticket.accepted || !isCurrentOperation(ownerId, generation))
             throw new IOException("AoaAudioSessionNotAccepted");
         return ticket.accepted;
+    }
+
+    AoaReceiverCoordinator.PlaybackEndpoint aoaPlaybackEndpoint(String ownerId, long generation) {
+        return new AoaReceiverCoordinator.PlaybackEndpoint() {
+            private AudioSession ownedSession;
+            private boolean current() { return isCurrentOperation(ownerId, generation); }
+
+            @Override public boolean isCurrent(String expectedOwner, long expectedGeneration) {
+                return ownerId.equals(expectedOwner) && generation == expectedGeneration && current();
+            }
+
+            @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) {
+                return format != null && format.profile >= 1 && format.profile <= 3;
+            }
+
+            @Override public void start(AoaSessionContext context) throws IOException {
+                if (!current()) throw new IOException("AoaOwnerStopped");
+                AudioSession accepted = startAoaAudio(context, ownerId, generation);
+                ownedSession = accepted;
+            }
+
+            @Override public void pause() throws IOException {
+                runOnMainForOwner(ownerId, generation, () -> setUdpAudioPaused(ownedSession, true));
+            }
+
+            @Override public void resume() throws IOException {
+                runOnMainForOwner(ownerId, generation, () -> setUdpAudioPaused(ownedSession, false));
+            }
+
+            @Override public void stop() {
+                AudioSession session = ownedSession;
+                if (session == null) return;
+                Runnable stop = () -> {
+                    if (currentAudio == session && isCurrentOperation(ownerId, generation))
+                        cancelAudio(session, "AoaSessionStopped");
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) stop.run(); else handler.post(stop);
+            }
+
+            @Override public boolean streaming() throws IOException {
+                if (!current()) throw new IOException("AoaOwnerStopped");
+                AudioSession session = ownedSession;
+                if (session == null || currentAudio != session) throw new IOException("AoaAudioSessionNotOwned");
+                return session.isStreamingAt(System.nanoTime());
+            }
+
+            @Override public byte[] playbackProgressPayloadV2() {
+                AudioSession session = ownedSession;
+                byte[] legacy = ReceiverService.playbackProgressPayload();
+                return P5cControlProtocol.playbackProgressPayloadV2(legacy,
+                        session == null ? 0 : session.openedTrackFormatV2,
+                        session == null ? 0 : session.openedTrackChannelsV2,
+                        session == null ? 0 : session.openedTrackSampleRateV2);
+            }
+        };
     }
 
     private void startNetworkBootstrap(String address, int prefixLength, long generation, String ownerId,

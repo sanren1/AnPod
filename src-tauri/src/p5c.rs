@@ -25,41 +25,41 @@ use std::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const CONTROL_MAGIC: &[u8; 4] = b"ANPC";
+pub(crate) const CONTROL_MAGIC: &[u8; 4] = b"ANPC";
 const CONTROL_HEADER_BYTES: usize = 30;
 const CONTROL_TAG_BYTES: usize = 32;
 const MAX_CONTROL_FRAME: usize = 1200;
-const HOST_TO_RECEIVER_CONTROL: u32 = 0x414e_5048;
-const RECEIVER_TO_HOST_CONTROL: u32 = 0x414e_5052;
-const BIND: u8 = 1;
-const SELECT_MODE: u8 = 2;
-const START: u8 = 3;
-const PAUSE: u8 = 4;
-const RESUME: u8 = 5;
-const STOP: u8 = 6;
-const HEARTBEAT: u8 = 7;
-const CAPABILITIES_QUERY: u8 = 8;
-const CAPABILITIES_INFO: u8 = 9;
-const PLAYBACK_PROGRESS_QUERY: u8 = 16;
+pub(crate) const HOST_TO_RECEIVER_CONTROL: u32 = 0x414e_5048;
+pub(crate) const RECEIVER_TO_HOST_CONTROL: u32 = 0x414e_5052;
+pub(crate) const BIND: u8 = 1;
+pub(crate) const SELECT_MODE: u8 = 2;
+pub(crate) const START: u8 = 3;
+pub(crate) const PAUSE: u8 = 4;
+pub(crate) const RESUME: u8 = 5;
+pub(crate) const STOP: u8 = 6;
+pub(crate) const HEARTBEAT: u8 = 7;
+pub(crate) const CAPABILITIES_QUERY: u8 = 8;
+pub(crate) const CAPABILITIES_INFO: u8 = 9;
+pub(crate) const PLAYBACK_PROGRESS_QUERY: u8 = 16;
 const CONNECTION_INTENT: u8 = 17;
 const BACKGROUND_START_REQUEST: u8 = 18;
 const BACKGROUND_START_STATUS: u8 = 19;
 const BACKGROUND_START_CANCEL: u8 = 20;
 const BACKGROUND_TRUST_QUERY: u8 = 21;
 const BACKGROUND_TRUST_REVOKE: u8 = 22;
-const ACK: u8 = 127;
-const RESULT_OK: u8 = 0;
+pub(crate) const ACK: u8 = 127;
+pub(crate) const RESULT_OK: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
 const RESULT_FAILED: u8 = 2;
-const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
-const AUDIO_PROTOCOL_MAJOR: u8 = 1;
+pub(crate) const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
+pub(crate) const AUDIO_PROTOCOL_MAJOR: u8 = 1;
 const CAP_RECEIVER_UI: u32 = 0x0000_0001;
-const CAP_AUTHENTICATED_STATUS: u32 = 0x0000_0002;
-const CAP_PLAYBACK_PROGRESS: u32 = 0x0000_0008;
+pub(crate) const CAP_AUTHENTICATED_STATUS: u32 = 0x0000_0002;
+pub(crate) const CAP_PLAYBACK_PROGRESS: u32 = 0x0000_0008;
 const CAP_CONNECTION_INTENT: u32 = 0x0000_0010;
 const CAP_BACKGROUND_START_AUTH: u32 = 0x0000_0020;
 const CAP_BACKGROUND_TRUST_MANAGEMENT: u32 = 0x0000_0040;
-const CAP_AUDIO_V2: u32 = 0x0000_0080;
+pub(crate) const CAP_AUDIO_V2: u32 = 0x0000_0080;
 const IMPLEMENTED_CAPABILITIES: u32 =
     CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
@@ -3173,11 +3173,11 @@ fn random_request_id() -> Result<[u8; 16], String> {
     }
 }
 
-struct Ack {
-    result: u8,
-    state: ReceiverState,
-    udp_port: u16,
-    playback_progress: Option<PlaybackDiagnostics>,
+pub(crate) struct Ack {
+    pub(crate) result: u8,
+    pub(crate) state: ReceiverState,
+    pub(crate) udp_port: u16,
+    pub(crate) playback_progress: Option<PlaybackDiagnostics>,
     background_authorization: Option<([u8; 16], u8)>,
     background_trust: Option<BackgroundTrustSnapshot>,
 }
@@ -3190,7 +3190,7 @@ pub(crate) struct BackgroundTrustSnapshot {
     pub(crate) remaining_ms: u64,
 }
 
-fn encode_control(
+pub(crate) fn encode_control(
     key: &[u8; 32],
     direction: u32,
     session_id: u64,
@@ -3215,7 +3215,11 @@ fn encode_control(
     Ok(frame)
 }
 
-fn encode_capabilities_query(control_major: u16, audio_major: u8, required: u32) -> [u8; 8] {
+pub(crate) fn encode_capabilities_query(
+    control_major: u16,
+    audio_major: u8,
+    required: u32,
+) -> [u8; 8] {
     let mut payload = [0; 8];
     payload[..2].copy_from_slice(&control_major.to_be_bytes());
     payload[2] = audio_major;
@@ -3223,7 +3227,7 @@ fn encode_capabilities_query(control_major: u16, audio_major: u8, required: u32)
     payload
 }
 
-fn decode_capabilities_info(
+pub(crate) fn decode_capabilities_info(
     frame: &[u8],
     response_sequence: u64,
     query_sequence: u64,
@@ -3360,7 +3364,21 @@ fn read_frame(
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, String> {
     let frame = read_raw_frame(tcp, cancellation)?;
-    if &frame[..4] != CONTROL_MAGIC
+    verify_control_frame(&frame, key, direction, session_id)?;
+    Ok(frame)
+}
+
+/// Validates a length-delimited P5-C frame. AOA's ANPU envelope supplies its
+/// length; LAN keeps its existing TCP prefix and calls this same validator.
+pub(crate) fn verify_control_frame(
+    frame: &[u8],
+    key: &[u8; 32],
+    direction: u32,
+    session_id: u64,
+) -> Result<(), String> {
+    if frame.len() < CONTROL_HEADER_BYTES + CONTROL_TAG_BYTES
+        || frame.len() > MAX_CONTROL_FRAME
+        || &frame[..4] != CONTROL_MAGIC
         || frame[4] != 1
         || frame[6..8] != [0, 0]
         || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
@@ -3376,8 +3394,7 @@ fn read_frame(
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
     mac.update(&frame[..body_len]);
     mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
-    Ok(frame)
+        .map_err(|_| "P5-C control authentication failed.".into())
 }
 
 fn read_frame_until(
@@ -3398,23 +3415,7 @@ fn read_frame_until(
     let mut frame = vec![0; length];
     read_exact_cancellable_until(tcp, &mut frame, cancellation, deadline)
         .map_err(|_| "P5-C control peer closed or approval deadline expired.".to_string())?;
-    if &frame[..4] != CONTROL_MAGIC
-        || frame[4] != 1
-        || frame[6..8] != [0, 0]
-        || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
-        || u64::from_be_bytes(frame[12..20].try_into().unwrap()) != session_id
-    {
-        return Err("P5-C control identity or header was rejected.".into());
-    }
-    let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
-    if frame.len() != CONTROL_HEADER_BYTES + payload_len + CONTROL_TAG_BYTES {
-        return Err("P5-C control length was rejected.".into());
-    }
-    let body_len = CONTROL_HEADER_BYTES + payload_len;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
-    mac.update(&frame[..body_len]);
-    mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
+    verify_control_frame(&frame, key, direction, session_id)?;
     Ok(frame)
 }
 
@@ -3453,23 +3454,7 @@ fn read_frame_until_request(
     .map_err(|_| {
         "P5-C background trust peer closed, expired, or request was cancelled.".to_string()
     })?;
-    if &frame[..4] != CONTROL_MAGIC
-        || frame[4] != 1
-        || frame[6..8] != [0, 0]
-        || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
-        || u64::from_be_bytes(frame[12..20].try_into().unwrap()) != session_id
-    {
-        return Err("P5-C control identity or header was rejected.".into());
-    }
-    let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
-    if frame.len() != CONTROL_HEADER_BYTES + payload_len + CONTROL_TAG_BYTES {
-        return Err("P5-C control length was rejected.".into());
-    }
-    let body_len = CONTROL_HEADER_BYTES + payload_len;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
-    mac.update(&frame[..body_len]);
-    mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
+    verify_control_frame(&frame, key, direction, session_id)?;
     Ok(frame)
 }
 
@@ -3482,7 +3467,7 @@ fn decode_ack(
     decode_ack_with_format(frame, expected_sequence, command, command_sequence, false)
 }
 
-fn decode_ack_with_format(
+pub(crate) fn decode_ack_with_format(
     frame: &[u8],
     expected_sequence: u64,
     command: u8,

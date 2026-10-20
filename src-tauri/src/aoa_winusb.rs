@@ -60,7 +60,11 @@ fn is_accessory_instance_id(id: &str) -> bool {
         return false;
     };
     let is_accessory = bus == "USB" && vendor_ok;
-    let is_data_interface = product == 0 || tokens.contains(&"MI_00");
+    let is_data_interface = if product == 0 {
+        !tokens.iter().any(|token| token.starts_with("MI_"))
+    } else {
+        tokens.contains(&"MI_00")
+    };
     is_accessory && is_data_interface
 }
 
@@ -882,6 +886,7 @@ mod tests {
     fn production_accessory_filter_excludes_adb_and_wrong_driver_nodes() {
         let cases = [
             ("USB\\VID_18D1&PID_2D00\\one", "WinUSB", true),
+            ("USB\\VID_18D1&PID_2D00&MI_01\\adb", "WinUSB", false),
             ("USB\\VID_18D1&PID_2D01&MI_00\\two", "winusb", true),
             ("USB\\VID_18D1&PID_2D01&MI_01\\adb", "WinUSB", false),
             ("USB\\VID_18D1&PID_2D01\\parent", "WinUSB", false),

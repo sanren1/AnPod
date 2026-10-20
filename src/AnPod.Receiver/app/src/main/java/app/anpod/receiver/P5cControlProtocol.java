@@ -101,15 +101,23 @@ final class P5cControlProtocol {
                     throw new SocketTimeoutException("P5-C control frame read deadline expired");
             }
         }
+        return decodeRaw(frame, key, direction, sessionId);
+    }
+
+    /** Authenticates one raw ANPC frame; byte-stream transports must apply their own record framing. */
+    static Frame decodeRaw(byte[] frame, byte[] key, int direction, long sessionId) throws IOException {
+        if (frame == null || key == null || key.length != 32
+                || frame.length < HEADER_BYTES + TAG_BYTES || frame.length > MAX_FRAME_BYTES)
+            throw new IOException("invalid P5-C control frame");
         int payloadLength = ((frame[28] & 0xff) << 8) | (frame[29] & 0xff);
         if (frame[0] != 'A' || frame[1] != 'N' || frame[2] != 'P' || frame[3] != 'C'
                 || frame[4] != 1 || frame[6] != 0 || frame[7] != 0
                 || getInt(frame, 8) != direction || getLong(frame, 12) != sessionId
-                || length != HEADER_BYTES + payloadLength + TAG_BYTES)
+                || frame.length != HEADER_BYTES + payloadLength + TAG_BYTES)
             throw new IOException("invalid P5-C control identity or length");
         byte[] expected = mac(key, frame, HEADER_BYTES + payloadLength);
         boolean authenticated = MessageDigest.isEqual(expected,
-                Arrays.copyOfRange(frame, HEADER_BYTES + payloadLength, length));
+                Arrays.copyOfRange(frame, HEADER_BYTES + payloadLength, frame.length));
         Arrays.fill(expected, (byte) 0);
         if (!authenticated) throw new IOException("P5-C control authentication failed");
         return new Frame(frame, frame[5] & 0xff, getLong(frame, 20),

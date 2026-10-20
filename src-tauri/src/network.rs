@@ -32,12 +32,12 @@ pub(crate) fn fail_next_udp_send_for_test() {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PcmBlockInfo {
-    frame_count: u32,
-    sample_rate: u32,
-    channels: u16,
-    frame_index: u64,
-    enqueued_at: Instant,
+pub(crate) struct PcmBlockInfo {
+    pub(crate) frame_count: u32,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) frame_index: u64,
+    pub(crate) enqueued_at: Instant,
 }
 
 struct PcmSlot {
@@ -67,7 +67,7 @@ pub(crate) struct FloatPcmBlockInfo {
     pub(crate) sample_rate: u32,
     pub(crate) channels: u16,
     pub(crate) frame_index: u64,
-    enqueued_at: Instant,
+    pub(crate) enqueued_at: Instant,
 }
 
 struct FloatPcmSlot {
@@ -196,6 +196,26 @@ impl FloatPcmQueue {
         self.wake.notify_all();
     }
 
+    pub(crate) fn clear_queued(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0.0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn queue_age_budget(&self) -> Duration {
+        Duration::from_millis(self.max_queue_ms)
+    }
+
+    pub(crate) fn record_dropped_frames(&self, frames: u64) {
+        self.add_dropped(frames);
+    }
+
     pub(crate) fn push_raw(
         &self,
         samples: *const f32,
@@ -299,6 +319,45 @@ impl FloatPcmQueue {
             return Some(info);
         }
     }
+
+    pub(crate) fn pop_timeout(
+        &self,
+        scratch: &mut Vec<f32>,
+        timeout: Duration,
+    ) -> Option<FloatPcmBlockInfo> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            if state.len == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (next, result) = self.wake.wait_timeout(state, remaining).ok()?;
+                state = next;
+                if result.timed_out() && state.len == 0 {
+                    return None;
+                }
+                continue;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
 }
 
 impl PcmQueue {
@@ -368,6 +427,26 @@ impl PcmQueue {
             }
         }
         self.wake.notify_all();
+    }
+
+    pub(crate) fn clear_queued(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn queue_age_budget(&self) -> Duration {
+        Duration::from_millis(self.max_queue_ms)
+    }
+
+    pub(crate) fn record_dropped_frames(&self, frames: u64) {
+        self.add_dropped(frames);
     }
 
     pub(crate) fn push_raw(
@@ -491,7 +570,11 @@ impl PcmQueue {
         self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
     }
 
-    fn pop_wait(&self, stopping: &AtomicBool, scratch: &mut Vec<i16>) -> Option<PcmBlockInfo> {
+    pub(crate) fn pop_wait(
+        &self,
+        stopping: &AtomicBool,
+        scratch: &mut Vec<i16>,
+    ) -> Option<PcmBlockInfo> {
         let mut state = self.state.lock().ok()?;
         loop {
             while state.len == 0 && !stopping.load(Ordering::Acquire) {
@@ -518,6 +601,49 @@ impl PcmQueue {
             scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
             return Some(info);
         }
+    }
+
+    pub(crate) fn pop_timeout(
+        &self,
+        scratch: &mut Vec<i16>,
+        timeout: Duration,
+    ) -> Option<PcmBlockInfo> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            if state.len == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (next, result) = self.wake.wait_timeout(state, remaining).ok()?;
+                state = next;
+                if result.timed_out() && state.len == 0 {
+                    return None;
+                }
+                continue;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     fn wake_worker(&self) {

@@ -133,6 +133,12 @@ public final class AnPodAoaVectorCheck {
                     v.get(prefix + "aoa_bind_payload"));
             equal(capabilities, v.get(prefix + "anpc_capabilities_query"), prefix + "ANPC capabilities");
             equal(bind, v.get(prefix + "anpc_aoa_bind"), prefix + "ANPC AOA bind");
+            P5cControlProtocol.Frame rawCapabilities = P5cControlProtocol.decodeRaw(capabilities,
+                    keys.hostToReceiverControl, P5cControlProtocol.HOST_TO_RECEIVER, sessionId);
+            check(rawCapabilities.type == P5cControlProtocol.CAPABILITIES_QUERY
+                    && rawCapabilities.sequence == 0, prefix + "raw ANPC shared decoder");
+            equal(rawCapabilities.payload, v.get(prefix + "capabilities_query_payload"),
+                    prefix + "raw ANPC payload");
             equal(AnpuRecordCodec.encode(AnpuRecordCodec.CONTROL, capabilities),
                     v.get(prefix + "anpu_capabilities_query"), prefix + "ANPU capabilities");
             equal(AnpuRecordCodec.encode(AnpuRecordCodec.CONTROL, bind),

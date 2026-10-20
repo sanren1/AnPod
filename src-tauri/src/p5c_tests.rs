@@ -202,6 +202,7 @@ const JAVA_SOURCES: &[&str] = &[
     "UdpSessionContext.java",
     "UdpPacketDecoder.java",
     "UdpPcmQueue.java",
+    "AnpdAudioIngress.java",
     "UdpReceiver.java",
     "P5cDiscovery.java",
     "P5cReceiverCoordinator.java",

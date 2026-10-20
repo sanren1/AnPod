@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 mod aoa;
 #[allow(dead_code)]
+mod aoa_owner;
+#[allow(dead_code)]
 mod aoa_winusb;
 mod audio;
 mod receiver;
