@@ -87,8 +87,12 @@ verified release signer is
 exact APK passed the Rust artifact-read test. This verifies the built
 candidate artifact only; installation and upgrade on a device remain
 `NOT_TESTED`. The current crash-fix candidate is PC 1.10.1 with Receiver
-`0.17.1-v3-flow-candidate` / code 35; package hashes and offline inspection
-results will be recorded with the generated candidate artifacts.
+`0.17.1-v3-flow-candidate` / code 35. Its release-signed APK SHA-256 is
+`8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f`, built
+from source `2bd998d65fe650bb225c09d7353c5c2ba39febfc` with
+`sourceModified=false` and the existing release signer. The exact artifact
+passed the Rust artifact-read test; installation and upgrade on a device
+remain `NOT_TESTED`.
 
 Real WASAPI capture, physical output format or precision, AOA attach/permission/
 detach behavior on hardware, acoustic quality/latency, hardware routing/focus

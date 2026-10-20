@@ -464,3 +464,12 @@ verified release signer is
 loaded and read this exact APK through the artifact test. Signature and APK
 inspection do not verify device installation, in-place upgrade, permission
 behavior, or playback.
+
+The current Receiver crash-fix candidate is `0.17.1-v3-flow-candidate` / code
+35, built from source `2bd998d65fe650bb225c09d7353c5c2ba39febfc` with
+`sourceModified=false`. Its release-signed APK SHA-256 is
+`8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f`; the
+verified signer remains
+`f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`. The
+exact artifact passed the Rust artifact-read test. Package inspection does not
+verify installation, upgrade, permission UX, or playback on a device.

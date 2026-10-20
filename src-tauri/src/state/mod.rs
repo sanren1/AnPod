@@ -2754,7 +2754,7 @@ impl AppState {
                 .clone();
             validate_audio_quality(&quality)?;
             if quality != "standard" {
-                return Err("HiFi and Hi-Res are available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
+                return Err("USB/ADB TCP playback supports Standard only. For HiFi or Hi-Res, use LAN UDP or experimental USB Direct.".into());
             }
         }
         if !self.operation_is_current(generation, token) {
