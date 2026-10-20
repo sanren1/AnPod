@@ -1,11 +1,16 @@
 package app.anpod.receiver
 
 import android.Manifest
+import android.app.PendingIntent
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
@@ -97,6 +102,11 @@ class MainActivity : ComponentActivity() {
     private var aodEnabled by mutableStateOf(false)
     private var aodShownForSession: String? = null
     private var outputEngine by mutableStateOf("audioTrack")
+    private var usbAccessory by mutableStateOf<UsbAccessory?>(null)
+    private var usbPermissionPending by mutableStateOf(false)
+    internal data class PendingUsbPermission(val generation: Long, val accessory: UsbAccessory, val action: String)
+    private var pendingUsbPermission: PendingUsbPermission? = null
+    private var usbPermissionReceiver: BroadcastReceiver? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -150,7 +160,17 @@ class MainActivity : ComponentActivity() {
             }
         }
         advancePendingConnection(snapshot)
+        refreshUsbAccessory()
         maybeEnterAod()
+    }
+
+    private fun refreshUsbAccessory() {
+        val available = Build.VERSION.SDK_INT >= 24
+                && packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY)
+        usbAccessory = if (available) {
+            val manager = getSystemService(UsbManager::class.java)
+            manager?.accessoryList?.firstOrNull { AoaReceiverCoordinator.isProductAccessory(it) }
+        } else null
     }
 
     private fun selectNetwork(item: UiInterface) {
@@ -215,6 +235,11 @@ class MainActivity : ComponentActivity() {
         activityStarted = false
         discoveryGeneration.incrementAndGet()
         pendingConnection = null
+        if (pendingUsbPermission != null) {
+            pendingUsbPermission = null
+            usbPermissionPending = false
+            unregisterUsbPermissionReceiver()
+        }
         mainHandler.removeCallbacks(refreshTask)
         if (bound) unbindService(connection)
         bound = false
@@ -223,6 +248,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        unregisterUsbPermissionReceiver()
+        pendingUsbPermission = null
+        usbPermissionPending = false
         super.onDestroy()
     }
 
@@ -246,6 +274,12 @@ class MainActivity : ComponentActivity() {
                     connectionPending = pendingConnection != null,
                     onSelect = { selectNetwork(it) },
                     onConnectComputer = { connectComputer() },
+                    onConnectUsbDirect = { connectUsbDirect() },
+                    usbDirectAvailable = usbAccessory != null,
+                    usbDirectSupported = Build.VERSION.SDK_INT >= 24,
+                    usbAccessoryFeatureAvailable = packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY),
+                    usbPermissionPending = usbPermissionPending,
+                    onCancelUsbPermission = { cancelUsbPermission() },
                     onStartBackgroundStandby = { startBackgroundStandby() },
                     onStopBackgroundStandby = { stopBackgroundStandby() },
                     serviceConnected = receiver != null,
@@ -274,6 +308,121 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun connectComputer() = beginReceive(backgroundStandby = false)
+
+    private fun connectUsbDirect() {
+        val service = receiver
+        if (!activityStarted || !bound || service == null) {
+            localMessage = getString(R.string.receiver_service_not_ready_retry)
+            return
+        }
+        if (Build.VERSION.SDK_INT < 24) {
+            localMessage = getString(R.string.usb_direct_requires_api24)
+            return
+        }
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY)) {
+            localMessage = getString(R.string.usb_direct_not_supported)
+            return
+        }
+        val current = snapshot
+        if (current?.bindingState != "saved") {
+            localMessage = getString(R.string.usb_direct_requires_pairing)
+            return
+        }
+        if (current.operationState in setOf("starting", "running", "stopping")
+            || current.serviceState in setOf("starting", "prepared", "authenticated", "receiverRunning", "streaming", "paused")) {
+            localMessage = getString(R.string.usb_direct_busy)
+            return
+        }
+        val manager = getSystemService(UsbManager::class.java)
+        val accessory = manager?.accessoryList?.firstOrNull { AoaReceiverCoordinator.isProductAccessory(it) }
+        if (accessory == null) {
+            usbAccessory = null
+            localMessage = getString(R.string.usb_direct_not_attached)
+            return
+        }
+        usbAccessory = accessory
+        val attempt = PendingUsbPermission(discoveryGeneration.incrementAndGet(), accessory,
+                "$packageName.USB_PERMISSION.${discoveryGeneration.get()}")
+        pendingUsbPermission = attempt
+        usbPermissionPending = true
+        localMessage = getString(R.string.usb_direct_permission_pending)
+        if (manager.hasPermission(accessory)) {
+            completeUsbPermission(attempt, true, accessory)
+            return
+        }
+        val permissionReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != attempt.action) return
+                val returned = if (Build.VERSION.SDK_INT >= 33)
+                    intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory::class.java)
+                else @Suppress("DEPRECATION") (intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY) as? UsbAccessory)
+                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                completeUsbPermission(attempt, granted, returned)
+            }
+        }
+        usbPermissionReceiver = permissionReceiver
+        val filter = IntentFilter(attempt.action)
+        if (Build.VERSION.SDK_INT >= 33)
+            registerReceiver(permissionReceiver, filter, RECEIVER_NOT_EXPORTED)
+        else registerReceiver(permissionReceiver, filter)
+        val permissionIntent = Intent(attempt.action).setPackage(packageName)
+            .setData(Uri.parse("anpod://usb-permission/${attempt.generation}"))
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+                if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+        val callback = PendingIntent.getBroadcast(this, attempt.generation.toInt(), permissionIntent, flags)
+        try { manager.requestPermission(accessory, callback) }
+        catch (error: RuntimeException) {
+            unregisterUsbPermissionReceiver()
+            pendingUsbPermission = null
+            usbPermissionPending = false
+            localMessage = getString(R.string.usb_direct_permission_failed)
+        }
+    }
+
+    private fun completeUsbPermission(attempt: PendingUsbPermission, granted: Boolean, returned: UsbAccessory?) {
+        if (pendingUsbPermission !== attempt) return
+        val currentAttempt = isUsbPermissionResultCurrent(attempt.generation)
+        unregisterUsbPermissionReceiver()
+        pendingUsbPermission = null
+        usbPermissionPending = false
+        if (!currentAttempt) return
+        if (!granted || returned == null || returned != attempt.accessory) {
+            localMessage = getString(R.string.usb_direct_permission_denied)
+            return
+        }
+        val manager = getSystemService(UsbManager::class.java)
+        val attached = manager?.accessoryList?.firstOrNull {
+            it == attempt.accessory && AoaReceiverCoordinator.isProductAccessory(it)
+        }
+        if (manager == null || attached == null || !manager.hasPermission(attached)) {
+            localMessage = getString(R.string.usb_direct_detached_or_permission_lost)
+            refreshUsbAccessory()
+            return
+        }
+        val result = receiver?.startAoaAccessory(attached, "usb-${attempt.generation}")
+        localMessage = if (result.isNullOrEmpty()) "" else result
+        refresh()
+    }
+
+    internal fun isUsbPermissionResultCurrent(generation: Long): Boolean {
+        val pending = pendingUsbPermission ?: return false
+        return pending.generation == generation && discoveryGeneration.get() == generation
+                && activityStarted && bound
+    }
+
+    private fun cancelUsbPermission() {
+        discoveryGeneration.incrementAndGet()
+        pendingUsbPermission = null
+        usbPermissionPending = false
+        unregisterUsbPermissionReceiver()
+        localMessage = getString(R.string.usb_direct_cancelled)
+    }
+
+    private fun unregisterUsbPermissionReceiver() {
+        val receiver = usbPermissionReceiver ?: return
+        usbPermissionReceiver = null
+        try { unregisterReceiver(receiver) } catch (_: IllegalArgumentException) { }
+    }
 
     private fun startBackgroundStandby() = beginReceive(backgroundStandby = true)
 
@@ -323,6 +472,7 @@ class MainActivity : ComponentActivity() {
             localMessage = getString(R.string.no_private_ipv4_interface_available)
             return
         }
+        if (pendingUsbPermission != null) cancelUsbPermission()
         localMessage = ""
         localMessage = if (pending.backgroundStandby)
             service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
@@ -417,6 +567,12 @@ private fun ReceiverScreen(
     connectionPending: Boolean,
     onSelect: (UiInterface) -> Unit,
     onConnectComputer: () -> Unit,
+    onConnectUsbDirect: () -> Unit,
+    usbDirectAvailable: Boolean,
+    usbDirectSupported: Boolean,
+    usbAccessoryFeatureAvailable: Boolean,
+    usbPermissionPending: Boolean,
+    onCancelUsbPermission: () -> Unit,
     onStartBackgroundStandby: () -> Unit,
     onStopBackgroundStandby: () -> Unit,
     serviceConnected: Boolean,
@@ -504,6 +660,28 @@ private fun ReceiverScreen(
                     else -> stringResource(R.string.start_receiving)
                 })
             }
+
+            OutlinedButton(
+                onClick = onConnectUsbDirect,
+                enabled = !running && !connectionPending && !usbPermissionPending
+                        && usbDirectSupported && usbAccessoryFeatureAvailable && usbDirectAvailable && bound,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+            ) {
+                Text(if (usbPermissionPending) stringResource(R.string.usb_direct_permission_pending)
+                    else stringResource(R.string.usb_direct_connect))
+            }
+            if (usbPermissionPending) {
+                TextButton(onClick = onCancelUsbPermission,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                    Text(stringResource(R.string.usb_direct_cancel))
+                }
+            }
+            if (!usbDirectSupported) Text(stringResource(R.string.usb_direct_requires_api24),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else if (!usbAccessoryFeatureAvailable) Text(stringResource(R.string.usb_direct_not_supported),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else if (!usbDirectAvailable) Text(stringResource(R.string.usb_direct_connect_hint),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
 
             OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)

@@ -7,6 +7,10 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.app.ActivityManager;
 import android.content.Intent;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -64,9 +68,11 @@ public final class ReceiverService extends Service {
     private static String pendingOboeFallbackReason = "";
     private static OboePlaybackOutput deferredOboeClose;
     public static final String ACTION_UI_START_NETWORK_AUDIO = "app.anpod.receiver.action.UI_START_NETWORK_AUDIO";
+    public static final String ACTION_UI_START_AOA_AUDIO = "app.anpod.receiver.action.UI_START_AOA_AUDIO";
     private static final String ACTION_NOTIFICATION_STOP = "app.anpod.receiver.action.NOTIFICATION_STOP";
     static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
     private static final String EXTRA_UI_REQUEST_ID = "uiRequestId";
+    private static final String EXTRA_AOA_ACCESSORY = "aoaAccessory";
     static final String CHANNEL_ID = "receiver-management";
     private static final int NOTIFICATION_ID = 1;
     static final int AUTH_NOTIFICATION_ID = 2;
@@ -125,6 +131,8 @@ public final class ReceiverService extends Service {
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
     final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
     private String pendingUiStartRequestId = "";
+    private String pendingAoaRequestId = "";
+    private UsbAccessory pendingAoaAccessory;
     private boolean pendingUiStandbyStart;
     private boolean pendingUiReceiveIntent;
     String networkCoordinatorOwnerId = "";
@@ -135,6 +143,12 @@ public final class ReceiverService extends Service {
     private boolean cleanupFailed;
     private String cleanupError = "";
     private int latestDeliveredStartId;
+    volatile AoaReceiverCoordinator aoaCoordinator;
+    volatile UsbAccessory aoaAccessory;
+    volatile String aoaOwnerId = "";
+    volatile long aoaOwnerGeneration;
+    private volatile Thread aoaBootstrapThread;
+    private BroadcastReceiver aoaDetachReceiver;
     final ReceiverBackgroundAuthorization authorization = new ReceiverBackgroundAuthorization(this);
     private final ReceiverUiBinder uiBinder = new ReceiverUiBinder(this);
     final ReceiverUiState uiState = new ReceiverUiState(this);
@@ -223,6 +237,7 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
         boolean uiNetworkAudio = intent != null && ACTION_UI_START_NETWORK_AUDIO.equals(intent.getAction());
+        boolean uiAoaAudio = intent != null && ACTION_UI_START_AOA_AUDIO.equals(intent.getAction());
         boolean requestedBackgroundStandby = uiNetworkAudio
                 && intent.getBooleanExtra(EXTRA_BACKGROUND_STANDBY, false);
         boolean requestedKeepReceiveIntent = uiNetworkAudio
@@ -244,6 +259,19 @@ public final class ReceiverService extends Service {
                     || !requestIdEqualsPending(requestId)
                     || requestedBackgroundStandby != pendingUiStandbyStart
                     || requestedKeepReceiveIntent != pendingUiReceiveIntent) {
+                stopRejectedStartIfIdle();
+                return START_NOT_STICKY;
+            }
+        } else if (uiAoaAudio) {
+            ownerId = intent.getStringExtra(EXTRA_UI_OWNER_ID);
+            generation = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
+            String requestId = intent.getStringExtra(EXTRA_UI_REQUEST_ID);
+            UsbAccessory requestedAccessory = usbAccessoryExtra(intent);
+            if (!uiOperation.owns(ownerId) || !ReceiverUiOperation.STARTING.equals(uiOperation.phase())
+                    || generation != currentOperationGeneration || generation != networkBootstrapGeneration.get()
+                    || !requestIdEqualsPendingAoa(requestId) || requestedAccessory == null
+                    || !requestedAccessory.equals(pendingAoaAccessory)
+                    || !AoaReceiverCoordinator.isProductAccessory(requestedAccessory)) {
                 stopRejectedStartIfIdle();
                 return START_NOT_STICKY;
             }
@@ -272,12 +300,16 @@ public final class ReceiverService extends Service {
         // shortService or attach a short-service timeout to the audio session.
         try {
             Notification notification = serviceNotification(
-                    audio ? "AnPod 音频连接正在运行。" : networkAudio
+                    audio ? "AnPod 音频连接正在运行。" : uiAoaAudio
+                            ? "正在连接 AnPod USB Direct，可随时停止。" : networkAudio
                             ? receiveIntentEnabled ? "正在等待电脑连接，可随时停止。" : "无线接收正在准备，可随时停止。"
                             : "管理检查进行中；当前不播放音频。",
-                    ownerId, generation, networkAudio || audio && currentAudio != null);
+                    ownerId, generation, networkAudio || uiAoaAudio || audio && currentAudio != null);
             if (Build.VERSION.SDK_INT >= 34) {
-                int type = audio
+                int type = uiAoaAudio
+                        ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                                | ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        : audio
                         ? playbackForegroundServiceType()
                         : receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                                 : ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
@@ -327,6 +359,23 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
 
+        if (uiAoaAudio) {
+            pendingAoaRequestId = "";
+            pendingAoaAccessory = null;
+            if (timeout != null) handler.removeCallbacks(timeout);
+            timeout = null;
+            uiOperation.running(ownerId);
+            UsbAccessory accessory = usbAccessoryExtra(intent);
+            aoaAccessory = accessory;
+            aoaOwnerId = ownerId;
+            aoaOwnerGeneration = generation;
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            if (!registerAoaDetachReceiver(accessory, ownerId, generation)) return START_NOT_STICKY;
+            startAoaBootstrap(accessory, ownerId, generation);
+            return START_NOT_STICKY;
+        }
+
         if (timeout != null) handler.removeCallbacks(timeout);
         uiOperation.running(ownerId);
         timeout = () -> requestTermination(ownerId, generation, false, "");
@@ -338,8 +387,122 @@ public final class ReceiverService extends Service {
         return requestId != null && requestId.equals(pendingUiStartRequestId);
     }
 
+    private boolean requestIdEqualsPendingAoa(String requestId) {
+        return requestId != null && requestId.equals(pendingAoaRequestId);
+    }
+
+    private static UsbAccessory usbAccessoryExtra(Intent intent) {
+        if (intent == null) return null;
+        if (Build.VERSION.SDK_INT >= 33)
+            return intent.getParcelableExtra(EXTRA_AOA_ACCESSORY, UsbAccessory.class);
+        @SuppressWarnings("deprecation") UsbAccessory accessory =
+                (UsbAccessory) intent.getParcelableExtra(EXTRA_AOA_ACCESSORY);
+        return accessory;
+    }
+
     boolean notificationPermissionAvailable() {
         return ReceiverNotifications.canPost(this, CHANNEL_ID);
+    }
+
+    private void startAoaBootstrap(UsbAccessory accessory, String ownerId, long generation) {
+        Thread bootstrap = new Thread(() -> {
+            PairingProtocol.BindingMaterial binding = null;
+            try {
+                if (!isCurrentOperation(ownerId, generation)) throw new IOException("AoaOwnerGenerationExpired");
+                binding = new BindingStore(getFilesDir()).load();
+                UsbManager manager = getSystemService(UsbManager.class);
+                AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.openAccessory(manager, accessory,
+                        binding, aoaPlaybackEndpoint(ownerId, generation), ownerId, generation);
+                binding = null; // The coordinator now owns and destroys the saved binding material.
+                synchronized (networkCoordinatorLock) { aoaCoordinator = coordinator; }
+                Thread monitor = new Thread(() -> monitorAoaCoordinator(coordinator, ownerId, generation),
+                        "AnPod AOA owner monitor");
+                monitor.setDaemon(true);
+                monitor.start();
+                if (!isCurrentOperation(ownerId, generation)) coordinator.cancel("AoaOwnerGenerationExpired");
+            } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
+                if (binding != null) binding.close();
+                String failure = error instanceof IOException && error.getMessage() != null
+                        ? error.getMessage() : error.getClass().getSimpleName();
+                if (isCurrentOperation(ownerId, generation)) requestTermination(ownerId, generation, true,
+                        describeAoaFailure(failure));
+            } finally {
+                synchronized (networkCoordinatorLock) {
+                    if (aoaBootstrapThread == Thread.currentThread()) aoaBootstrapThread = null;
+                }
+                handler.post(() -> {
+                    if (ReceiverUiOperation.STOPPING.equals(uiOperation.phase())
+                            && uiOperation.owns(ownerId)) finishTerminationIfReady(ownerId, currentOperationGeneration);
+                });
+            }
+        }, "AnPod AOA accessory open");
+        bootstrap.setDaemon(true);
+        synchronized (networkCoordinatorLock) {
+            aoaBootstrapThread = bootstrap;
+            bootstrap.start();
+        }
+    }
+
+    private void monitorAoaCoordinator(AoaReceiverCoordinator coordinator, String ownerId, long generation) {
+        try { coordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        String failure = coordinator.failureMessage();
+        handler.post(() -> {
+            if (aoaCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            requestTermination(ownerId, generation, !failure.isEmpty(), failure);
+        });
+    }
+
+    private boolean registerAoaDetachReceiver(UsbAccessory accessory, String ownerId, long generation) {
+        unregisterAoaDetachReceiver();
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override public void onReceive(android.content.Context context, Intent intent) {
+                if (!UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(intent.getAction())
+                        || !isCurrentOperation(ownerId, generation)
+                        || !ownerId.equals(aoaOwnerId) || aoaOwnerGeneration != generation
+                        || !accessory.equals(aoaAccessory)) return;
+                UsbAccessory detached = usbAccessoryExtra(intent);
+                if (detached == null || !accessory.equals(detached)
+                        || !AoaReceiverCoordinator.isProductAccessory(detached)) return;
+                UsbManager manager = getSystemService(UsbManager.class);
+                if (manager != null) {
+                    UsbAccessory[] attached = manager.getAccessoryList();
+                    if (attached != null) for (UsbAccessory current : attached)
+                        if (detached.equals(current) && manager.hasPermission(current)) return;
+                }
+                requestTermination(ownerId, generation, true, "AoaAccessoryDetached");
+            }
+        };
+        try {
+            aoaDetachReceiver = receiver;
+            IntentFilter filter = new IntentFilter(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+            // USB broadcasts originate outside this app; the handler rechecks UsbManager state before stopping.
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_EXPORTED);
+            else registerReceiver(receiver, filter);
+            return true;
+        } catch (RuntimeException error) {
+            aoaDetachReceiver = null;
+            requestTermination(ownerId, generation, true, "AoaDetachReceiverUnavailable");
+            return false;
+        }
+    }
+
+    private String describeAoaFailure(String failure) {
+        if ("AoaSessionCleanupPending".equals(failure)) return getString(R.string.usb_direct_cleanup_pending);
+        if ("UsbAccessoryPermissionOrAttachmentLost".equals(failure)
+                || "UsbAccessoryChangedDuringOpen".equals(failure)
+                || "UsbAccessoryPermissionCheckFailed".equals(failure))
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        if ("UsbAccessoryOpenFailed".equals(failure)) return getString(R.string.usb_direct_open_failed);
+        if ("AoaDetachReceiverUnavailable".equals(failure)) return getString(R.string.usb_direct_receiver_unavailable);
+        return failure;
+    }
+
+    private void unregisterAoaDetachReceiver() {
+        BroadcastReceiver receiver = aoaDetachReceiver;
+        aoaDetachReceiver = null;
+        if (receiver != null) try { unregisterReceiver(receiver); }
+        catch (IllegalArgumentException ignored) { }
     }
 
     private boolean applicationIsVisible() {
@@ -435,6 +598,9 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         currentAudio = null;
         if (session != null) cancelAudio(session, "AudioServiceDestroyed");
+        AoaReceiverCoordinator aoa = aoaCoordinator;
+        if (aoa != null) aoa.cancel("AudioServiceDestroyed");
+        unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator;
         synchronized (networkCoordinatorLock) {
             coordinator = networkCoordinator;
@@ -511,6 +677,64 @@ public final class ReceiverService extends Service {
         } catch (Exception error) {
             return error.getMessage() == null ? "无法开始接收。" : error.getMessage();
         }
+    }
+
+    String startAoaFromUi(UsbAccessory accessory, String requestId) {
+        if (requestId == null || requestId.isEmpty()) return getString(R.string.operation_failed_retry);
+        if (Build.VERSION.SDK_INT < 24) return getString(R.string.usb_direct_requires_api24);
+        if (!applicationIsVisible()) return getString(R.string.usb_direct_foreground_required);
+        if (!getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_USB_ACCESSORY))
+            return getString(R.string.usb_direct_not_supported);
+        if (!AoaReceiverCoordinator.isProductAccessory(accessory)) return getString(R.string.usb_direct_wrong_accessory);
+        UsbManager manager = getSystemService(UsbManager.class);
+        boolean attached = false;
+        if (manager != null) {
+            UsbAccessory[] accessories = manager.getAccessoryList();
+            if (accessories != null) for (UsbAccessory current : accessories)
+                if (accessory.equals(current) && AoaReceiverCoordinator.isProductAccessory(current)) attached = true;
+        }
+        if (manager == null || !manager.hasPermission(accessory) || !attached)
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        try {
+            BindingStore.Status binding = new BindingStore(getFilesDir()).status();
+            if (!"saved".equals(binding.state)) return getString(R.string.usb_direct_requires_pairing);
+        } catch (IOException | PairingProtocol.Failure error) {
+            return getString(R.string.binding_status_temporarily_unavailable);
+        }
+        String ownerId = UUID.randomUUID().toString();
+        long generation;
+        synchronized (networkCoordinatorLock) {
+            if (!uiOperation.canBegin() || currentAudio != null || pendingAudio != null
+                    || networkCoordinator != null || aoaCoordinator != null || aoaBootstrapThread != null
+                    || !uiOperation.begin(ownerId)) return getString(R.string.usb_direct_busy);
+            generation = networkBootstrapGeneration.incrementAndGet();
+            currentOperationGeneration = generation;
+            backgroundStandbyEnabled = false;
+            receiveIntentEnabled = false;
+            pendingAoaRequestId = requestId;
+            pendingAoaAccessory = accessory;
+            aoaAccessory = accessory;
+            aoaOwnerId = ownerId;
+            aoaOwnerGeneration = generation;
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            networkAudioAddress = "";
+            networkAudioPort = 0;
+            startFailure = "";
+        }
+        Intent start = new Intent(this, ReceiverService.class).setAction(ACTION_UI_START_AOA_AUDIO)
+                .setData(Uri.parse("anpod://receiver/aoa/" + Uri.encode(ownerId) + "/" + generation))
+                .putExtra(EXTRA_UI_REQUEST_ID, requestId)
+                .putExtra(EXTRA_UI_OWNER_ID, ownerId)
+                .putExtra(EXTRA_UI_GENERATION, generation)
+                .putExtra(EXTRA_AOA_ACCESSORY, accessory);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(start); else startService(start);
+        } catch (RuntimeException error) {
+            requestTermination(ownerId, generation, true, error.getClass().getSimpleName());
+            return error.getClass().getSimpleName();
+        }
+        return "";
     }
 
     boolean stopFromUi(String ownerId) {
@@ -650,6 +874,8 @@ public final class ReceiverService extends Service {
         if (timeout != null) handler.removeCallbacks(timeout);
         timeout = null;
         pendingUiStartRequestId = "";
+        pendingAoaRequestId = "";
+        pendingAoaAccessory = null;
         pendingUiStandbyStart = false;
         pendingUiReceiveIntent = false;
         networkRecoveryDeadlineElapsedMs = 0;
@@ -659,6 +885,16 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         if (session != null && ownerId.equals(session.ownerId))
             cancelAudio(session, session.request.usesPacketIngress() ? "NetworkSessionStopped" : "UiSessionStopped");
+        Thread opening = null;
+        AoaReceiverCoordinator aoa = null;
+        synchronized (networkCoordinatorLock) {
+            if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                opening = aoaBootstrapThread;
+                aoa = aoaCoordinator;
+            }
+        }
+        if (aoa != null) aoa.cancel("AoaOwnerStopped");
+        unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator = null;
         synchronized (networkCoordinatorLock) {
             if (networkCoordinator != null && ownerId.equals(networkCoordinatorOwnerId)) {
@@ -679,6 +915,64 @@ public final class ReceiverService extends Service {
                     finishTerminationIfReady(ownerId, terminatingGeneration);
                 });
             }, "AnPod receiver cleanup").start();
+        }
+        if (opening != null || aoa != null) {
+            Thread openingThread = opening;
+            AoaReceiverCoordinator initialCoordinator = aoa;
+            cleanupCoordinatorClosed = false;
+            long terminatingGeneration = cleanupGeneration;
+            new Thread(() -> {
+                boolean interrupted = false;
+                if (openingThread != null && openingThread != Thread.currentThread()) {
+                    while (openingThread.isAlive()) try { openingThread.join(); }
+                    catch (InterruptedException error) { interrupted = true; }
+                }
+                AoaReceiverCoordinator completedCoordinator = initialCoordinator;
+                synchronized (networkCoordinatorLock) {
+                    if (completedCoordinator == null && ownerId.equals(aoaOwnerId)
+                            && aoaOwnerGeneration == generation) completedCoordinator = aoaCoordinator;
+                }
+                if (completedCoordinator != null) {
+                    completedCoordinator.cancel("AoaOwnerCleanup");
+                    for (;;) try {
+                        completedCoordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+                        break;
+                    } catch (InterruptedException error) { interrupted = true; }
+                    String aoaCleanupFailure = completedCoordinator.failureMessage();
+                    if (!aoaCleanupFailure.isEmpty()) {
+                        cleanupFailed = true;
+                        cleanupError = cleanupError.isEmpty() ? aoaCleanupFailure
+                                : cleanupError + "; " + aoaCleanupFailure;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+                AoaReceiverCoordinator cleaned = completedCoordinator;
+                handler.post(() -> {
+                    if (!isPendingCleanup(ownerId, terminatingGeneration)) return;
+                    synchronized (networkCoordinatorLock) {
+                        if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                            if (cleaned == null || aoaCoordinator == cleaned) aoaCoordinator = null;
+                            aoaAccessory = null;
+                            aoaOwnerId = "";
+                            aoaOwnerGeneration = 0;
+                            aoaBootstrapThread = null;
+                        }
+                    }
+                    unregisterAoaDetachReceiver();
+                    cleanupCoordinatorClosed = true;
+                    finishTerminationIfReady(ownerId, terminatingGeneration);
+                });
+            }, "AnPod AOA session cleanup").start();
+        } else if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+            synchronized (networkCoordinatorLock) {
+                if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                    aoaCoordinator = null;
+                    aoaAccessory = null;
+                    aoaOwnerId = "";
+                    aoaOwnerGeneration = 0;
+                    aoaBootstrapThread = null;
+                }
+            }
         }
         networkAudioState = "stopping";
         networkAudioAddress = "";
@@ -1292,6 +1586,10 @@ public final class ReceiverService extends Service {
         return !destroyed && uiOperation.owns(ownerId) && currentOperationGeneration == generation
                 && networkBootstrapGeneration.get() == generation
                 && (ReceiverUiOperation.STARTING.equals(phase) || ReceiverUiOperation.RUNNING.equals(phase));
+    }
+
+    boolean isAoaSession() {
+        return aoaOwnerId != null && !aoaOwnerId.isEmpty();
     }
 
     private void runOnMainForOwner(String ownerId, long generation, MainOwnerCommand command) throws IOException {

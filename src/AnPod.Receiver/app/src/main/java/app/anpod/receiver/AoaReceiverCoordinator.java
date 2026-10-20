@@ -2,6 +2,8 @@ package app.anpod.receiver;
 
 import java.io.IOException;
 import android.os.ParcelFileDescriptor;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -67,30 +69,73 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         }
     }
 
-    /** Production entry: reserve the sole owner slot before opening the accessory descriptor. */
-    static AoaReceiverCoordinator open(ParcelFileDescriptor descriptor,
+    /** Production entry keeps permission, attachment, and the actual open under the sole-owner lock. */
+    static AoaReceiverCoordinator openAccessory(UsbManager manager, UsbAccessory accessory,
             PairingProtocol.BindingMaterial savedBinding, PlaybackEndpoint playback,
             String ownerId, long generation) throws IOException {
-        if (descriptor == null || savedBinding == null || playback == null || ownerId == null)
+        if (manager == null || accessory == null || savedBinding == null || playback == null || ownerId == null)
             throw new NullPointerException();
         synchronized (OWNER_LOCK) {
             if (owner != null) {
-                IOException busy = new IOException("AoaSessionCleanupPending");
-                try { descriptor.close(); } catch (IOException closeError) { busy.addSuppressed(closeError); }
                 savedBinding.close();
-                throw busy;
+                throw new IOException("AoaSessionCleanupPending");
             }
-            AoaAccessoryIo io;
-            try { io = AoaAccessoryIo.open(descriptor); }
-            catch (IOException | RuntimeException error) {
-                try { descriptor.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
+            boolean authorized;
+            try {
+                authorized = isProductAccessory(accessory) && manager.hasPermission(accessory)
+                        && isCurrentlyAttached(manager, accessory);
+            } catch (RuntimeException error) {
+                savedBinding.close();
+                throw new IOException("UsbAccessoryPermissionCheckFailed", error);
+            }
+            if (!authorized) {
+                savedBinding.close();
+                throw new IOException("UsbAccessoryPermissionOrAttachmentLost");
+            }
+            if (!playback.isCurrent(ownerId, generation)) {
+                savedBinding.close();
+                throw new IOException("AoaOwnerGenerationExpired");
+            }
+
+            ParcelFileDescriptor descriptor;
+            try { descriptor = manager.openAccessory(accessory); }
+            catch (RuntimeException error) {
+                savedBinding.close();
+                throw new IOException("UsbAccessoryOpenFailed", error);
+            }
+            if (descriptor == null) {
+                savedBinding.close();
+                throw new IOException("UsbAccessoryOpenFailed");
+            }
+            AoaAccessoryIo io = null;
+            try {
+                if (!manager.hasPermission(accessory) || !isCurrentlyAttached(manager, accessory)
+                        || !playback.isCurrent(ownerId, generation))
+                    throw new IOException("UsbAccessoryChangedDuringOpen");
+                io = AoaAccessoryIo.open(descriptor);
+                return startLocked(io, savedBinding, playback, ownerId, generation,
+                        TimeUnit.SECONDS.toMillis(30));
+            } catch (IOException | RuntimeException error) {
+                if (io != null) io.cancel();
+                else try { descriptor.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
                 savedBinding.close();
                 if (error instanceof IOException) throw (IOException) error;
-                throw error;
+                throw new IOException("UsbAccessoryOpenFailed", error);
             }
-            return startLocked(io, savedBinding, playback, ownerId, generation,
-                    TimeUnit.SECONDS.toMillis(30));
         }
+    }
+
+    static boolean isProductAccessory(UsbAccessory accessory) {
+        return accessory != null && "AnPod".equals(accessory.getManufacturer())
+                && "AnPod USB Direct".equals(accessory.getModel());
+    }
+
+    private static boolean isCurrentlyAttached(UsbManager manager, UsbAccessory expected) {
+        UsbAccessory[] attached = manager.getAccessoryList();
+        if (attached == null) return false;
+        for (UsbAccessory candidate : attached)
+            if (expected.equals(candidate) && isProductAccessory(candidate)) return true;
+        return false;
     }
 
     private static void ensureNoOwner() throws IOException {

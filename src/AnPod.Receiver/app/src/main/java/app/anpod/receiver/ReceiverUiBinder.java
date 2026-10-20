@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import android.os.Binder;
+import android.hardware.usb.UsbAccessory;
 
 import java.io.IOException;
 import java.util.List;
@@ -22,6 +23,9 @@ import java.util.List;
         }
         public String startBackgroundStandby(String address, int prefixLength, String requestId) {
             return service.startFromUi(address, prefixLength, requestId, true, true);
+        }
+        public String startAoaAccessory(UsbAccessory accessory, String requestId) {
+            return service.startAoaFromUi(accessory, requestId);
         }
         public boolean stop(String ownerId) { return service.stopFromUi(ownerId); }
         public boolean stop(String ownerId, long generation) { return service.stopFromUi(ownerId, generation); }

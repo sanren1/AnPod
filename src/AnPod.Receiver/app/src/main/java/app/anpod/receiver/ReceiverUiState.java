@@ -99,7 +99,8 @@ final class ReceiverUiState {
             grantPersistence = "unavailable";
             authorizationError = service.describeFailure(error);
         }
-        String method = service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
+        String method = service.isAoaSession() ? "usb-aoa"
+                : service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
                 : ReceiverService.currentAudio != null ? "usb-or-local" : "unknown";
         String state = ReceiverUiOperation.displayState(ReceiverService.networkAudioState, ReceiverService.currentAudio != null, ReceiverService.audioActive);
         String mode = ReceiverService.currentAudio == null ? "" : ReceiverService.actualMode;

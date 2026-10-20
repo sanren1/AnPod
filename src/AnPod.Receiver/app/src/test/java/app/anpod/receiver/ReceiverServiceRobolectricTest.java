@@ -9,6 +9,9 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import android.content.Intent;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
+import android.os.Looper;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
@@ -17,6 +20,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -26,6 +31,8 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
+import org.robolectric.RuntimeEnvironment;
+import org.robolectric.Shadows;
 import org.robolectric.android.controller.ServiceController;
 import org.robolectric.shadows.ShadowAudioTrack;
 import org.robolectric.annotation.Config;
@@ -196,6 +203,199 @@ public final class ReceiverServiceRobolectricTest {
             assertNull(floatSession.udpQueue);
             assertNull(floatSession.networkThread);
         } finally { floatContext.destroy(); }
+    }
+
+    @Test
+    public void aoaStopKeepsServiceOwnerUntilCoordinatorAndAccessoryCloseFinish() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-cleanup-owner";
+        long generation = 41;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        Field generationField = ReceiverService.class.getDeclaredField("networkBootstrapGeneration");
+        generationField.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicLong) generationField.get(service)).set(generation);
+
+        CountDownLatch closeEntered = new CountDownLatch(1);
+        CountDownLatch allowClose = new CountDownLatch(1);
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(new AoaAccessoryIo(
+                new DelayedCloseInput(closeEntered, allowClose), new IdleOutput(), () -> { }),
+                new PairingProtocol.BindingMaterial(new byte[16], new byte[16], new byte[32]),
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String id, long token) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, 5000);
+        service.aoaCoordinator = coordinator;
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        try {
+            service.requestTermination(owner, generation, false, "");
+            assertTrue("cleanup should reach the accessory close", closeEntered.await(2, TimeUnit.SECONDS));
+            assertEquals(ReceiverUiOperation.STOPPING, service.uiOperation.phase());
+            allowClose.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (ReceiverUiOperation.STOPPING.equals(service.uiOperation.phase())
+                    && System.nanoTime() < deadline) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle();
+                Thread.sleep(2);
+            }
+            assertEquals(ReceiverUiOperation.STOPPED, service.uiOperation.phase());
+            assertTrue(AoaReceiverCoordinator.isAvailable());
+            assertFalse(service.isAoaSession());
+        } finally {
+            allowClose.countDown();
+            coordinator.cancel("test-finished");
+            coordinator.awaitTermination(2, TimeUnit.SECONDS);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void aoaFailureMonitorReleasesServiceOwnerBeforeNextSession() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-failure-owner";
+        long generation = 42;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        Field generationField = ReceiverService.class.getDeclaredField("networkBootstrapGeneration");
+        generationField.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicLong) generationField.get(service)).set(generation);
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(new AoaAccessoryIo(
+                new FailingInput(), new IdleOutput(), () -> { }),
+                new PairingProtocol.BindingMaterial(new byte[16], new byte[16], new byte[32]),
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String id, long token) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, 5000);
+        service.aoaCoordinator = coordinator;
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        Method monitor = ReceiverService.class.getDeclaredMethod("monitorAoaCoordinator",
+                AoaReceiverCoordinator.class, String.class, long.class);
+        monitor.setAccessible(true);
+        try {
+            monitor.invoke(service, coordinator, owner, generation);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!ReceiverUiOperation.FAILED.equals(service.uiOperation.phase())
+                    && System.nanoTime() < deadline) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle();
+                Thread.sleep(2);
+            }
+            assertEquals(ReceiverUiOperation.FAILED, service.uiOperation.phase());
+            assertFalse(service.isAoaSession());
+            assertNull(service.aoaCoordinator);
+            assertTrue(AoaReceiverCoordinator.isAvailable());
+            assertTrue("a completed cleanup must permit a fresh UI owner",
+                    service.uiOperation.begin("next-session"));
+        } finally {
+            coordinator.cancel("test-finished");
+            coordinator.awaitTermination(2, TimeUnit.SECONDS);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void aoaDetachBroadcastMustMatchCurrentUsbManagerState() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-detach-owner";
+        long generation = 43;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        Field generationField = ReceiverService.class.getDeclaredField("networkBootstrapGeneration");
+        generationField.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicLong) generationField.get(service)).set(generation);
+        UsbAccessory accessory = org.robolectric.util.ReflectionHelpers.callConstructor(UsbAccessory.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "1"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, ""),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "test-serial"));
+        UsbManager manager = RuntimeEnvironment.getApplication().getSystemService(UsbManager.class);
+        Shadows.shadowOf(manager).setAttachedUsbAccessory(accessory);
+        Shadows.shadowOf(manager).grantPermission(accessory);
+        service.aoaAccessory = accessory;
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        Method register = ReceiverService.class.getDeclaredMethod("registerAoaDetachReceiver",
+                UsbAccessory.class, String.class, long.class);
+        register.setAccessible(true);
+        try {
+            assertTrue((Boolean) register.invoke(service, accessory, owner, generation));
+            Intent detach = new Intent(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
+                    .putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+            RuntimeEnvironment.getApplication().sendBroadcast(detach);
+            assertEquals("a forged/stale detach must not stop a still-attached accessory",
+                    ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+
+            Shadows.shadowOf(manager).setAttachedUsbAccessory(null);
+            RuntimeEnvironment.getApplication().sendBroadcast(detach);
+            assertEquals(ReceiverUiOperation.FAILED, service.uiOperation.phase());
+            assertFalse(service.isAoaSession());
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    private static final class DelayedCloseInput implements java.nio.channels.ReadableByteChannel {
+        private final CountDownLatch closeEntered;
+        private final CountDownLatch allowClose;
+        private boolean open = true;
+        DelayedCloseInput(CountDownLatch closeEntered, CountDownLatch allowClose) {
+            this.closeEntered = closeEntered;
+            this.allowClose = allowClose;
+        }
+        @Override public synchronized int read(java.nio.ByteBuffer destination) throws IOException {
+            while (open) try { wait(); }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("cancelled", interrupted);
+            }
+            throw new java.nio.channels.AsynchronousCloseException();
+        }
+        @Override public synchronized boolean isOpen() { return open; }
+        @Override public void close() {
+            closeEntered.countDown();
+            try { allowClose.await(); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            synchronized (this) { open = false; notifyAll(); }
+        }
+    }
+
+    private static final class IdleOutput implements java.nio.channels.WritableByteChannel {
+        private boolean open = true;
+        @Override public int write(java.nio.ByteBuffer source) throws IOException {
+            if (!open) throw new java.nio.channels.AsynchronousCloseException();
+            int count = source.remaining();
+            source.position(source.limit());
+            return count;
+        }
+        @Override public synchronized boolean isOpen() { return open; }
+        @Override public synchronized void close() { open = false; }
+    }
+
+    private static final class FailingInput implements java.nio.channels.ReadableByteChannel {
+        private volatile boolean open = true;
+        @Override public int read(java.nio.ByteBuffer destination) throws IOException {
+            throw new IOException("test transport failure");
+        }
+        @Override public boolean isOpen() { return open; }
+        @Override public void close() { open = false; }
     }
 
     @Test
