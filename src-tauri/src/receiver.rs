@@ -120,6 +120,9 @@ pub struct PlaybackDiagnostics {
     pub capacity_frames: Option<u32>,
     pub start_threshold_frames: Option<u32>,
     pub pre_roll_frames: Option<u32>,
+    pub output_format: Option<u8>,
+    pub opened_track_channels: Option<u8>,
+    pub output_sample_rate: Option<u32>,
 }
 
 impl ReceiverStatus {

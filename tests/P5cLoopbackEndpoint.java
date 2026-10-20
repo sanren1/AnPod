@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import com.anpod.server.FloatPcmFrameQueue;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
@@ -26,6 +27,10 @@ import javax.crypto.spec.SecretKeySpec;
 /** Test-only Java endpoint used by Rust's merged P5-C localhost check. */
 public final class P5cLoopbackEndpoint {
     public static void main(String[] args) throws Exception {
+        if (Arrays.asList(args).contains("--audio-v2-upgrade")) {
+            runAudioV2UpgradeFixture(args);
+            return;
+        }
         if (args.length == 1 && "--verify-coordinator-discovery-recovery".equals(args[0])) {
             verifyCoordinatorDiscoveryRecovery();
             System.out.println("JAVA_P5C_DISCOVERY_RECOVERY=PASS");
@@ -218,6 +223,47 @@ public final class P5cLoopbackEndpoint {
         }
     }
 
+    private static void runAudioV2UpgradeFixture(String[] args) throws Exception {
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
+                repeated((byte) 0x11, 16), repeated((byte) 0x22, 16), repeated((byte) 0x33, 32));
+        String authMode = Arrays.stream(args).filter(value -> value.startsWith("--background-auth-mode="))
+                .map(value -> value.substring("--background-auth-mode=".length())).findFirst().orElse("");
+        FakePlayback playback = new FakePlayback(false, false, false, false, false, false, authMode);
+        playback.audioV2Support = true;
+        int formalSessions = Arrays.stream(args).filter(value -> value.startsWith("--audio-v2-upgrade-sessions="))
+                .map(value -> Integer.parseInt(value.substring("--audio-v2-upgrade-sessions=".length())))
+                .findFirst().orElse(1);
+        playback.expectedAudioV2Sessions = formalSessions;
+        playback.keepReceiveIntent = formalSessions > 1;
+        int profile = Arrays.stream(args).filter(value -> value.startsWith("--audio-v2-profile="))
+                .map(value -> Integer.parseInt(value.substring("--audio-v2-profile=".length())))
+                .findFirst().orElse(2);
+        playback.expectedAudioV2Profile = profile;
+        P5cReceiverCoordinator endpoint = P5cReceiverCoordinator.openLoopbackAudioV2Test(binding, playback);
+        java.lang.reflect.Method beginIntent = P5cReceiverCoordinator.class
+                .getDeclaredMethod("beginConnectionIntent", byte[].class);
+        beginIntent.setAccessible(true);
+        beginIntent.invoke(endpoint, repeated((byte) 0x5a, 16));
+        try (endpoint) {
+            endpoint.start();
+            Thread closeOnInput = new Thread(() -> {
+                try {
+                    if (System.in.read() >= 0) endpoint.close();
+                } catch (IOException error) { throw new RuntimeException(error); }
+            }, "P5-C v2 fixture close signal");
+            closeOnInput.setDaemon(true);
+            closeOnInput.start();
+            System.out.println("PORT=" + endpoint.port());
+            System.out.flush();
+            if (!endpoint.await(25, TimeUnit.SECONDS))
+                throw new IOException("audio-v2 upgrade fixture timed out");
+            System.out.println("RESULT=" + endpoint.failure() + "," + playback.starts.get() + ","
+                    + playback.pauses.get() + "," + playback.resumes.get() + "," + playback.stops.get()
+                    + "," + playback.udpClosed.get() + "," + playback.allPcm24SessionsDecoded());
+            System.out.flush();
+        }
+    }
+
     private static String verifyAutomaticSearchAfterAuthenticatedConnection(P5cReceiverCoordinator endpoint,
             P5cDiscovery initialDiscovery) throws Exception {
         java.lang.reflect.Field authenticatedField = P5cReceiverCoordinator.class.getDeclaredField("authenticatedSocket");
@@ -274,6 +320,18 @@ public final class P5cLoopbackEndpoint {
         byte[] expectedInfo = {0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0,
                 0, 0, 0, 3, 0, 0, 0, 4};
         if (!Arrays.equals(info, expectedInfo)) throw new AssertionError("CAPABILITIES_INFO vector changed");
+        byte[] legacyProgress = new byte[70];
+        legacyProgress[69] = 0x5a;
+        byte[] progressV2 = P5cControlProtocol.playbackProgressPayloadV2(legacyProgress, 2, 2, 48_000);
+        if (progressV2.length != 78 || progressV2[69] != 0x5a || progressV2[70] != 1
+                || progressV2[71] != 2 || progressV2[72] != 2 || progressV2[73] != 0
+                || !Arrays.equals(Arrays.copyOfRange(progressV2, 74, 78), new byte[] {0, 0, (byte) 0xbb, (byte) 0x80}))
+            throw new AssertionError("v2 playback progress extension changed");
+        byte[] unknownProgressV2 = P5cControlProtocol.playbackProgressPayloadV2(legacyProgress, 0, 0, 0);
+        if (unknownProgressV2.length != 78 || unknownProgressV2[70] != 1 || unknownProgressV2[71] != 0
+                || unknownProgressV2[72] != 0 || unknownProgressV2[73] != 0
+                || !Arrays.equals(Arrays.copyOfRange(unknownProgressV2, 74, 78), new byte[4]))
+            throw new AssertionError("unknown v2 playback output must remain zero-filled");
     }
 
     private static void verifyV2DiscoveryVectors() {
@@ -730,6 +788,8 @@ public final class P5cLoopbackEndpoint {
         final AtomicInteger shutdowns = new AtomicInteger();
         final AtomicInteger pcmBytes = new AtomicInteger();
         final AtomicBoolean udpClosed = new AtomicBoolean();
+        final AtomicBoolean pcm24Decoded = new AtomicBoolean();
+        final AtomicInteger pcm24DecodedSessions = new AtomicInteger();
         final AtomicBoolean stopped = new AtomicBoolean();
         final AtomicBoolean failResume;
         final AtomicInteger modeSequenceErrors = new AtomicInteger();
@@ -743,6 +803,7 @@ public final class P5cLoopbackEndpoint {
         volatile UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
         volatile long activityClockOffsetNanos;
         volatile UdpPcmQueue queue;
+        volatile FloatPcmFrameQueue floatQueue;
         volatile UdpReceiver receiver;
         volatile UdpSessionContext context;
         volatile Thread receiverThread;
@@ -752,6 +813,9 @@ public final class P5cLoopbackEndpoint {
         final AtomicBoolean throwStartOnce;
         final AtomicBoolean throwStopOnce;
         final String backgroundAuthMode;
+        volatile boolean audioV2Support;
+        volatile int expectedAudioV2Profile = 2;
+        volatile int expectedAudioV2Sessions = 1;
         final AtomicInteger backgroundAuthRequests = new AtomicInteger();
         final AtomicInteger backgroundAuthQueries = new AtomicInteger();
         final AtomicInteger backgroundAuthEnds = new AtomicInteger();
@@ -785,6 +849,13 @@ public final class P5cLoopbackEndpoint {
         }
 
         @Override public boolean supportsPlaybackProgress() { return true; }
+        @Override public boolean supportsAudioV2() { return audioV2Support; }
+        @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+            return audioV2Support && format != null && expectedAudioV2Profile == 2
+                    && format.profile == 2 && format.sampleFormat == 2 && format.sampleRate == 48_000
+                    && format.channels == 2 && format.validBits == 24 && format.bytesPerSample == 3
+                    && format.frameBytes == 6;
+        }
         @Override public boolean supportsBackgroundTrustManagement() {
             if (delayBackgroundTrustCapability) {
                 delayBackgroundTrustCapability = false;
@@ -891,6 +962,23 @@ public final class P5cLoopbackEndpoint {
             if (throwStartOnce.compareAndSet(true, false)) throw new IOException("injected START throw");
             if (failStartOnce.compareAndSet(true, false)) return false;
             int startNumber = starts.incrementAndGet();
+            if (context.formatV2 != null) {
+                if (startNumber > expectedAudioV2Sessions)
+                    throw new IOException("more V2 formal sessions than this fixture allows");
+                if (!audioV2Support || context.parameters != null
+                        || context.formatV2.profile != expectedAudioV2Profile || context.formatV2.profile != 2
+                        || context.formatV2.sampleRate != 48_000 || context.formatV2.validBits != 24
+                        || context.formatV2.channels != 2)
+                    throw new IOException("unexpected authenticated v2 capture format");
+                stopped.set(false);
+                paused.set(false);
+                pcm24Decoded.set(false);
+                floatQueue = new FloatPcmFrameQueue(context.formatV2.sampleRate, true);
+                receiver = new UdpReceiver(context, floatQueue);
+                receiverThread = new Thread(receiver, "P5-C test PCM24 UDP receiver");
+                receiverThread.start();
+                return true;
+            }
             if (verifyModeSwitch) {
                 int expectedMode = startNumber == 1 ? 1 : 0;
                 if (context.parameters.mode != expectedMode) modeSequenceErrors.incrementAndGet();
@@ -934,14 +1022,18 @@ public final class P5cLoopbackEndpoint {
 
         @Override public void pause() {
             awaitModeSwitchPayload();
+            FloatPcmFrameQueue currentFloatQueue = floatQueue;
+            if (currentFloatQueue != null && !pcm24Decoded.get()) verifyPcm24Decoded(currentFloatQueue);
             pauses.incrementAndGet(); paused.set(true);
             if (queue != null) queue.setPaused(true);
+            if (currentFloatQueue != null) currentFloatQueue.setPaused(true);
         }
         @Override public void resume() throws IOException {
             resumes.incrementAndGet();
             if (failResume.compareAndSet(true, false)) throw new IOException("P5-D test RESUME failure");
             paused.set(false);
             if (queue != null) queue.setPaused(false);
+            if (floatQueue != null) floatQueue.setPaused(false);
         }
         @Override public boolean streaming() {
             UdpPcmQueue current = queue;
@@ -973,6 +1065,8 @@ public final class P5cLoopbackEndpoint {
             if (currentContext != null) currentContext.destroy();
             UdpPcmQueue currentQueue = queue;
             if (currentQueue != null) currentQueue.stop();
+            FloatPcmFrameQueue currentFloatQueue = floatQueue;
+            if (currentFloatQueue != null) currentFloatQueue.stop();
             join(receiverThread);
             join(sinkThread);
             udpClosed.set(currentReceiver == null || currentReceiver.isClosed());
@@ -993,6 +1087,28 @@ public final class P5cLoopbackEndpoint {
                     throw new AssertionError("mode-switch sink wait interrupted", error);
                 }
             }
+        }
+
+        private void verifyPcm24Decoded(FloatPcmFrameQueue currentQueue) {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (currentQueue.queuedFrames() < 2 && System.nanoTime() < deadline) {
+                try { Thread.sleep(1); }
+                catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            float[] decoded = new float[4];
+            if (currentQueue.poll(decoded, 0, 2) != 2) return;
+            boolean matches = Float.floatToRawIntBits(decoded[0]) == Float.floatToRawIntBits(1.0f / 8_388_608.0f)
+                    && Float.floatToRawIntBits(decoded[1]) == Float.floatToRawIntBits(-1.0f / 8_388_608.0f)
+                    && Float.floatToRawIntBits(decoded[2]) == Float.floatToRawIntBits(32_769.0f / 8_388_608.0f)
+                    && Float.floatToRawIntBits(decoded[3]) == Float.floatToRawIntBits(-32_769.0f / 8_388_608.0f);
+            if (matches && pcm24Decoded.compareAndSet(false, true)) pcm24DecodedSessions.incrementAndGet();
+        }
+
+        boolean allPcm24SessionsDecoded() {
+            return pcm24DecodedSessions.get() == expectedAudioV2Sessions;
         }
 
         private static void join(Thread thread) {

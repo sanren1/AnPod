@@ -6,19 +6,32 @@ import { SettingToggle } from "./SettingToggle";
 export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
   const settings = snapshot.settings;
   const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
+  const negotiated = snapshot.negotiatedAudioFormat;
+  const mix = snapshot.windowsMixFormat;
+  const android = snapshot.androidOutputFormat;
+  const actualFormat = negotiated
+    ? `${negotiated.sampleRateHz / 1000} kHz · ${strings.app.audioSampleFormats[negotiated.sampleFormat]} · ${negotiated.channels} ch · ${negotiated.validBitsPerSample} ${strings.app.validBits}`
+    : strings.app.audioFormatNotConfirmed;
+  const mixFormat = mix
+    ? `${mix.sampleRate === null ? strings.app.audioFormatUnknown : `${mix.sampleRate / 1000} kHz`} · ${mix.sampleFormat === null ? strings.app.audioFormatUnknown : strings.app.mixSampleFormats[mix.sampleFormat]} · ${mix.channels === null ? strings.app.audioFormatUnknown : `${mix.channels} ch`} · ${mix.containerBits === null ? strings.app.audioFormatUnknown : `${mix.containerBits} ${strings.app.containerBits}`} · ${mix.validBits === null ? strings.app.audioFormatUnknown : `${mix.validBits} ${strings.app.validBits}`}`
+    : strings.app.audioFormatUnknown;
+  const outputFormat = android
+    ? `${android.sampleRate === null ? strings.app.audioFormatUnknown : `${android.sampleRate / 1000} kHz`} · ${android.encoding === null ? strings.app.audioFormatUnknown : strings.app.androidSampleFormats[android.encoding]} · ${android.channels === null ? strings.app.audioFormatUnknown : `${android.channels} ch`}`
+    : strings.app.audioFormatUnknown;
   return <Modal title={strings.app.settingsTitle} onClose={onClose} className="settings-dialog">
     <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
       <legend>{strings.app.transportQuality}</legend>
       {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
         <span>{strings.app.audioQualityLabels[quality]}</span>
-        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={quality !== "standard" || busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
+        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={quality === "hires" || busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
       </label>)}
       <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
       <dl className="audio-quality-status">
-        <div><dt>{strings.app.actualTransportFormat}</dt><dd>{snapshot.negotiatedAudioFormat ? `${snapshot.negotiatedAudioFormat.sampleRateHz / 1000} kHz / PCM16LE / ${snapshot.negotiatedAudioFormat.channels} ch` : strings.app.audioFormatNotConfirmed}</dd></div>
-        <div><dt>{strings.app.windowsMixFormat}</dt><dd>{strings.app.audioFormatUnknown}</dd></div>
-        <div><dt>{strings.app.androidOutputFormat}</dt><dd>{strings.app.audioFormatUnknown}</dd></div>
+        <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>
+        <div><dt>{strings.app.windowsMixFormat}</dt><dd>{mixFormat}</dd></div>
+        <div><dt>{strings.app.androidOutputFormat}</dt><dd>{outputFormat}</dd></div>
       </dl>
+      <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
     </fieldset>
     <h3>{strings.app.settingsConnection}</h3>
     <SettingToggle disabled={snapshot.busy} title={strings.app.autoConnect} description={strings.app.autoConnectDescription} checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />

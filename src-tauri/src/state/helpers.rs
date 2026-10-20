@@ -272,12 +272,29 @@ pub(crate) fn automatic_reception_binding(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pcm_queue_identity_changed(
     current: Option<&Arc<PcmQueue>>,
     next: Option<&Arc<PcmQueue>>,
 ) -> bool {
     match (current, next) {
         (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn session_audio_queue_identity_changed(
+    current: Option<&SessionAudioQueue>,
+    next: Option<&SessionAudioQueue>,
+) -> bool {
+    match (current, next) {
+        (Some(SessionAudioQueue::Pcm16(current)), Some(SessionAudioQueue::Pcm16(next))) => {
+            !Arc::ptr_eq(current, next)
+        }
+        (Some(SessionAudioQueue::Float32(current)), Some(SessionAudioQueue::Float32(next))) => {
+            !Arc::ptr_eq(current, next)
+        }
         (None, None) => false,
         _ => true,
     }
@@ -762,9 +779,9 @@ pub(crate) fn normalize_mdns_instance(value: &str) -> String {
 
 pub(crate) fn validate_audio_quality(value: &str) -> Result<(), String> {
     match value {
-        "standard" => Ok(()),
-        "hifi" | "hires" => Err("音质升级开发中；请选择标准音质后重试。 / Audio quality upgrade is in development; select Standard and retry.".into()),
-        _ => Err("无效音质设置；请选择标准音质。 / Invalid audio quality; select Standard.".into()),
+        "standard" | "hifi" => Ok(()),
+        "hires" => Err("Hi-Res 96 kHz is not available yet; select Standard or HiFi.".into()),
+        _ => Err("Invalid audio quality; select Standard or HiFi.".into()),
     }
 }
 

@@ -16,6 +16,8 @@ fn sample_snapshot() -> AppSnapshot {
         session_capabilities: None,
         playback_diagnostics: Some(PlaybackDiagnostics::default()),
         negotiated_audio_format: None,
+        windows_mix_format: None,
+        android_output_format: None,
         network_recovery_seconds_remaining: None,
         wireless_connection_offers: HostDiscoverySnapshot::default(),
         session_android_version: Some("15".into()),
@@ -38,7 +40,8 @@ fn audio_quality_defaults_and_rejects_unavailable_profiles_without_changing_play
     let old_settings: AppSettings = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(old_settings.audio_quality, "standard");
 
-    for quality in ["hifi", "hires", "unsupported"] {
+    assert!(validate_audio_quality("hifi").is_ok());
+    for quality in ["hires", "unsupported"] {
         assert!(validate_audio_quality(quality).is_err(), "{quality}");
     }
     assert!(validate_audio_quality("standard").is_ok());

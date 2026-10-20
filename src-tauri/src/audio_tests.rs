@@ -48,6 +48,14 @@ fn float_v2_abi_layout_and_response_version_are_checked() {
 }
 
 #[test]
+fn stopped_float_queue_is_not_reused_by_audio_sink_fast_path() {
+    let queue = std::sync::Arc::new(crate::network::FloatPcmQueue::new(false));
+    assert!(super::can_reuse_float_sink(Some(&queue), &queue));
+    queue.stop_and_clear();
+    assert!(!super::can_reuse_float_sink(Some(&queue), &queue));
+}
+
+#[test]
 fn float_pcm16_quantization_is_symmetric_saturating_and_bit_exact_on_pcm16_grid() {
     for value in i16::MIN..=i16::MAX {
         let normalized = value as f32 / 32768.0;

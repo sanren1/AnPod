@@ -3,18 +3,20 @@ pub(crate) use helpers::*;
 mod discovery_ops;
 mod receiver_ops;
 
+#[cfg(test)]
+use crate::network::PcmQueue;
 use crate::receiver::{self, PlaybackDiagnostics, ReceiverStatus};
 use crate::{
-    audio::AudioActor,
+    audio::{AudioActor, CaptureFormatV2},
     discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener},
-    network::PcmQueue,
+    network::FloatPcmQueue,
     network_interface::{self, Ipv4Interface},
     p5c::{
-        BackgroundTrustSnapshot, HostSession, ReceiverCapabilities, SessionLifecycleState,
-        SessionOwner,
+        BackgroundTrustSnapshot, HostAudioProfile, HostSession, ReceiverCapabilities,
+        SessionAudioQueue, SessionLifecycleState, SessionOwner,
     },
     presence::{PresenceTracker, PresenceView},
-    protocol::PcmFormat,
+    protocol::{AudioFormatV2, PcmFormat},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,6 +152,70 @@ pub struct NegotiatedAudioFormat {
     pub frame_bytes: u8,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsMixFormat {
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u32>,
+    pub sample_format: Option<String>,
+    pub container_bits: Option<u32>,
+    pub valid_bits: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidOutputFormat {
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u8>,
+    pub encoding: Option<String>,
+}
+
+fn negotiated_v2_audio_format(format: AudioFormatV2) -> NegotiatedAudioFormat {
+    NegotiatedAudioFormat {
+        codec_version: 2,
+        sample_format: if format.sample_format == 2 {
+            "pcm24le"
+        } else {
+            "pcm16le"
+        }
+        .into(),
+        sample_rate_hz: format.sample_rate,
+        channels: format.channels,
+        valid_bits_per_sample: format.valid_bits,
+        bytes_per_sample: format.bytes_per_sample,
+        frame_bytes: format.frame_bytes as u8,
+    }
+}
+
+fn android_output_format(diagnostics: Option<&PlaybackDiagnostics>) -> Option<AndroidOutputFormat> {
+    let diagnostics = diagnostics?;
+    let encoding = match diagnostics.output_format? {
+        1 => "pcm16",
+        2 => "pcm24Packed",
+        3 => "float32",
+        _ => return None,
+    };
+    Some(AndroidOutputFormat {
+        sample_rate: diagnostics.output_sample_rate,
+        channels: diagnostics.opened_track_channels,
+        encoding: Some(encoding.into()),
+    })
+}
+
+fn windows_mix_format(format: CaptureFormatV2) -> WindowsMixFormat {
+    WindowsMixFormat {
+        sample_rate: (format.mix_sample_rate != 0).then_some(format.mix_sample_rate),
+        channels: (format.mix_channels != 0).then_some(format.mix_channels),
+        sample_format: match format.mix_sample_format {
+            1 => Some("integer".into()),
+            2 => Some("float".into()),
+            _ => None,
+        },
+        container_bits: (format.mix_container_bits != 0).then_some(format.mix_container_bits),
+        valid_bits: (format.mix_valid_bits != 0).then_some(format.mix_valid_bits),
+    }
+}
+
 fn negotiated_audio_format(
     session_active: bool,
     output: &str,
@@ -190,6 +256,8 @@ pub struct AppSnapshot {
     pub session_capabilities: Option<ReceiverCapabilities>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
     pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    pub windows_mix_format: Option<WindowsMixFormat>,
+    pub android_output_format: Option<AndroidOutputFormat>,
     pub network_recovery_seconds_remaining: Option<u64>,
     pub wireless_connection_offers: HostDiscoverySnapshot,
     pub session_android_version: Option<String>,
@@ -228,6 +296,8 @@ pub struct DiagnosticsExport {
     pub playback_mode: String,
     pub audio_quality: String,
     pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    pub windows_mix_format: Option<WindowsMixFormat>,
+    pub android_output_format: Option<AndroidOutputFormat>,
     pub audio_backend: String,
     pub audio_bitrate_bps: Option<u64>,
     pub session_capabilities: Option<ReceiverCapabilities>,
@@ -249,6 +319,8 @@ fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
         playback_mode: snapshot.settings.playback_mode.clone(),
         audio_quality: snapshot.settings.audio_quality.clone(),
         negotiated_audio_format: snapshot.negotiated_audio_format.clone(),
+        windows_mix_format: snapshot.windows_mix_format.clone(),
+        android_output_format: snapshot.android_output_format.clone(),
         audio_backend: snapshot.settings.audio_backend.clone(),
         audio_bitrate_bps: snapshot.audio_bitrate_bps,
         session_capabilities: snapshot.session_capabilities.clone(),
@@ -342,8 +414,9 @@ pub(crate) struct Session {
     output: String,
     output_tail: Arc<Mutex<VecDeque<String>>>,
     network_owner: Option<SessionOwner>,
-    network_sink_queue: Option<Arc<PcmQueue>>,
+    network_sink_queue: Option<SessionAudioQueue>,
     network_binding_ref: Option<String>,
+    windows_mix_format: Option<WindowsMixFormat>,
 }
 
 pub(crate) struct ActiveOperation {
@@ -377,6 +450,8 @@ pub(crate) struct ViewState {
     audio_bitrate_bps: Option<u64>,
     session_capabilities: Option<ReceiverCapabilities>,
     playback_diagnostics: Option<PlaybackDiagnostics>,
+    negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    windows_mix_format: Option<WindowsMixFormat>,
     network_recovery_seconds_remaining: Option<u64>,
 }
 
@@ -499,6 +574,8 @@ impl AppState {
                 audio_bitrate_bps: None,
                 session_capabilities: None,
                 playback_diagnostics: None,
+                negotiated_audio_format: None,
+                windows_mix_format: None,
                 network_recovery_seconds_remaining: None,
             }),
             host_offer_listener: Mutex::new(None),
@@ -597,7 +674,8 @@ impl AppState {
         let _gate = self.gate.lock().await;
         let result = async {
             token_check(&token)?;
-            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
+            let audio_quality = self.view.lock().expect("view lock").settings.audio_quality.clone();
+            validate_audio_quality(&audio_quality)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
             {
                 let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
@@ -610,7 +688,29 @@ impl AppState {
                 .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
             audio_initialized = true;
             self.audio.initialize()?;
-            let capture_format = self.audio.pcm_format()?;
+            let playback_mode = if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 };
+            let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality == "hifi" {
+                let native = self.audio.probe_float_format()?;
+                if native.mix_sample_rate != 48_000
+                    || native.capture_sample_rate != 48_000
+                    || native.capture_channels != 2
+                    || native.capture_sample_format != 2
+                {
+                    return Err("HiFi requires a 48 kHz stereo Float32 Windows mix; select Standard or use a 48 kHz mix.".into());
+                }
+                let mix_format = windows_mix_format(native);
+                let queue = Arc::new(FloatPcmQueue::new(playback_mode == 1));
+                let format = AudioFormatV2::for_profile(2, playback_mode)
+                    .map_err(|_| "Unable to construct the authenticated PCM24 format.".to_string())?;
+                (
+                    PcmFormat { sample_rate: native.capture_sample_rate, channels: native.capture_channels as u16 },
+                    HostAudioProfile::Hifi48(format),
+                    Some(queue),
+                    Some(mix_format),
+                )
+            } else {
+                (self.audio.pcm_format()?, HostAudioProfile::Standard, None, None)
+            };
             let (binding_ref, binding_path, peer) = if let Some(serial) = bootstrap_serial {
                 let address = receiver_address.ok_or_else(|| "USB/bootstrap 需要明确选择手机 IPv4 接口。".to_string())?;
                 let prefix = receiver_prefix.ok_or_else(|| "USB/bootstrap 需要手机接口前缀长度。".to_string())?;
@@ -662,16 +762,22 @@ impl AppState {
             // P5-C handshake still proves the phone holds the same secret.
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
-            let mut owner = if background_authorization_required {
-                SessionOwner::start_on_interface_with_background_authorization(
-                    &interface, peer, binding, parameters, token.clone())?
-            } else if let Some((nonce, required, _)) = &intent {
-                SessionOwner::start_on_interface_with_intent(&interface, peer, binding, parameters, token.clone(), *nonce, *required)?
-            } else { SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())? };
+            let connection_intent = intent.as_ref().map(|(nonce, required, _)| (*nonce, *required));
+            let mut owner = SessionOwner::start_on_interface_with_profile(
+                &interface,
+                peer,
+                binding,
+                parameters,
+                profile,
+                initial_float_queue,
+                token.clone(),
+                connection_intent,
+                background_authorization_required,
+            )?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let queue = loop {
                 token_check(&token)?;
-                if let Some(queue) = owner.pcm_queue() { break Some(queue); }
+                if let Some(queue) = owner.audio_queue() { break Some(queue); }
                 let snapshot = owner.snapshot();
                 if snapshot.state == SessionLifecycleState::Authenticated
                     && snapshot.capabilities.as_ref().is_some_and(|info| info.management_compatible && !info.compatible) {
@@ -690,11 +796,19 @@ impl AppState {
             } else {
                 audio_initialized = true;
                 let queue_ref = queue.as_ref().expect("audio-compatible session queue");
-                if let Err(error) = self.audio.start_pcm_sink(queue_ref.clone()) {
-                    let _ = self.audio.stop_and_cleanup();
-                    let _ = self.audio.restore_muted();
-                    owner.stop();
-                    return Err(error);
+                let sink_result = match queue_ref {
+                    SessionAudioQueue::Pcm16(queue) => self.audio.start_pcm_sink(queue.clone()).map(|()| None),
+                    SessionAudioQueue::Float32(_) => self.start_session_audio_sink(queue_ref),
+                };
+                match sink_result {
+                    Ok(Some(format)) => mix_format = Some(format),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = self.audio.stop_and_cleanup();
+                        let _ = self.audio.restore_muted();
+                        owner.stop();
+                        return Err(error);
+                    }
                 }
                 if let Err(error) = self.audio.mute_active() {
                     let _ = self.audio.stop_pcm_sink();
@@ -717,14 +831,20 @@ impl AppState {
                 listener.take();
             }
             let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let owner_snapshot = owner.snapshot();
+            let negotiated_format = owner_snapshot.negotiated_format.map(negotiated_v2_audio_format);
+            let unsupported_v2_format = owner_snapshot
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("PCM24 format"));
+            let capabilities = owner_snapshot.capabilities;
             *self.session.lock().await = Some(Session {
                 generation: session_generation,
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
                 installed_receiver: false, output: session_output.into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
                 network_owner: Some(owner), network_sink_queue: queue, network_binding_ref: Some(binding_ref.clone()),
+                windows_mix_format: mix_format.clone(),
             });
-            let capabilities = self.session.lock().await.as_ref().and_then(|session| session.network_owner.as_ref())
-                .and_then(|owner| owner.snapshot().capabilities);
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = true;
@@ -735,11 +855,14 @@ impl AppState {
                 view.session_android_version = None;
                 view.session_capabilities = capabilities;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = negotiated_format;
+                view.windows_mix_format = if management_only { None } else { mix_format.clone() };
                 view.network_recovery_seconds_remaining = None;
                 view.output = session_output.into();
                 view.state = if management_only { "managementOnly" } else { "phoneReady" }.into();
-                view.message = if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
-                view.status_detail = if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
+                view.message = if unsupported_v2_format { "Receiver 不支持所选 PCM24 格式" } else if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
+                view.status_detail = if unsupported_v2_format { "V2 握手已认证，但 Receiver 拒绝所选音频描述符；未启动 BIND、START 或 PCM。请选择 Standard 或更新 Receiver。" }
+                    else if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
                     else { "P5-A 已认证；本机 PCM 已接入所选 LAN 接收会话。" }.into();
                 view.audio_bitrate_bps = if management_only { None } else { Some(0) };
             }
@@ -872,11 +995,22 @@ impl AppState {
                 .map(str::to_owned),
             session_capabilities: view.session_capabilities.clone(),
             playback_diagnostics: view.playback_diagnostics.clone(),
-            negotiated_audio_format: negotiated_audio_format(
-                view.session_active,
-                &view.output,
-                view.playback_diagnostics.as_ref(),
-            ),
+            negotiated_audio_format: (view.session_active && view.output == "phone")
+                .then(|| {
+                    negotiated_audio_format(
+                        view.session_active,
+                        &view.output,
+                        view.playback_diagnostics.as_ref(),
+                    )
+                    .or_else(|| view.negotiated_audio_format.clone())
+                })
+                .flatten(),
+            windows_mix_format: (view.session_active && view.output == "phone")
+                .then(|| view.windows_mix_format.clone())
+                .flatten(),
+            android_output_format: (view.session_active && view.output == "phone")
+                .then(|| android_output_format(view.playback_diagnostics.as_ref()))
+                .flatten(),
             network_recovery_seconds_remaining: view.network_recovery_seconds_remaining,
             wireless_connection_offers: self.wireless_connection_offers(),
             session_android_version: view.session_android_version.clone(),
@@ -1595,6 +1729,29 @@ impl AppState {
         }
     }
 
+    fn start_session_audio_sink(
+        &self,
+        queue: &SessionAudioQueue,
+    ) -> Result<Option<WindowsMixFormat>, String> {
+        match queue {
+            SessionAudioQueue::Pcm16(queue) => {
+                self.audio.start_pcm_sink(queue.clone()).map(|()| None)
+            }
+            SessionAudioQueue::Float32(queue) => {
+                let format = self.audio.start_float_sink(queue.clone())?;
+                if format.mix_sample_rate != 48_000
+                    || format.capture_sample_rate != 48_000
+                    || format.capture_channels != 2
+                    || format.capture_sample_format != 2
+                {
+                    let _ = self.audio.stop_float_sink();
+                    return Err("HiFi capture format changed outside the authenticated 48 kHz PCM24 session.".into());
+                }
+                Ok(Some(windows_mix_format(format)))
+            }
+        }
+    }
+
     async fn monitor_network_session(&self, app: &AppHandle) -> bool {
         let mut session = self.session.lock().await;
         let Some(active) = session
@@ -1614,7 +1771,7 @@ impl AppState {
                 .capabilities
                 .as_ref()
                 .is_some_and(|info| info.management_compatible && !info.compatible);
-        let queue = owner.pcm_queue();
+        let queue = owner.audio_queue();
         let mut failure = self.audio.take_last_error().ok().flatten();
         if failure.is_none() && needs_bootstrap {
             failure = Some(
@@ -1635,18 +1792,26 @@ impl AppState {
                 }
             } else if active.output == "phone" {
                 if let Some(queue) = queue.as_ref() {
-                    if pcm_queue_identity_changed(active.network_sink_queue.as_ref(), Some(queue)) {
-                        if let Err(error) = self.audio.start_pcm_sink(queue.clone()) {
-                            failure = Some(error);
-                        } else if let Err(error) = self.audio.mute_active() {
-                            let _ = self.audio.stop_pcm_sink();
-                            let _ = self.audio.restore_muted();
-                            failure = Some(error);
-                        } else {
-                            active.network_sink_queue = Some(queue.clone());
+                    if session_audio_queue_identity_changed(
+                        active.network_sink_queue.as_ref(),
+                        Some(queue),
+                    ) {
+                        match self.start_session_audio_sink(queue) {
+                            Err(error) => failure = Some(error),
+                            Ok(mix_format) => {
+                                if let Err(error) = self.audio.mute_active() {
+                                    let _ = self.audio.stop_pcm_sink();
+                                    let _ = self.audio.restore_muted();
+                                    failure = Some(error);
+                                } else {
+                                    active.network_sink_queue = Some(queue.clone());
+                                    active.windows_mix_format = mix_format;
+                                }
+                            }
                         }
                     }
                 } else if active.network_sink_queue.take().is_some() {
+                    active.windows_mix_format = None;
                     if let Err(error) = self.audio.stop_pcm_sink() {
                         failure = Some(error);
                     }
@@ -1694,6 +1859,8 @@ impl AppState {
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = None;
+                view.windows_mix_format = None;
                 view.network_recovery_seconds_remaining = None;
                 view.session_android_version = None;
                 view.output = "computer".into();
@@ -1765,6 +1932,13 @@ impl AppState {
             view.session_receiver_binding = active.network_binding_ref.clone();
             view.session_capabilities = snapshot.capabilities.clone();
             view.playback_diagnostics = snapshot.playback_diagnostics.clone();
+            view.negotiated_audio_format =
+                snapshot.negotiated_format.map(negotiated_v2_audio_format);
+            if active.output == "computer" || management_only {
+                view.windows_mix_format = None;
+            } else {
+                view.windows_mix_format = active.windows_mix_format.clone();
+            }
             view.network_recovery_seconds_remaining = snapshot.recovery_seconds_remaining;
             changed
         };
@@ -2087,7 +2261,17 @@ impl AppState {
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
         if play_on_phone {
-            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
+            let quality = self
+                .view
+                .lock()
+                .expect("view lock")
+                .settings
+                .audio_quality
+                .clone();
+            validate_audio_quality(&quality)?;
+            if quality == "hifi" {
+                return Err("HiFi is available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
+            }
         }
         if !self.operation_is_current(generation, token) {
             return Ok(OperationResult {
@@ -2200,6 +2384,7 @@ impl AppState {
             network_owner: None,
             network_sink_queue: None,
             network_binding_ref: None,
+            windows_mix_format: None,
         });
         self.view.lock().expect("view lock").session_generation = Some(session_generation);
         {
@@ -2210,6 +2395,8 @@ impl AppState {
             view.session_transport = Some(device.transport.clone());
             view.session_capabilities = None;
             view.playback_diagnostics = None;
+            view.negotiated_audio_format = None;
+            view.windows_mix_format = None;
             view.network_recovery_seconds_remaining = None;
             view.session_android_version =
                 (!device.android_version.is_empty()).then(|| device.android_version.clone());
@@ -2821,6 +3008,8 @@ impl AppState {
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = None;
+                view.windows_mix_format = None;
                 view.network_recovery_seconds_remaining = None;
                 view.session_android_version = None;
                 view.audio_bitrate_bps = None;
@@ -2965,7 +3154,24 @@ impl AppState {
         token: &CancellationToken,
     ) -> Result<(), String> {
         if output == "phone" {
-            validate_audio_quality(&self.view.lock().expect("view lock").settings.audio_quality)?;
+            let quality = self
+                .view
+                .lock()
+                .expect("view lock")
+                .settings
+                .audio_quality
+                .clone();
+            validate_audio_quality(&quality)?;
+            let hifi_network = self
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|session| session.network_owner.as_ref())
+                .is_some_and(SessionOwner::uses_hifi48);
+            if quality == "hifi" && !hifi_network {
+                return Err("HiFi is available for LAN UDP audio; USB/ADB TCP playback supports Standard only.".into());
+            }
         }
         {
             let mut session = self.session.lock().await;
@@ -2990,7 +3196,7 @@ impl AppState {
                 let change = async {
                     if output == "phone" {
                         let queue = if active.output == "computer" {
-                            let old_queue = owner.pcm_queue();
+                            let old_queue = owner.audio_queue();
                             owner.reconnect()?;
                             owner.set_paused(false)?;
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -3002,10 +3208,8 @@ impl AppState {
                                         .last_error
                                         .unwrap_or_else(|| "Receiver session stopped".into()));
                                 }
-                                if let Some(queue) = owner.pcm_queue() {
-                                    let is_fresh = old_queue
-                                        .as_ref()
-                                        .is_none_or(|old| !Arc::ptr_eq(old, &queue));
+                                if let Some(queue) = owner.audio_queue() {
+                                    let is_fresh = session_audio_queue_identity_changed(old_queue.as_ref(), Some(&queue));
                                     if is_fresh
                                         && matches!(
                                             snapshot.state,
@@ -3024,16 +3228,30 @@ impl AppState {
                             }
                         } else {
                             owner.set_paused(false)?;
-                            let Some(queue) = owner.pcm_queue() else {
+                            let Some(queue) = owner.audio_queue() else {
                                 return Ok(());
                             };
                             queue
                         };
-                        self.audio.start_pcm_sink(queue.clone())?;
+                        active.windows_mix_format = self.start_session_audio_sink(&queue)?;
                         self.audio.mute_active()?;
                         active.network_sink_queue = Some(queue);
                     } else {
                         owner.set_paused(true)?;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                        loop {
+                            token_check(token)?;
+                            match owner.snapshot().state {
+                                SessionLifecycleState::Paused => break,
+                                SessionLifecycleState::Stopped => {
+                                    return Err("Receiver session stopped while pausing phone output.".into());
+                                }
+                                _ if tokio::time::Instant::now() >= deadline => {
+                                    return Err("Receiver did not confirm pause before stopping local capture.".into());
+                                }
+                                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                            }
+                        }
                         self.audio.stop_pcm_sink()?;
                         self.audio.restore_muted()?;
                         active.network_sink_queue = None;
@@ -3066,6 +3284,8 @@ impl AppState {
                     view.session_transport = None;
                     view.session_capabilities = None;
                     view.playback_diagnostics = None;
+                    view.negotiated_audio_format = None;
+                    view.windows_mix_format = None;
                     view.network_recovery_seconds_remaining = None;
                     view.session_android_version = None;
                     view.output = "computer".into();
@@ -3076,8 +3296,30 @@ impl AppState {
                     return Err(detail);
                 }
                 active.output = output.into();
+                let active_snapshot = active
+                    .network_owner
+                    .as_ref()
+                    .expect("network session owner")
+                    .snapshot();
                 let mut view = self.view.lock().expect("view lock");
                 view.output = output.into();
+                view.negotiated_audio_format = if output == "phone" {
+                    active_snapshot
+                        .negotiated_format
+                        .map(negotiated_v2_audio_format)
+                } else {
+                    None
+                };
+                view.windows_mix_format = if output == "phone" {
+                    active.windows_mix_format.clone()
+                } else {
+                    None
+                };
+                view.playback_diagnostics = if output == "phone" {
+                    active_snapshot.playback_diagnostics
+                } else {
+                    None
+                };
                 view.state = if output == "phone" {
                     "phoneReady".into()
                 } else {

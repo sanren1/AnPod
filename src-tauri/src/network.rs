@@ -1,6 +1,8 @@
+use crate::protocol::{
+    AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
+};
 #[cfg(test)]
 use crate::protocol::{PacketDecoder, ProtocolError, MAX_DATAGRAM_LEN};
-use crate::protocol::{PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::{
@@ -80,8 +82,8 @@ struct FloatQueueState {
     queued_frames: u64,
 }
 
-/// Preallocated, bounded Float32 capture queue for the future high-precision
-/// encoder path. It is deliberately independent of the existing PCM16 sender.
+/// Preallocated, bounded Float32 capture queue for the high-precision encoder.
+/// It is deliberately independent of the existing PCM16 sender.
 pub struct FloatPcmQueue {
     state: Mutex<FloatQueueState>,
     wake: Condvar,
@@ -168,6 +170,17 @@ impl FloatPcmQueue {
 
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn queued_frames(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.queued_frames)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     pub(crate) fn stop_and_clear(&self) {
@@ -261,8 +274,7 @@ impl FloatPcmQueue {
         self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
     }
 
-    // Phase 3's encoder worker consumes this staged queue API.
-    #[allow(dead_code)]
+    /// Encoder worker consumes blocks into a reusable scratch buffer.
     pub(crate) fn pop_wait(&self, scratch: &mut Vec<f32>) -> Option<FloatPcmBlockInfo> {
         let mut state = self.state.lock().ok()?;
         loop {
@@ -559,6 +571,241 @@ pub struct UdpSender {
     queue: Arc<PcmQueue>,
     worker: Option<JoinHandle<Result<NetworkStats, String>>>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+pub(crate) struct FloatUdpSender {
+    stopping: Arc<AtomicBool>,
+    expected_queue_stop: Arc<AtomicBool>,
+    queue: Arc<FloatPcmQueue>,
+    worker: Option<JoinHandle<Result<NetworkStats, String>>>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+struct FloatSenderSignals {
+    stopping: Arc<AtomicBool>,
+    expected_queue_stop: Arc<AtomicBool>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+impl FloatUdpSender {
+    pub(crate) fn spawn_authenticated(
+        remote: SocketAddr,
+        queue: Arc<FloatPcmQueue>,
+        socket: UdpSocket,
+        material: UdpSessionMaterial,
+        format: AudioFormatV2,
+        pcm_payload_bytes_sent: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        format.encode().map_err(|error| error.to_string())?;
+        if format.profile != 2
+            || format.sample_format != 2
+            || format.channels != 2
+            || format.valid_bits != 24
+            || format.bytes_per_sample != 3
+            || format.sample_rate != 48_000
+            || format.frame_bytes != 6
+            || !remote.is_ipv4()
+            || !socket
+                .local_addr()
+                .map_err(|error| error.to_string())?
+                .is_ipv4()
+        {
+            return Err("Unsupported PCM24 format or UDP source for the native sink.".into());
+        }
+        let stopping = Arc::new(AtomicBool::new(false));
+        let expected_queue_stop = Arc::new(AtomicBool::new(false));
+        let worker_expected_queue_stop = expected_queue_stop.clone();
+        let worker_stopping = stopping.clone();
+        let worker_queue = queue.clone();
+        let worker_signals = FloatSenderSignals {
+            stopping: worker_stopping,
+            expected_queue_stop: worker_expected_queue_stop,
+            pcm_payload_bytes_sent: pcm_payload_bytes_sent.clone(),
+        };
+        let worker = thread::Builder::new()
+            .name("AnPod local Float32 UDP audio".into())
+            .spawn(move || {
+                send_float_loop(
+                    socket,
+                    remote,
+                    worker_queue,
+                    worker_signals,
+                    material,
+                    format,
+                )
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stopping,
+            expected_queue_stop,
+            queue,
+            worker: Some(worker),
+            pcm_payload_bytes_sent,
+        })
+    }
+
+    pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
+        self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn expect_queue_stop(&self) {
+        self.expected_queue_stop.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn resume_after_ack(&self) -> Result<(), String> {
+        if self.queue.is_stopped() || self.worker.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(
+                "Float32 sender cannot resume after its queue stopped; reconnect with a fresh queue."
+                    .into(),
+            );
+        }
+        self.expected_queue_stop.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_joined(&self) -> bool {
+        self.worker.is_none()
+    }
+
+    pub(crate) fn stop(mut self) -> Result<NetworkStats, String> {
+        self.stop_worker()
+    }
+
+    pub(crate) fn take_finished_error(&mut self) -> Option<String> {
+        let worker = self.worker.as_ref()?;
+        if !worker.is_finished() {
+            return None;
+        }
+        let worker = self.worker.take().expect("finished Float32 UDP worker");
+        match worker.join() {
+            Ok(Ok(_))
+                if self.expected_queue_stop.load(Ordering::Acquire) && self.queue.is_stopped() =>
+            {
+                None
+            }
+            Ok(Ok(_)) => Some("Float32 UDP sender stopped unexpectedly.".into()),
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("Float32 UDP worker thread panicked.".into()),
+        }
+    }
+
+    fn stop_worker(&mut self) -> Result<NetworkStats, String> {
+        self.stopping.store(true, Ordering::Release);
+        self.expected_queue_stop.store(true, Ordering::Release);
+        self.queue.stop_and_clear();
+        let Some(worker) = self.worker.take() else {
+            return Ok(NetworkStats::default());
+        };
+        worker
+            .join()
+            .map_err(|_| "Float32 UDP worker thread panicked.".to_string())?
+    }
+}
+
+impl Drop for FloatUdpSender {
+    fn drop(&mut self) {
+        let _ = self.stop_worker();
+    }
+}
+
+pub(crate) fn float_to_pcm24(sample: f32) -> Result<i32, &'static str> {
+    if !sample.is_finite() {
+        return Err("Float32 PCM contains a non-finite sample.");
+    }
+    let scaled = (sample.clamp(-1.0, 1.0) * 8_388_608.0).round();
+    Ok((scaled as i32).clamp(-8_388_608, 8_388_607))
+}
+
+fn send_float_loop(
+    socket: UdpSocket,
+    remote: SocketAddr,
+    queue: Arc<FloatPcmQueue>,
+    signals: FloatSenderSignals,
+    material: UdpSessionMaterial,
+    format: AudioFormatV2,
+) -> Result<NetworkStats, String> {
+    let FloatSenderSignals {
+        stopping,
+        expected_queue_stop,
+        pcm_payload_bytes_sent,
+    } = signals;
+    let mut encoder =
+        PacketEncoder::new_v2(&material.key, material.session_id, HOST_TO_RECEIVER, format)
+            .map_err(|error| error.to_string())?;
+    let mut stats = NetworkStats::default();
+    send_packet(
+        &socket,
+        remote,
+        &mut encoder,
+        PacketType::Format,
+        0,
+        &format.encode().map_err(|error| error.to_string())?,
+    )?;
+    stats.packets_sent = 1;
+    let mut samples = Vec::with_capacity(MAX_CAPTURE_FRAMES * FLOAT_QUEUE_CHANNELS as usize);
+    let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
+    let frames_per_packet = MAX_PAYLOAD_LEN / format.frame_bytes as usize;
+
+    while let Some(info) = queue.pop_wait(&mut samples) {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        if info.sample_rate != format.sample_rate || info.channels != format.channels as u16 {
+            return Err(
+                "Float32 queue block does not match the authenticated PCM24 format.".into(),
+            );
+        }
+        let frames = info.frame_count as usize;
+        if samples.len() != frames * info.channels as usize {
+            return Err("Float32 queue block length does not match its frame count.".into());
+        }
+        let mut offset_frames = 0;
+        while offset_frames < frames {
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if info.enqueued_at.elapsed() > Duration::from_millis(queue.max_queue_ms) {
+                queue.add_dropped((frames - offset_frames) as u64);
+                break;
+            }
+            let packet_frames = frames_per_packet.min(frames - offset_frames);
+            let sample_offset = offset_frames * info.channels as usize;
+            let sample_end = sample_offset + packet_frames * info.channels as usize;
+            payload.clear();
+            for sample in &samples[sample_offset..sample_end] {
+                let quantized = float_to_pcm24(*sample).map_err(str::to_string)? as u32;
+                payload.extend_from_slice(&quantized.to_le_bytes()[..3]);
+            }
+            let frame_index = info
+                .frame_index
+                .checked_add(offset_frames as u64)
+                .ok_or_else(|| "PCM sample frame index exhausted.".to_string())?;
+            send_packet_with(
+                &mut encoder,
+                PacketType::Audio,
+                frame_index,
+                &payload,
+                |packet| send_datagram(&socket, remote, packet),
+            )?;
+            stats.packets_sent = stats.packets_sent.saturating_add(1);
+            stats.pcm_payload_bytes_sent = stats
+                .pcm_payload_bytes_sent
+                .saturating_add(payload.len() as u64);
+            pcm_payload_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+            offset_frames += packet_frames;
+        }
+    }
+    if expected_queue_stop.load(Ordering::Acquire) {
+        Ok(stats)
+    } else {
+        Err("Float32 PCM queue stopped while the authenticated sender was active.".into())
+    }
 }
 
 impl UdpSender {

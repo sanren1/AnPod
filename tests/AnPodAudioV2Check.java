@@ -7,6 +7,9 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
@@ -217,6 +220,45 @@ public final class AnPodAudioV2Check {
         check(maxDecoder.open(maxPacket, maxPacket.length).payload.length == 1146, "largest aligned datagram");
         maxDecoder.destroy();
         v2decoder.destroy();
+        checkFloatUdpReceiverEdges(audioKey, audioSession, format);
         System.out.println("Android audio v2 vector and handshake checks passed.");
+    }
+
+    private static void checkFloatUdpReceiverEdges(byte[] key, long sessionId,
+            UdpPacketDecoder.AudioFormatV2 format) throws Exception {
+        DatagramSocket socket = new DatagramSocket(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        InetSocketAddress local = (InetSocketAddress) socket.getLocalSocketAddress();
+        UdpSessionContext context = new UdpSessionContext(socket, local, sessionId, key, format);
+        com.anpod.server.FloatPcmFrameQueue queue =
+                new com.anpod.server.FloatPcmFrameQueue(48_000, true);
+        UdpReceiver receiver = new UdpReceiver(context, queue);
+        try {
+            byte[] lowBits = { 1, 0, 0, (byte) 0xff, (byte) 0xff, (byte) 0xff };
+            byte[] firstAudio = packet(key, 2, sessionId, 1, 0, UdpPacketDecoder.AUDIO, lowBits);
+            check(receiver.processDatagram(firstAudio, firstAudio.length, local) == UdpReceiver.ProcessResult.AUDIO,
+                    "V2 audio must not wait for a possibly lost FORMAT datagram");
+            float[] samples = new float[2];
+            check(queue.poll(samples, 0, 1) == 1 && samples[0] == 1f / 8_388_608f
+                    && samples[1] == -1f / 8_388_608f,
+                    "V2 receiver must preserve PCM24 low bits into the Float32 queue");
+
+            byte[] formatPacket = packet(key, 2, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, format.encode());
+            check(receiver.processDatagram(formatPacket, formatPacket.length, local) == UdpReceiver.ProcessResult.FORMAT,
+                    "a reordered authenticated FORMAT descriptor must remain valid");
+
+            byte[] overflowingIndex = packet(key, 2, sessionId, 2, -1,
+                    UdpPacketDecoder.AUDIO, lowBits);
+            check(receiver.processDatagram(overflowingIndex, overflowingIndex.length, local)
+                    == UdpReceiver.ProcessResult.FORMAT_REJECTED,
+                    "wrapping V2 sample frame range must be rejected as a protocol error");
+            byte[] validRetry = packet(key, 2, sessionId, 2, 1,
+                    UdpPacketDecoder.AUDIO, lowBits);
+            check(receiver.processDatagram(validRetry, validRetry.length, local) == UdpReceiver.ProcessResult.AUDIO,
+                    "semantic rejection must leave its sequence available for a valid retry");
+        } finally {
+            receiver.close();
+            context.destroy();
+        }
     }
 }

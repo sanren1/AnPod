@@ -19,7 +19,7 @@ fs.mkdirSync(out, {recursive:true});
   const secondDevice={...device,serial:'TESTSECOND',transport:'usb',displayName:'Long Google Pixel Wireless Device Name',androidVersion:'14'};
   let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewBackgroundStartError='';let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
   let reviewReceiverManagementBusy=false;let reviewManagementSlotConflicts=0;
-  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
+  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
   window.reviewManagementSlotConflicts=()=>reviewManagementSlotConflicts;
@@ -76,6 +76,7 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewSetUdpStreaming=()=>{snapshot={...snapshot,state:'streaming',message:'手机正在播放',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:12,versionCode:7},canDisconnect:true,busy:false,output:'phone',connectionTransport:'wireless',transport:'wifi',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();};
   window.reviewSetManagementOnly=()=>{snapshot={...snapshot,state:'managementOnly',message:'管理连接已认证，音频不兼容',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:false,compatible:false,capabilityBits:4,versionCode:7},canDisconnect:true,busy:false,output:'computer',connectionTransport:'wireless',transport:'wifi',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();};
   window.reviewSetBusy=(busy=true)=>{snapshot.busy=busy;emit();};
+  window.reviewSetAudioFormats=(negotiatedAudioFormat,windowsMixFormat,androidOutputFormat)=>{snapshot={...snapshot,negotiatedAudioFormat,windowsMixFormat,androidOutputFormat,output:'phone'};emit();};
   window.reviewRecoverySeconds=seconds=>{snapshot={...snapshot,state:'reconnecting',networkRecoverySecondsRemaining:seconds,busy:true,canDisconnect:true,sessionSerial:'TESTUSB',sessionTransport:'wifi',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'adb',sessionAndroidVersion:'15',sessionCapabilities:null,output:'computer'};emit();};
   window.reviewSetActiveError=()=>{window.reviewSet('connected','usb');snapshot.state='error';snapshot.message='模拟播放失败详情';snapshot.statusDetail='电脑声音保持输出';emit();};
   window.reviewUsbWirelessReady=()=>{snapshot={...snapshot,state:'ready',devices:[device],transport:'wifi',connectionTransport:'wireless',output:'computer',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();};
@@ -153,36 +154,54 @@ fs.mkdirSync(out, {recursive:true});
  if(process.env.ANPOD_AUDIO_QUALITY_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
+  await page.evaluate(()=>window.reviewSetAudioFormats(
+   {codecVersion:2,sampleFormat:'pcm24le',sampleRateHz:48000,channels:2,validBitsPerSample:24,bytesPerSample:3,frameBytes:6},
+   {sampleRate:48000,channels:2,sampleFormat:'float',containerBits:32,validBits:null},
+   {sampleRate:48000,channels:2,encoding:'pcm24Packed'}));
   await page.getByRole('button',{name:/打开设置|settings/i}).click();
   let dialog=page.getByRole('dialog');
   await dialog.waitFor();
-  results.zhLabelsAndDefault=await dialog.getByRole('radio',{name:'标准 · 48 kHz / 16-bit'}).isChecked()&&await dialog.getByRole('radio',{name:/高保真/}).isDisabled()&&await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText('目前仅标准音质可用').isVisible();
+  const hifi=dialog.getByRole('radio',{name:/高保真/});
+  results.zhLabelsAndDefault=await dialog.getByRole('radio',{name:'标准 · 48 kHz / 16-bit'}).isChecked()&&!await hifi.isDisabled()&&await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText(/标准音质仍是默认/).isVisible();
+  results.zhActualFormats=await dialog.locator('.audio-quality-status').innerText().then(text=>text.includes('48 kHz · Packed PCM24LE · 2 ch · 24 有效位')&&text.includes('Float · 2 ch · 32 容器位 · 未知（尚未提供格式遥测）')&&text.includes('Packed PCM24 流'))&&await dialog.getByText(/手机物理输出设备的有效精度未知/).isVisible();
+  await hifi.check();
+  results.hifiCanBeRequested=await page.evaluate(()=>window.reviewRead().settings.audioQuality==='hifi');
+  await page.evaluate(()=>window.reviewSetBusy(true));
+  results.busyLocksQuality=await hifi.isDisabled();
+  await page.evaluate(()=>window.reviewSetBusy(false));
   results.zhDialogNoHorizontalOverflow=await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth&&[...el.querySelectorAll('.audio-quality-status div')].every(row=>row.scrollWidth<=row.clientWidth));
   await page.keyboard.press('Tab');
   results.keyboardFocusStaysInSettings=await dialog.evaluate(el=>el.contains(document.activeElement)&&getComputedStyle(document.activeElement).outlineStyle!=='none');
+  await dialog.evaluate(el=>el.scrollTop=0);
   await page.screenshot({path:`${out}/audio-quality-settings-zh-dark-360x640.png`});
   await dialog.getByRole('button',{name:'关闭',exact:true}).click();
   await page.addInitScript(()=>Object.defineProperty(navigator,'language',{configurable:true,get:()=> 'en-US'}));
   await page.reload();
   await page.locator('.app-shell').waitFor();
+  await page.evaluate(()=>window.reviewSetAudioFormats(
+   {codecVersion:1,sampleFormat:'pcm16le',sampleRateHz:48000,channels:2,validBitsPerSample:16,bytesPerSample:2,frameBytes:4},
+   {sampleRate:44100,channels:2,sampleFormat:'integer',containerBits:24,validBits:null},
+   {sampleRate:48000,channels:2,encoding:'float32'}));
   await page.getByRole('button',{name:/settings/i}).click();
   dialog=page.getByRole('dialog');await dialog.waitFor();
-  results.enLabelsAndDefault=await dialog.getByRole('radio',{name:'Standard · 48 kHz / 16-bit'}).isChecked()&&await dialog.getByRole('radio',{name:/Hi-Fi/}).isDisabled()&&await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText('Only Standard is available').isVisible();
+  results.enLabelsAndDefault=await dialog.getByRole('radio',{name:'Standard · 48 kHz / 16-bit'}).isChecked()&&!await dialog.getByRole('radio',{name:/Hi-Fi/}).isDisabled()&&await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText(/Standard remains the default/).isVisible();
+  results.enActualFormats=await dialog.locator('.audio-quality-status').innerText().then(text=>text.includes('48 kHz · PCM16LE · 2 ch · 16 valid bits')&&text.includes('44.1 kHz · Integer PCM · 2 ch · 24 container bits · Unknown')&&text.includes('Float32 stream'))&&await dialog.getByText(/physical output device’s effective precision is unknown/).isVisible();
   results.enDialogGeometry=await dialog.evaluate(el=>({dialog:{scrollWidth:el.scrollWidth,clientWidth:el.clientWidth},quality:{scrollWidth:el.querySelector('.audio-quality-settings').scrollWidth,clientWidth:el.querySelector('.audio-quality-settings').clientWidth},rows:[...el.querySelectorAll('.audio-quality-status div')].map(row=>({scrollWidth:row.scrollWidth,clientWidth:row.clientWidth,text:row.innerText}))}));
   results.enDialogNoHorizontalOverflow=results.enDialogGeometry.dialog.scrollWidth<=results.enDialogGeometry.dialog.clientWidth&&results.enDialogGeometry.quality.scrollWidth<=results.enDialogGeometry.quality.clientWidth&&results.enDialogGeometry.rows.every(row=>row.scrollWidth<=row.clientWidth);
   await page.emulateMedia({colorScheme:'light',reducedMotion:'reduce'});await page.waitForFunction(()=>document.documentElement.dataset.theme==='light');
   await page.setViewportSize({width:375,height:640});
   await dialog.getByRole('checkbox',{name:/Larger text/i}).check();
   results.largeTextApplied=await page.locator('.app-shell.large-text').count()===1;
-  results.englishLight375NoOverflow=await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth&&el.querySelector('.audio-quality-settings').scrollWidth<=el.querySelector('.audio-quality-settings').clientWidth);
+  results.englishLight375Geometry=await dialog.evaluate(el=>({dialog:{scrollWidth:el.scrollWidth,clientWidth:el.clientWidth},quality:{scrollWidth:el.querySelector('.audio-quality-settings').scrollWidth,clientWidth:el.querySelector('.audio-quality-settings').clientWidth},rows:[...el.querySelectorAll('.setting-toggle')].map(row=>({scrollWidth:row.scrollWidth,clientWidth:row.clientWidth,text:row.innerText}))}));
+  results.englishLight375NoOverflow=results.englishLight375Geometry.dialog.scrollWidth<=results.englishLight375Geometry.dialog.clientWidth&&results.englishLight375Geometry.quality.scrollWidth<=results.englishLight375Geometry.quality.clientWidth;
   await dialog.evaluate(el=>el.scrollTop=0);
   await page.screenshot({path:`${out}/audio-quality-settings-en-light-large-375x640.png`});
   await page.setViewportSize({width:640,height:360});
   results.landscapeDialogCanScroll=await dialog.evaluate(el=>{const horizontal=el.scrollWidth<=el.clientWidth&&[...el.querySelectorAll('.audio-quality-status div')].every(row=>row.scrollWidth<=row.clientWidth);if(el.scrollHeight<=el.clientHeight)return horizontal;el.scrollTop=el.scrollHeight;return horizontal&&el.scrollTop>0;});
   fs.writeFileSync(`${out}/audio-quality-result.json`,JSON.stringify(results,null,2));
-  console.log(JSON.stringify({zhLabelsAndDefault:results.zhLabelsAndDefault,zhDialogNoHorizontalOverflow:results.zhDialogNoHorizontalOverflow,keyboardFocusStaysInSettings:results.keyboardFocusStaysInSettings,enLabelsAndDefault:results.enLabelsAndDefault,enDialogNoHorizontalOverflow:results.enDialogNoHorizontalOverflow,largeTextApplied:results.largeTextApplied,englishLight375NoOverflow:results.englishLight375NoOverflow,landscapeDialogCanScroll:results.landscapeDialogCanScroll,errors}));
+  console.log(JSON.stringify({zhLabelsAndDefault:results.zhLabelsAndDefault,zhActualFormats:results.zhActualFormats,hifiCanBeRequested:results.hifiCanBeRequested,busyLocksQuality:results.busyLocksQuality,zhDialogNoHorizontalOverflow:results.zhDialogNoHorizontalOverflow,keyboardFocusStaysInSettings:results.keyboardFocusStaysInSettings,enLabelsAndDefault:results.enLabelsAndDefault,enActualFormats:results.enActualFormats,enDialogNoHorizontalOverflow:results.enDialogNoHorizontalOverflow,largeTextApplied:results.largeTextApplied,englishLight375NoOverflow:results.englishLight375NoOverflow,englishLight375Geometry:results.englishLight375Geometry,landscapeDialogCanScroll:results.landscapeDialogCanScroll,errors}));
   await browser.close();assert.deepEqual(errors,[]);
-  for(const key of ['zhLabelsAndDefault','zhDialogNoHorizontalOverflow','keyboardFocusStaysInSettings','enLabelsAndDefault','enDialogNoHorizontalOverflow','largeTextApplied','englishLight375NoOverflow','landscapeDialogCanScroll'])assert.equal(results[key],true,key);
+  for(const key of ['zhLabelsAndDefault','zhActualFormats','hifiCanBeRequested','busyLocksQuality','zhDialogNoHorizontalOverflow','keyboardFocusStaysInSettings','enLabelsAndDefault','enActualFormats','enDialogNoHorizontalOverflow','largeTextApplied','englishLight375NoOverflow','landscapeDialogCanScroll'])assert.equal(results[key],true,key);
   return;
  }
  if(process.env.ANPOD_DIAGNOSTICS_ONLY){

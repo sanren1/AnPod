@@ -31,11 +31,11 @@ enum Request {
     Start(mpsc::SyncSender<Result<(), String>>),
     StartPcmSink(Arc<PcmQueue>, mpsc::SyncSender<Result<(), String>>),
     PcmFormat(mpsc::SyncSender<Result<PcmFormat, String>>),
+    ProbeFloatFormat(mpsc::SyncSender<Result<CaptureFormatV2, String>>),
     StartFloatSink(
         Arc<FloatPcmQueue>,
         mpsc::SyncSender<Result<CaptureFormatV2, String>>,
     ),
-    FloatCaptureFormat(mpsc::SyncSender<Result<CaptureFormatV2, String>>),
     StopFloatSink(mpsc::SyncSender<Result<(), String>>),
     StopPcmSink(mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
@@ -80,19 +80,19 @@ struct CapabilitiesV2 {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CaptureFormatV2 {
-    size: u32,
-    version: u32,
-    mix_sample_rate: u32,
-    mix_channels: u32,
-    mix_sample_format: u32,
-    mix_container_bits: u32,
-    mix_valid_bits: u32,
+    pub(crate) size: u32,
+    pub(crate) version: u32,
+    pub(crate) mix_sample_rate: u32,
+    pub(crate) mix_channels: u32,
+    pub(crate) mix_sample_format: u32,
+    pub(crate) mix_container_bits: u32,
+    pub(crate) mix_valid_bits: u32,
     #[allow(dead_code)] // Retained so the cached descriptor preserves the native mix layout.
-    mix_channel_mask: u32,
-    capture_sample_rate: u32,
-    capture_channels: u32,
-    capture_sample_format: u32,
-    conversion_flags: u32,
+    pub(crate) mix_channel_mask: u32,
+    pub(crate) capture_sample_rate: u32,
+    pub(crate) capture_channels: u32,
+    pub(crate) capture_sample_format: u32,
+    pub(crate) conversion_flags: u32,
 }
 
 struct NativeV2Fns {
@@ -434,7 +434,7 @@ impl AudioActor {
                         let result = if let Some(native) = native.as_ref() {
                             match native.float_capabilities() {
                                 Err(error) => Err(error),
-                                Ok(_capabilities) if float_sink.as_ref().is_some_and(|old| Arc::ptr_eq(old, &queue)) => {
+                                Ok(_capabilities) if can_reuse_float_sink(float_sink.as_ref(), &queue) => {
                                     float_capture_format.ok_or_else(|| "Float32 采集格式尚未缓存。".to_string())
                                 }
                                 Ok(capabilities) => {
@@ -479,8 +479,33 @@ impl AudioActor {
                         } else { Err("音频采集组件尚未初始化。".into()) };
                         let _ = reply.send(result);
                     }
-                    Request::FloatCaptureFormat(reply) => {
-                        let result = float_capture_format.ok_or_else(|| "Float32 WASAPI 尚未初始化。".to_string());
+                    Request::ProbeFloatFormat(reply) => {
+                        let result = if let Some(native) = native.as_ref() {
+                            cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
+                                .and_then(|()| {
+                                    let probe = (|| {
+                                        let v2 = native.require_v2()?;
+                                        if unsafe { (v2.initialize_float)() } == 0 {
+                                            return Err(native.describe_error("无法查询 WASAPI Float32 格式"));
+                                        }
+                                        let format = native.float_capture_format()?;
+                                        if format.capture_sample_rate != format.mix_sample_rate
+                                            || format.capture_channels != 2
+                                        {
+                                            return Err("Native DLL 的 Float32 格式与 mix 格式不一致。".into());
+                                        }
+                                        Ok(format)
+                                    })();
+                                    let cleanup = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                                    float_capture_format = None;
+                                    match (probe, cleanup) {
+                                        (Ok(format), Ok(())) => Ok(format),
+                                        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                                    }
+                                })
+                        } else {
+                            Err("音频采集组件尚未初始化。".into())
+                        };
                         let _ = reply.send(result);
                     }
                     Request::StopFloatSink(reply) => {
@@ -578,19 +603,15 @@ impl AudioActor {
     pub fn pcm_format(&self) -> Result<PcmFormat, String> {
         self.call(Request::PcmFormat)
     }
-    // Staged entry point for Phase 3; Phase 2 keeps product playback on PCM16.
-    #[allow(dead_code)]
+    pub(crate) fn probe_float_format(&self) -> Result<CaptureFormatV2, String> {
+        self.call(Request::ProbeFloatFormat)
+    }
     pub(crate) fn start_float_sink(
         &self,
         queue: Arc<FloatPcmQueue>,
     ) -> Result<CaptureFormatV2, String> {
         self.call(|reply| Request::StartFloatSink(queue, reply))
     }
-    #[allow(dead_code)]
-    pub(crate) fn float_capture_format(&self) -> Result<CaptureFormatV2, String> {
-        self.call(Request::FloatCaptureFormat)
-    }
-    #[allow(dead_code)]
     pub(crate) fn stop_float_sink(&self) -> Result<(), String> {
         self.call(Request::StopFloatSink)
     }
@@ -709,6 +730,10 @@ pub(crate) unsafe extern "C" fn on_native_float_pcm(
     }
     let queue = &*user_data.cast::<FloatPcmQueue>();
     queue.push_raw(samples, frame_count, sample_rate, channels, frame_index);
+}
+
+fn can_reuse_float_sink(current: Option<&Arc<FloatPcmQueue>>, queue: &Arc<FloatPcmQueue>) -> bool {
+    !queue.is_stopped() && current.is_some_and(|old| Arc::ptr_eq(old, queue))
 }
 
 fn cleanup_capture_contexts(

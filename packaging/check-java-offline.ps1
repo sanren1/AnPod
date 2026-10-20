@@ -16,12 +16,16 @@ $sources = @(
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpPcmQueue.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpReceiver.java',
     'src\AnPod.AndroidProtocol\src\main\java\com\anpod\server\Pcm16FrameStream.java',
+    'src\AnPod.AndroidProtocol\src\main\java\com\anpod\server\Pcm24PackedCodec.java',
+    'src\AnPod.AndroidProtocol\src\main\java\com\anpod\server\FloatPcmFrameQueue.java',
+    'src\AnPod.AndroidProtocol\src\main\java\com\anpod\server\FloatPcmDriftController.java',
     'src\AnPod.AndroidServer\src\main\java\com\anpod\server\Options.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AudioFocusState.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\BackgroundStartAuthorization.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\DiscoveryAuth.java',
     'tests\AnPodUdpVectorCheck.java',
     'tests\AnPod.AndroidServer.PcmCheck.java',
+    'tests\AnPodAndroidProtocolPcm24Check.java',
     'tests\AnPodAudioFocusStateCheck.java',
     'tests\BackgroundStartAuthorizationCheck.java',
     'tests\AnPodDiscoveryAuthCheck.java',
@@ -44,6 +48,9 @@ try {
 
     & $java -cp $classes com.anpod.server.PcmCheck
     if ($LASTEXITCODE -ne 0) { throw "PcmCheck failed with exit code $LASTEXITCODE" }
+
+    & $java -cp $classes com.anpod.server.AnPodAndroidProtocolPcm24Check
+    if ($LASTEXITCODE -ne 0) { throw "AnPodAndroidProtocolPcm24Check failed with exit code $LASTEXITCODE" }
 
     & $java -cp $classes app.anpod.receiver.AnPodAudioFocusStateCheck
     if ($LASTEXITCODE -ne 0) { throw "AnPodAudioFocusStateCheck failed with exit code $LASTEXITCODE" }

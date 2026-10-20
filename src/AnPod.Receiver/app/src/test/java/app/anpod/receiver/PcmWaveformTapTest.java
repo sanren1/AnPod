@@ -25,6 +25,27 @@ public final class PcmWaveformTapTest {
     }
 
     @Test
+    public void floatSamplesPreserveIndependentChannelPeaks() {
+        PcmWaveformTap tap = new PcmWaveformTap();
+        float[] frames = new float[480 * 2];
+        for (int frame = 0; frame < 480; frame++) {
+            frames[frame * 2] = 0.375f;
+            frames[frame * 2 + 1] = -0.125f;
+        }
+        long now = 0;
+        for (int chunk = 0; chunk < 10; chunk++) {
+            tap.accept(frames, 0, 480, 2, now);
+            now += 10_000_000L;
+        }
+
+        PcmWaveformTap.Waveform waveform = tap.waveform(now);
+        assertTrue(max(waveform.left) > 0.35f);
+        assertTrue(max(waveform.left) < 0.4f);
+        assertTrue(max(waveform.right) > 0.1f);
+        assertTrue(max(waveform.right) < 0.15f);
+    }
+
+    @Test
     public void channelsAreIndependent() {
         PcmWaveformTap tap = new PcmWaveformTap();
         long now = 0;

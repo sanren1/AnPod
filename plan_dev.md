@@ -108,7 +108,7 @@ README 中 **PC 1.2.1 + Receiver 0.9.1** 的旧声学短测中，无线 UDP 低�
 1. 保持现有「播放模式：均衡／低延迟」原位独立选择。切换音质**不改变**播放模式、音量、连接方式。
 2. 显示“请求：高保真 / 实际传输：48kHz PCM24 / PC mix：48kHz Float32 / 手机输出：48kHz Float32”；如不支持，应解释是哪一层限制。
 3. 老配置字段缺失：填 `Standard`，不改变既有表现；新安装初版默认也采用 `Standard`，能力验证稳定后方可考虑调整新装默认值。
-4. 高音质不可用时禁用或提示“改用标准档”；绝不在 UI 标为高保真、实际传 PCM16。可由用户选择「自动回退」，且状态必须可见。
+4. 高音质不可用时明确显示失败原因，并允许用户选择标准档后重新连接；绝不在 UI 标为高保真、实际传 PCM16，也不在同一会话静默改格式。
 5. 正在播放时改变音质：预协商新会话并**有序停止—切换—启动**；旧会话不得混用新 PCM；失败返回原档并恢复原会话（恢复失败给出可操作错误）。
 6. 手机 AOD 仅扩展显示**实际生效音质**（如不挤占原有指标可选）；不增加 AOD 开关，也不在 PC 端控制手机 AOD。
 7. UI 不将 96kHz 软件升采样等同于源内容 Hi-Res；若显示采样率不一致，明确标注 `已重采样`。
@@ -334,15 +334,17 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 ### Phase 3 — 高保真 48kHz / 24-bit 端到端（最优先的实用增量）
 
-**任务**：PCM24 packed encode/decode + 2 包/5ms 的 UDP 切分、Android 24-bit/Float32 输出通道及高精度 PLC/漂移处理；UI 状态和自动回退。
+**任务**：PCM24 packed encode/decode + 按 ANPD v2 最大 1150 B payload 进行帧对齐分包、Android 24-bit/Float32 输出通道及高精度 PLC/漂移处理；UI 状态与格式不支持时的明确失败提示。当前不静默切换格式；Standard/HiFi 变更由用户选择并重连。48 kHz 双声道 PCM24 每帧 6 B，每包最多 191 帧；240 帧按 191+49 分包，480 帧按 191+191+98 分包，不要求固定 5 ms 采集块。
 
 **交付**：48/24 真机可用版本、格式一致性 golden vectors、30–60 分钟实测。**通过门槛**：从 PC 采集到 Android 输出前无暗中 16-bit 量化；无新增不稳定行为。
 
+**开发状态（2026-10-20）**：P5-C Java coordinator 已加入仅查询的 v1 `0x82` 能力探测、等待 EOF 后的新 v2 会话、认证 descriptor 锁定、现有连接意图/后台授权状态机复用、格式级 BIND 门控及 v2 78-byte 实际输出进度扩展。当前产品格式策略由 playback endpoint 单点控制，只接受 48 kHz 双声道 packed PCM24；profile 1/3 不进入解码/播放。JDK 17 P5-C 编译、自检向量、discovery-recovery、Rust↔Java fresh-session/拒绝测试及两代 Owner pause/恢复 loopback 已通过；Android Receiver JVM 44 项、Java offline checks、Frontend build 与目标 Playwright 场景也已通过。Host normal Clippy、V2/Float 定向测试通过；Rust 锁定离线单线程全量门禁 **111 passed / 0 failed / 1 ignored / 2 filtered**（93.98 秒）。筛除的两项是人工 PowerShell artifact 检查与显式真机 USB Receiver 测试。验证依赖提升权限以通过 DPAPI/fakeADB 环境检查；额外 `--all-targets` Clippy 仍有既有 test/bin 配置 dead-code 警告，不计作通过门禁。以上仅是源码、mock 与合成离线检查，不表示真实链路验收；用户授权跳过设备核查，真实 WASAPI capture、设备 AudioTrack 打开、物理输出有效精度、30–60 分钟稳定性和声学测量均为 **NOT_TESTED**。
+
 ### Phase 4 — Hi-Res 96kHz / 24-bit（设备能力有条件启用）
 
-**任务**：Windows mix 96k 识别、可选软件重采样与明确标记、3 包/5ms 的 UDP 切分、Android 48/96 输出能力适配。按第 14 章优先评估 Rust Rubato、必要时评估 SpeexDSP；只有在真实需要重采样的场景才引入依赖，保持 48k/24 直通。
+**任务**：Windows mix 96k 识别、按测量结果选择的软件重采样与明确标记、按 ANPD v2 payload 上限进行帧对齐分包、Android 48/96 输出能力适配。96 kHz 双声道 PCM24 每包最多 191 帧；480 帧（5 ms）按 191+191+98 分包。握手 descriptor 必须与选定格式完全一致；不支持时向用户说明并允许选择新建 48/24 会话，不能在当前会话静默改采样率。按第 14 章优先评估 Rust Rubato、必要时评估 SpeexDSP；只有在真实需要且延迟/频响/失真已测量后才引入 SRC，保持 48k/24 直通。
 
-**交付**：真实 Windows mix 为 96k 时的链路报告；48k→96k 的误导性 UI 被禁止。**通过门槛**：实际采样率真实展示，必要重采样的延迟、频响/失真和稳定性经测试；不支持时安全回落到 48k/24。
+**交付**：真实 Windows mix 为 96k 时的链路报告；48k→96k 的误导性 UI 被禁止。**通过门槛**：实际采样率真实展示，必要重采样的延迟、频响/失真和稳定性经测试；不支持时提示并由用户选择启动新的 48k/24 会话，不在已认证会话内改格式。
 
 ### Phase 5 — Oboe Native 可选输出后端（与音质档兼容）
 
@@ -432,7 +434,7 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 | 假 Hi-Res | 48k mix 被无提示升为 96k | 源 mix 前置条件 + `已重采样` 标记；默认不提供原生 Hi-Res 选项 |
 | v1 兼容性破坏 | 直接改变 7 字节认证参数或 FORMAT 标签 | 并行 v2 协议与黄金向量；老设备回退 v1 |
 | 无线断音增加 | 高位深每 5ms 拆成 2–3 包，队列不适配 | 1200B UDP 上限不变，逐帧片段可入队；真实丢包压力测试 |
-| 音频精度回退 | Android 24-bit 轨道失败时静默降 PCM16 | 明确有效输出格式；支持 Float32 输出转换，必要时整档回退 |
+| 音频精度回退 | Android 24-bit 轨道失败时静默降 PCM16 | 明确报告实际输出格式；支持 Float32 输出转换，不支持时明确失败并由用户选择新格式会话 |
 | Oboe 不更快 | iQOO 内置扬声器仍走 Legacy/Shared | 保留 AudioTrack 默认，隔离实验开关，A/B 数据说话 |
 | 不安全 USB 恢复 | 意外替换 ADB `MI_01` 或无提示重枚举 | 只绑定 Accessory `MI_00`，用户确认，断线可手工拔插或退回 USB ADB |
 | 版本/签名不一致 | Receiver 重新打包后失去原签名或 hash 白名单 | 原密钥签名、versionCode 递增、精确 artifact 审核 |

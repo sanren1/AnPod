@@ -12,6 +12,17 @@ export type Settings = {
   audioQuality: "standard" | "hifi" | "hires";
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
+export type NegotiatedAudioFormat = {
+  codecVersion: 1 | 2; sampleFormat: "pcm16le" | "pcm24le"; sampleRateHz: number;
+  channels: number; validBitsPerSample: number; bytesPerSample: number; frameBytes: number;
+};
+export type WindowsMixFormat = {
+  sampleRate: number | null; channels: number | null; sampleFormat: "integer" | "float" | null;
+  containerBits: number | null; validBits: number | null;
+};
+export type AndroidOutputFormat = {
+  sampleRate: number | null; channels: number | null; encoding: "pcm16" | "pcm24Packed" | "float32" | null;
+};
 export type Snapshot = {
   state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "managementOnly" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
@@ -22,7 +33,8 @@ export type Snapshot = {
   presence: PresenceEntry[];
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
   playbackDiagnostics: PlaybackDiagnostics | null;
-  negotiatedAudioFormat: { codecVersion: 1; sampleFormat: "pcm16le"; sampleRateHz: number; channels: number; validBitsPerSample: 16; bytesPerSample: 2; frameBytes: 4 } | null;
+  negotiatedAudioFormat: NegotiatedAudioFormat | null;
+  windowsMixFormat: WindowsMixFormat | null; androidOutputFormat: AndroidOutputFormat | null;
   output: "computer" | "phone"; settings: Settings;
   busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
   audioBitrateBps: number | null; networkRecoverySecondsRemaining?: number | null; version: string;

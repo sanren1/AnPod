@@ -1,8 +1,52 @@
-# Phase 1 audio format and authentication v2
+# Audio format and authentication v2
 
-This specification describes an offline negotiation simulator. Product playback,
-discovery, P5-C capabilities, native capture and ReceiverService remain v1 PCM16.
-All integer fields are unsigned big endian; PCM sample bytes are little endian.
+This document defines the v2 descriptor, authentication and UDP wire formats. The
+Receiver coordinator now has an additive P5-C v2 capability and a fresh-session
+v2 authentication path. Product format support is still decided by the playback
+endpoint; current Phase 3 work targets only stereo 48 kHz packed PCM24. Source
+integration and synthetic loopback checks do not establish real playback quality
+or device compatibility. All integer fields are unsigned big endian; PCM sample
+bytes are little endian.
+
+## P5-C negotiation and output reporting
+
+P5-C remains frame version 1 with management major 3 and audio major 1. Capability
+bit `0x80` (`CAP_AUDIO_V2`) is additive and is advertised only when the playback
+endpoint has a v2 consumer. The host probes it in a mutually authenticated v1
+session using a capability query whose required mask includes `0x82`; that
+session is query-only and does not claim the pending connection intent. The host
+half-closes its write side and waits for receiver EOF before opening a new socket
+and performing a fresh v2 authentication. A receiver without the capability
+returns its supported capability bitmap with a rejected result, allowing the
+host to report that v2 is unavailable.
+
+The fresh v2 session carries the selected 16-byte descriptor inside the
+authenticated handshake transcript. It then uses the existing P5-C control and
+background authorization lifecycle. Each receiver endpoint checks the session
+descriptor before BIND; descriptors it does not support are rejected without
+entering the audio decoder. The descriptor schema permits standard PCM16, hifi
+48 kHz PCM24 and hires 96 kHz PCM24, while current Phase 3 product policy supports
+only hifi 48 kHz stereo PCM24. A 96 kHz session remains unavailable until Phase 4.
+
+Legacy playback progress remains exactly 70 bytes. A v2 session appends an
+8-byte extension: schema `1`, actual opened output encoding (`0` unknown, `1`
+PCM16, `2` packed24, `3` Float32), opened channel count (`0` unknown), reserved
+zero, and actual opened sample rate as a big-endian u32 (`0` unknown). Before a
+track opens, all fields after the schema byte are zero. These values describe the
+AudioTrack format reported by the app; they do not prove the physical DAC's
+effective precision.
+
+**Implementation status (2026-10-20):** Java coordinator and synthetic loopback
+fixture cover capability probing, fresh v2 authentication, per-format endpoint
+gating, the 78-byte progress layout, and per-session PCM24 low-bit decode checks.
+P5-C javac, protocol self-checks, Rust↔Java upgrade/rejection loopbacks, and the
+two-generation owner pause/restart test pass. Java offline checks, 44 Android
+Receiver JVM tests, and the focused frontend build/Playwright check pass. The
+locked, offline, single-thread Rust suite passed **111 tests, 0 failed, 1
+ignored, 2 filtered** (93.98 seconds); the filtered tests are the manual
+PowerShell artifact check and explicitly requested real-USB Receiver test.
+Real WASAPI capture, device AudioTrack opening, physical playback, and
+acoustic/long-duration measurements remain `NOT_TESTED`.
 
 ## Descriptor (16 bytes)
 

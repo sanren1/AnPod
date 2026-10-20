@@ -44,6 +44,7 @@ final class P5cControlProtocol {
     static final int CAP_CONNECTION_INTENT = 0x00000010;
     static final int CAP_BACKGROUND_START_AUTH = 0x00000020;
     static final int CAP_BACKGROUND_TRUST_MANAGEMENT = 0x00000040;
+    static final int CAP_AUDIO_V2 = 0x00000080;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
     static final int AUTH_PENDING = 0;
     static final int AUTH_ONCE = 1;
@@ -212,6 +213,22 @@ final class P5cControlProtocol {
         putInt(payload, 58, capacityFrames);
         putInt(payload, 62, startThresholdFrames);
         putInt(payload, 66, preRollFrames);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadV2(byte[] legacyPayload, int openedTrackFormat,
+            int openedTrackChannels, int openedTrackSampleRate) {
+        if (legacyPayload == null || legacyPayload.length != 70
+                || openedTrackFormat < 0 || openedTrackFormat > 3
+                || openedTrackChannels < 0 || openedTrackChannels > 2
+                || openedTrackSampleRate < 0)
+            throw new IllegalArgumentException("invalid v2 playback progress fields");
+        byte[] payload = Arrays.copyOf(legacyPayload, 78);
+        payload[70] = 1; // schema
+        payload[71] = (byte) openedTrackFormat;
+        payload[72] = (byte) openedTrackChannels;
+        payload[73] = 0; // reserved
+        putInt(payload, 74, openedTrackSampleRate);
         return payload;
     }
 

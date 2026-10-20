@@ -29,6 +29,9 @@ import android.os.Process;
 import android.os.Binder;
 
 import com.anpod.server.Pcm16FrameStream;
+import com.anpod.server.FloatPcmFrameQueue;
+import com.anpod.server.FloatPcmDriftController;
+import com.anpod.server.Pcm24PackedCodec;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -822,6 +825,22 @@ public final class ReceiverService extends Service {
                 private boolean current() { return isCurrentOperation(ownerId, generation); }
 
                 @Override public boolean supportsPlaybackProgress() { return true; }
+                @Override public boolean supportsAudioV2() { return true; }
+                @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+                    return supportsPhase3AudioFormatV2(format);
+                }
+                @Override public int openedTrackFormatV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackFormatV2;
+                }
+                @Override public int openedTrackChannelsV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackChannelsV2;
+                }
+                @Override public int openedTrackSampleRateV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackSampleRateV2;
+                }
 
                 @Override public boolean requiresBackgroundStartAuthorization() {
                     return backgroundStandby && current();
@@ -1251,6 +1270,7 @@ public final class ReceiverService extends Service {
             ensureRunning(session);
             AudioFocusState.Action action = session.focusState.setUserPaused(paused);
             if (session.udpQueue != null) session.udpQueue.setPaused(!session.focusState.canPlay());
+            if (session.floatQueue != null) session.floatQueue.setPaused(!session.focusState.canPlay());
             if (action == AudioFocusState.Action.PAUSE && session.audioTrack != null
                     && (session.trackPlaying || !session.trackReady)) {
                 try { pauseAndFlushTrack(session, session.audioTrack); }
@@ -1264,6 +1284,8 @@ public final class ReceiverService extends Service {
                     session.audioTrack.play();
                     session.trackPlaying = true;
                     session.focusState.markTrackPlaying();
+                    session.driftPlaybackHead.reset(session.audioTrack.getPlaybackHeadPosition(), System.nanoTime());
+                    session.driftResetGeneration++;
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) audioActive = true;
                     }
@@ -1279,7 +1301,434 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private void receiveFloatAudio(AudioSession session) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+        AudioTrack track = null;
+        AudioManager manager = null;
+        AudioFocusRequest focusRequest = null;
+        AudioManager.OnAudioFocusChangeListener focusListener = null;
+        FloatPcmFrameQueue queue = null;
+        UdpReceiver receiver = null;
+        Thread networkThread = null;
+        WifiManager.WifiLock wifiLock = null;
+        String failure = "";
+        try {
+            UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.udpContext.formatV2;
+            if (!supportsPhase3AudioFormatV2(sourceFormat))
+                throw new IOException("Unsupported audio format for Phase 3 high-resolution playback");
+            ensureRunning(session);
+            WifiManager wifi = getSystemService(WifiManager.class);
+            if (wifi == null) throw new IOException("WiFi service unavailable");
+            int wifiMode = Build.VERSION.SDK_INT >= 29
+                    ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+            wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+            wifiLock.acquire();
+            boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.udpContext.playbackMode);
+            queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency);
+            receiver = new UdpReceiver(session.request.udpContext, queue);
+            UdpReceiver receiverForThread = receiver;
+            networkThread = new Thread(() -> {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+                receiverForThread.run();
+            }, "AnPod Float32 UDP packet receiver");
+            synchronized (session) {
+                ensureRunning(session);
+                session.floatQueue = queue;
+                queue.setPaused(!session.focusState.canPlay());
+                session.udpReceiver = receiver;
+                session.networkThread = networkThread;
+                networkThread.start();
+            }
+
+            OpenedV2Track openedTrack = openV2AudioTrack(sourceFormat.sampleRate,
+                    AudioFormat.CHANNEL_OUT_STEREO);
+            track = openedTrack.track;
+            synchronized (session) {
+                ensureRunning(session);
+                session.audioTrack = track;
+                session.trackWrittenFrames = 0;
+                session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+                session.openedTrackFormatV2 = openedTrack.formatCode;
+                session.openedTrackChannelsV2 = track.getChannelCount();
+                session.openedTrackSampleRateV2 = track.getSampleRate();
+            }
+
+            int capacityFrames = Build.VERSION.SDK_INT >= 24
+                    ? track.getBufferCapacityInFrames() : track.getBufferSizeInFrames();
+            int requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                    sourceFormat.sampleRate, Math.max(1, capacityFrames), lowLatency);
+            int acceptedBufferFrames = Build.VERSION.SDK_INT >= 24
+                    ? track.setBufferSizeInFrames(requestedBufferFrames) : -1;
+            int effectiveFrames = track.getBufferSizeInFrames();
+            int requestedStartFrames = 0;
+            int thresholdFrames = -1;
+            boolean thresholdLimited = false;
+            if (Build.VERSION.SDK_INT >= 31 && lowLatency && acceptedBufferFrames >= 0) {
+                requestedStartFrames = Math.min(acceptedBufferFrames, Math.max(1,
+                        sourceFormat.sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
+                int acceptedStartFrames = track.setStartThresholdInFrames(requestedStartFrames);
+                thresholdLimited = acceptedStartFrames < 0 || acceptedStartFrames != requestedStartFrames;
+                thresholdFrames = track.getStartThresholdInFrames();
+            }
+            String configuredMode = acceptedBufferFrames < 0 ? "balanced-fallback"
+                    : acceptedBufferFrames == requestedBufferFrames && !thresholdLimited
+                            ? (lowLatency ? "low-latency" : "balanced")
+                            : (lowLatency ? "low-latency-limited" : "balanced-limited");
+            if (lowLatency && requestedStartFrames > 0 && thresholdFrames != requestedStartFrames)
+                configuredMode = "low-latency-limited";
+            publishMode(session, configuredMode);
+            int minBufferFrames = Math.max(1, (openedTrack.minBufferBytes + openedTrack.frameBytes - 1)
+                    / openedTrack.frameBytes);
+            int preRollFrames = lowLatency && thresholdFrames > 0
+                    ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
+            publishMetrics(session, track.getSampleRate(), track.getChannelCount(), capacityFrames,
+                    requestedBufferFrames, acceptedBufferFrames, effectiveFrames, thresholdFrames,
+                    Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, preRollFrames, configuredMode);
+
+            int chunkFrames = Math.max(1, sourceFormat.sampleRate / 200);
+            float[] samples = new float[(chunkFrames + 1) * sourceFormat.channels];
+            byte[] packed = openedTrack.formatCode == 2
+                    ? new byte[(chunkFrames + 1) * openedTrack.frameBytes] : null;
+            manager = getSystemService(AudioManager.class);
+            final AudioSession focusSession = session;
+            final AudioTrack focusTrack = track;
+            focusListener = change -> handler.post(() ->
+                    handleAudioFocusChange(focusSession, focusTrack, change));
+            boolean focusRequested = false;
+            while (true) {
+                V2PreRollProgress preRoll = new V2PreRollProgress(session.focusState.writeGeneration());
+                while (preRoll.completedFrames() < preRollFrames) {
+                    ensureRunning(session);
+                    long blockGeneration = session.focusState.writeGeneration();
+                    preRoll.observeGeneration(blockGeneration);
+                    int count = readFloatFrames(queue, samples,
+                            Math.min(chunkFrames, preRollFrames - preRoll.completedFrames()));
+                    if (count < 0) throw new IOException("FloatAudioStreamEndedBeforePlayback");
+                    boolean complete = writeV2Frames(session, track, openedTrack, samples, count, packed,
+                            blockGeneration);
+                    long currentGeneration = session.focusState.writeGeneration();
+                    preRoll.recordWrite(blockGeneration, currentGeneration, count, complete);
+                }
+                publishPreRollFrames(session, preRoll.completedFrames());
+                synchronized (session) {
+                    ensureRunning(session);
+                    if (session.focusState.writeGeneration() != preRoll.generation()) continue;
+                    if (!focusRequested) {
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                                    .setWillPauseWhenDucked(true).setOnAudioFocusChangeListener(focusListener).build();
+                            if (manager.requestAudioFocus(focusRequest) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+                                throw new IOException("Audio focus denied");
+                        } else if (manager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
+                                AudioManager.AUDIOFOCUS_GAIN) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                            throw new IOException("Audio focus denied");
+                        }
+                        focusRequested = true;
+                    }
+                    ensureRunning(session);
+                    session.trackReady = true;
+                    if (session.focusState.canPlay()) {
+                        track.play();
+                        if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                            throw new IOException("AudioTrack did not start");
+                        session.trackPlaying = true;
+                        session.focusState.markTrackPlaying();
+                    }
+                    synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) audioActive = session.focusState.canPlay();
+                    }
+                }
+                break;
+            }
+
+            FloatPcmDriftController drift = new FloatPcmDriftController(sourceFormat.sampleRate,
+                    queue.initialTargetFrames());
+            long driftNow = System.nanoTime();
+            drift.reset(driftNow);
+            session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), driftNow);
+            long observedDriftResetGeneration = session.driftResetGeneration;
+            long observedConcealedFrames = queue.concealedFrames();
+            long observedDroppedFrames = queue.droppedFrames();
+            long observedExpiredFrames = queue.expiredFrames();
+            long observedOversizedGapSkips = queue.oversizedGapSkips();
+            int observedUnderruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+
+            while (true) {
+                ensureRunning(session);
+                awaitFocusResume(session);
+                long blockGeneration = session.focusState.writeGeneration();
+                int count = readFloatFrames(queue, samples, chunkFrames);
+                if (count < 0) {
+                    failure = "FloatAudioStreamEnded";
+                    break;
+                }
+                if (!session.focusState.acceptsWrite(blockGeneration)) continue;
+                long nowNanos = System.nanoTime();
+                int playbackPosition = track.getPlaybackHeadPosition();
+                long playedFrames = session.driftPlaybackHead.update(playbackPosition, nowNanos);
+                long concealedFrames = queue.concealedFrames();
+                long droppedFrames = queue.droppedFrames();
+                long expiredFrames = queue.expiredFrames();
+                long oversizedGapSkips = queue.oversizedGapSkips();
+                int underrunsBefore = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
+                boolean discontinuity = concealedFrames != observedConcealedFrames
+                        || droppedFrames != observedDroppedFrames
+                        || expiredFrames != observedExpiredFrames
+                        || oversizedGapSkips != observedOversizedGapSkips
+                        || (observedUnderruns >= 0 && underrunsBefore >= 0
+                                && observedUnderruns != underrunsBefore)
+                        || observedDriftResetGeneration != session.driftResetGeneration;
+                boolean playing = session.trackPlaying
+                        && session.driftPlaybackHead.isAdvancing(nowNanos)
+                        && concealedFrames == observedConcealedFrames;
+                long pendingFrames = Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, playedFrames);
+                long waterlineFrames = (long) queue.queuedFrames() + count + pendingFrames;
+                int adjustment = drift.observe(nowNanos, waterlineFrames, playing, discontinuity);
+                int outputFrames = count;
+                if (adjustment != 0 && (adjustment > 0 ? count >= 3 : count >= 2)) {
+                    outputFrames = queue.adjustDrift(samples, count, chunkFrames + 1, adjustment);
+                    drift.commit(adjustment);
+                }
+                writeV2Frames(session, track, openedTrack, samples, outputFrames, packed, blockGeneration);
+                observedDriftResetGeneration = session.driftResetGeneration;
+                observedConcealedFrames = concealedFrames;
+                observedDroppedFrames = droppedFrames;
+                observedExpiredFrames = expiredFrames;
+                observedOversizedGapSkips = oversizedGapSkips;
+                observedUnderruns = underrunsBefore;
+                if (Build.VERSION.SDK_INT >= 24) {
+                    int underruns = track.getUnderrunCount();
+                    synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) {
+                            underrunIncrement = underrunCount < 0 || underruns < underrunCount
+                                    ? -1 : underruns - underrunCount;
+                            underrunCount = underruns;
+                        }
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            failure = session.cancelled ? session.stopReason : describeFailure(error);
+        } finally {
+            session.trackPlaying = false;
+            String trackReleaseFailure;
+            synchronized (session) {
+                if (session.audioTrack == track) session.audioTrack = null;
+                trackReleaseFailure = releaseTrack(track);
+                session.openedTrackFormatV2 = 0;
+                session.openedTrackChannelsV2 = 0;
+                session.openedTrackSampleRateV2 = 0;
+            }
+            String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
+            if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
+            if (!focusReleaseFailure.isEmpty()) failure = appendFailure(failure, focusReleaseFailure);
+            if (receiver != null) receiver.close();
+            if (queue != null) queue.stop();
+            if (wifiLock != null) {
+                try { if (wifiLock.isHeld()) wifiLock.release(); }
+                catch (RuntimeException error) { failure = appendFailure(failure, "WiFiLockRelease: " + describeFailure(error)); }
+            }
+            joinNetworkThread(networkThread);
+            session.request.destroy();
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) {
+                    audioActive = false;
+                    if (failure.isEmpty()) failure = session.stopReason.isEmpty() ? "AudioSessionEnded" : session.stopReason;
+                }
+            }
+            synchronized (session) {
+                if (session.udpReceiver == receiver) session.udpReceiver = null;
+                if (session.floatQueue == queue) session.floatQueue = null;
+                if (session.networkThread == networkThread) session.networkThread = null;
+            }
+            String finalFailure = failure;
+            handler.post(() -> finishAudio(session, finalFailure));
+        }
+    }
+
+    private static boolean supportsPhase3AudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+        return format != null && format.profile == 2 && format.sampleRate == 48_000
+                && format.channels == 2 && format.sampleFormat == 2 && format.validBits == 24
+                && format.bytesPerSample == Pcm24PackedCodec.BYTES_PER_SAMPLE && format.frameBytes == 6;
+    }
+
+    static OpenedV2Track openV2AudioTrack(int sampleRate, int channelMask) throws IOException {
+        return chooseV2AudioTrack(Build.VERSION.SDK_INT, sampleRate, channelMask,
+                ReceiverService::buildV2AudioTrack);
+    }
+
+    interface V2TrackOpener {
+        OpenedV2Track open(int sampleRate, int channelMask, int encoding, int formatCode) throws IOException;
+    }
+
+    static OpenedV2Track chooseV2AudioTrack(int sdk, int sampleRate, int channelMask,
+            V2TrackOpener opener) throws IOException {
+        IOException packed24Failure = null;
+        if (sdk >= 31) {
+            try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_24BIT_PACKED, 2); }
+            catch (IOException | RuntimeException error) {
+                packed24Failure = error instanceof IOException
+                        ? (IOException) error : new IOException("Packed PCM24 AudioTrack could not be opened", error);
+            }
+        }
+        try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_FLOAT, 3); }
+        catch (IOException | RuntimeException floatFailure) {
+            IOException failure = new IOException("Neither packed PCM24 nor Float32 AudioTrack is supported", floatFailure);
+            if (packed24Failure != null) failure.addSuppressed(packed24Failure);
+            throw failure;
+        }
+    }
+
+    private static OpenedV2Track buildV2AudioTrack(int sampleRate, int channelMask, int encoding, int formatCode)
+            throws IOException {
+        int minBufferBytes;
+        try { minBufferBytes = AudioTrack.getMinBufferSize(sampleRate, channelMask, encoding); }
+        catch (RuntimeException error) { throw new IOException("AudioTrack format probe failed", error); }
+        if (minBufferBytes <= 0) throw new IOException("AudioTrack format is unsupported: " + encoding);
+        AudioTrack track = null;
+        try {
+            AudioTrack.Builder builder = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setAudioFormat(new AudioFormat.Builder().setEncoding(encoding)
+                            .setSampleRate(sampleRate).setChannelMask(channelMask).build())
+                    .setBufferSizeInBytes(minBufferBytes * 2).setTransferMode(AudioTrack.MODE_STREAM);
+            if (Build.VERSION.SDK_INT >= 26) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+            track = builder.build();
+            if (track.getState() != AudioTrack.STATE_INITIALIZED || track.getAudioFormat() != encoding)
+                throw new IOException("AudioTrack initialized with a different format");
+            int channels = track.getChannelCount();
+            if (channels != 2) throw new IOException("AudioTrack did not open stereo output");
+            if (track.getSampleRate() != sampleRate)
+                throw new IOException("AudioTrack opened a different sample rate");
+            int frameBytes = channels * (encoding == AudioFormat.ENCODING_PCM_FLOAT ? 4 : 3);
+            return new OpenedV2Track(track, formatCode, minBufferBytes, frameBytes);
+        } catch (IOException | RuntimeException error) {
+            releaseTrack(track);
+            if (error instanceof IOException) throw (IOException) error;
+            throw new IOException("AudioTrack format could not be opened: " + encoding, error);
+        }
+    }
+
+    static final class OpenedV2Track {
+        final AudioTrack track;
+        final int formatCode;
+        final int minBufferBytes;
+        final int frameBytes;
+        OpenedV2Track(AudioTrack track, int formatCode, int minBufferBytes, int frameBytes) {
+            this.track = track;
+            this.formatCode = formatCode;
+            this.minBufferBytes = minBufferBytes;
+            this.frameBytes = frameBytes;
+        }
+    }
+
+    private static int readFloatFrames(FloatPcmFrameQueue queue, float[] samples, int maxFrames) throws IOException {
+        try { return queue.readFrames(samples, 0, maxFrames); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Float32 playback worker interrupted", interrupted);
+        }
+    }
+
+    boolean writeV2Frames(AudioSession session, AudioTrack track, OpenedV2Track openedTrack,
+            float[] samples, int frameCount, byte[] packed, long generation) throws IOException {
+        if (frameCount <= 0) return true;
+        return writeV2WithGeneration(session.focusState, generation, frameCount, (offsetFrames, remainingFrames) -> {
+            ensureRunning(session);
+            int writtenFrames;
+            int writtenBytes;
+            if (openedTrack.formatCode == 2) {
+                Pcm24PackedCodec.encodeFromFloat(samples, offsetFrames * 2, remainingFrames * 2,
+                        packed, 0);
+                int written = track.write(packed, 0, remainingFrames * openedTrack.frameBytes,
+                        AudioTrack.WRITE_BLOCKING);
+                if (written <= 0) throw new IOException("AudioTrack packed PCM24 write failed: " + written);
+                if (written % openedTrack.frameBytes != 0)
+                    throw new IOException("AudioTrack returned a partial packed PCM24 frame");
+                writtenBytes = written;
+                writtenFrames = written / openedTrack.frameBytes;
+            } else {
+                int written = track.write(samples, offsetFrames * 2, remainingFrames * 2,
+                        AudioTrack.WRITE_BLOCKING);
+                if (written <= 0) throw new IOException("AudioTrack Float32 write failed: " + written);
+                if (written % 2 != 0) throw new IOException("AudioTrack returned a partial Float32 frame");
+                writtenBytes = written * Float.BYTES;
+                writtenFrames = written / 2;
+            }
+            synchronized (session) {
+                if (!session.focusState.acceptsWrite(generation)) return writtenFrames;
+                ensureRunning(session);
+                session.trackWrittenFrames += writtenFrames;
+                PCM_BYTES_WRITTEN.addAndGet(writtenBytes);
+                session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+            }
+            WAVEFORM.accept(samples, offsetFrames * 2, writtenFrames, 2, System.nanoTime());
+            return writtenFrames;
+        });
+    }
+
+    interface V2PartialFrameWriter {
+        int write(int offsetFrames, int remainingFrames) throws IOException;
+    }
+
+    static final class V2PreRollProgress {
+        private long generation;
+        private int completedFrames;
+
+        V2PreRollProgress(long generation) { this.generation = generation; }
+
+        void observeGeneration(long currentGeneration) {
+            if (currentGeneration != generation) {
+                generation = currentGeneration;
+                completedFrames = 0;
+            }
+        }
+
+        void recordWrite(long blockGeneration, long currentGeneration, int frames, boolean complete) {
+            if (blockGeneration != generation || currentGeneration != generation) {
+                generation = currentGeneration;
+                completedFrames = 0;
+            } else if (complete) {
+                completedFrames += frames;
+            }
+        }
+
+        long generation() { return generation; }
+        int completedFrames() { return completedFrames; }
+    }
+
+    static boolean writeV2WithGeneration(AudioFocusState focusState, long generation, int frameCount,
+            V2PartialFrameWriter writer) throws IOException {
+        int offset = 0;
+        while (offset < frameCount) {
+            if (!focusState.acceptsWrite(generation)) return false;
+            int writtenFrames = writer.write(offset, frameCount - offset);
+            if (writtenFrames <= 0 || writtenFrames > frameCount - offset)
+                throw new IOException("AudioTrack returned an invalid partial frame count");
+            offset += writtenFrames;
+            if (!focusState.acceptsWrite(generation)) return false;
+        }
+        return true;
+    }
+
+    private static void joinNetworkThread(Thread networkThread) {
+        if (networkThread == null || networkThread == Thread.currentThread()) return;
+        boolean interrupted = Thread.interrupted();
+        while (networkThread.isAlive()) {
+            try { networkThread.join(); }
+            catch (InterruptedException ignored) { interrupted = true; }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
     private void receiveAudio(AudioSession session) {
+        if (session.request.udpContext != null && session.request.udpContext.formatV2 != null) {
+            receiveFloatAudio(session);
+            return;
+        }
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
         AudioManager manager = null;
@@ -1730,6 +2179,7 @@ public final class ReceiverService extends Service {
                     failure = "AudioFocusLost";
                 } else if (action == AudioFocusState.Action.PAUSE) {
                     if (session.udpQueue != null) session.udpQueue.setPaused(true);
+                    if (session.floatQueue != null) session.floatQueue.setPaused(true);
                     if (session.trackPlaying || !session.trackReady) pauseAndFlushTrack(session, track);
                     else synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) audioActive = false;
@@ -1763,6 +2213,8 @@ public final class ReceiverService extends Service {
         if (!session.focusState.canPlay()) return "";
         UdpPcmQueue queue = session.udpQueue;
         if (queue != null) queue.setPaused(false);
+        FloatPcmFrameQueue floatQueue = session.floatQueue;
+        if (floatQueue != null) floatQueue.setPaused(false);
         try {
             session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), System.nanoTime());
             track.play();
@@ -1891,6 +2343,7 @@ public final class ReceiverService extends Service {
         LocalSocket socket;
         UdpReceiver receiver;
         UdpPcmQueue queue;
+        FloatPcmFrameQueue floatQueue;
         Thread networkThread;
         synchronized (session) {
             if (!session.cancelled) {
@@ -1907,6 +2360,7 @@ public final class ReceiverService extends Service {
             socket = session.socket;
             receiver = session.udpReceiver;
             queue = session.udpQueue;
+            floatQueue = session.floatQueue;
             networkThread = session.networkThread;
             if (!stopFailure.isEmpty()) session.stopReason = appendFailure(session.stopReason, stopFailure);
         }
@@ -1921,6 +2375,7 @@ public final class ReceiverService extends Service {
         if (socket != null) try { socket.close(); } catch (IOException ignored) {}
         if (receiver != null) receiver.close();
         if (queue != null) queue.stop();
+        if (floatQueue != null) floatQueue.stop();
         if (networkThread != null) networkThread.interrupt();
     }
 
@@ -2073,7 +2528,7 @@ public final class ReceiverService extends Service {
         getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
-    private static final class AudioRequest {
+    static final class AudioRequest {
         final String socketName;
         final String connectCode;
         final String playbackMode;
@@ -2115,12 +2570,16 @@ public final class ReceiverService extends Service {
         volatile LocalSocket socket;
         volatile UdpReceiver udpReceiver;
         volatile UdpPcmQueue udpQueue;
+        volatile FloatPcmFrameQueue floatQueue;
         final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
         final Pcm16FrameStream.PlaybackHeadTracker driftPlaybackHead =
                 new Pcm16FrameStream.PlaybackHeadTracker();
         volatile long driftResetGeneration;
         volatile int driftLastUnderruns = -1;
         volatile AudioTrack audioTrack;
+        volatile int openedTrackFormatV2;
+        volatile int openedTrackChannelsV2;
+        volatile int openedTrackSampleRateV2;
         boolean trackReady;
         volatile long trackWrittenFrames;
         volatile long inputPcmBytes;
@@ -2139,8 +2598,10 @@ public final class ReceiverService extends Service {
         boolean isStreamingAt(long nowNanos) throws IOException {
             if (cancelled || !focusState.canPlay() || !trackPlaying) return false;
             UdpPcmQueue queue = udpQueue;
+            FloatPcmFrameQueue floatQueue = this.floatQueue;
+            UdpReceiver receiver = udpReceiver;
             AudioTrack track = audioTrack;
-            if (queue == null || track == null) return false;
+            if ((queue == null && floatQueue == null) || track == null) return false;
             int playbackHead;
             try {
                 playbackHead = track.getPlaybackHeadPosition();
@@ -2148,8 +2609,12 @@ public final class ReceiverService extends Service {
                 if (audioTrack != track || cancelled) return false;
                 throw new IOException("AudioTrack playback position unavailable", error);
             }
-            return playbackActivity.isActive(nowNanos, playbackHead, queue.hasAuthenticatedAudio(),
-                    queue.lastAuthenticatedAudioAtNanos(), focusState.isUserPaused());
+            boolean hasAudio = queue != null ? queue.hasAuthenticatedAudio()
+                    : receiver != null && receiver.hasAuthenticatedAudio();
+            long lastAudioAt = queue != null ? queue.lastAuthenticatedAudioAtNanos()
+                    : receiver == null ? 0 : receiver.lastAuthenticatedAudioAtNanos();
+            return playbackActivity.isActive(nowNanos, playbackHead, hasAudio,
+                    lastAudioAt, focusState.isUserPaused());
         }
     }
 }
