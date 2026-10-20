@@ -658,7 +658,7 @@ public final class ReceiverService extends Service {
 
         AudioSession session = currentAudio;
         if (session != null && ownerId.equals(session.ownerId))
-            cancelAudio(session, session.request.udpContext != null ? "NetworkSessionStopped" : "UiSessionStopped");
+            cancelAudio(session, session.request.usesPacketIngress() ? "NetworkSessionStopped" : "UiSessionStopped");
         P5cReceiverCoordinator coordinator = null;
         synchronized (networkCoordinatorLock) {
             if (networkCoordinator != null && ownerId.equals(networkCoordinatorOwnerId)) {
@@ -741,7 +741,7 @@ public final class ReceiverService extends Service {
             cancelAudio(existing, "AudioSessionReplaced");
             return null;
         }
-        if (request.udpContext == null && (request.socketName == null || request.socketName.isEmpty()
+        if (request.udpContext == null && request.aoaContext == null && (request.socketName == null || request.socketName.isEmpty()
                 || request.connectCode == null || request.connectCode.isEmpty())) {
             recordStartFailure("InvalidAudioRequest");
             request.destroy();
@@ -770,7 +770,7 @@ public final class ReceiverService extends Service {
             tcpDroppedBacklogFrames = -1;
             startFailure = "";
         }
-        if (request.udpContext != null) PCM_BYTES_WRITTEN.set(0);
+        if (request.usesPacketIngress()) PCM_BYTES_WRITTEN.set(0);
         session.thread = new Thread(() -> receiveAudio(session), "AnPod audio receiver");
         session.thread.start();
         handler.post(() -> {
@@ -801,6 +801,71 @@ public final class ReceiverService extends Service {
         };
         if (Looper.myLooper() == Looper.getMainLooper()) start.run();
         else if (!handler.post(start)) context.destroy();
+    }
+
+    /** Starts one already-authenticated AOA session before START is ACKed; the caller retains context ownership. */
+    AudioSession startAoaAudio(AoaSessionContext context) throws IOException {
+        if (context == null) throw new NullPointerException("context");
+        String ownerId = networkCoordinatorOwnerId;
+        long generation = currentOperationGeneration;
+        AudioStartTicket ticket = new AudioStartTicket();
+        Runnable start = () -> {
+            synchronized (ticket) {
+                try {
+                    if (ticket.cancelled || !isCurrentOperation(ownerId, generation)
+                            || currentAudio != null || pendingAudio != null) {
+                        context.stopQueue();
+                        return;
+                    }
+                    AudioSession accepted = startAudio(AudioRequest.aoa(context));
+                    if (accepted == null || accepted.request.aoaContext != context || currentAudio != accepted)
+                        throw new IOException("AoaAudioSessionNotAccepted");
+                    ticket.accepted = accepted;
+                } catch (IOException | RuntimeException error) {
+                    context.stopQueue();
+                    if (isCurrentOperation(ownerId, generation))
+                        requestTermination(ownerId, generation, true,
+                                error instanceof IOException ? error.getMessage() : error.getClass().getSimpleName());
+                } finally { ticket.finished.countDown(); }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) start.run();
+        else if (!handler.post(start)) {
+            context.stopQueue();
+            throw new IOException("AoaAudioServiceUnavailable");
+        }
+        try {
+            if (!ticket.finished.await(3, TimeUnit.SECONDS)) {
+                AudioSession accepted;
+                synchronized (ticket) {
+                    accepted = ticket.accepted;
+                    if (accepted == null) ticket.cancelled = true;
+                }
+                if (accepted == null) {
+                    context.stopQueue();
+                    throw new IOException("AoaAudioSessionStartTimedOut");
+                }
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            AudioSession accepted;
+            synchronized (ticket) {
+                accepted = ticket.accepted;
+                if (accepted == null) ticket.cancelled = true;
+            }
+            if (accepted != null) {
+                Runnable cancel = () -> {
+                    if (isCurrentOperation(ownerId, generation) && currentAudio == accepted)
+                        cancelAudio(accepted, "AoaAudioStartInterrupted");
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) cancel.run(); else handler.post(cancel);
+            }
+            context.stopQueue();
+            throw new IOException("AoaAudioSessionStartInterrupted", interrupted);
+        }
+        if (ticket.accepted == null || currentAudio != ticket.accepted || !isCurrentOperation(ownerId, generation))
+            throw new IOException("AoaAudioSessionNotAccepted");
+        return ticket.accepted;
     }
 
     private void startNetworkBootstrap(String address, int prefixLength, long generation, String ownerId,
@@ -1268,7 +1333,7 @@ public final class ReceiverService extends Service {
 
     /** Internal pause hook: drop pending and incoming history without adding a control datagram. */
     private void setUdpAudioPaused(AudioSession session, boolean paused) throws IOException {
-        if (session == null || currentAudio != session || session.request.udpContext == null)
+        if (session == null || currentAudio != session || !session.request.usesPacketIngress())
             throw new IOException("NetworkAudioSessionNotOwned");
         PlaybackOutput output;
         boolean shouldPause = false;
@@ -1329,31 +1394,40 @@ public final class ReceiverService extends Service {
         WifiManager.WifiLock wifiLock = null;
         String failure = "";
         try {
-            UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.udpContext.formatV2;
+            UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.formatV2();
             if (!supportsPcm24AudioFormatV2(sourceFormat))
                 throw new IOException("Unsupported audio format for high-resolution playback");
             ensureRunning(session);
-            WifiManager wifi = getSystemService(WifiManager.class);
-            if (wifi == null) throw new IOException("WiFi service unavailable");
-            int wifiMode = Build.VERSION.SDK_INT >= 29
-                    ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-            wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
-            wifiLock.acquire();
-            boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.udpContext.playbackMode);
-            queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency);
-            receiver = new UdpReceiver(session.request.udpContext, queue);
-            UdpReceiver receiverForThread = receiver;
-            networkThread = new Thread(() -> {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
-                receiverForThread.run();
-            }, "AnPod Float32 UDP packet receiver");
-            synchronized (session) {
-                ensureRunning(session);
-                session.floatQueue = queue;
-                queue.setPaused(!session.focusState.canPlay());
-                session.udpReceiver = receiver;
-                session.networkThread = networkThread;
-                networkThread.start();
+            boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.playbackMode);
+            if (session.request.aoaContext != null) {
+                queue = session.request.aoaContext.floatQueue;
+                if (queue == null) throw new IOException("AOA Float queue missing");
+                synchronized (session) {
+                    ensureRunning(session);
+                    queue.setPaused(!session.focusState.canPlay());
+                }
+            } else {
+                WifiManager wifi = getSystemService(WifiManager.class);
+                if (wifi == null) throw new IOException("WiFi service unavailable");
+                int wifiMode = Build.VERSION.SDK_INT >= 29
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+                wifiLock.acquire();
+                queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency);
+                receiver = new UdpReceiver(session.request.udpContext, queue);
+                UdpReceiver receiverForThread = receiver;
+                networkThread = new Thread(() -> {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+                    receiverForThread.run();
+                }, "AnPod Float32 UDP packet receiver");
+                synchronized (session) {
+                    ensureRunning(session);
+                    session.floatQueue = queue;
+                    queue.setPaused(!session.focusState.canPlay());
+                    session.udpReceiver = receiver;
+                    session.networkThread = networkThread;
+                    networkThread.start();
+                }
             }
 
             output = openOboeOutputIfRequested(session, sourceFormat.sampleRate, sourceFormat.channels,
@@ -1932,7 +2006,7 @@ public final class ReceiverService extends Service {
     private void receiveAudio(AudioSession session) {
         if (!retryDeferredOboeClose())
             session.outputFallbackReason = "Previous Oboe stream has not closed; retaining AudioTrack output";
-        if (session.request.udpContext != null && session.request.udpContext.formatV2 != null) {
+        if (session.request.usesFloatV2Worker()) {
             receiveFloatAudio(session);
             return;
         }
@@ -1949,32 +2023,41 @@ public final class ReceiverService extends Service {
         String failure = "";
         try {
             ensureRunning(session);
-            LocalSocket ownedSocket = session.request.udpContext == null ? new LocalSocket() : null;
+            LocalSocket ownedSocket = session.request.usesPacketIngress() ? null : new LocalSocket();
             try (ownedSocket) {
                 InputStream input;
                 UdpPcmQueue.QueueInputStream udpPcmInput = null;
-                if (ownedSocket == null) {
-                    WifiManager wifi = getSystemService(WifiManager.class);
-                    if (wifi == null) throw new IOException("WiFi service unavailable");
-                    int wifiMode = Build.VERSION.SDK_INT >= 29
-                            ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-                    wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
-                    wifiLock.acquire();
-                    udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
-                            session.request.udpContext.playbackMode);
-                    udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
-                    UdpReceiver receiverForThread = udpReceiver;
-                    networkThread = new Thread(() -> {
-                        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
-                        receiverForThread.run();
-                    }, "AnPod UDP packet receiver");
-                    synchronized (session) {
-                        ensureRunning(session);
-                        session.udpQueue = udpQueue;
-                        udpQueue.setPaused(!session.focusState.canPlay());
-                        session.udpReceiver = udpReceiver;
-                        session.networkThread = networkThread;
-                        networkThread.start();
+                if (session.request.usesPacketIngress()) {
+                    if (session.request.aoaContext != null) {
+                        udpQueue = session.request.aoaContext.pcmQueue;
+                        if (udpQueue == null) throw new IOException("AOA PCM16 queue missing");
+                        synchronized (session) {
+                            ensureRunning(session);
+                            udpQueue.setPaused(!session.focusState.canPlay());
+                        }
+                    } else {
+                        WifiManager wifi = getSystemService(WifiManager.class);
+                        if (wifi == null) throw new IOException("WiFi service unavailable");
+                        int wifiMode = Build.VERSION.SDK_INT >= 29
+                                ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                        wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+                        wifiLock.acquire();
+                        udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
+                                session.request.udpContext.playbackMode);
+                        udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
+                        UdpReceiver receiverForThread = udpReceiver;
+                        networkThread = new Thread(() -> {
+                            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+                            receiverForThread.run();
+                        }, "AnPod UDP packet receiver");
+                        synchronized (session) {
+                            ensureRunning(session);
+                            session.udpQueue = udpQueue;
+                            udpQueue.setPaused(!session.focusState.canPlay());
+                            session.udpReceiver = udpReceiver;
+                            session.networkThread = networkThread;
+                            networkThread.start();
+                        }
                     }
                     udpPcmInput = (UdpPcmQueue.QueueInputStream) udpQueue.asPcmInputStream();
                     input = udpPcmInput;
@@ -2078,6 +2161,11 @@ public final class ReceiverService extends Service {
                     acceptedBufferFrames = output.effectiveBufferFrames();
                     configuredMode = lowLatency ? "low-latency" : "balanced";
                     publishMode(session, configuredMode);
+                }
+                if (session.request.formatV2() != null) {
+                    session.openedTrackFormatV2 = output.formatCode();
+                    session.openedTrackChannelsV2 = output.channels();
+                    session.openedTrackSampleRateV2 = output.sampleRate();
                 }
 
                 int driftReserveFrames = Pcm16FrameStream.driftReserveFrames(sampleRate);
@@ -2361,6 +2449,11 @@ public final class ReceiverService extends Service {
                 }
                 if (session.audioTrack == track) session.audioTrack = null;
                 if (session.playbackOutput == output) session.playbackOutput = null;
+                if (session.request.formatV2() != null) {
+                    session.openedTrackFormatV2 = 0;
+                    session.openedTrackChannelsV2 = 0;
+                    session.openedTrackSampleRateV2 = 0;
+                }
             }
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
@@ -2427,7 +2520,7 @@ public final class ReceiverService extends Service {
                 if (written <= 0) throw new IOException("Audio output write failed: " + written);
                 if (written % frameBytes != 0) throw new IOException("Audio output returned a partial PCM frame");
                 session.trackWrittenFrames += written / frameBytes;
-                if (session.request.udpContext != null) {
+                if (session.request.usesPacketIngress()) {
                     PCM_BYTES_WRITTEN.addAndGet(written);
                     session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
                 }
@@ -2870,22 +2963,41 @@ public final class ReceiverService extends Service {
         final String connectCode;
         final String playbackMode;
         final UdpSessionContext udpContext;
+        final AoaSessionContext aoaContext;
 
         AudioRequest(String socketName, String connectCode, String playbackMode) {
-            this(socketName, connectCode, playbackMode, null);
+            this(socketName, connectCode, playbackMode, null, null);
         }
 
-        private AudioRequest(String socketName, String connectCode, String playbackMode, UdpSessionContext udpContext) {
+        private AudioRequest(String socketName, String connectCode, String playbackMode,
+                UdpSessionContext udpContext, AoaSessionContext aoaContext) {
             this.socketName = socketName;
             this.connectCode = connectCode;
             this.playbackMode = playbackMode;
             this.udpContext = udpContext;
+            this.aoaContext = aoaContext;
         }
 
         static AudioRequest udp(UdpSessionContext context) {
-            return new AudioRequest(null, null, context.playbackMode, context);
+            return new AudioRequest(null, null, context.playbackMode, context, null);
         }
 
+        static AudioRequest aoa(AoaSessionContext context) {
+            return new AudioRequest(null, null, context.playbackMode, null, context);
+        }
+
+        UdpPacketDecoder.AudioFormatV2 formatV2() {
+            return udpContext != null ? udpContext.formatV2 : aoaContext == null ? null : aoaContext.formatV2;
+        }
+
+        boolean usesPacketIngress() { return udpContext != null || aoaContext != null; }
+
+        boolean usesFloatV2Worker() {
+            UdpPacketDecoder.AudioFormatV2 format = formatV2();
+            return format != null && format.profile > 1;
+        }
+
+        // AOA context lifetime belongs to its coordinator, which joins transport IO before closing it.
         void destroy() { if (udpContext != null) udpContext.destroy(); }
     }
 
@@ -2935,6 +3047,10 @@ public final class ReceiverService extends Service {
             this.request = request;
             this.ownerId = ownerId;
             this.networkGeneration = networkGeneration;
+            if (request.aoaContext != null) {
+                udpQueue = request.aoaContext.pcmQueue;
+                floatQueue = request.aoaContext.floatQueue;
+            }
         }
 
         boolean isStreamingAt(long nowNanos) throws IOException {
@@ -2953,8 +3069,10 @@ public final class ReceiverService extends Service {
             }
             if (playbackHead < 0) return false;
             boolean hasAudio = queue != null ? queue.hasAuthenticatedAudio()
+                    : request.aoaContext != null ? request.aoaContext.ingress.hasAuthenticatedAudio()
                     : receiver != null && receiver.hasAuthenticatedAudio();
             long lastAudioAt = queue != null ? queue.lastAuthenticatedAudioAtNanos()
+                    : request.aoaContext != null ? request.aoaContext.ingress.lastAuthenticatedAudioAtNanos()
                     : receiver == null ? 0 : receiver.lastAuthenticatedAudioAtNanos();
             return playbackActivity.isActive(nowNanos, (int) playbackHead, hasAudio,
                     lastAudioAt, focusState.isUserPaused());

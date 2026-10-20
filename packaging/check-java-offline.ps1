@@ -13,6 +13,8 @@ $sources = @(
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\P5cControlProtocol.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpSessionContext.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpPacketDecoder.java',
+    'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AnpdAudioIngress.java',
+    'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AoaSessionContext.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AnpuRecordCodec.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpPcmQueue.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpReceiver.java',

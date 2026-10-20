@@ -343,3 +343,29 @@ authenticated session/ingress wiring in 6b2 or the UI/state product wiring in
 6c. Real AOA mode switching, Android permission behavior on OEM devices,
 Windows PnP/WinUSB access with hardware, USB throughput, 96 kHz compatibility,
 latency, and audible quality remain `NOT_TESTED`.
+
+## 6b2a shared ingress and Receiver audio-worker foundation
+
+The Receiver now has a shared authenticated ANPD ingress for existing UDP and
+AOA contexts, plus an AOA session audio context that creates the profile-matched
+bounded queue before playback starts. Existing v1 UDP still uses its PCM queue
+accept path; locked v2 PCM16 uses the PCM16 queue worker, while packed-PCM24
+profiles use the Float queue worker. AOA requires a valid FORMAT record before
+accepting AUDIO. The Service can accept an already-authenticated AOA audio
+request, but its coordinator still owns AOA context lifetime and must stop I/O,
+join its reader/writer, and then destroy that context. The Service only stops
+the queue and does not join an AOA reader. This is shared ingress and worker
+plumbing, not complete authenticated-session product integration; the 6b2
+Coordinator and 6c UI/state wiring remain pending.
+
+Offline verification on 2026-10-20:
+
+- `packaging/check-java-offline.ps1` passed all 7 offline Java checks.
+- Android Receiver JVM tests passed 61/61 (9 XML suites; 0 failures, errors, or
+  skipped tests). Logs: `artifacts/phase6b2-java-offline.log` and
+  `artifacts/phase6b2-android-jvm.log`.
+
+These tests verify shared software ingress and Service worker behavior with
+synthetic/fake inputs. They do not establish a complete AOA connection or test
+USB permission, detach, Windows device I/O, physical playback, throughput,
+latency, or acoustics; those remain `NOT_TESTED`.

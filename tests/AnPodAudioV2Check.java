@@ -221,7 +221,55 @@ public final class AnPodAudioV2Check {
         maxDecoder.destroy();
         v2decoder.destroy();
         checkFloatUdpReceiverEdges(audioKey, audioSession, format);
+        checkAoaIngress(audioKey, audioSession);
         System.out.println("Android audio v2 vector and handshake checks passed.");
+    }
+
+    private static void checkAoaIngress(byte[] key, long sessionId) throws Exception {
+        UdpPacketDecoder.AudioFormatV2 standard = UdpPacketDecoder.AudioFormatV2.forProfile(1, 0);
+        AoaSessionContext pcm = new AoaSessionContext(sessionId, key, standard);
+        try {
+            byte[] stereoFrame = { 0x34, 0x12, (byte) 0xcc, (byte) 0xed };
+            byte[] firstAudio = packet(key, 2, sessionId, 1, 0, UdpPacketDecoder.AUDIO, stereoFrame);
+            check(pcm.ingress.accept(firstAudio, firstAudio.length) == AnpdAudioIngress.Result.FORMAT_REJECTED,
+                    "AOA must require its authenticated FORMAT before audio");
+            check(pcm.pcmQueue.queuedFrames() == 0, "audio-before-FORMAT is not admitted into the AOA queue");
+
+            byte[] formatPacket = packet(key, 2, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, standard.encode());
+            check(pcm.ingress.accept(formatPacket, formatPacket.length) == AnpdAudioIngress.Result.FORMAT,
+                    "AOA profile1 commits the locked V2 FORMAT");
+            check(pcm.ingress.accept(firstAudio, firstAudio.length) == AnpdAudioIngress.Result.AUDIO,
+                    "AOA profile1 routes authenticated audio through the PCM16 ingress");
+            check(pcm.pcmQueue.acceptedAudioFrames() == 1 && pcm.pcmQueue.audioPayloadBytes() == 4,
+                    "profile1 audio is counted as one complete stereo PCM16 frame");
+            check(pcm.pcmQueue.queuedFrames() == 1, "profile1 audio reaches its precreated bounded queue");
+        } finally { pcm.destroy(); }
+
+        checkAoaFloatProfile(key, sessionId + 1, 2, 48_000);
+        checkAoaFloatProfile(key, sessionId + 2, 3, 96_000);
+    }
+
+    private static void checkAoaFloatProfile(byte[] key, long sessionId, int profile, int sampleRate)
+            throws Exception {
+        UdpPacketDecoder.AudioFormatV2 format = UdpPacketDecoder.AudioFormatV2.forProfile(profile, 0);
+        AoaSessionContext context = new AoaSessionContext(sessionId, key, format);
+        try {
+            check(context.floatQueue.initialTargetFrames() == sampleRate / 25,
+                    "AOA profile" + profile + " creates a queue at its locked sample rate");
+            byte[] formatPacket = packet(key, 2, sessionId, 0, 0,
+                    UdpPacketDecoder.FORMAT, format.encode());
+            check(context.ingress.accept(formatPacket, formatPacket.length) == AnpdAudioIngress.Result.FORMAT,
+                    "AOA profile" + profile + " commits the locked V2 FORMAT");
+            byte[] pcm24 = { 1, 0, 0, (byte) 0xff, (byte) 0xff, (byte) 0xff };
+            byte[] audio = packet(key, 2, sessionId, 1, 0, UdpPacketDecoder.AUDIO, pcm24);
+            check(context.ingress.accept(audio, audio.length) == AnpdAudioIngress.Result.AUDIO,
+                    "AOA profile" + profile + " routes through the shared Float32 ingress");
+            float[] samples = new float[2];
+            check(context.floatQueue.poll(samples, 0, 1) == 1
+                    && samples[0] == 1f / 8_388_608f && samples[1] == -1f / 8_388_608f,
+                    "AOA profile" + profile + " keeps PCM24 low bits without PCM16 conversion");
+        } finally { context.destroy(); }
     }
 
     private static void checkFloatUdpReceiverEdges(byte[] key, long sessionId,

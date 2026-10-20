@@ -170,6 +170,35 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void aoaSessionRegistersItsPrecreatedQueueAndSelectsTheMatchingWorker() {
+        byte[] key = new byte[32];
+        AoaSessionContext pcmContext = new AoaSessionContext(501,
+                key, UdpPacketDecoder.AudioFormatV2.forProfile(1, 0));
+        try {
+            ReceiverService.AudioRequest pcmRequest = ReceiverService.AudioRequest.aoa(pcmContext);
+            ReceiverService.AudioSession pcmSession = new ReceiverService.AudioSession(501,
+                    pcmRequest, "aoa-test", 1);
+            assertTrue(pcmRequest.usesPacketIngress());
+            assertFalse(pcmRequest.usesFloatV2Worker());
+            assertSame(pcmContext.pcmQueue, pcmSession.udpQueue);
+            assertNull(pcmSession.floatQueue);
+            assertNull(pcmSession.networkThread);
+        } finally { pcmContext.destroy(); }
+
+        AoaSessionContext floatContext = new AoaSessionContext(502,
+                key, UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        try {
+            ReceiverService.AudioRequest floatRequest = ReceiverService.AudioRequest.aoa(floatContext);
+            ReceiverService.AudioSession floatSession = new ReceiverService.AudioSession(502,
+                    floatRequest, "aoa-test", 1);
+            assertTrue(floatRequest.usesFloatV2Worker());
+            assertSame(floatContext.floatQueue, floatSession.floatQueue);
+            assertNull(floatSession.udpQueue);
+            assertNull(floatSession.networkThread);
+        } finally { floatContext.destroy(); }
+    }
+
+    @Test
     public void floatPartialWriteStopsWhenPauseChangesTheBlockGeneration() throws Exception {
         AudioFocusState focus = new AudioFocusState();
         long generation = focus.writeGeneration();

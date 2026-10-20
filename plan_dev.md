@@ -372,6 +372,8 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **6b1 离线状态（2026-10-20，源码已冻结）**：Android AOA `FileChannel` I/O owner 与基于生产 ANPU codec 的 fake-channel 检查通过，定向 JUnit 5/5；验证覆盖阻塞读取消、记录 deadline、短读写及 owner descriptor 的单次关闭，不代表 OEM/真机行为。Windows WinUSB I/O owner 的 focused 7/7、Rust fmt、严格 Clippy 与 `x86_64-pc-windows-msvc` `cargo check` 均通过。6b1 仅是平台 I/O 基础，不包含 6b2 session/ingress 或 6c UI/state 接线，也没有真实 accessory 传输；Android OEM 行为、Windows 实机、完整产品会话和音频/声学仍为 **NOT_TESTED**。命令与结果见 `docs/audio-quality/06-aoa-transport.md`；日志为 `artifacts/phase6b-focused-tests.log`、`phase6b-fmt-check.log`、`phase6b-clippy.log`、`phase6b-windows-check.log` 与 Android `artifacts/phase6b1-android-build/test-results/testDebugUnitTest/TEST-app.anpod.receiver.AoaAccessoryIoTest.xml`。
 
+**6b2a 离线状态（2026-10-20，源码已冻结）**：Android 增加共享 ANPD 认证 ingress、预建 profile 匹配队列及 Receiver Service 音频 worker 接点；旧 v1 UDP PCM 队列入口保持，V2 PCM16 与 packed-PCM24 走各自 worker。Service 不接管或 join AOA I/O reader，context 销毁仍由尚待完成的 Coordinator 在 I/O 停止并 join 后负责。`packaging/check-java-offline.ps1` 的 7 项检查通过；Android Receiver JVM 测试 61/61（9 XML suites，0 failures/errors/skips），日志见 `artifacts/phase6b2-java-offline.log` 与 `artifacts/phase6b2-android-jvm.log`。这只验收共享 ingress/worker 基础，不是完整认证 session 或产品 USB Direct 接入；6b2 Coordinator 和 6c UI/state 仍待完成。USB 权限/拔插、真实 Windows/Android accessory、播放链路、吞吐、延迟和声学仍为 **NOT_TESTED**。
+
 **交付**：AOA 技术文档、可恢复连接、可重复安装与回退流程、完整声学测量。**通过门槛**：不伤害 ADB 驱动，不要求 Root，不在无用户授权时静默重置手机 USB 模式；任何失败可退回原模式。
 
 ### Phase 7 — 发行、文档与最终验收
