@@ -18,6 +18,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$componentSourceBySha256 = @{
+    'dbdf5fcc250e2d6711d16807ec97e479cd46c346cfddcc004db326a9b8abe94e' = [ordered]@{
+        sourceCommit = '393628dd2a43a221154b8226d70c03de2629cb66'
+        provenance = 'Phase 2 Native artifact built from the audited source commit.'
+    }
+    '0676594acbbb9489a6f53f661b57a3700544e6e0560f666b59163ea581d2bec7' = [ordered]@{
+        sourceCommit = '52795df94699204b7a3212803487c392217f95c3'
+        provenance = 'Phase 7 Legacy server built from the audited source commit.'
+    }
+}
+
+function Get-AnPodComponentBuildMetadata {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $source = $componentSourceBySha256[$sha256]
+    if ($source) {
+        return [ordered]@{ sha256 = $sha256; sourceCommit = $source.sourceCommit; provenance = $source.provenance }
+    }
+    return [ordered]@{ sha256 = $sha256; sourceCommit = $null; provenance = 'Source provenance is not registered for this SHA-256.' }
+}
+
 $config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 if (-not $Version) { $Version = $config.version }
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
@@ -171,9 +193,10 @@ if ($IncludeReceiverCandidate) {
         }
 
         if ($ReceiverCandidate -eq 'v3') {
-            $auditedComponentCommit = '608c98c75ec04e11555e9e547caa516c96d4e0dd'
-            $expectedNativeSha256 = 'eeda608983ef520f281d72c4f0021634b4e87c251ab83dea7f8dcb413068761e'
-            $expectedLegacySha256 = '9552af169e4c2b2ab82c39719d3afd7c2c5dd729551d8d487e836013eeb9cfa3'
+            $auditedNativeSourceCommit = '393628dd2a43a221154b8226d70c03de2629cb66'
+            $auditedLegacySourceCommit = '52795df94699204b7a3212803487c392217f95c3'
+            $expectedNativeSha256 = 'dbdf5fcc250e2d6711d16807ec97e479cd46c346cfddcc004db326a9b8abe94e'
+            $expectedLegacySha256 = '0676594acbbb9489a6f53f661b57a3700544e6e0560f666b59163ea581d2bec7'
             $receiverMatchesCandidate = $receiverMetadata.versionName -eq $versionName `
                 -and $receiverMetadata.versionCode -eq $versionCode `
                 -and $receiverMetadata.signerSha256.ToLowerInvariant() -eq 'f5d31b5c142b8be47b345971a9993bb6a124379833e01e59feb519bda9469439'
@@ -186,16 +209,23 @@ if ($IncludeReceiverCandidate) {
             $nativeHash = (Get-FileHash -LiteralPath (Join-Path $nativeSource 'audio_capture.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
             $legacyHash = (Get-FileHash -LiteralPath (Join-Path $legacyPayloadSource 'server') -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($nativeHash -ne $expectedNativeSha256 -or $legacyHash -ne $expectedLegacySha256) {
-                throw 'V3 reused Native or Legacy payload does not match the audited 608c98c candidate hashes.'
+                throw 'V3 Native or Legacy payload does not match the currently audited artifact hashes.'
             }
-            & git -C $root merge-base --is-ancestor $auditedComponentCommit $currentSourceCommit
-            if ($LASTEXITCODE -ne 0) { throw 'Audited Native/Legacy source commit is not an ancestor of the current source.' }
-            $componentInputPaths = @('src/AnPod.Native', 'src/AnPod.AndroidServer', 'src/AnPod.AndroidProtocol')
-            $componentCommittedChanges = @(& git -C $root diff --name-only "$auditedComponentCommit..$currentSourceCommit" -- @componentInputPaths)
-            if ($LASTEXITCODE -ne 0) { throw 'Could not compare the audited Native/Legacy source inputs.' }
-            $componentWorkingChanges = @(& git -C $root status --porcelain=v1 -- @componentInputPaths)
-            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the audited Native/Legacy source inputs.' }
-            if ($componentCommittedChanges.Count -or $componentWorkingChanges.Count) { throw 'Native/Legacy source inputs changed after the audited 608c98c build.' }
+            foreach ($componentSourceCommit in @($auditedNativeSourceCommit, $auditedLegacySourceCommit)) {
+                & git -C $root merge-base --is-ancestor $componentSourceCommit $currentSourceCommit
+                if ($LASTEXITCODE -ne 0) { throw "Audited component source commit $componentSourceCommit is not an ancestor of the current source." }
+            }
+            $nativeCommittedChanges = @(& git -C $root diff --name-only "$auditedNativeSourceCommit..$currentSourceCommit" -- src/AnPod.Native)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not compare the audited Native source inputs.' }
+            $nativeWorkingChanges = @(& git -C $root status --porcelain=v1 -- src/AnPod.Native)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the audited Native source inputs.' }
+            $legacyInputPaths = @('src/AnPod.AndroidServer', 'src/AnPod.AndroidProtocol')
+            $legacyCommittedChanges = @(& git -C $root diff --name-only "$auditedLegacySourceCommit..$currentSourceCommit" -- @legacyInputPaths)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not compare the audited Legacy source inputs.' }
+            $legacyWorkingChanges = @(& git -C $root status --porcelain=v1 -- @legacyInputPaths)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the audited Legacy source inputs.' }
+            if ($nativeCommittedChanges.Count -or $nativeWorkingChanges.Count) { throw 'Native source inputs changed after the audited Native build.' }
+            if ($legacyCommittedChanges.Count -or $legacyWorkingChanges.Count) { throw 'Legacy source inputs changed after the audited Legacy build.' }
             $desktopWorkingChanges = @(& git -C $root status --porcelain=v1 -- src-tauri frontend)
             if ($LASTEXITCODE -ne 0 -or ($desktopWorkingChanges.Count -and -not $ReviewWorkingTree)) { throw 'V3 desktop build inputs must be committed and clean, or explicitly use a source-verified working-tree review build.' }
         }
@@ -359,6 +389,8 @@ if ($IncludeReceiverCandidate -or $IncludeReceiverRelease) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }
 if ($ReceiverCandidate -eq 'v3' -and $IncludeReceiverCandidate) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'audio_capture.dll')
+    $legacyMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'server')
     $buildMetadata = [ordered]@{
         schemaVersion = 1
         candidate = 'receiver-v3-usb-oneclick-review'
@@ -367,13 +399,15 @@ if ($ReceiverCandidate -eq 'v3' -and $IncludeReceiverCandidate) {
         workingTreeReview = [bool]$ReviewWorkingTree
         desktop = [ordered]@{ sha256 = (Get-FileHash -LiteralPath (Join-Path $packageDir 'AnPod.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); sourceCommit = $currentSourceCommit; sourceInputsSha256 = $desktopInputsSha256 }
         receiver = [ordered]@{ sha256 = $receiverMetadata.sha256.ToLowerInvariant(); sourceCommit = $receiverMetadata.sourceCommit; sourceInputsSha256 = $receiverMetadata.sourceInputsSha256; sourceModified = $receiverMetadata.sourceModified; versionCode = $receiverMetadata.versionCode; versionName = $receiverMetadata.versionName; targetSdk = $receiverMetadata.targetSdk; variant = $receiverMetadata.variant; signerSha256 = $receiverMetadata.signerSha256.ToLowerInvariant() }
-        native = [ordered]@{ sha256 = $expectedNativeSha256; sourceCommit = $auditedComponentCommit }
-        legacyServer = [ordered]@{ sha256 = $expectedLegacySha256; sourceCommit = $auditedComponentCommit }
+        native = $nativeMetadata
+        legacyServer = $legacyMetadata
     }
     $buildMetadataPath = Join-Path $packageDir 'build-metadata.json'
     [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 }
 if ($IncludeReceiverRelease) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'audio_capture.dll')
+    $legacyMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'server')
     $buildMetadata = [ordered]@{
         schemaVersion = 1
         candidate = 'receiver-release'
@@ -383,6 +417,8 @@ if ($IncludeReceiverRelease) {
         workingTreeDirty = [bool](@(& git -C $root status --porcelain=v1).Count)
         desktop = [ordered]@{ sha256 = (Get-FileHash -LiteralPath (Join-Path $packageDir 'AnPod.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); sourceCommit = $currentSourceCommit; sourceInputsSha256 = $desktopInputsSha256 }
         receiver = [ordered]@{ sha256 = $receiverMetadata.sha256.ToLowerInvariant(); sourceCommit = $receiverMetadata.sourceCommit; sourceInputsSha256 = $receiverMetadata.sourceInputsSha256; sourceModified = $receiverMetadata.sourceModified; versionCode = $receiverMetadata.versionCode; versionName = $receiverMetadata.versionName; targetSdk = $receiverMetadata.targetSdk; variant = $receiverMetadata.variant; signerSha256 = $receiverMetadata.signerSha256.ToLowerInvariant() }
+        native = $nativeMetadata
+        legacyServer = $legacyMetadata
     }
     $buildMetadataPath = Join-Path $packageDir 'build-metadata.json'
     [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
