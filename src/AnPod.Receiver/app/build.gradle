@@ -35,8 +35,8 @@ android {
         applicationId 'app.anpod.receiver'
         minSdk 23
         targetSdk 35
-        versionCode 33
-        versionName '0.16.0-v3-flow-candidate'
+        versionCode 34
+        versionName '0.17.0-v3-flow-candidate'
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'
         externalNativeBuild {
             cmake { arguments '-DANDROID_STL=c++_shared' }
