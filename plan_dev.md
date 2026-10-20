@@ -2,9 +2,9 @@
 
 > 版本：1.1（工程执行基线；补充开源项目、官方指南及可复用实现调研）  
 > 制定日期：2026-10-19  
-> 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；实际本地开发基线为 `dev@a406ced`，后续按 `dev` 提交推进并复核差异。
+> 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；本轮开发 HEAD 为 `13d666277e1de4ccf0d41d12836a1e2a945dcb42`。本地便携候选离线验收已完成；这不代表公开发布或生产验收。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1–5 源码与相应离线验收已完成，AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。Phase 6a–6c 的 AOA 协议、平台 I/O、共享 ingress、认证 session、Host State/命令与 Android USB permission/UI 产品入口已完成源码审查和离线门禁。Phase 7 文档已更新，Receiver 0.17.0/code 34 发布签名候选 APK 已构建并验签；PC 便携候选包及最终包级 metadata/ZIP 检查正在进行，尚未形成最终候选验收。真实 WASAPI capture、手机硬件输出格式/精度、AOA 设备权限与拔插、声学/延迟/长时稳定性，以及 release 签名升级仍为 **NOT_TESTED**；源码和离线门禁不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1–5 源码与相应离线验收已完成，AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。Phase 6a–6c 的 AOA 协议、平台 I/O、共享 ingress、认证 session、Host State/命令与 Android USB permission/UI 产品入口已完成源码审查和离线门禁。Phase 7 文档与本地候选离线验收已完成：Receiver 0.17.0/code 34 发布签名候选 APK 已构建并验签，PC 1.10.0 便携候选的 ZIP、包内 metadata 与文件校验通过。真实 WASAPI capture、手机硬件输出格式/精度、AOA 设备权限与拔插、吞吐、声学/延迟/长时稳定性，以及实机原地升级仍为 **NOT_TESTED**；源码、签名验证和离线门禁不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
 
 ## 0. 开发指令与决策摘要
 
@@ -376,7 +376,7 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **6b2b 离线状态（2026-10-20，源码已冻结）**：Rust AOA owner 与 Android `AoaReceiverCoordinator`/Service endpoint 核心已有生产路径和 fake-stream session checks；实现 P5-A 认证、CAP_AUDIO_V2、共享 P5-C raw-frame verifier、descriptor 锁定后 START 前 ingress 注册、PAUSE/RESUME/STOP、队列/worker 清理。Rust owner focused 6/6、WinUSB focused 7/7、P5-C 向量 1/1、fmt 与 normal strict Clippy 通过；最终 elevated locked/offline 单线程 Rust suite 135 passed / 0 failed / 0 ignored / 2 filtered（95.81 秒）。两个过滤项为 `adb_stdin_child_helper` 与 `p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested`。`reads_the_artifact_written_by_windows_powershell_when_requested` 本轮未设置 `ANPOD_RECEIVER_ARTIFACT_DIR`，测试走无 artifact 的提前返回分支，因此不算 artifact I/O 验证。Android Receiver JVM 64/64（10 XML suites，0 failures/errors/skips），专类 focused 3/3，Java offline 7/7。日志和精确结果见 `docs/audio-quality/06-aoa-transport.md`。该批仅验收认证 session 核心，不包含生产 `UsbManager.openAccessory`/权限入口和 Coordinator 的产品创建/保留接线；这两项由 6c 完成。Android permission/拔插、Windows PnP/WinUSB 实机、真实 USB 播放、吞吐/延迟/声学仍为 **NOT_TESTED**。
 
-**6c 离线状态（2026-10-20，源码已冻结）**：Host 的 Tauri State/命令、Android `UsbManager` permission/Coordinator 与前端显式 target+binding flow 已接线；AOA 会话报告 `aoa` / `usbDirect`，不修改持久 USB/ADB 或 LAN 偏好，不在失败时回退到 ADB/LAN。Host 锁定 label 为 `AnPod USB Direct`，opaque PnP instance ID 只作为内部 target id。Rust full locked/offline suite 为 137 passed / 0 failed / 0 ignored / 2 filtered（96.81 秒），早于最后仅 label 的修改；该修改后 fmt、AOA focused 18/18、Windows target check 均通过。Android Receiver JVM 12 XML suites 共 70 tests/0 failures/errors/skips；随后新增的 callback-only test focused 1/1，Java offline 7 checks 全通过。Frontend production build 与持久 AOA smoke 检查覆盖 target/binding 明确选择、取消、实际 transport 展示和 active mode/backend locks。Receiver 0.17.0/code 34 release-signed APK 已通过离线身份、签名和包内 Native 检查；最终 portable candidate 正在构建/校验，未提前记录为通过。真实 accessory 权限、拔插恢复、Windows 设备访问、播放、吞吐、声学/延迟与长时稳定性仍为 **NOT_TESTED**。精确命令和日志见 `docs/audio-quality/06-aoa-transport.md` 与 `docs/audio-quality/COMPATIBILITY.md`。
+**6c 离线状态（2026-10-20，源码已冻结）**：Host 的 Tauri State/命令、Android `UsbManager` permission/Coordinator 与前端显式 target+binding flow 已接线；AOA 会话报告 `aoa` / `usbDirect`，不修改持久 USB/ADB 或 LAN 偏好，不在失败时回退到 ADB/LAN。Host 锁定 label 为 `AnPod USB Direct`，opaque PnP instance ID 只作为内部 target id。Rust full locked/offline suite 为 137 passed / 0 failed / 0 ignored / 2 filtered（96.81 秒），早于最后仅 label 的修改；该修改后 fmt、AOA focused 18/18、Windows target check 均通过。Android Receiver JVM 12 XML suites 共 70 tests/0 failures/errors/skips；随后新增的 callback-only test focused 1/1，Java offline 7 checks 全通过。Frontend production build 与持久 AOA smoke 检查覆盖 target/binding 明确选择、取消、实际 transport 展示和 active mode/backend locks。Receiver 0.17.0/code 34 release-signed APK 已通过离线身份、签名和包内 Native 检查；Phase 7 的本地 portable candidate 离线验收现已完成，记录见下文。真实 accessory 权限、拔插恢复、Windows 设备访问、播放、吞吐、声学/延迟与长时稳定性仍为 **NOT_TESTED**。精确命令和日志见 `docs/audio-quality/06-aoa-transport.md` 与 `docs/audio-quality/COMPATIBILITY.md`。
 
 **交付**：AOA 技术文档、可恢复连接、可重复安装与回退流程、完整声学测量。**通过门槛**：不伤害 ADB 驱动，不要求 Root，不在无用户授权时静默重置手机 USB 模式；任何失败可退回原模式。
 
@@ -384,7 +384,20 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 **任务**：稳定档默认值策略、混合老/新版本兼容、错误上报、文档和 release APK 精确校验。**交付**：`FORMAT_V2.md`、`COMPATIBILITY.md`、`BENCHMARKS.md`、`ROLLBACK.md`、README、第三方来源与许可证索引、打包日志、签名/制品哈希、版本更新和最终报告。性能与真机项目没有数据时记录为 **NOT_TESTED**，不以离线回归数或 Echo RTT 替代实测。
 
-**当前状态（2026-10-20）**：兼容性、基准与回退文档、README 和第三方归属索引已按当前源码更新。Receiver 发布签名 APK 已构建并核验；portable ZIP 及实际包内 build-metadata 还在构建/验证，最终 SHA-256 待制品生成后补录。性能与设备项保持 **NOT_TESTED**。
+**当前状态（2026-10-20）**：兼容性、基准与回退文档、README 和第三方归属索引已按当前源码更新。本地候选离线验收完成，最终记录如下；这不是公开发布或生产验收。
+
+| 制品 | 版本/来源 | SHA-256 与验收记录 |
+|---|---|---|
+| PC portable ZIP | AnPod 1.10.0；build/desktopSource `13d666277e1de4ccf0d41d12836a1e2a945dcb42`；desktopInputs `2c0c6831306128ae009a1096828bf76fb0bdf37f25a3618f6c0e44c3629dd546` | `artifacts/AnPod-1.10.0-tauri-win-x64-portable.zip`，18,394,287 bytes，`e7295e58f228b80ea920f91c2c0ebbc5ccb3c02bd30ea436a0a5ba35ae9eac04`；49 entries/stage files，同名同流，components 5/5，metadata checks 11/11。AnPod.exe：`b1233bd162bfa7c33b8ca25408baf310ecdb88337f3c7b9413e49fdddd2b9d82`。 |
+| Receiver APK | `0.17.0-v3-flow-candidate` / code 34；source `8ca9638db128f99e36769f42de18ed9244f457c2`；sourceInputs `c53bf4adff2b928e5a4edc499d0ad2eb639ec86ae8fe8d2407da8f09bcfbc890`；`sourceModified=false` | SHA-256 `711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83`；signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。复用相同 APK 字节的既有离线签名验证；不代表手机安装或升级通过。 |
+| Native capture DLL | source `393628dd2a43a221154b8226d70c03de2629cb66` | SHA-256 `dbdf5fcc250e2d6711d16807ec97e479cd46c346cfddcc004db326a9b8abe94e`。 |
+| Legacy server | source `52795df94699204b7a3212803487c392217f95c3` | SHA-256 `0676594acbbb9489a6f53f661b57a3700544e6e0560f666b59163ea581d2bec7`。 |
+
+便携包审计记录为 `artifacts/phase7-portable-audit.json` 与 `artifacts/phase7-portable-audit.log`。审计时 tracked tree clean；metadata 的 `workingTreeDirty=true` 来自保留的三个未跟踪用户 cache 目录。README 统计为 13 个 Markdown 链接（9 个本地、4 个外部）、1 个 Markdown 图片和 1 个 HTML 图片，本地目标均存在。旧聚合报告的原始 FAIL 表达式不可追溯，旧报告被覆盖后的读取输出恢复记录见 `artifacts/phase7-portable-audit-reconstructed-old-report.json` 与 `.log`；不将其表述为保留了旧报告原始字节。
+
+历史门禁顺序保持原样：Rust full 137 passed / 0 failed / 0 ignored / 2 filtered（96.81 秒）早于仅 label 修改，之后运行 AOA focused 18/18、fmt 与 Windows target check；Android full JVM 70 tests/12 suites 早于最终 callback-only 用例修改，之后该用例 focused 1/1（不并入 full 计数）；Java offline 7 checks、Frontend production build + smoke、以及真实读取最终 artifact 的审计均通过。未因本次计划更新重跑 Rust/JVM/Gradle/签名或重建 ZIP。
+
+真实 WASAPI capture/输出精度、手机硬件输出格式/精度、AOA 真实权限与拔插、真实吞吐、声学/延迟/长时稳定性和实机原地升级仍为 **NOT_TESTED**。性能与设备项不以离线回归、签名验证或包级校验替代。
 
 **阶段推进规则**：Phase 2 之后允许在隔离开发路径中先推进下一阶段的源码和相关离线门禁；这不代表前阶段尚未执行的设备、声学、延迟或稳定性门槛已验收。每个阶段仍须保留 `PASS`、`NOT_TESTED` 与失败证据，不能以源码/合成测试代替真实链路验收。发行、稳定默认值变更和最终验收仍须满足相应设备实测门槛；`preview` 已有稳定工作路径不得回退。
 
