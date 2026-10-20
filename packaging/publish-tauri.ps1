@@ -367,6 +367,9 @@ New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { $source = if ($name -eq 'audio_capture.dll') { $nativeSource } elseif ($name -eq 'server') { $legacyPayloadSource } else { $deps }; Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $packageDir $name) }
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
+$audioQualityDocsDir = Join-Path $packageDir 'docs\audio-quality'
+New-Item -ItemType Directory -Path $audioQualityDocsDir -Force | Out-Null
+Get-ChildItem -LiteralPath (Join-Path $root 'docs\audio-quality') -Filter '*.md' -File | Copy-Item -Destination $audioQualityDocsDir
 Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'frontend\public\icon.png') -Destination (Join-Path $packageDir 'icon.png')

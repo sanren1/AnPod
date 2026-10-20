@@ -108,9 +108,14 @@ The pinned release and package contents are recorded in
 APK's `Oboe-ATTRIBUTION.txt` records the upstream version and copyright owner;
 the upstream release does not contain a separate NOTICE file.
 
-The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
-queue and applies a short fade when trimming backlog. This is AnPod-owned code
-and adds no dependency or change to the Native DLL protocol.
+The Phase 6 AOA protocol, session owners, USB record framing, Windows WinUSB
+adapter, Android `FileChannel` adapter, and shared PCM ingress are AnPod-owned
+code. They use the existing `windows` crate and Android/Java platform APIs;
+Phase 6 did not add a third-party USB, cryptography, or audio dependency. AOA
+uses a session-only secret derived from the existing ANPB binding and does not
+change the saved binding format. The `AnPod Lab` / `AOA Bulk Probe` echo tool
+remains a separate diagnostic identity from the product `AnPod` / `AnPod USB
+Direct` identity.
 
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional

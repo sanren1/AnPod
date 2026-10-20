@@ -1,16 +1,11 @@
-# AOA direct audio transport (Phase 6 implementation foundations)
+# AOA direct audio transport
 
-This specification defines the accepted accessory-mode byte-stream transport
-for an AnPod host and Receiver pair. Phase 6a implements its offline record
-codec, transport-specific binding derivation, and shared-vector checks. It
-reuses the existing ANPB binding,
-P5-A v2 handshake, P5-C authenticated control messages and ANPD v2 encrypted
-audio packets. It does not reuse the AOA 4096-byte echo probe, ADB TCP, or the
-LAN UDP transport context. Phase 6a protocol codecs, the 6b1 platform I/O
-owners, and the 6b2 authenticated session cores have offline implementations.
-The 6b2 host owner and Android coordinator are not yet opened through the
-product USB permission/state entrypoints, and no physical accessory transfer
-has been tested.
+This specification defines the accessory-mode byte-stream transport for an
+AnPod host and Receiver pair. Phase 6a–6c source integration and offline gates
+are complete: AOA uses an isolated binding secret, the existing P5-A v2
+handshake, authenticated P5-C control, ANPD v2 audio, ANPU record framing,
+platform I/O owners, and the product USB permission/state entrypoints. It does
+not reuse the AOA 4096-byte echo probe, ADB TCP, or the LAN UDP context. The release-signed Receiver candidate has passed offline package inspection; the portable package records actual component hashes and registered source provenance in its build metadata. No physical accessory transfer or audio playback has been tested.
 
 The Receiver must have the matching accessory-mode application installed. The
 first product stage connects only to a target already in AOA accessory mode;
@@ -315,8 +310,11 @@ have offline implementations. Android's focused `AoaAccessoryIoTest` passed
 JDK 17 and SDK 35 using:
 
 ```powershell
-:app:testDebugUnitTest --tests app.anpod.receiver.AoaAccessoryIoTest --offline --no-daemon -PreceiverBuildDir=F:\Program\AnPod\artifacts\phase6b1-android-build
+gradlew.bat -p src/AnPod.Receiver :app:testDebugUnitTest --tests app.anpod.receiver.AoaAccessoryIoTest --offline --no-daemon -PreceiverBuildDir=<absolute-repo>\artifacts\phase6b1-android-build
 ```
+
+Replace `<absolute-repo>` with the local checkout path; this is equivalent to
+the recorded invocation and keeps machine-specific paths out of the document.
 
 The XML result is
 `artifacts/phase6b1-android-build/test-results/testDebugUnitTest/TEST-app.anpod.receiver.AoaAccessoryIoTest.xml`.
@@ -381,10 +379,9 @@ isolated coordinator that authenticates P5-A v2, requires the AOA capability
 query first, validates raw P5-C frames, registers the descriptor-matched
 ingress before acknowledging START, and owns transport/context teardown. Its
 Service endpoint reuses the existing audio workers and playback controls. The
-production `UsbManager.openAccessory` permission/state entrypoint and
-coordinator creation/retention are still pending 6c; the current Java
-coordinator tests use fake channels and an in-memory endpoint. This milestone
-is session-core verification, not a complete product USB Direct path.
+6b2 coordinator tests use fake channels and an in-memory endpoint; production
+`UsbManager.openAccessory`, permission handling, Android Coordinator
+ownership, and the host State/command route are recorded under 6c below.
 
 Offline verification on 2026-10-20:
 
@@ -418,7 +415,47 @@ These checks exercise synthetic handshakes, fake byte-stream I/O, queue
 lifecycles, and the existing audio worker. They do not exercise the Android
 permission dialog, accessory attachment/detachment, Windows PnP/WinUSB hardware,
 complete product session recovery, physical playback, throughput, latency, or
-acoustics. Those remain `NOT_TESTED`. The production accessory descriptor must
-be opened while reserving the single coordinator owner slot; a separate
-`isAvailable` check before `UsbManager.openAccessory` is not sufficient. That
-product entrypoint is outside the 6b2b core and remains pending 6c.
+acoustics. Those remain `NOT_TESTED`.
+
+## 6c product entrypoint and offline status
+
+The Receiver foreground UI exposes USB Direct and requests Android accessory
+permission for the selected device. Its coordinator owns the PFD, transport
+workers, authenticated context, and teardown; the Service owns audio queue
+playback but does not join USB I/O workers. The host exposes target listing and
+`start_aoa_audio`, requires an explicit saved binding and target selection, and
+reports the session as `aoa` / `usbDirect`. USB Direct does not alter the
+persistent USB/ADB or LAN preference and does not silently fall back to ADB.
+On Windows it requires an already available WinUSB accessory interface. The
+manual mode-switch helper is separate and restricted to the documented iQOO
+11 V2243A / `VID_2D95&PID_6013&MI_02` pre-switch interface.
+
+The final Phase 6c offline source gates completed on 2026-10-20:
+
+- Host Rust full locked/offline suite: 137 passed, 0 failed, 0 ignored, 2
+  filtered (96.81 seconds), before the final opaque-device-label-only change.
+  After that change, formatting, AOA focused tests (18/18), and the Windows
+  target check passed. The labels are the fixed product name; the opaque PnP
+  instance ID is retained only as an internal target identifier.
+- Android Receiver JVM suite: 70 tests, 0 failures/errors/skips across 12 XML
+  suites. The final callback-only test then passed focused (1/1); Java offline
+  checks passed 7/7. Logs: `artifacts/phase6c-full-jvm.log`,
+  `artifacts/phase6c-focused-final.log`, and `artifacts/phase6c-java-offline.log`.
+- Frontend production build and persistent AOA smoke check passed for
+  explicit target/binding selection, cancellation, actual transport display,
+  and active-session mode/backend locks.
+
+The signed Receiver APK build is verified. Portable package checks and its final SHA-256 are recorded in the development plan after package generation; they are not embedded in this document, which ships in the package. USB permission UX on hardware, accessory attach/detach recovery,
+Windows PnP/WinUSB hardware access, real playback, throughput, acoustic
+latency, and long-duration stability remain `NOT_TESTED`. Source and synthetic
+gates do not establish those results.
+
+The Receiver candidate is `0.17.0-v3-flow-candidate` / code 34, built from
+source commit `8ca9638db128f99e36769f42de18ed9244f457c2` with
+`sourceModified=false`. Its APK SHA-256 is
+`711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83`; the
+verified release signer is
+`f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`. Rust
+loaded and read this exact APK through the artifact test. Signature and APK
+inspection do not verify device installation, in-place upgrade, permission
+behavior, or playback.
