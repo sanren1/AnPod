@@ -144,6 +144,83 @@ fn v2_packet_matches_shared_vectors_and_rejects_cross_version_and_bad_format() {
 }
 
 #[test]
+fn aoa_v2_packets_match_all_profiles_reject_lan_keys_and_replay() {
+    let expected = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/aoa-v1-vectors.txt"
+    ))
+    .unwrap()
+    .lines()
+    .filter_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if value.is_empty()
+            || !value.len().is_multiple_of(2)
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some((
+            name.to_owned(),
+            (0..value.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+                .collect::<Vec<_>>(),
+        ))
+    })
+    .collect::<std::collections::HashMap<_, _>>();
+
+    for profile in 1..=3 {
+        let prefix = format!("profile.{profile}");
+        let format = AudioFormatV2::for_profile(profile, 0).unwrap();
+        let session_id = 0x0102_0304_0506_0708 + (profile as u64 - 1);
+        let key: [u8; 32] = expected[&format!("{prefix}.key_h2r_audio")]
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let mut decoder =
+            PacketDecoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format).unwrap();
+        let format_packet = &expected[&format!("{prefix}.format_datagram")];
+        let decoded_format = decoder.open(format_packet).unwrap();
+        assert_eq!(decoded_format.payload, format.encode().unwrap());
+        assert_eq!(decoded_format.header.sample_frame_index, 0);
+        decoder.commit(0);
+        let audio_packet = &expected[&format!("{prefix}.audio_datagram")];
+        let decoded_audio = decoder.open(audio_packet).unwrap();
+        assert_eq!(decoded_audio.header.sample_frame_index, 0);
+        assert_eq!(decoded_audio.payload.len() % format.frame_bytes as usize, 0);
+        assert_eq!(
+            decoded_audio.payload,
+            expected[&format!("{prefix}.audio_payload")]
+        );
+        decoder.commit(1);
+        assert_eq!(
+            decoder.open(audio_packet).unwrap_err(),
+            ProtocolError::Replay
+        );
+
+        let wrong_key: [u8; 32] = expected[&format!("{prefix}.wrong_domain_audio_key")]
+            .as_slice()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            PacketDecoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format)
+                .unwrap()
+                .open(&expected[&format!("{prefix}.wrong_domain_audio_datagram")])
+                .unwrap_err(),
+            ProtocolError::Authentication
+        );
+        assert_ne!(key, wrong_key);
+
+        assert_eq!(
+            PacketEncoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format)
+                .unwrap()
+                .encode_at(2, PacketType::Audio, 0, &[0]),
+            Err(ProtocolError::InvalidFormat)
+        );
+    }
+}
+
+#[test]
 fn v2_descriptors_roundtrip_and_reject_unknown_or_reserved_fields() {
     for profile in 1..=3 {
         for mode in 0..=1 {

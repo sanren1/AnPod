@@ -13,6 +13,7 @@ $sources = @(
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\P5cControlProtocol.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpSessionContext.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpPacketDecoder.java',
+    'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\AnpuRecordCodec.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpPcmQueue.java',
     'src\AnPod.Receiver\app\src\main\java\app\anpod\receiver\UdpReceiver.java',
     'src\AnPod.AndroidProtocol\src\main\java\com\anpod\server\Pcm16FrameStream.java',
@@ -29,7 +30,8 @@ $sources = @(
     'tests\AnPodAudioFocusStateCheck.java',
     'tests\BackgroundStartAuthorizationCheck.java',
     'tests\AnPodDiscoveryAuthCheck.java',
-    'tests\AnPodAudioV2Check.java'
+    'tests\AnPodAudioV2Check.java',
+    'tests\AnPodAoaVectorCheck.java'
 ) | ForEach-Object { Join-Path $repo $_ }
 
 New-Item -ItemType Directory -Path $classes | Out-Null
@@ -45,6 +47,9 @@ try {
 
     & $java -cp $classes app.anpod.receiver.AnPodAudioV2Check (Join-Path $repo 'tests\audio-v2-vectors.txt')
     if ($LASTEXITCODE -ne 0) { throw "AnPodAudioV2Check failed with exit code $LASTEXITCODE" }
+
+    & $java -cp $classes app.anpod.receiver.AnPodAoaVectorCheck (Join-Path $repo 'tests\aoa-v1-vectors.txt')
+    if ($LASTEXITCODE -ne 0) { throw "AnPodAoaVectorCheck failed with exit code $LASTEXITCODE" }
 
     & $java -cp $classes com.anpod.server.PcmCheck
     if ($LASTEXITCODE -ne 0) { throw "PcmCheck failed with exit code $LASTEXITCODE" }

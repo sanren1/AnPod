@@ -65,6 +65,24 @@ pub(crate) struct BindingMaterial {
 }
 
 impl BindingMaterial {
+    pub(crate) fn derive_aoa_transport(&self) -> Self {
+        let mut salt_input = b"AnPod AOA Direct binding salt v1\0".to_vec();
+        salt_input.extend_from_slice(&self.host_id);
+        salt_input.extend_from_slice(&self.receiver_id);
+        let salt = Sha256::digest(&salt_input);
+        salt_input.fill(0);
+
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), &self.secret);
+        let mut secret = [0; 32];
+        hkdf.expand(b"AnPod AOA Direct P5-A binding secret v1", &mut secret)
+            .expect("32-byte HKDF output");
+        Self {
+            host_id: self.host_id,
+            receiver_id: self.receiver_id,
+            secret,
+        }
+    }
+
     pub(crate) fn duplicate_for_session(&self) -> Self {
         Self {
             host_id: self.host_id,

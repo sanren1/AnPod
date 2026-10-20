@@ -1,5 +1,64 @@
 use super::*;
 
+fn aoa_vectors() -> std::collections::HashMap<String, Vec<u8>> {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/aoa-v1-vectors.txt"
+    ))
+    .unwrap()
+    .lines()
+    .filter_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if value.is_empty()
+            || !value.len().is_multiple_of(2)
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some((
+            name.to_owned(),
+            (0..value.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+                .collect(),
+        ))
+    })
+    .collect()
+}
+
+#[test]
+fn aoa_p5c_control_vectors_match_existing_encoder_for_all_profiles() {
+    let vectors = aoa_vectors();
+    for profile in 1..=3 {
+        let prefix = format!("profile.{profile}");
+        let session = 0x0102_0304_0506_0708 + (profile as u64 - 1);
+        let key: [u8; 32] = vectors[&format!("{prefix}.key_h2r_control")]
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let query = encode_control(
+            &key,
+            HOST_TO_RECEIVER_CONTROL,
+            session,
+            0,
+            CAPABILITIES_QUERY,
+            &vectors[&format!("{prefix}.capabilities_query_payload")],
+        )
+        .unwrap();
+        assert_eq!(query, vectors[&format!("{prefix}.anpc_capabilities_query")]);
+        let bind = encode_control(
+            &key,
+            HOST_TO_RECEIVER_CONTROL,
+            session,
+            1,
+            BIND,
+            &vectors[&format!("{prefix}.aoa_bind_payload")],
+        )
+        .unwrap();
+        assert_eq!(bind, vectors[&format!("{prefix}.anpc_aoa_bind")]);
+    }
+}
+
 #[test]
 fn background_authorization_ack_enforces_exact_length_and_status_range() {
     let request_id = [0x35; 16];

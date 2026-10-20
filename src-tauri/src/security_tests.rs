@@ -29,6 +29,17 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn vector(name: &str) -> Vec<u8> {
+    let value = include_str!("../../tests/aoa-v1-vectors.txt")
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("missing vector {name}"));
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
+}
+
 #[test]
 fn mutual_handshake_derives_identical_directional_keys_and_rebuilds_fresh() {
     let (host, receiver) = complete();
@@ -384,4 +395,89 @@ fn generated_binding_material_is_fresh() {
     assert_ne!(first.host_id, second.host_id);
     assert_ne!(first.receiver_id, second.receiver_id);
     assert_ne!(first.secret, second.secret);
+}
+
+#[test]
+fn aoa_binding_derivation_matches_fixed_vector_and_rejects_lan_proof() {
+    let mut material = BindingMaterial {
+        host_id: [0; 16],
+        receiver_id: [0; 16],
+        secret: [0; 32],
+    };
+    material.host_id.copy_from_slice(&vector("binding.host_id"));
+    material
+        .receiver_id
+        .copy_from_slice(&vector("binding.receiver_id"));
+    material
+        .secret
+        .copy_from_slice(&vector("binding.synthetic_secret"));
+
+    let derived = material.derive_aoa_transport();
+    assert_eq!(derived.host_id, material.host_id);
+    assert_eq!(derived.receiver_id, material.receiver_id);
+    assert_eq!(derived.secret.as_slice(), vector("aoa.binding_secret"));
+    assert_ne!(derived.secret, material.secret);
+
+    for profile in 1..=3 {
+        let prefix = format!("profile.{profile}");
+        let transcript = vector(&format!("{prefix}.transcript"));
+        let host_proof = hmac(
+            &derived.secret,
+            b"AnPod P5-A proof host v2",
+            &transcript,
+            &[],
+        );
+        let receiver_proof = hmac(
+            &derived.secret,
+            b"AnPod P5-A proof receiver v2",
+            &transcript,
+            &[],
+        );
+        let mut proof_pair = [0; 64];
+        proof_pair[..32].copy_from_slice(&host_proof);
+        proof_pair[32..].copy_from_slice(&receiver_proof);
+        let ready = hmac(
+            &derived.secret,
+            b"AnPod P5-A ready v2",
+            &transcript,
+            &proof_pair,
+        );
+        assert_eq!(
+            hex(&host_proof),
+            hex(&vector(&format!("{prefix}.host_proof")))
+        );
+        assert_eq!(
+            hex(&receiver_proof),
+            hex(&vector(&format!("{prefix}.receiver_proof")))
+        );
+        assert_eq!(hex(&ready), hex(&vector(&format!("{prefix}.ready_proof"))));
+        assert!(verify_hmac(
+            &derived.secret,
+            b"AnPod P5-A proof receiver v2",
+            &transcript,
+            &[],
+            &vector(&format!("{prefix}.wrong_domain_receiver_proof")),
+        )
+        .is_err());
+
+        let keys = derive_v2_keys(&derived.secret, &transcript);
+        for (actual, name) in [
+            (keys.host_to_receiver_audio, "key_h2r_audio"),
+            (keys.receiver_to_host_audio, "key_r2h_audio"),
+            (keys.host_to_receiver_control, "key_h2r_control"),
+            (keys.receiver_to_host_control, "key_r2h_control"),
+        ] {
+            assert_eq!(hex(&actual), hex(&vector(&format!("{prefix}.{name}"))));
+        }
+    }
+
+    let format = AudioFormatV2::for_profile(1, 0).unwrap();
+    let (host, hello) = HostHandshakeV2::start(derived.duplicate_for_session(), format).unwrap();
+    let (receiver, challenge) =
+        ReceiverHandshakeV2::accept_hello(derived.duplicate_for_session(), &hello).unwrap();
+    let (host, finish) = host.accept_challenge(&challenge).unwrap();
+    let (ready, receiver_session) = receiver.accept_finish(&finish).unwrap();
+    let host_session = host.accept_ready(&ready).unwrap();
+    assert_eq!(host_session.format, receiver_session.format);
+    assert_eq!(host_session.session_id, receiver_session.session_id);
 }

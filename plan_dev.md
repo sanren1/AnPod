@@ -358,7 +358,13 @@ Windows Float32 PCM / Profile Encoder → `TransportSink` → **WinUSB Bulk OUT 
 
 ### Phase 6 — USB Direct AOA 正式接入（已承诺的后续路径）
 
-**任务**：把经验证的 AOA 探针变成受控 transport；接 Android 现有音频引擎；按 PCM16 → PCM24 → 96k 逐步完成，进行 USB ADB/AOA 对照。结合第 14 章 Windows WinUSB 官方示例和 Android AOA/UsbManager 官方文档实现接口枚举、Bulk I/O、权限、短包与安全断线恢复；不得把 Echo RTT 探针直接作为流协议。
+**任务**：按独立阶段把经验证的 AOA 探针发展为受控 transport；不得把 Echo RTT 探针直接作为流协议。
+
+- **6a 协议与离线编解码**：AOA-only ANPB 派生密钥、ANPU 有界外层记录、已有 P5-A/P5-C/ANPD codecs 的协议复用，以及共享合成向量和跨语言消费者检查。不接 USB 设备。
+- **6b 设备 I/O**：结合第 14 章 Windows WinUSB 官方示例和 Android AOA/UsbManager 官方文档实现设备枚举、foreground 权限、nonblocking/有界 Bulk I/O、短包处理与安全取消/断线恢复。
+- **6c 产品接线**：把授权后的 AOA session 接入 Android 现有音频引擎与主机现有 owner/session 管理，依次验证 PCM16、PCM24、96k。不要把 UI 或 codec 测试当作设备链路通过。
+
+**6a 离线状态（2026-10-20）**：Rust 与 Java 实现 AOA 独立密钥派生、ANPU 有界记录 read/write，并用共享合成向量覆盖 3 个 profile 的 P5-A proof/key、P5-C query/BIND、ANPD FORMAT/AUDIO 与错误域/replay 校验。JDK 17 Java offline checks 与 Android Receiver JVM 55/55 通过；Rust fmt、normal strict Clippy、focused 7/7 通过。Rust 全量锁定离线单线程套件为 120 passed / 0 failed / 1 ignored / 2 filtered（126.92 秒），但此全量运行早于最终新增的部分读写取消测试；新增后 focused、fmt 与 Clippy 已复跑通过，全量未重复。详见 `docs/audio-quality/06-aoa-transport.md`。这只验收 6a 协议/离线编解码，不表示 6b/6c 已实现，也不表示设备测试、AOA USB 传输、权限流程、真实吞吐、延迟或声学验收通过，相关项目仍为 **NOT_TESTED**。
 
 **交付**：AOA 技术文档、可恢复连接、可重复安装与回退流程、完整声学测量。**通过门槛**：不伤害 ADB 驱动，不要求 Root，不在无用户授权时静默重置手机 USB 模式；任何失败可退回原模式。
 
