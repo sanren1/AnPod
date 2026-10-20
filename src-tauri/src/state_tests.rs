@@ -533,6 +533,58 @@ fn operation_owner_cannot_be_cleared_by_an_older_completion() {
 }
 
 #[test]
+fn cancelled_aoa_start_cannot_publish_over_a_new_operation_generation() {
+    let generation = AtomicU64::new(0);
+    let slot = Mutex::new(None);
+    let (old_generation, old_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+    cancel_operation_slot(&generation, &slot);
+    assert!(old_token.is_cancelled());
+    assert!(!operation_generation_matches(&generation, old_generation));
+
+    let (new_generation, new_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+    finish_operation_slot(&slot, old_generation);
+    assert!(operation_generation_matches(&generation, new_generation));
+    assert!(!new_token.is_cancelled());
+    assert!(slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|operation| operation.generation == new_generation));
+}
+
+#[test]
+fn aoa_snapshot_keeps_transport_and_binding_separate_from_adb_identity() {
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.settings.preferred_transport = "Wifi".into();
+        view.selected_serial = Some("existing-adb-serial".into());
+        view.session_active = true;
+        view.session_serial = None;
+        view.session_receiver_binding = Some("b".repeat(64));
+        view.session_transport = Some("aoa".into());
+        view.output = "phone".into();
+    }
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.session_transport.as_deref(), Some("aoa"));
+    assert_eq!(
+        snapshot.session_connection_transport.as_deref(),
+        Some("usbDirect")
+    );
+    assert_eq!(snapshot.session_wireless_protocol, None);
+    assert_eq!(snapshot.session_serial, None);
+    assert_eq!(
+        snapshot.selected_serial.as_deref(),
+        Some("existing-adb-serial")
+    );
+    assert_eq!(snapshot.session_receiver_binding, Some("b".repeat(64)));
+    assert_eq!(snapshot.transport, "wifi");
+    assert_eq!(snapshot.connection_transport, "wireless");
+    assert!(!snapshot.can_change_modes);
+}
+
+#[test]
 fn wireless_protocol_switch_rejects_completion_from_previous_owner() {
     let generation = AtomicU64::new(0);
     let slot = Mutex::new(None);

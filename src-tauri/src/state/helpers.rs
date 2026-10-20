@@ -2,6 +2,10 @@ use super::*;
 
 pub(crate) static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(crate) fn operation_generation_matches(generation: &AtomicU64, expected: u64) -> bool {
+    generation.load(Ordering::Acquire) == expected
+}
+
 pub(crate) fn begin_operation_slot(
     generation: &AtomicU64,
     slot: &Mutex<Option<ActiveOperation>>,
@@ -879,6 +883,7 @@ pub(crate) fn selected_connection_transport(preferred: &str) -> &'static str {
 pub(crate) fn session_connection_transport(transport: &str) -> Option<&'static str> {
     match transport {
         "usb" => Some("usb"),
+        "aoa" => Some("usbDirect"),
         "wifi" | "lan" => Some("wireless"),
         _ => None,
     }

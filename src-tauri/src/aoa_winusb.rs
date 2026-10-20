@@ -16,6 +16,12 @@ pub(crate) struct AoaTarget {
     interface_path: String,
 }
 
+impl AoaTarget {
+    pub(crate) fn label(&self) -> String {
+        "AnPod USB Direct".into()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DeviceNode {
     instance_id: String,
@@ -378,7 +384,7 @@ mod windows_backend {
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces,
         SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceInterfaceDetailW,
         SetupDiGetDeviceRegistryPropertyW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL,
-        DIGCF_ALLCLASSES, DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SPDRP_SERVICE,
+        DIGCF_ALLCLASSES, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SPDRP_SERVICE,
         SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
     };
     use windows::Win32::Devices::Usb::{
@@ -538,7 +544,12 @@ mod windows_backend {
 
     fn enumerate_nodes() -> io::Result<Vec<DeviceNode>> {
         let set = unsafe {
-            SetupDiGetClassDevsW(None, PCWSTR::null(), None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+            SetupDiGetClassDevsW(
+                None,
+                PCWSTR::null(),
+                None,
+                DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE,
+            )
         }
         .map(DeviceInfoSet)
         .map_err(|error| last_error(error, "SetupDiGetClassDevsW"))?;
@@ -912,6 +923,15 @@ mod tests {
                 "{instance_id}"
             );
         }
+
+        let target = accessory_target(DeviceNode {
+            instance_id: "USB\\VID_18D1&PID_2D00\\private-serial".into(),
+            service: "WinUSB".into(),
+            interface_path: "test-path".into(),
+            interface_guid: "{registered-guid}".into(),
+        })
+        .unwrap();
+        assert_eq!(target.label(), "AnPod USB Direct");
     }
 
     #[test]

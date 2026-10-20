@@ -27,7 +27,7 @@ mod protocol;
 #[allow(dead_code)]
 mod security;
 
-use state::{AppSnapshot, AppState, OperationResult};
+use state::{AoaDeviceTarget, AppSnapshot, AppState, OperationResult};
 use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
@@ -43,6 +43,23 @@ async fn refresh_devices(
     let snapshot = state.refresh_devices().await?;
     let _ = app.emit("anpod://snapshot", &snapshot);
     Ok(snapshot)
+}
+
+#[tauri::command]
+async fn list_aoa_targets(state: State<'_, AppState>) -> Result<Vec<AoaDeviceTarget>, String> {
+    state.list_aoa_targets().await
+}
+
+#[tauri::command]
+async fn start_aoa_audio(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+    binding_reference: String,
+) -> Result<AppSnapshot, String> {
+    state
+        .start_aoa_audio(&app, &target_id, &binding_reference)
+        .await
 }
 
 #[tauri::command]
@@ -427,6 +444,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             refresh_devices,
+            list_aoa_targets,
+            start_aoa_audio,
             select_device,
             connect_device,
             connect_device_only,
