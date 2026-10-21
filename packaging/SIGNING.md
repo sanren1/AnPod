@@ -29,6 +29,9 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
+| 0.17.4-v3-flow-candidate / code 38 | `01beca356daf6e5630fbce9ff5c24a3b61f5ca75b08f22ce40c1ab08a29037c7` | PC 1.10.5 本地候选；source f1040de（sourceModified=false）；未进行设备安装或原地升级验证 |
+| 0.17.3-v3-flow-candidate / code 37 | `379d66041630c65f2ecfab2dedbf649441687759bfdd5d41746079be0fb4dbac` | 本地候选；source 1739473（sourceModified=false）；未进行设备安装或原地升级验证 |
+| 0.17.2-v3-flow-candidate / code 36 | `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e` | 本地候选；source ce81f03（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.17.1-v3-flow-candidate / code 35 | `8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f` | PC 1.10.1 USB Direct crash-fix 候选；source 2bd998d（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.17.0-v3-flow-candidate / code 34 | `711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83` | PC 1.10.0 本地 USB Direct 候选；source 8ca9638（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.16.0 / code 33 | `c05f3407aefd7e324017ccfecd5fd431d8eb1e1e9beac4b66e4e59b4cbc0647d` | 主屏状态与文案简化；基于 c299c80 未提交源码验收构建（sourceModified=true），随 PC 1.9.0 |
