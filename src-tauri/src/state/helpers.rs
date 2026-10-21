@@ -806,6 +806,7 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         "wifi" => "Wifi".into(),
         _ => "Usb".into(),
     };
+    settings.wired_mode = normalize_wired_mode(&settings.wired_mode).into();
     settings.wireless_protocol = if settings.wireless_protocol.is_empty() {
         if settings.preferred_transport == "Wifi" {
             "adb"
@@ -816,6 +817,9 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     } else {
         normalize_wireless_protocol(&settings.wireless_protocol).into()
     };
+    if adb_transport_enabled(&settings) {
+        settings.audio_quality = "standard".into();
+    }
     settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() {
         "lowlatency" | "low_latency" => "LowLatency".into(),
@@ -841,6 +845,20 @@ pub(crate) fn normalize_wireless_protocol(value: &str) -> &'static str {
         "adb"
     } else {
         "udp"
+    }
+}
+pub(crate) fn normalize_wired_mode(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("aoa") {
+        "aoa"
+    } else {
+        "adb"
+    }
+}
+pub(crate) fn adb_transport_enabled(settings: &AppSettings) -> bool {
+    if settings.preferred_transport == "Wifi" {
+        settings.wireless_protocol == "adb"
+    } else {
+        settings.wired_mode == "adb"
     }
 }
 pub(crate) fn normalize_audio_backend(value: &str) -> &'static str {

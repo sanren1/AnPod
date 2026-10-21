@@ -46,7 +46,6 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.security.MessageDigest;
-import java.util.Enumeration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -55,6 +54,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.UUID;
 
@@ -759,7 +759,7 @@ public final class ReceiverService extends Service {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();
             if (!"saved".equals(binding.state)) throw new IOException("请先通过 USB 完成电脑绑定。");
             InetAddress selected = parseIpv4(address);
-            if (!isAssignedPrivateAddress(selected, prefixLength)) throw new IOException("所选网络接口已不可用，请重新选择。");
+            findNetworkForInterface(selected, prefixLength);
             String ownerId = UUID.randomUUID().toString();
             long generation;
             synchronized (networkCoordinatorLock) {
@@ -1391,7 +1391,6 @@ public final class ReceiverService extends Service {
         try {
             if (!isCurrentOperation(ownerId, generation)) return;
             InetAddress local = parseIpv4(address);
-            if (!isAssignedPrivateAddress(local, prefixLength)) throw new IOException("InvalidReceiverInterface");
             Network selectedNetwork = findNetworkForInterface(local, prefixLength);
             PairingProtocol.BindingMaterial binding;
             synchronized (BindingStore.storageLock()) {
@@ -1657,6 +1656,7 @@ public final class ReceiverService extends Service {
             }
             Thread waiter = new Thread(() -> {
                 long nextStandbyCheckAt = 0;
+                long nextNetworkCheckAt = 0;
                 long nextSearchMaintenanceAt = 0;
                 try {
                     while (true) {
@@ -1675,6 +1675,19 @@ public final class ReceiverService extends Service {
                             } catch (IOException searchError) {
                                 networkAudioFailure = searchError.getMessage() == null
                                         ? searchError.getClass().getSimpleName() : searchError.getMessage();
+                            }
+                        }
+                        if (now >= nextNetworkCheckAt && (keepReceiveIntent
+                                || (currentAudio == null && "prepared".equals(networkAudioState)))) {
+                            nextNetworkCheckAt = now + 1_000L;
+                            try {
+                                if (!isNetworkForInterface(selectedNetwork, local, prefixLength)) {
+                                    requestTermination(ownerId, generation, true, "ReceiveInterfaceChanged");
+                                    return;
+                                }
+                            } catch (IOException unavailable) {
+                                requestTermination(ownerId, generation, true, "ReceiveInterfaceUnavailable");
+                                return;
                             }
                         }
                         if (keepReceiveIntent && now >= nextStandbyCheckAt) {
@@ -1699,15 +1712,6 @@ public final class ReceiverService extends Service {
                             }
                             if (!notificationPermissionAvailable()) {
                                 requestTermination(ownerId, generation, true, "ReceiveNotificationsUnavailable");
-                                return;
-                            }
-                            try {
-                                if (!selectedNetwork.equals(findNetworkForInterface(local, prefixLength))) {
-                                    requestTermination(ownerId, generation, true, "ReceiveInterfaceChanged");
-                                    return;
-                                }
-                            } catch (IOException unavailable) {
-                                requestTermination(ownerId, generation, true, "ReceiveInterfaceUnavailable");
                                 return;
                             }
                         }
@@ -1804,32 +1808,117 @@ public final class ReceiverService extends Service {
         });
     }
 
-    private static boolean isAssignedPrivateAddress(InetAddress address, int prefixLength) throws SocketException {
-        if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress() || prefixLength < 1 || prefixLength > 32) return false;
-        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-        while (interfaces != null && interfaces.hasMoreElements()) {
-            NetworkInterface network = interfaces.nextElement();
-            if (!network.isUp() || network.isLoopback()) continue;
-            for (java.net.InterfaceAddress item : network.getInterfaceAddresses())
-                if (address.equals(item.getAddress()) && item.getNetworkPrefixLength() == prefixLength) return true;
+    static final class AvailableNetwork {
+        final Network network;
+        final String interfaceName;
+        final int interfaceIndex;
+        final InetAddress address;
+        final int prefixLength;
+
+        AvailableNetwork(Network network, String interfaceName, int interfaceIndex, InetAddress address, int prefixLength) {
+            this.network = network;
+            this.interfaceName = interfaceName;
+            this.interfaceIndex = interfaceIndex;
+            this.address = address;
+            this.prefixLength = prefixLength;
         }
+    }
+
+    static List<AvailableNetwork> availableNetworks(android.content.Context context) throws SocketException {
+        ConnectivityManager connectivity = context.getSystemService(ConnectivityManager.class);
+        if (connectivity == null) return Collections.emptyList();
+        ArrayList<AvailableNetwork> result = new ArrayList<>();
+        for (Network network : connectivity.getAllNetworks()) {
+            LinkProperties properties = connectivity.getLinkProperties(network);
+            if (properties == null || properties.getInterfaceName() == null
+                    || properties.getInterfaceName().isEmpty()) continue;
+            NetworkInterface networkInterface = NetworkInterface.getByName(properties.getInterfaceName());
+            if (networkInterface == null || !networkInterface.isUp() || networkInterface.isLoopback()) continue;
+            for (LinkAddress link : properties.getLinkAddresses()) {
+                InetAddress address = link.getAddress();
+                int prefixLength = link.getPrefixLength();
+                if (!isSelectableNetworkAddress(properties, address, prefixLength)
+                        || !isAssignedAddress(networkInterface, address, prefixLength)) continue;
+                boolean alreadyListed = false;
+                for (AvailableNetwork existing : result)
+                    if (address.equals(existing.address) && prefixLength == existing.prefixLength) {
+                        alreadyListed = true;
+                        break;
+                    }
+                if (!alreadyListed) result.add(new AvailableNetwork(network, properties.getInterfaceName(),
+                        networkInterface.getIndex(), address, prefixLength));
+            }
+        }
+        return result;
+    }
+
+    private static boolean isAssignedAddress(NetworkInterface networkInterface, InetAddress address,
+            int prefixLength) {
+        for (java.net.InterfaceAddress item : networkInterface.getInterfaceAddresses())
+            if (address.equals(item.getAddress()) && prefixLength == item.getNetworkPrefixLength()) return true;
+        return false;
+    }
+
+    private static boolean isSelectableNetworkAddress(LinkProperties properties, InetAddress address,
+            int prefixLength) {
+        if (properties == null || properties.getInterfaceName() == null
+                || properties.getInterfaceName().isEmpty()
+                || !(address instanceof Inet4Address) || !address.isSiteLocalAddress()
+                || prefixLength < 1 || prefixLength > 32) return false;
+        for (LinkAddress link : properties.getLinkAddresses())
+            if (address.equals(link.getAddress()) && prefixLength == link.getPrefixLength()) return true;
         return false;
     }
 
     private Network findNetworkForInterface(InetAddress address, int prefixLength) throws IOException {
-        NetworkInterface selected = NetworkInterface.getByInetAddress(address);
-        ConnectivityManager connectivity = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        if (selected == null || !selected.isUp() || connectivity == null)
-            throw new IOException("所选网络接口已不可用，请重新选择。");
-        for (Network network : connectivity.getAllNetworks()) {
-            LinkProperties properties = connectivity.getLinkProperties(network);
-            if (properties == null || !selected.getName().equals(properties.getInterfaceName())) continue;
-            for (LinkAddress link : properties.getLinkAddresses()) {
-                if (address.equals(link.getAddress()) && link.getPrefixLength() == prefixLength)
-                    return network;
-            }
+        if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress()
+                || prefixLength < 1 || prefixLength > 32)
+            throw new IOException("所选 Android 网络已不可用或发生变化。");
+        try {
+            for (AvailableNetwork available : availableNetworks(this))
+                if (address.equals(available.address) && prefixLength == available.prefixLength)
+                    return available.network;
+        } catch (SocketException unavailable) {
+            throw new IOException("所选 Android 网络已不可用或发生变化。", unavailable);
         }
         throw new IOException("所选 Android 网络已不可用或发生变化。");
+    }
+
+    boolean isNetworkForInterface(Network network, InetAddress address, int prefixLength)
+            throws IOException {
+        try {
+            for (AvailableNetwork available : availableNetworks(this))
+                if (network.equals(available.network) && address.equals(available.address)
+                        && prefixLength == available.prefixLength) return true;
+            return false;
+        } catch (SocketException unavailable) {
+            throw new IOException("Connectivity service unavailable", unavailable);
+        }
+    }
+
+    boolean clearNetworkSelectionFailure(String address, int prefixLength) {
+        if (currentAudio != null || networkCoordinator != null || !uiOperation.canBegin()) return false;
+        String ownerId = uiOperation.ownerId();
+        String error = uiOperation.error();
+        if (!isNetworkSelectionFailure(error)) return false;
+        try { findNetworkForInterface(parseIpv4(address), prefixLength); }
+        catch (IOException unavailable) { return false; }
+        synchronized (networkCoordinatorLock) {
+            if (currentAudio != null || networkCoordinator != null || !uiOperation.canBegin()
+                    || !uiOperation.clearFailure(ownerId, error)) return false;
+            networkAudioState = "stopped";
+            networkAudioFailure = "";
+            startFailure = "";
+            return true;
+        }
+    }
+
+    private static boolean isNetworkSelectionFailure(String error) {
+        return "InvalidReceiverInterface".equals(error)
+                || "ReceiveInterfaceChanged".equals(error)
+                || "ReceiveInterfaceUnavailable".equals(error)
+                || "所选 Android 网络已不可用或发生变化。".equals(error)
+                || "所选网络接口已不可用，请重新选择。".equals(error);
     }
 
     private static InetAddress parseIpv4(String text) throws IOException {
@@ -2220,7 +2309,7 @@ public final class ReceiverService extends Service {
 
     String requestedOutputEnginePreference() {
         String value = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
-                .getString("output_engine", "audioTrack");
+                .getString("output_engine", "oboeExperimental");
         return "oboeExperimental".equals(value) ? "oboeExperimental" : "audioTrack";
     }
 
@@ -3566,7 +3655,7 @@ public final class ReceiverService extends Service {
         volatile int oboeXrunCount = -1;
         volatile AudioTrack audioTrack;
         volatile PlaybackOutput playbackOutput;
-        volatile String requestedOutputEngine = "audioTrack";
+        volatile String requestedOutputEngine = "oboeExperimental";
         volatile String actualOutputEngine = "unknown";
         volatile String outputFallbackReason = "";
         volatile int openedTrackFormatV2;

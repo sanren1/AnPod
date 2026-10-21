@@ -5,6 +5,10 @@ import { SettingToggle } from "./SettingToggle";
 
 export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
   const settings = snapshot.settings;
+  const adbQualityOnly = snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
+    ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
+      || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb"
+    : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb";
   const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
   const negotiated = snapshot.negotiatedAudioFormat;
   const mix = snapshot.windowsMixFormat;
@@ -23,8 +27,9 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <legend>{strings.app.transportQuality}</legend>
       {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
         <span>{strings.app.audioQualityLabels[quality]}</span>
-        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes} onChange={() => update("audioQuality", quality)} />
+        <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => update("audioQuality", quality)} />
       </label>)}
+      {adbQualityOnly && <p className="dialog-footnote">{strings.app.adbStandardQualityOnly}</p>}
       <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
       <dl className="audio-quality-status">
         <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>

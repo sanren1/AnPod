@@ -7,6 +7,7 @@ export type AoaTarget = { id: string; label: string };
 export type Settings = {
   schemaVersion: number; lastDeviceId: string | null;
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
+  wiredMode: "adb" | "aoa"; lastUsbDirectTargetId: string | null; lastUsbDirectBindingReference: string | null;
   wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
   lastWirelessEndpoint: string | null;
   lastReceiverEndpoint: string | null;

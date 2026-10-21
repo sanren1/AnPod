@@ -2,9 +2,9 @@
 
 > 版本：1.1（工程执行基线；补充开源项目、官方指南及可复用实现调研）  
 > 制定日期：2026-10-19  
-> 代码基线：`c299c805f8917df0f961b5174dff47fb074517e6` 为历史调研基线；`13d666277e1de4ccf0d41d12836a1e2a945dcb42` 是 PC 1.10.0 旧候选源码提交。Receiver APK source commit 为 `2bd998d65fe650bb225c09d7353c5c2ba39febfc`；PC 1.10.1 portable source commit 为 `ec8312ac569d395872cf803f71afda56419de86c`。当前工作准备 PC 1.10.2 USB Direct 控制修复；源码冻结/提交后再记录该版本便携包审计。历史制品记录保留。
+> 代码基线：当前已交付 PC 1.10.4 / Receiver 0.17.3 code 37；开发起点 `1ca1d97`，源码及制品来源见文末。历史调研、提交与制品记录保留。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1–5 源码与相应离线验收已完成，AudioTrack 仍是默认，Oboe 是需本地选择的实验后端。Phase 6a–6c 的 AOA 协议、平台 I/O、共享 ingress、认证 session、Host State/命令与 Android USB permission/UI 产品入口已完成源码审查和离线门禁。PC 1.10.0 及 1.10.1 制品记录是历史基线（见文末）；当前准备 PC 1.10.2 / Receiver 0.17.1 code 35 候选，尚待源码冻结后的打包与审计。真实 WASAPI capture、手机硬件输出格式/精度、AOA 设备权限与拔插、吞吐、声学/延迟/长时稳定性，以及实机原地升级仍为 **NOT_TESTED**；源码、签名验证和离线门禁不代表这些门槛通过。Phase 0 旧实机前置核查仍为 NOT_TESTED。历史调研基线 `c299c805f8917df0f961b5174dff47fb074517e6` 保留。
+> 项目阶段：Phase 1–6c、连接策略与独立 Astra 修订已完成源码及离线验收，记录见文末。本轮执行持久化有线模式、切网恢复操作、采集初始化及 Oboe 默认选择；完成前不记为已交付。真实 WASAPI capture、手机硬件输出格式/精度、AOA 权限与拔插、吞吐、声学/延迟/长时稳定性及实机原地升级仍为 **NOT_TESTED**；按用户要求跳过旧实机核查，离线门禁不改变此状态。
 
 ## 0. 开发指令与决策摘要
 
@@ -19,8 +19,8 @@
 | 32-bit 定位 | **Float32 用于内部采集/处理与必要的 Android 输出适配**；不提供 32-bit 整数传输档位；暂不将 F32 作为用户可选的第四个档位 |
 | 延迟选择 | 保留独立的「低延迟／均衡」；与音质档正交，不自动绑定 |
 | 默认兼容 | 老用户配置迁移后依旧为 **标准 PCM16**；切换到高保真需能力协商与真机验证 |
-| Android 默认输出 | 保留 Java `AudioTrack`，优先支持 24-bit packed/Float32 路径；不允许无提示降成 16-bit |
-| Android 实验后端 | `Oboe + AAudio Shared + Native Callback`；仅实验性可选，不预设比 AudioTrack 更快 |
+| Android 默认输出 | 本轮改为无保存偏好时默认 `Oboe`；保留用户显式选择的 `AudioTrack`，后者仍作兼容回退，不允许无提示降成 16-bit |
+| Android Oboe 后端 | `Oboe + AAudio Shared + Native Callback`；失败沿现有同速率/格式回退，不预设比 AudioTrack 更快 |
 | USB Direct (AOA) | **底层可行性已验证，确定后续集成**；先保留证据与独立探针，不在音质升级期间破坏 USB ADB |
 | 未支持的能力 | 必须报告并安全降级到完整的**另一档格式**，禁止仅修改显示文字或在设备端无提示截断 |
 | 发行管理 | 严格遵守既有 Receiver 签名、版本码、制品哈希白名单和 GPL/LGPL 义务 |
@@ -640,3 +640,18 @@ Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connec
 最终便携交付：`artifacts/AnPod-1.10.4-tauri-win-x64-portable.zip`，18,457,176 bytes，SHA-256 `10fe4a068d356d4650a8cf03c825f905ea520572a0aca2ed3875d56bb99e5de0`；EXE ProductVersion 1.10.4，SHA-256 `2ae13cf3b6a290eb3e3c8d4cad085582f5bbddb4169ea91a3c4fe131a7ed31e1`。PC 构建/桌面来源 `c62e09f320da94c9c851aee20011a6e9159e1384`，desktopInputsSha256 `8341c65b91c014a3b09c53a54ac6d7ee6a33422307e1fe0c9adc2d05c8e3e646`，根代理构建前后重算均匹配。独立审计 `artifacts/astra-review-portable-audit.json` 为 PASS：49 个 ZIP/stage 文件逐项路径、长度、哈希一致；Receiver exact release 版本/签名/来源与 Native/Legacy provenance 匹配；README 10 个本地链接解析通过，禁止文件与 secret marker 均为 0。根代理独立核对了 ZIP 哈希/长度、EXE 版本、metadata、审计记录及输入快照。metadata workingTreeDirty=true 仅因保留的三个既有缓存，受跟踪源码无修改。PC 端新增 Receiver37 的精确白名单后，实际 artifact-read 1/1 通过；旧白名单、历史包及用户缓存均保留。
 
 使用本轮改进需同时更新 PC 1.10.4 和随包 Receiver code 37。独立 Astra 的原 3 项 P1/2 项 UX 与最终 deadline/管理停止路径均闭合；上述离线结果不代表真实 AppState 恢复、手机安装升级或音频表现已验证，实机状态仍为 NOT_TESTED。
+
+## 有线模式与网络、输出体验修订（2026-10-21，进行中）
+
+目标候选：PC 1.10.5 / Receiver 0.17.4 code 38。以下为本轮执行及验收契约，未完成项不记为通过。
+
+- [SUBAGENT] Rust：修复 Direct 高保真/Hi-Res 首次使用未加载采集组件；保留真实 96 kHz Float32 采集要求，无自动升采样。增加持久化 `wiredMode=adb|aoa`，默认保留 ADB；有效 ADB 路径原子使用标准音质，Direct/LAN 三档不变。只有成功认证的 Direct 会话可记住设备/绑定配对用于下次预选，诊断隐藏其标识。
+- [SUBAGENT] UI：有线页直接切换 ADB / USB Direct，活动会话先成功断开再保存模式；选择模式不会物理切换手机或自动播放。Direct 配置中自动只读发现设备、保留有效选择，只有唯一设备可自动预选；接收端仅手选或复用已认证的同设备记忆。短文案、键盘及窄屏可用，均衡/低延迟仍可在所有支持的活动会话使用。
+- [SUBAGENT] Android：统一网络选择列表和可绑定 Network 来源，切网及时结束旧等待，选择新的有效网络后可手动重新开始；不改电脑/绑定目标、不自动重绑。无保存偏好默认 Oboe，显式 AudioTrack 设置保留，既有兼容回退和精确格式门槛不变。
+- [SERIAL] 三项依赖字段契约对齐后合验，再由独立 GPT 6 astra high 审查实现、UI/UX 和连接链路；修订通过后冻结源码、构建签名 Receiver 和便携包并审计。
+
+执行代理使用 GPT 6 luna high，最多三个并行、不嵌套。ADB 仍仅标准；Direct 协议已有标准/高保真/Hi-Res，实际可用取决于真实采集格式及 Receiver 输出能力。Direct 暂不作为新默认；兼容增强先覆盖发现、初始化、持久选择与可诊断失败。预切换手机 allowlist 和 WinUSB/授权边界保持，未经硬件验证不扩展厂商切换或自动安装驱动。手动初连、同链路意外恢复、任一端手动断开后不重连继续生效。保留旧包及三个用户缓存。
+
+本轮业务与候选版本已实现，待独立审查及制品冻结验收。Rust `cargo fmt --check`、`cargo check --offline` 通过；完整离线串行 suite 为 **151 passed、0 failed、1 ignored**。新增测试夹具曾因缺少 `mut` 编译失败，修正后完整复跑通过；忽略项仍为原有子进程辅助用例。Android 两类 Robolectric 合计 **44 项全部通过**（ReceiverService 38、AOA coordinator 6，0 failures/errors/skipped）；首次网络测试的隐藏 API 夹具构造问题修正后，已在最新 Kotlin 刷新路径上复跑。前端类型检查、Vite build 和检查脚本语法通过；专项浏览器检查及独立审查最终结果在源码冻结时登记，不将旧全量 harness 计为通过。
+
+前端最终专项通过：AOA 24 项显式结果断言，覆盖模式持久化、手动开始、发现/移除、多设备与已认证记忆、断开失败/成功和活动播放能力。mock 已按真实活动会话设置 `canChangeModes=false`：音质锁定，播放模式仅在支持 `0x200` 时可切换。音质中英文专项全部通过，375px 大字模式下拉框的 flex 最小宽度溢出已修正，严格检查 `scrollWidth==clientWidth`、`overflowing=[]`；未放宽阈值。两类专项 `errors=[]`，证据 `.tmp-frontend-check/wired-mode-v4/`。独立审查与制品验收仍待后续登记。

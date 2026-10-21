@@ -81,6 +81,22 @@ fn authenticated_pcm24_format_is_checked_against_each_actual_native_mix_before_s
 }
 
 #[test]
+fn float_format_probe_loads_the_native_component_without_initializing_pcm16() {
+    let root = std::env::temp_dir().join(format!("anpod-missing-native-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let dll = root.join("missing-audio-capture.dll");
+    let actor = super::AudioActor::new(dll.clone(), root.join("mute-state.txt"));
+
+    let error = actor.probe_float_format().unwrap_err();
+    assert!(error.contains("无法加载音频采集组件"), "{error}");
+    assert!(!error.contains("尚未初始化"), "{error}");
+
+    drop(actor);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn stopped_float_queue_is_not_reused_by_audio_sink_fast_path() {
     let queue = std::sync::Arc::new(crate::network::FloatPcmQueue::new(false));
     assert!(super::can_reuse_float_sink(Some(&queue), &queue));

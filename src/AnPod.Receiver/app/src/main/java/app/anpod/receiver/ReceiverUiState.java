@@ -1,14 +1,10 @@
 package app.anpod.receiver;
 
 import java.io.IOException;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Enumeration;
 import java.util.List;
 
 /** Read-only views of ReceiverService state used by the UI binder. */
@@ -135,16 +131,8 @@ final class ReceiverUiState {
     List<UiInterface> interfaces() {
         ArrayList<UiInterface> result = new ArrayList<>();
         try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                NetworkInterface network = interfaces.nextElement();
-                if (!network.isUp() || network.isLoopback()) continue;
-                for (java.net.InterfaceAddress item : network.getInterfaceAddresses()) {
-                    InetAddress address = item.getAddress();
-                    if (address instanceof Inet4Address && address.isSiteLocalAddress())
-                        result.add(new UiInterface(network.getDisplayName(), address.getHostAddress(), item.getNetworkPrefixLength()));
-                }
-            }
+            for (ReceiverService.AvailableNetwork network : ReceiverService.availableNetworks(service))
+                result.add(new UiInterface(network.interfaceName, network.address.getHostAddress(), network.prefixLength));
         } catch (SocketException ignored) { }
         Collections.sort(result, new Comparator<UiInterface>() {
             @Override

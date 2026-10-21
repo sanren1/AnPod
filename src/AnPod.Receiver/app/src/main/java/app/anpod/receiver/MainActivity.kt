@@ -101,7 +101,7 @@ class MainActivity : ComponentActivity() {
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
     private var aodEnabled by mutableStateOf(false)
     private var aodShownForSession: String? = null
-    private var outputEngine by mutableStateOf("audioTrack")
+    private var outputEngine by mutableStateOf("oboeExperimental")
     private var usbDirectAvailable by mutableStateOf(false)
     private var usbPermissionPending by mutableStateOf(false)
     internal data class PendingUsbPermission(val generation: Long, val accessory: UsbAccessory, val action: String)
@@ -146,10 +146,9 @@ class MainActivity : ComponentActivity() {
             snapshot?.operationState == "running" && activeInterface != null -> {
                 selectNetwork(activeInterface)
             }
-            currentSelection != null -> Unit
+            currentSelection != null -> selectNetwork(currentSelection)
             savedSelection != null -> {
-                selectedAddress = savedSelection.address
-                selectedPrefix = savedSelection.prefixLength
+                selectNetwork(savedSelection)
             }
             interfaces.size == 1 -> {
                 selectNetwork(interfaces.single())
@@ -174,13 +173,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun selectNetwork(item: UiInterface) {
-        if (selectedAddress == item.address && selectedPrefix == item.prefixLength) return
+        val changed = selectedAddress != item.address || selectedPrefix != item.prefixLength
         selectedAddress = item.address
         selectedPrefix = item.prefixLength
-        getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit()
-            .putString("network_address", item.address)
-            .putInt("network_prefix", item.prefixLength)
-            .apply()
+        if (changed) {
+            getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit()
+                .putString("network_address", item.address)
+                .putInt("network_prefix", item.prefixLength)
+                .apply()
+        }
+        if (receiver?.clearNetworkSelectionFailure(item.address, item.prefixLength) == true)
+            snapshot = receiver?.snapshot()
     }
 
     private fun copyDiagnostics(message: String) {
@@ -258,7 +261,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
         aodEnabled = preferences.getBoolean("aod_enabled", false)
-        outputEngine = when (preferences.getString("output_engine", "audioTrack")) {
+        outputEngine = when (preferences.getString("output_engine", "oboeExperimental")) {
             "oboeExperimental" -> "oboeExperimental"
             else -> "audioTrack"
         }

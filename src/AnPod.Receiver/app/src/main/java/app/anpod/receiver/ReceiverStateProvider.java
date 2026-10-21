@@ -22,10 +22,7 @@ import java.io.FileNotFoundException;
 import java.io.FileDescriptor;
 import java.io.InterruptedIOException;
 import java.io.IOException;
-import java.net.Inet4Address;
-import java.net.NetworkInterface;
 import java.net.SocketException;
-import java.util.Enumeration;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -158,24 +155,18 @@ public final class ReceiverStateProvider extends ContentProvider {
         for (String column : columns) if (!contains(INTERFACE_COLUMNS, column)) throw new IllegalArgumentException("Unsupported interface column");
         MatrixCursor result = new MatrixCursor(columns);
         try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                NetworkInterface network = interfaces.nextElement();
-                if (!network.isUp() || network.isLoopback()) continue;
-                for (java.net.InterfaceAddress item : network.getInterfaceAddresses()) {
-                    if (!(item.getAddress() instanceof Inet4Address) || !item.getAddress().isSiteLocalAddress()) continue;
-                    Object[] row = new Object[columns.length];
-                    for (int i = 0; i < columns.length; i++) switch (columns[i]) {
-                        case "address": row[i] = item.getAddress().getHostAddress(); break;
-                        case "prefixLength": row[i] = item.getNetworkPrefixLength(); break;
-                        case "interfaceIndex": row[i] = network.getIndex(); break;
-                        case "interfaceName": row[i] = network.getName(); break;
-                        default: throw new IllegalArgumentException("Unsupported interface column");
-                    }
-                    result.addRow(row);
+            for (ReceiverService.AvailableNetwork network : ReceiverService.availableNetworks(getContext())) {
+                Object[] row = new Object[columns.length];
+                for (int i = 0; i < columns.length; i++) switch (columns[i]) {
+                    case "address": row[i] = network.address.getHostAddress(); break;
+                    case "prefixLength": row[i] = network.prefixLength; break;
+                    case "interfaceIndex": row[i] = network.interfaceIndex; break;
+                    case "interfaceName": row[i] = network.interfaceName; break;
+                    default: throw new IllegalArgumentException("Unsupported interface column");
                 }
+                result.addRow(row);
             }
-        } catch (SocketException error) { throw new IllegalStateException("Receiver interface status is unavailable"); }
+        } catch (SocketException error) { throw new IllegalStateException("Receiver interface status is unavailable", error); }
         return result;
     }
 

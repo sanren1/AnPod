@@ -516,7 +516,11 @@ impl AudioActor {
                         let _ = reply.send(result);
                     }
                     Request::ProbeFloatFormat(reply) => {
-                        let result = if let Some(native) = native.as_ref() {
+                        let result = (|| {
+                            if native.is_none() {
+                                native = Some(unsafe { NativeFns::load(&dll_path)? });
+                            }
+                            let native = native.as_ref().expect("loaded audio capture");
                             cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
                                 .and_then(|()| {
                                     let probe = (|| {
@@ -539,9 +543,7 @@ impl AudioActor {
                                         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                                     }
                                 })
-                        } else {
-                            Err("音频采集组件尚未初始化。".into())
-                        };
+                        })();
                         let _ = reply.send(result);
                     }
                     Request::StopPcmSink(reply) => {

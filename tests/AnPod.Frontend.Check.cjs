@@ -21,11 +21,13 @@ fs.mkdirSync(out, {recursive:true});
   let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewBackgroundStartError='';let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
   let reviewReceiverManagementBusy=false;let reviewManagementSlotConflicts=0;
   let reviewAoaStartResolve=null;
+  let reviewDisconnectFails=false;
   let reviewAoaTargets=[{id:'opaque-target-a',label:'AnPod 配件设备'}];let reviewAoaSwitchTargets=[{id:'switch-phone-a',label:'iQOO 11 (V2243A)'}];
-  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
+  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,lastUsbDirectTargetId:null,lastUsbDirectBindingReference:null,wiredMode:'adb',minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
   window.reviewSetAoaTargets=targets=>{reviewAoaTargets=structuredClone(targets);};
+  window.reviewSetAoaBindings=bindings=>{reviewBindings=[...bindings];};
   window.reviewManagementSlotConflicts=()=>reviewManagementSlotConflicts;
   window.reviewManagementSlotBusy=()=>reviewReceiverManagementBusy;
   window.reviewChangeUsbDevices=devices=>{snapshot.devices=structuredClone(devices);emit();};
@@ -35,6 +37,9 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewEmitReceiverProgress=payload=>emitEvent('anpod://receiver-install-progress',payload);
   window.reviewProgressListenerCount=()=>listeners.has('anpod://receiver-install-progress')?1:0;
   window.reviewRead=()=>structuredClone(snapshot);
+  window.reviewSetDirectMemory=(targetId,binding)=>{snapshot.settings.lastUsbDirectTargetId=targetId;snapshot.settings.lastUsbDirectBindingReference=binding;emit();};
+  window.reviewSetWiredMode=value=>{snapshot.settings.wiredMode=value;emit();};
+  window.reviewFailNextDisconnect=()=>{reviewDisconnectFails=true;};
   window.reviewReceiverVersionError=()=>{window.reviewUsbScenario();snapshot.state='error';snapshot.message='连接失败';snapshot.statusDetail='RECEIVER_UPDATE_REQUIRED:模拟版本核验的冗长底层诊断';snapshot.canDisconnect=false;emit();};
   let reviewCandidate={versionCode:9,versionName:'0.9.0-usb',sizeBytes:5*1024*1024,currentVersionCode:null,bindingReference:null};
   let reviewUsbStatuses={TESTUSB:{installed:true,versionName:'0.8.0',versionCode:8,serviceActive:false,foreground:false,healthy:true,audioActive:false,error:null,message:'Receiver 已安装'}};
@@ -81,7 +86,7 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewSetManagementOnly=()=>{snapshot={...snapshot,state:'managementOnly',message:'管理连接已认证，音频不兼容',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:false,compatible:false,capabilityBits:4,versionCode:7},canDisconnect:true,busy:false,output:'computer',connectionTransport:'wireless',transport:'wifi',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();};
   window.reviewSetBusy=(busy=true)=>{snapshot.busy=busy;emit();};
   window.reviewSetAudioFormats=(negotiatedAudioFormat,windowsMixFormat,androidOutputFormat)=>{snapshot={...snapshot,negotiatedAudioFormat,windowsMixFormat,androidOutputFormat,output:'phone'};emit();};
-  window.reviewActivateAoa=()=>{snapshot={...snapshot,state:'streaming',message:'USB Direct 已连接',deviceName:'AnPod 配件模式设备',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'aoa',sessionConnectionTransport:'usbDirect',sessionWirelessProtocol:null,sessionCapabilities:null,canDisconnect:true,canChangeModes:false,busy:false,output:'phone',connectionTransport:'usb',settings:{...snapshot.settings,audioBackend:'receiver'}};emit();};
+  window.reviewActivateAoa=(capabilityBits=512,canChangePlaybackMode=true)=>{snapshot={...snapshot,state:'streaming',message:'USB Direct 已连接',deviceName:'AnPod 配件模式设备',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionTransport:'aoa',sessionConnectionTransport:'usbDirect',sessionWirelessProtocol:null,sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits,versionCode:7},canDisconnect:true,canChangeModes:false,canChangePlaybackMode,busy:false,output:'phone',connectionTransport:'usb',settings:{...snapshot.settings,audioBackend:'receiver',wiredMode:'aoa'}};emit();};
   window.reviewSetAudioQualityFailure=()=>{snapshot={...snapshot,state:'error',message:'Hi-Res 请求失败',statusDetail:'Hi-Res 需要 96 kHz Windows 混音源与 Receiver 支持；当前混音源为 48 kHz。请选择其他档位并重新连接。',canDisconnect:false};emit();};
   window.reviewRecoverySeconds=seconds=>{snapshot={...snapshot,state:'reconnecting',networkRecoverySecondsRemaining:seconds,busy:true,canDisconnect:true,sessionSerial:'TESTUSB',sessionTransport:'wifi',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'adb',sessionAndroidVersion:'15',sessionCapabilities:null,output:'computer'};emit();};
   window.reviewSetActiveError=()=>{window.reviewSet('connected','usb');snapshot.state='error';snapshot.message='模拟播放失败详情';snapshot.statusDetail='电脑声音保持输出';emit();};
@@ -148,13 +153,13 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='qr_credentials')return {instanceName:'studio-Test123456',password:'abcdefghijklmnopqrst',payload:'WIFI:T:ADB;S:studio-Test123456;P:abcdefghijklmnopqrst;;'};
    if(cmd==='pair_qr')return new Promise(resolve=>{window.reviewPairQrArgs=args;window.reviewCompleteQrPair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
    if(cmd==='pair_wifi')return new Promise(resolve=>{window.reviewCompletePair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
-   if(cmd==='update_setting'){snapshot.settings[args.key]=args.value;if(args.key==='transport'){snapshot.connectionTransport=args.value;snapshot.transport=args.value==='wireless'?'wifi':'usb';snapshot.settings.preferredTransport=args.value==='wireless'?'Wifi':'Usb';}return structuredClone(snapshot);}
+   if(cmd==='update_setting'){snapshot.settings[args.key]=args.value;if(args.key==='wiredMode'&&args.value==='adb')snapshot.settings.audioQuality='standard';if(args.key==='transport'){snapshot.connectionTransport=args.value;snapshot.transport=args.value==='wireless'?'wifi':'usb';snapshot.settings.preferredTransport=args.value==='wireless'?'Wifi':'Usb';}return structuredClone(snapshot);}
    if(cmd==='connect_device'){window.reviewSet('streaming',snapshot.transport);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='connect_device_only'){window.reviewSet('connected',snapshot.transport,args.serial);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='switch_device'){if(window.reviewSwitchMode==='failure')return {success:false,message:'模拟切换失败，已恢复原连接',snapshot:structuredClone(snapshot)};window.reviewSet(snapshot.output==='phone'?'streaming':'connected',snapshot.transport,args.serial);snapshot.selectedSerial=args.serial;return {success:true,message:'已切换',snapshot:structuredClone(snapshot)};}
    if(cmd==='select_device'){snapshot.selectedSerial=args.serial;return structuredClone(snapshot);}
    if(cmd==='cancel_operation'){const current={...snapshot,state:'ready',message:'已取消 USB Direct 连接',sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionReceiverBinding:null,sessionGeneration:null,canDisconnect:false,canChangeModes:true,busy:false,output:'computer'};snapshot=current;emit();if(reviewAoaStartResolve){const resolve=reviewAoaStartResolve;reviewAoaStartResolve=null;resolve(structuredClone(snapshot));}return structuredClone(snapshot);}
-   if(cmd==='disconnect'){window.reviewSet('ready',snapshot.transport);return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
+   if(cmd==='disconnect'){if(reviewDisconnectFails){reviewDisconnectFails=false;return {success:false,message:'模拟断开失败',snapshot:structuredClone(snapshot)};}window.reviewSet('ready',snapshot.transport);return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
    if(cmd==='set_output'){snapshot.output=args.output;snapshot.state=args.output==='phone'?'streaming':'connected';emit();return structuredClone(snapshot);}
    if(cmd==='reconfigure_session'){snapshot.settings[args.kind==='playback'?'playbackMode':'preferredTransport']=args.kind==='playback'?(args.value==='balanced'?'Balanced':'LowLatency'):(args.value==='usb'?'Usb':'Wifi');snapshot.transport=snapshot.settings.preferredTransport==='Wifi'?'wifi':'usb';window.reviewSet(snapshot.state,snapshot.transport);}
    return structuredClone(snapshot);
@@ -166,7 +171,15 @@ fs.mkdirSync(out, {recursive:true});
  const results={errors,layouts:[],focusStable:null};
  if(process.env.ANPOD_AOA_ONLY){
   await page.setViewportSize({width:360,height:640});
-  await page.getByRole('button',{name:'USB Direct（实验）',exact:true}).click();
+  await page.getByRole('button',{name:'打开设置'}).click();
+  let qualityDialog=page.getByRole('dialog');
+  results.adbOnlyOffersStandardQuality=await qualityDialog.getByRole('radio',{name:/高保真/}).isDisabled()
+    &&await qualityDialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()
+    &&await qualityDialog.getByText('ADB 仅支持标准音质').isVisible();
+  await qualityDialog.getByRole('button',{name:'关闭'}).click();
+  await page.getByRole('group',{name:'USB 连接模式'}).getByRole('button',{name:'USB Direct'}).click();
+  results.modePreferenceDoesNotSwitchOrStart=await page.evaluate(()=>window.reviewRead().settings.wiredMode==='aoa'&&!window.reviewCalls.switch_aoa_mode&&!window.reviewCalls.start_aoa_audio);
+  await page.getByRole('button',{name:'连接 USB Direct',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   await dialog.waitFor();
   const switchDetails=dialog.locator('details.aoa-switch-section');
@@ -192,8 +205,7 @@ fs.mkdirSync(out, {recursive:true});
   await switchSummary.click();
   const target=dialog.getByLabel('USB Direct 设备');
   const binding=dialog.getByLabel('已配对接收端');
-  results.aoaNeedsExplicitChoices=await target.inputValue()===''&&await binding.inputValue()===''&&await dialog.getByRole('button',{name:'开始连接'}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===undefined);
-  await target.selectOption('opaque-target-a');
+  results.uniqueTargetPreselectedButBindingExplicit=await target.inputValue()==='opaque-target-a'&&await binding.inputValue()===''&&await dialog.getByRole('button',{name:'开始连接'}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===undefined);
   await binding.selectOption('phoneB-abcdef');
   await dialog.getByRole('button',{name:'开始连接'}).click();
   await page.waitForFunction(()=>window.reviewAoaStartArgs!==undefined);
@@ -202,8 +214,35 @@ fs.mkdirSync(out, {recursive:true});
   await dialog.getByRole('button',{name:'取消连接'}).click();
   await page.waitForFunction(()=>window.reviewCalls.cancel_operation===1&&document.querySelector('dialog[open]')===null);
   results.cancelUsesExistingOperation=await page.evaluate(()=>window.reviewCalls.cancel_operation===1&&window.reviewRead().sessionTransport===null);
+  await page.locator('.device-select').click();
+  const replacementDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   await page.evaluate(()=>window.reviewSetAoaTargets([]));
-  await page.getByRole('button',{name:'USB Direct（实验）',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.value==='');
+  await page.evaluate(()=>window.reviewSetAoaTargets([{id:'opaque-target-b',label:'新接入配件设备'}]));
+  await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.value==='opaque-target-b');
+  results.removedTargetDoesNotReuseBinding=await replacementDialog.getByLabel('USB Direct 设备').inputValue()==='opaque-target-b'
+    &&await replacementDialog.getByLabel('已配对接收端').inputValue()===''
+    &&await replacementDialog.getByRole('button',{name:'开始连接'}).isDisabled()
+    &&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===1);
+  await replacementDialog.getByRole('button',{name:'关闭'}).click();
+  await page.evaluate(()=>window.reviewSetDirectMemory('opaque-target-b','phoneA-abcdef'));
+  await page.getByRole('button',{name:'连接 USB Direct',exact:true}).click();
+  const rememberedDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
+  await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.value==='opaque-target-b'&&document.querySelectorAll('.aoa-dialog select')[2]?.value==='phoneA-abcdef');
+  results.remembersExactTargetAndBinding=await rememberedDialog.getByLabel('USB Direct 设备').inputValue()==='opaque-target-b'
+    &&await rememberedDialog.getByLabel('已配对接收端').inputValue()==='phoneA-abcdef';
+  await rememberedDialog.getByRole('button',{name:'关闭'}).click();
+  await page.evaluate(()=>{window.reviewSetDirectMemory(null,null);window.reviewSetAoaTargets([{id:'target-one',label:'第一台配件设备'},{id:'target-two',label:'第二台配件设备'}]);window.reviewSetAoaBindings(['phoneA-abcdef','phoneB-abcdef']);});
+  await page.getByRole('button',{name:'连接 USB Direct',exact:true}).click();
+  const ambiguousDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
+  await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.options.length===3&&document.querySelectorAll('.aoa-dialog select')[2]?.options.length===3);
+  results.multipleTargetsNeverGuessBinding=await ambiguousDialog.getByLabel('USB Direct 设备').inputValue()===''
+    &&await ambiguousDialog.getByLabel('已配对接收端').inputValue()===''
+    &&await ambiguousDialog.getByRole('button',{name:'开始连接'}).isDisabled()
+    &&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===1);
+  await ambiguousDialog.getByRole('button',{name:'关闭'}).click();
+  await page.evaluate(()=>window.reviewSetAoaTargets([]));
+  await page.getByRole('button',{name:'连接 USB Direct',exact:true}).click();
   const firstSwitchDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   const firstSwitch=firstSwitchDialog.locator('details.aoa-switch-section');
   await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===true);
@@ -223,18 +262,40 @@ fs.mkdirSync(out, {recursive:true});
     &&await page.evaluate(previous=>window.reviewCalls.start_aoa_audio===previous&&window.reviewCalls.switch_aoa_mode===1,previousAoaStarts);
   await firstSwitchDialog.getByRole('button',{name:'关闭'}).click();
   await page.evaluate(()=>window.reviewActivateAoa());
+  await page.evaluate(()=>window.reviewSetWiredMode('adb'));
   results.actualAoaConnectionIsVisible=await page.locator('.device-select').innerText().then(text=>text.includes('USB Direct'));
   await page.getByRole('button',{name:'打开设置'}).click();
   const settings=page.getByRole('dialog');
   const backend=settings.getByLabel('手机接收方式');
-  results.activeAoaLocksBackendAndMode=await backend.isDisabled()
-    &&await settings.getByText(/USB Direct 会话使用 Receiver；请先断开 USB Direct，再更改接收后端。/).isVisible()
+  results.activeAoaLocksQualityButKeepsPlaybackAvailable=await backend.isDisabled()
+    &&await settings.getByText('USB Direct 使用 Receiver。').isVisible()
     &&!(await settings.innerText()).includes('UDP 使用 Receiver 后端')
-    &&await page.getByRole('button',{name:'均衡'}).isDisabled()
-    &&await page.getByRole('button',{name:'低延迟'}).isDisabled();
+    &&await page.getByRole('button',{name:'均衡'}).isEnabled()
+    &&await page.getByRole('button',{name:'低延迟'}).isEnabled()
+    &&await settings.getByRole('radio',{name:/高保真/}).isDisabled()
+    &&await settings.getByRole('radio',{name:/Hi-Res/}).isDisabled()
+    &&!await settings.getByText('ADB 仅支持标准音质。').isVisible();
+  await settings.getByRole('button',{name:'关闭'}).click();
+  await page.evaluate(()=>window.reviewSetWiredMode('aoa'));
+  await page.evaluate(()=>window.reviewActivateAoa(0,false));
+  results.activeAoaWithoutRestartCapabilityStaysLocked=await page.getByRole('button',{name:'均衡'}).isDisabled()
+    &&await page.getByRole('button',{name:'低延迟'}).isDisabled()
+    &&await page.getByText('更新手机 Receiver 后可切换播放模式。').isVisible();
+  await page.evaluate(()=>window.reviewActivateAoa());
+  await page.getByRole('group',{name:'USB 连接模式'}).getByRole('button',{name:'ADB'}).click();
+  let modeConfirm=page.getByRole('dialog');
+  await page.evaluate(()=>window.reviewFailNextDisconnect());
+  await modeConfirm.getByRole('button',{name:'断开并切换'}).click();
+  await page.waitForFunction(()=>window.reviewCalls.disconnect===1&&document.querySelector('dialog[open]')===null);
+  results.failedDisconnectKeepsMode=await page.evaluate(()=>window.reviewRead().settings.wiredMode==='aoa'&&window.reviewCalls.update_setting===1&&window.reviewRead().sessionTransport==='aoa');
+  await page.getByRole('group',{name:'USB 连接模式'}).getByRole('button',{name:'ADB'}).click();
+  modeConfirm=page.getByRole('dialog');
+  await modeConfirm.getByRole('button',{name:'断开并切换'}).click();
+  results.activeModeChangeDisconnectsAndSaves=await page.evaluate(()=>window.reviewCalls.disconnect===2&&window.reviewCalls.update_setting===2&&window.reviewRead().settings.wiredMode==='adb'&&window.reviewRead().settings.audioQuality==='standard'&&window.reviewCalls.start_aoa_audio===1);
   await page.goto(`${(process.env.ANPOD_UI_URL || 'http://127.0.0.1:1420').replace(/\/$/,'')}?lang=en`);
   await page.locator('.app-shell').waitFor();
-  await page.getByRole('button',{name:'USB Direct (experimental)',exact:true}).click();
+  await page.getByRole('group',{name:'USB connection mode'}).getByRole('button',{name:'USB Direct'}).click();
+  await page.getByRole('button',{name:'Connect USB Direct',exact:true}).click();
   const englishDialog=page.getByRole('dialog',{name:'USB Direct (experimental)'});
   const englishSwitch=englishDialog.locator('details.aoa-switch-section');
   await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===false);
@@ -252,7 +313,16 @@ fs.mkdirSync(out, {recursive:true});
    keyboardDisclosureKeepsConsent:results.keyboardDisclosureKeepsConsent,
    readyAoaFits360LargeText:results.readyAoaFits360LargeText,
    manualDisclosureSurvivesRerender:results.manualDisclosureSurvivesRerender,
-   aoaNeedsExplicitChoices:results.aoaNeedsExplicitChoices,
+   modePreferenceDoesNotSwitchOrStart:results.modePreferenceDoesNotSwitchOrStart,
+   adbOnlyOffersStandardQuality:results.adbOnlyOffersStandardQuality,
+   uniqueTargetPreselectedButBindingExplicit:results.uniqueTargetPreselectedButBindingExplicit,
+   removedTargetDoesNotReuseBinding:results.removedTargetDoesNotReuseBinding,
+   remembersExactTargetAndBinding:results.remembersExactTargetAndBinding,
+   multipleTargetsNeverGuessBinding:results.multipleTargetsNeverGuessBinding,
+   activeModeChangeDisconnectsAndSaves:results.activeModeChangeDisconnectsAndSaves,
+   failedDisconnectKeepsMode:results.failedDisconnectKeepsMode,
+   activeAoaLocksQualityButKeepsPlaybackAvailable:results.activeAoaLocksQualityButKeepsPlaybackAvailable,
+   activeAoaWithoutRestartCapabilityStaysLocked:results.activeAoaWithoutRestartCapabilityStaysLocked,
    noTargetKeepsSwitchStepsDiscoverable:results.noTargetKeepsSwitchStepsDiscoverable,
    switchingKeepsStatusAndDetailsVisible:results.switchingKeepsStatusAndDetailsVisible,
    successFocusIsVisible:results.successFocusIsVisible,
@@ -269,12 +339,13 @@ fs.mkdirSync(out, {recursive:true});
   fs.writeFileSync(`${out}/aoa-result.json`,JSON.stringify(results,null,2));
   console.log(JSON.stringify({readyAoaPrioritizesConnection:results.readyAoaPrioritizesConnection,keyboardDisclosureKeepsConsent:results.keyboardDisclosureKeepsConsent,noTargetKeepsSwitchStepsDiscoverable:results.noTargetKeepsSwitchStepsDiscoverable,switchingKeepsStatusAndDetailsVisible:results.switchingKeepsStatusAndDetailsVisible,manualDisclosureSurvivesRerender:results.manualDisclosureSurvivesRerender,manualSelectionKeepsDisclosureOpen:results.manualSelectionKeepsDisclosureOpen,successFocusIsVisible:results.successFocusIsVisible,successCollapsesWithoutConnecting:results.successCollapsesWithoutConnecting,englishDisclosureAndConsent:results.englishDisclosureAndConsent,englishKeyboardCollapse:results.englishKeyboardCollapse,errors}));
   await browser.close();assert.deepEqual(errors,[]);
-  for(const key of ['readyAoaPrioritizesConnection','keyboardDisclosureKeepsConsent','readyAoaFits360LargeText','manualDisclosureSurvivesRerender','manualSelectionKeepsDisclosureOpen','aoaNeedsExplicitChoices','noTargetKeepsSwitchStepsDiscoverable','switchingKeepsStatusAndDetailsVisible','successFocusIsVisible','successCollapsesWithoutConnecting','explicitTargetAndBindingReachBackend','opaqueTargetIdIsNotDisplayed','cancelUsesExistingOperation','englishDisclosureAndConsent','englishKeyboardCollapse','englishFits375LargeText'])assert.equal(results[key],true,key);
+  for(const key of ['modePreferenceDoesNotSwitchOrStart','adbOnlyOffersStandardQuality','readyAoaPrioritizesConnection','keyboardDisclosureKeepsConsent','readyAoaFits360LargeText','manualDisclosureSurvivesRerender','manualSelectionKeepsDisclosureOpen','uniqueTargetPreselectedButBindingExplicit','removedTargetDoesNotReuseBinding','remembersExactTargetAndBinding','multipleTargetsNeverGuessBinding','noTargetKeepsSwitchStepsDiscoverable','switchingKeepsStatusAndDetailsVisible','successFocusIsVisible','successCollapsesWithoutConnecting','explicitTargetAndBindingReachBackend','opaqueTargetIdIsNotDisplayed','cancelUsesExistingOperation','activeAoaLocksQualityButKeepsPlaybackAvailable','activeAoaWithoutRestartCapabilityStaysLocked','failedDisconnectKeepsMode','activeModeChangeDisconnectsAndSaves','englishDisclosureAndConsent','englishKeyboardCollapse','englishFits375LargeText'])assert.equal(results[key],true,key);
   return;
  }
  if(process.env.ANPOD_AUDIO_QUALITY_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
+  await page.getByRole('group',{name:'USB 连接模式'}).getByRole('button',{name:'USB Direct'}).click();
   await page.evaluate(()=>window.reviewSetAudioFormats(
    {codecVersion:2,sampleFormat:'pcm24le',sampleRateHz:48000,channels:2,validBitsPerSample:24,bytesPerSample:3,frameBytes:6},
    {sampleRate:48000,channels:2,sampleFormat:'float',containerBits:32,validBits:null},
@@ -284,7 +355,7 @@ fs.mkdirSync(out, {recursive:true});
   await dialog.waitFor();
   const hifi=dialog.getByRole('radio',{name:/高保真/});
   const hires=dialog.getByRole('radio',{name:/Hi-Res/});
-  results.zhLabelsAndDefault=await dialog.getByRole('radio',{name:'标准 · 48 kHz / 16-bit'}).isChecked()&&!await hifi.isDisabled()&&!await hires.isDisabled()&&await dialog.getByText(/标准音质仍是默认/).isVisible()&&await dialog.getByText(/仅在 Windows 混音源为 96 kHz 且 Receiver 支持时可用/).isVisible();
+  results.zhLabelsAndDefault=await dialog.getByRole('radio',{name:'标准 · 48 kHz / 16-bit'}).isChecked()&&!await hifi.isDisabled()&&!await hires.isDisabled()&&await dialog.getByText(/Hi-Res 需 Windows 采集与 Receiver 输出均支持 96 kHz/).isVisible();
   results.zhActualFormats=await dialog.locator('.audio-quality-status').innerText().then(text=>text.includes('48 kHz · Packed PCM24LE · 2 ch · 24 有效位')&&text.includes('Float · 2 ch · 32 容器位 · 未知（尚未提供格式遥测）')&&text.includes('Packed PCM24 流'))&&await dialog.getByText(/手机物理输出设备的有效精度未知/).isVisible();
   await hifi.check();
   results.hifiCanBeRequested=await page.evaluate(()=>window.reviewRead().settings.audioQuality==='hifi');
@@ -314,13 +385,14 @@ fs.mkdirSync(out, {recursive:true});
   await page.addInitScript(()=>Object.defineProperty(navigator,'language',{configurable:true,get:()=> 'en-US'}));
   await page.reload();
   await page.locator('.app-shell').waitFor();
+  await page.getByRole('group',{name:'USB connection mode'}).getByRole('button',{name:'USB Direct'}).click();
   await page.evaluate(()=>window.reviewSetAudioFormats(
    {codecVersion:1,sampleFormat:'pcm16le',sampleRateHz:48000,channels:2,validBitsPerSample:16,bytesPerSample:2,frameBytes:4},
    {sampleRate:44100,channels:2,sampleFormat:'integer',containerBits:24,validBits:null},
    {sampleRate:48000,channels:2,encoding:'float32'}));
   await page.getByRole('button',{name:/settings/i}).click();
   dialog=page.getByRole('dialog');await dialog.waitFor();
-  results.enLabelsAndDefault=await dialog.getByRole('radio',{name:'Standard · 48 kHz / 16-bit'}).isChecked()&&!await dialog.getByRole('radio',{name:/Hi-Fi/}).isDisabled()&&!await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText(/Standard remains the default/).isVisible()&&await dialog.getByText(/requires a 96 kHz Windows mix source and Receiver support/).isVisible();
+  results.enLabelsAndDefault=await dialog.getByRole('radio',{name:'Standard · 48 kHz / 16-bit'}).isChecked()&&!await dialog.getByRole('radio',{name:/Hi-Fi/}).isDisabled()&&!await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText(/Hi-Res requires 96 kHz capture and Receiver support/).isVisible();
   results.enActualFormats=await dialog.locator('.audio-quality-status').innerText().then(text=>text.includes('48 kHz · PCM16LE · 2 ch · 16 valid bits')&&text.includes('44.1 kHz · Integer PCM · 2 ch · 24 container bits · Unknown')&&text.includes('Float32 stream'))&&await dialog.getByText(/physical output device’s effective precision is unknown/).isVisible();
   results.enDialogGeometry=await dialog.evaluate(el=>({dialog:{scrollWidth:el.scrollWidth,clientWidth:el.clientWidth},quality:{scrollWidth:el.querySelector('.audio-quality-settings').scrollWidth,clientWidth:el.querySelector('.audio-quality-settings').clientWidth},rows:[...el.querySelectorAll('.audio-quality-status div')].map(row=>({scrollWidth:row.scrollWidth,clientWidth:row.clientWidth,text:row.innerText}))}));
   results.enDialogNoHorizontalOverflow=results.enDialogGeometry.dialog.scrollWidth<=results.enDialogGeometry.dialog.clientWidth&&results.enDialogGeometry.quality.scrollWidth<=results.enDialogGeometry.quality.clientWidth&&results.enDialogGeometry.rows.every(row=>row.scrollWidth<=row.clientWidth);
@@ -328,7 +400,8 @@ fs.mkdirSync(out, {recursive:true});
   await page.setViewportSize({width:375,height:640});
   await dialog.getByRole('checkbox',{name:/Larger text/i}).check();
   results.largeTextApplied=await page.locator('.app-shell.large-text').count()===1;
-  results.englishLight375Geometry=await dialog.evaluate(el=>({dialog:{scrollWidth:el.scrollWidth,clientWidth:el.clientWidth},quality:{scrollWidth:el.querySelector('.audio-quality-settings').scrollWidth,clientWidth:el.querySelector('.audio-quality-settings').clientWidth},rows:[...el.querySelectorAll('.setting-toggle')].map(row=>({scrollWidth:row.scrollWidth,clientWidth:row.clientWidth,text:row.innerText}))}));
+  await dialog.evaluate(el=>{if(document.activeElement instanceof HTMLElement)document.activeElement.blur();});
+  results.englishLight375Geometry=await dialog.evaluate(el=>({dialog:{scrollWidth:el.scrollWidth,clientWidth:el.clientWidth},quality:{scrollWidth:el.querySelector('.audio-quality-settings').scrollWidth,clientWidth:el.querySelector('.audio-quality-settings').clientWidth},rows:[...el.querySelectorAll('.setting-toggle')].map(row=>({scrollWidth:row.scrollWidth,clientWidth:row.clientWidth,text:row.innerText})),overflowing:[...el.querySelectorAll('*')].filter(item=>item.scrollWidth>item.clientWidth).map(item=>({tag:item.tagName,className:item.className?.baseVal??item.className,scrollWidth:item.scrollWidth,clientWidth:item.clientWidth,rect:item.getBoundingClientRect().toJSON(),text:item.innerText?.slice(0,70)}))}));
   results.englishLight375NoOverflow=results.englishLight375Geometry.dialog.scrollWidth<=results.englishLight375Geometry.dialog.clientWidth&&results.englishLight375Geometry.quality.scrollWidth<=results.englishLight375Geometry.quality.clientWidth;
   await dialog.evaluate(el=>el.scrollTop=0);
   await page.screenshot({path:`${out}/audio-quality-settings-en-light-large-375x640.png`});

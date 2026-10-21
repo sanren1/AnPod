@@ -102,6 +102,8 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     #[serde(default = "usb")]
     pub preferred_transport: String,
+    #[serde(default = "adb")]
+    pub wired_mode: String,
     #[serde(default)]
     pub wireless_protocol: String,
     #[serde(default = "receiver")]
@@ -112,6 +114,10 @@ pub struct AppSettings {
     /// next wireless search so a known phone answers without a broadcast.
     #[serde(default)]
     pub last_receiver_endpoint: Option<String>,
+    #[serde(default)]
+    pub last_usb_direct_target_id: Option<String>,
+    #[serde(default)]
+    pub last_usb_direct_binding_reference: Option<String>,
     #[serde(default = "standard")]
     pub audio_quality: String,
     #[serde(default = "balanced")]
@@ -131,6 +137,9 @@ fn usb() -> String {
 }
 fn udp() -> String {
     "udp".into()
+}
+fn adb() -> String {
+    "adb".into()
 }
 fn receiver() -> String {
     "receiver".into()
@@ -153,10 +162,13 @@ impl Default for AppSettings {
             minimize_to_tray: true,
             launch_at_login: false,
             preferred_transport: usb(),
+            wired_mode: adb(),
             wireless_protocol: udp(),
             audio_backend: receiver(),
             last_wireless_endpoint: None,
             last_receiver_endpoint: None,
+            last_usb_direct_target_id: None,
+            last_usb_direct_binding_reference: None,
             audio_quality: standard(),
             playback_mode: balanced(),
             appearance_theme: system(),
@@ -1342,6 +1354,21 @@ impl AppState {
         self.view.lock().expect("app view lock").settings = settings;
     }
 
+    fn remember_usb_direct_target(
+        &self,
+        target_id: &str,
+        binding_reference: &str,
+    ) -> Result<(), String> {
+        let mut view = self.view.lock().expect("app view lock");
+        let mut settings = view.settings.clone();
+        settings.last_usb_direct_target_id = Some(target_id.into());
+        settings.last_usb_direct_binding_reference = Some(binding_reference.into());
+        let settings = normalize_settings(settings);
+        self.save_settings(&settings)?;
+        view.settings = settings;
+        Ok(())
+    }
+
     fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
         fs::create_dir_all(&self.data_dir).map_err(|e| e.to_string())?;
         let path = self.data_dir.join("settings.json");
@@ -1607,10 +1634,13 @@ impl AppState {
             view.status_detail = "正在验证所选绑定并建立 USB Direct 会话。".into();
         }
         self.emit(app);
-        let mut audio_initialized = false;
+        let mut audio_initialized = true;
         let result = async {
             token_check(&token)?;
             let settings = self.view.lock().expect("view lock").settings.clone();
+            if settings.preferred_transport != "Usb" || settings.wired_mode != "aoa" {
+                return Err("请先选择 USB Direct 有线模式。".into());
+            }
             validate_audio_quality(&settings.audio_quality)?;
             let mode = if settings.playback_mode.eq_ignore_ascii_case("lowlatency") {
                 1
@@ -1628,7 +1658,6 @@ impl AppState {
             let (owner, queue, mix_format) = self
                 .create_aoa_owner(target_id, binding_reference, format, &token)
                 .await?;
-            audio_initialized = profile == 1;
             token_check(&token)?;
             let sink = match &queue {
                 SessionAudioQueue::Pcm16(queue) => {
@@ -1644,7 +1673,6 @@ impl AppState {
                     return Err(error);
                 }
             };
-            audio_initialized = true;
             if let Err(error) = self.audio.mute_active() {
                 let _ = self.audio.stop_pcm_sink();
                 let _ = self.audio.restore_muted();
@@ -1653,6 +1681,10 @@ impl AppState {
                 return Err(error);
             }
             token_check(&token)?;
+            if let Err(error) = self.remember_usb_direct_target(target_id, binding_reference) {
+                let _ = owner.stop();
+                return Err(error);
+            }
             let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
             let owner_snapshot = owner.snapshot();
             *self.session.lock().await = Some(Session {
@@ -3150,16 +3182,16 @@ impl AppState {
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
         if play_on_phone {
-            let quality = self
-                .view
-                .lock()
-                .expect("view lock")
-                .settings
-                .audio_quality
-                .clone();
+            let settings = self.view.lock().expect("view lock").settings.clone();
+            if settings.preferred_transport == "Usb" && settings.wired_mode == "aoa" {
+                return Err(
+                    "USB Direct 有线模式已选；请从 USB Direct 入口连接，或切回 ADB。".into(),
+                );
+            }
+            let quality = settings.audio_quality;
             validate_audio_quality(&quality)?;
             if quality != "standard" {
-                return Err("USB/ADB TCP playback supports Standard only. For HiFi or Hi-Res, use LAN UDP or experimental USB Direct.".into());
+                return Err("ADB连接仅支持标准音质。".into());
             }
         }
         if !self.operation_is_current(generation, token) {
@@ -3884,6 +3916,7 @@ impl AppState {
             "playbackMode" => settings.playback_mode = normalized.into(),
             _ => unreachable!(),
         }
+        let settings = normalize_settings(settings);
         self.save_settings(&settings)?;
         self.host_offer_listener
             .lock()
@@ -4538,6 +4571,7 @@ impl AppState {
             key,
             "transport"
                 | "preferredTransport"
+                | "wiredMode"
                 | "wirelessProtocol"
                 | "audioBackend"
                 | "playbackMode"
@@ -4556,6 +4590,13 @@ impl AppState {
             "preferredTransport" => {
                 settings.preferred_transport =
                     normalize_transport(value.as_str().ok_or("无效连接方式")?).into()
+            }
+            "wiredMode" => {
+                settings.wired_mode = match value.as_str().ok_or("无效有线模式")? {
+                    value if value.eq_ignore_ascii_case("adb") => "adb".into(),
+                    value if value.eq_ignore_ascii_case("aoa") => "aoa".into(),
+                    _ => return Err("有线模式必须为 adb 或 aoa。".into()),
+                }
             }
             "transport" => {
                 settings.preferred_transport = match value.as_str().ok_or("无效连接方式")? {
@@ -4583,6 +4624,9 @@ impl AppState {
                     .as_str()
                     .ok_or("无效音质设置 / Invalid audio quality")?;
                 validate_audio_quality(quality)?;
+                if adb_transport_enabled(&settings) && quality != "standard" {
+                    return Err("ADB连接仅支持标准音质。".into());
+                }
                 settings.audio_quality = quality.into();
             }
             "playbackMode" => {
@@ -4595,7 +4639,14 @@ impl AppState {
             }
             _ => return Err("未知设置项。".into()),
         }
-        if matches!(key, "transport" | "preferredTransport" | "wirelessProtocol") {
+        if adb_transport_enabled(&settings) {
+            settings.audio_quality = "standard".into();
+        }
+        let settings = normalize_settings(settings);
+        if matches!(
+            key,
+            "transport" | "preferredTransport" | "wiredMode" | "wirelessProtocol"
+        ) {
             self.host_offer_listener
                 .lock()
                 .expect("offer listener lock")

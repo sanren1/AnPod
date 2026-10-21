@@ -15,9 +15,14 @@ import android.os.Looper;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CountDownLatch;
@@ -168,6 +173,125 @@ public final class ReceiverServiceRobolectricTest {
         assertEquals(BuildConfig.VERSION_CODE, snapshot.versionCode);
         assertNotNull(snapshot.searchCandidates);
         assertEquals(false, snapshot.searchActive);
+    }
+
+    @Test
+    public void listedNetworkIsTheNetworkUsedByResolverAndSelectionFailureClearsWithoutStarting() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        NetworkFixture fixture = addSelectableNetwork();
+        try {
+            List<ReceiverService.AvailableNetwork> available = ReceiverService.availableNetworks(service);
+            assertTrue(available.stream().anyMatch(item -> item.network.equals(fixture.network)
+                    && item.address.equals(fixture.address) && item.prefixLength == fixture.prefixLength));
+            assertTrue(service.uiState.interfaces().stream().anyMatch(item -> item.address.equals(fixture.address.getHostAddress())
+                    && item.prefixLength == fixture.prefixLength));
+
+            java.lang.reflect.Method resolver = ReceiverService.class.getDeclaredMethod(
+                    "findNetworkForInterface", InetAddress.class, int.class);
+            resolver.setAccessible(true);
+            assertEquals(fixture.network, resolver.invoke(service, fixture.address, fixture.prefixLength));
+
+            String owner = "stale-network-selection";
+            assertTrue(service.uiOperation.begin(owner));
+            assertTrue(service.uiOperation.stop(owner));
+            assertTrue(service.uiOperation.completeFailure(owner, "ReceiveInterfaceChanged"));
+            ReceiverService.networkAudioState = "failed";
+            service.currentOperationGeneration = 42;
+            assertTrue(service.clearNetworkSelectionFailure(fixture.address.getHostAddress(), fixture.prefixLength));
+            assertEquals(ReceiverUiOperation.STOPPED, service.uiOperation.phase());
+            assertEquals("stopped", ReceiverService.networkAudioState);
+            assertEquals(42L, service.currentOperationGeneration);
+            assertNull(service.networkCoordinator);
+            assertFalse(service.clearNetworkSelectionFailure(fixture.address.getHostAddress(), fixture.prefixLength));
+        } finally {
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(fixture.network);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void preparedOwnerNetworkCheckRejectsTheOldNetworkAfterAReplacementIsListed() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        NetworkFixture fixture = addSelectableNetwork();
+        Network replacement = org.robolectric.util.ReflectionHelpers.callConstructor(Network.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(int.class, fixture.networkId + 1));
+        try {
+            assertTrue(service.isNetworkForInterface(fixture.network, fixture.address, fixture.prefixLength));
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(fixture.network);
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).addNetwork(replacement, null);
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).setLinkProperties(replacement, fixture.properties);
+            assertFalse(service.isNetworkForInterface(fixture.network, fixture.address, fixture.prefixLength));
+            assertTrue(service.isNetworkForInterface(replacement, fixture.address, fixture.prefixLength));
+        } finally {
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(fixture.network);
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(replacement);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void missingOutputEnginePreferenceDefaultsToOboeAndExplicitAudioTrackIsPreserved() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        android.content.SharedPreferences preferences = service.getSharedPreferences("anpod_receiver", 0);
+        try {
+            preferences.edit().remove("output_engine").commit();
+            assertEquals("oboeExperimental", service.requestedOutputEnginePreference());
+            preferences.edit().putString("output_engine", "audioTrack").commit();
+            assertEquals("audioTrack", service.requestedOutputEnginePreference());
+        } finally {
+            preferences.edit().remove("output_engine").commit();
+            service.onDestroy();
+        }
+    }
+
+    private static final class NetworkFixture {
+        final int networkId;
+        final Network network;
+        final InetAddress address;
+        final int prefixLength;
+        final LinkProperties properties;
+        NetworkFixture(int networkId, Network network, InetAddress address, int prefixLength, LinkProperties properties) {
+            this.networkId = networkId;
+            this.network = network;
+            this.address = address;
+            this.prefixLength = prefixLength;
+            this.properties = properties;
+        }
+    }
+
+    private NetworkFixture addSelectableNetwork() throws Exception {
+        NetworkInterface selected = java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).stream()
+                .filter(item -> {
+                    try { return item.isUp() && !item.isLoopback(); }
+                    catch (java.net.SocketException unavailable) { return false; }
+                })
+                .filter(item -> item.getInterfaceAddresses().stream().anyMatch(address ->
+                        address.getAddress() instanceof java.net.Inet4Address
+                                && address.getAddress().isSiteLocalAddress()
+                                && address.getNetworkPrefixLength() >= 1
+                                && address.getNetworkPrefixLength() <= 32))
+                .findFirst().orElseThrow(() -> new AssertionError("No private IPv4 interface for network fixture"));
+        java.net.InterfaceAddress hostAddress = selected.getInterfaceAddresses().stream()
+                .filter(address -> address.getAddress() instanceof java.net.Inet4Address
+                        && address.getAddress().isSiteLocalAddress()
+                        && address.getNetworkPrefixLength() >= 1 && address.getNetworkPrefixLength() <= 32)
+                .findFirst().orElseThrow(AssertionError::new);
+        int networkId = 4242;
+        Network network = org.robolectric.util.ReflectionHelpers.callConstructor(Network.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(int.class, networkId));
+        LinkProperties properties = new LinkProperties();
+        properties.setInterfaceName(selected.getName());
+        LinkAddress linkAddress = org.robolectric.util.ReflectionHelpers.callConstructor(LinkAddress.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(InetAddress.class, hostAddress.getAddress()),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(int.class,
+                        (int) hostAddress.getNetworkPrefixLength()));
+        org.robolectric.util.ReflectionHelpers.callInstanceMethod(properties, "addLinkAddress",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(LinkAddress.class, linkAddress));
+        ConnectivityManager connectivity = RuntimeEnvironment.getApplication().getSystemService(ConnectivityManager.class);
+        Shadows.shadowOf(connectivity).addNetwork(network, null);
+        Shadows.shadowOf(connectivity).setLinkProperties(network, properties);
+        return new NetworkFixture(networkId, network, hostAddress.getAddress(),
+                (int) hostAddress.getNetworkPrefixLength(), properties);
     }
 
     @Test

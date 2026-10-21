@@ -2,9 +2,9 @@
     <string name="app_name">AnPod</string>
     <string name="audio_output">声音输出</string>
     <string name="output_engine_title">播放引擎</string>
-    <string name="output_engine_description">仅对下一个播放会话生效；不会切换当前播放。</string>
-    <string name="output_engine_audio_track">AudioTrack（默认）</string>
-    <string name="output_engine_oboe">Oboe（实验）</string>
+    <string name="output_engine_description">新会话默认用 Oboe；格式不匹配时回退到 AudioTrack。当前会话不会切换。</string>
+    <string name="output_engine_audio_track">AudioTrack（备用）</string>
+    <string name="output_engine_oboe">Oboe（默认）</string>
     <string name="output_engine_unknown">未知</string>
     <string name="output_engine_actual">当前会话实际引擎：%1$s</string>
     <string name="output_engine_oboe_xruns">Oboe 中断计数：%1$d</string>
