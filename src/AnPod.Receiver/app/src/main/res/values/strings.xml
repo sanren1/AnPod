@@ -156,4 +156,6 @@
     <string name="diagnostics_copied">错误详情已复制</string>
     <string name="show_paired_computer_id">查看完整配对标识</string>
     <string name="hide_paired_computer_id">收起配对标识</string>
+    <string name="other_connection_methods">其他连接方式</string>
+    <string name="hide_other_connection_methods">收起其他连接方式</string>
 </resources>

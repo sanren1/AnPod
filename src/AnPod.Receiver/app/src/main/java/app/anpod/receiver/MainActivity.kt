@@ -615,6 +615,7 @@ private fun ReceiverScreen(
     onOpenNotificationSettings: () -> Unit
 ) {
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
+    var showMoreMethods by remember { mutableStateOf(false) }
     val currentTrustTarget = snapshot?.takeIf {
         serviceConnected && (it.backgroundStandbyEnabled || it.canRevokeBackgroundTrust)
             && it.bindingFingerprint.isNotEmpty()
@@ -688,8 +689,15 @@ private fun ReceiverScreen(
                 })
             }
 
-            OutlinedButton(
-                onClick = onConnectUsbDirect,
+            TextButton(
+                onClick = { showMoreMethods = !showMoreMethods },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            ) {
+                Text(stringResource(if (showMoreMethods) R.string.hide_other_connection_methods else R.string.other_connection_methods))
+            }
+            if (showMoreMethods) {
+                OutlinedButton(
+                    onClick = onConnectUsbDirect,
                 enabled = !running && !connectionPending && !usbPermissionPending
                         && usbDirectSupported && usbAccessoryFeatureAvailable && usbDirectAvailable && bound,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
@@ -709,7 +717,7 @@ private fun ReceiverScreen(
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             else if (!usbDirectAvailable) Text(stringResource(R.string.usb_direct_connect_hint),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
+            }
 
             OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
 
@@ -744,6 +752,7 @@ private fun ReceiverScreen(
                 }
             }
 
+            if (showMoreMethods) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(stringResource(R.string.background_standby_title), style = MaterialTheme.typography.titleMedium)
@@ -793,6 +802,7 @@ private fun ReceiverScreen(
                         else -> Text(stringResource(R.string.background_standby_requires_idle_receiver), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
+            }
             }
 
             if (!running && (networkChoiceNeeded || interfaces.isEmpty())) {
