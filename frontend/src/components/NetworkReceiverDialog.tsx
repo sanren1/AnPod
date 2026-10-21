@@ -52,12 +52,17 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive || disabled) return;
     if (!localAddress || !bindingReference || offers.active) return;
     listeningStarted.current = true;
-    void listenerCall.current(localAddress, true, bindingReference, true);
-    // The first bind may be blocked by the Windows firewall prompt; retry visibly soon after.
-    const retry = window.setTimeout(() => {
-      if (!offersActiveRef.current) void listenerCall.current(localAddress, true, bindingReference);
-    }, 1500);
-    return () => window.clearTimeout(retry);
+    // The first bind may be blocked by the Windows firewall prompt, so retry until the listener reports active.
+    let cancelled = false;
+    let attempts = 0;
+    const attempt = () => {
+      if (cancelled || offersActiveRef.current || attempts >= 6) return;
+      attempts += 1;
+      void listenerCall.current(localAddress, true, bindingReference, attempts > 1);
+      window.setTimeout(attempt, 2000);
+    };
+    attempt();
+    return () => { cancelled = true; };
   }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, disabled, localAddress, bindingReference, offers.active]);
   useEffect(() => {
     if (audioSessionActive && listeningStarted.current) {

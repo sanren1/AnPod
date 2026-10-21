@@ -14,7 +14,7 @@ export function Modal({ title, children, onClose, className = "" }: { title: str
     dialog.addEventListener("keydown", key);
     return () => { dialog.removeEventListener("keydown", key); if (dialog.open) dialog.close(); };
   }, []);
-  return <dialog ref={ref} aria-label={title} className={`modal ${className}`} onCancel={event => { event.preventDefault(); onClose(); }} onClick={event => { if (event.target === ref.current) onClose(); }}>
+  return <dialog ref={ref} aria-label={title} className={`modal ${className}`} onCancel={event => { event.preventDefault(); onClose(); }} onClick={event => { const dialog = ref.current; if (!dialog || event.target !== dialog) return; const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose(); }}>
     <div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label={strings.modal.close}><X size={18} /></button></div>{children}
   </dialog>;
 }
