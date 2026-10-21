@@ -524,7 +524,7 @@ function App() {
     } finally { setWorking(false); }
   };
 
-  const setOfferListener = async (localAddress: string, allowed: boolean, bindingReference?: string) => {
+  const setOfferListener = async (localAddress: string, allowed: boolean, bindingReference?: string, silent = false) => {
     if (!snapshot || (allowed && (active || working || snapshot.busy))) return;
     if (allowed) setWorking(true);
     setNetworkDialogError("");
@@ -535,9 +535,10 @@ function App() {
         const choice = await resolveWirelessChoice(selectedAddress, selectedBinding);
         selectedAddress = choice.selectedAddress;
         selectedBinding = choice.selectedBinding;
-        if (!selectedBinding && choice.availableBindings.length === 0) { setPanel("setup"); return; }
+        if (!selectedBinding && choice.availableBindings.length === 0) { if (silent) { setNetworkDialogError(strings.network.firstUseBindOverUsb); return; } setPanel("setup"); return; }
         if (!selectedAddress || !selectedBinding) {
           setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
+          if (silent) { setNetworkDialogError(strings.network.chooseComputerInterface); return; }
           openNetworkDialog(false); return;
         }
       }

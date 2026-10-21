@@ -16,7 +16,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   initialReceiverSerial: string;
   requiredChoices: { interfaceAddress: boolean; bindingReference: boolean };
   usbDevices: Device[]; usbSeenDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; receiverOperationProgress: ReceiverInstallProgress | null; audioSessionActive: boolean; udpMode: boolean; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
-  onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string) => void;
+  onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string, silent?: boolean) => void;
   onAcceptOffer: (offerId: string, bindingReference: string) => void; onReceiverSerialChange: (serial: string) => void;
   onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onAddPhone: () => void; onOpenReceiverManager: () => void; onClose: () => void;
 }) {
@@ -40,6 +40,28 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const [updateCandidateError, setUpdateCandidateError] = useState("");
   const [candidateLoading, setCandidateLoading] = useState(false);
   const [localError, setLocalError] = useState("");
+  // Waiting for a phone that taps "连接电脑" is an implementation detail now: opening this dialog
+  // starts the listener, so nobody has to pick between "start listening" and "connect".
+  const listenerCall = useRef(onSetOfferListener);
+  listenerCall.current = onSetOfferListener;
+  const listeningStarted = useRef(false);
+  useEffect(() => {
+    if (listeningStarted.current) return;
+    if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive) return;
+    if (!localAddress || !bindingReference || offers.active) return;
+    listeningStarted.current = true;
+    void listenerCall.current(localAddress, true, bindingReference, true);
+  }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, localAddress, bindingReference, offers.active]);
+  useEffect(() => {
+    if (audioSessionActive && listeningStarted.current) {
+      listeningStarted.current = false;
+      void listenerCall.current("", false);
+    }
+  }, [audioSessionActive]);
+  useEffect(() => () => {
+    if (listeningStarted.current) void listenerCall.current("", false);
+    listeningStarted.current = false;
+  }, []);
   const [addressNotice, setAddressNotice] = useState("");
   const [bindingResetPreview, setBindingResetPreview] = useState<BindingResetPreview | null>(null);
   const [bindingResetResult, setBindingResetResult] = useState<BindingResetResult | null>(null);
@@ -395,6 +417,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const canRequestUsbInstall = receiverNeedsInstall && !!updateCandidate && !receiverError;
   const canRequestUsbMaintenance = receiverNeedsUpgrade && snapshot.sessionTransport !== "lan" && !bindingReference && !!updateCandidate && !receiverError;
   const canRequestUsbUpgrade = receiverNeedsUpgrade && bindings.length > 0 && !!updateCandidate && !!bindingReference && !receiverError;
+  const canAcceptSelectedOffer = udpMode && offers.active && !!selectedOffer && !!bindingReference;
   const canStart = backgroundStartMode ? method === "paired" && !!bindingReference && endpointFitsInterface(peer, selectedLocalInterface)
     : method === "bootstrap"
     ? !!serial && receiverStatus?.installed === true && !!selectedBootstrapPair
@@ -681,7 +704,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
                 ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.offers.length === 1 ? strings.network.confirmRequestOnPc : strings.network.waitPhoneReceive
                 : bindings.length === 0 ? strings.network.firstUseBindOverUsb : strings.network.phoneCanStartOneTap}</small>
             </div>
-            {!offers.active && <button className="dialog-secondary" type="button" disabled={busy || audioSessionActive || !localAddress || !bindingReference} onClick={() => void onSetOfferListener(localAddress, true, bindingReference || undefined)}>{strings.network.startListening}</button>}
+
           </div>
           {offers.active && <>
             {offers.offers.length > 0
@@ -811,7 +834,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             {candidates.length > 0 && <div className="candidate-list" aria-label={strings.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>{candidate.bindingReference ? strings.network.verifiedCandidate : strings.network.unverifiedCandidate}</small></button>)}</div>}
           </>}
           {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />{strings.network.refreshInterfacesAndBindings}</button>}
-          {!receiverManagerOnly && <button className="primary-button network-connect" disabled={busy || !canStart}>{disabled ? strings.network.processing : backgroundStartMode ? strings.app.backgroundStartConnect : method === "bootstrap" ? strings.network.firstBindAndConnect : strings.network.connectReceiverDirectly}</button>}
+          {!receiverManagerOnly && <button className="primary-button network-connect" type={canAcceptSelectedOffer ? "button" : "submit"} disabled={busy || (!canStart && !canAcceptSelectedOffer)} onClick={canAcceptSelectedOffer ? () => { if (selectedOffer && bindingReference) onAcceptOffer(selectedOffer.id, bindingReference); } : undefined}>{disabled ? strings.network.processing : canAcceptSelectedOffer ? strings.network.acceptSelectedPhone : !canStart && offers.active ? strings.network.waitPhoneReceive : backgroundStartMode ? strings.app.backgroundStartConnect : method === "bootstrap" ? strings.network.firstBindAndConnect : strings.network.connectReceiverDirectly}</button>}
           </div>
       </>}
       {receiverProgressStage && <div className={`receiver-operation-progress${receiverProgressStage === "failed" ? " is-failed" : ""}`} role={receiverProgressStage === "failed" ? "alert" : "status"} aria-live={receiverProgressStage === "failed" ? "assertive" : "polite"}>
