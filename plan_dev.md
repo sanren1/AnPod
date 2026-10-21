@@ -2,9 +2,9 @@
 
 > 版本：1.1（工程执行基线；补充开源项目、官方指南及可复用实现调研）  
 > 制定日期：2026-10-19  
-> 代码基线：当前已交付 PC 1.10.4 / Receiver 0.17.3 code 37；开发起点 `1ca1d97`，源码及制品来源见文末。历史调研、提交与制品记录保留。
+> 代码基线：当前本地候选为 PC 1.10.5 / Receiver 0.17.4 code 38；业务实现 `f1040de`，PC 便携构建来源 `2d52d9b`，完整来源与验收见文末。历史调研、提交与制品记录保留。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
-> 项目阶段：Phase 1–6c、连接策略与独立 Astra 修订已完成源码及离线验收，记录见文末。本轮执行持久化有线模式、切网恢复操作、采集初始化及 Oboe 默认选择；完成前不记为已交付。真实 WASAPI capture、手机硬件输出格式/精度、AOA 权限与拔插、吞吐、声学/延迟/长时稳定性及实机原地升级仍为 **NOT_TESTED**；按用户要求跳过旧实机核查，离线门禁不改变此状态。
+> 项目阶段：Phase 1–6c、连接策略与独立 Astra 修订，以及本轮持久化有线模式、切网清理、采集初始化和 Oboe 默认选择，均已完成源码、离线验收与独立审查；签名候选和便携包审计通过，记录见文末。真实 WASAPI capture、手机硬件输出格式/精度、AOA 权限与拔插、吞吐、声学/延迟/长时稳定性及实机原地升级仍为 **NOT_TESTED**；按用户要求跳过旧实机核查，离线门禁不改变此状态。
 
 ## 0. 开发指令与决策摘要
 
@@ -641,7 +641,7 @@ Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connec
 
 使用本轮改进需同时更新 PC 1.10.4 和随包 Receiver code 37。独立 Astra 的原 3 项 P1/2 项 UX 与最终 deadline/管理停止路径均闭合；上述离线结果不代表真实 AppState 恢复、手机安装升级或音频表现已验证，实机状态仍为 NOT_TESTED。
 
-## 有线模式与网络、输出体验修订（2026-10-21，进行中）
+## 有线模式与网络、输出体验修订（2026-10-21，已完成本地候选）
 
 目标候选：PC 1.10.5 / Receiver 0.17.4 code 38。以下为本轮执行及验收契约，未完成项不记为通过。
 
@@ -665,3 +665,9 @@ PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈�
 封包收尾发现 README 仍列旧候选 PC 1.10.4/Receiver37，首轮 PC1.10.5 未交付产物及其过时审计已作废删除；历史旧版未动。README 已同步 PC1.10.5/Receiver38、首次 ADB 安装配对、Direct 偏好/发现、配件授权与手动开始、Oboe 默认/AudioTrack 备用和真实限制，10 个本地链接通过。独立复算浏览器检查脚本的显式断言数为 AOA **25**、音质 **17**，更正先前执行摘要的 24 项计数（实际检查均通过，未改生产代码或降低断言）。重封审计新增 README 与冻结源码及版本内容一致性检查，不只检查链接。
 
 最终文档增量复核另发现 Direct 的 Android API24 门槛在说明精简时遗漏，已补回“Direct Android7/API24+，ADB/LAN Android6+”；该门槛与程序一致，未放宽设备能力。相关未交付封包继续作废，待门槛说明复核通过后从新冻结提交重封。业务代码、版本、APK及其输入快照均未变化，不重复无关自动测试。
+
+最终收尾验收通过。Astra 对业务、精确 APK 登记和 README/API24 门槛逐次只读复核后给出最终 **PASS**，无残留必须修订项。最终便携包为 `artifacts/AnPod-1.10.5-tauri-win-x64-portable.zip`，18,458,769 bytes，SHA-256 `f0cdb1b54cf4cea261bd3b4c1e90df7237932ae35af07f1530cb6cb764938601`；EXE ProductVersion 1.10.5，SHA-256 `2cfe52c5c3ad13bb0001bbf0b5cc52e5c81af65aeaddb33dbabaa88d5555f442`。PC build/desktop source commit 均为 `2d52d9b661acd0e248a6ffad0b5016b277407196`，desktopInputsSha256 `858af61978b9fc7853b2ff73ff88073629a6776c0de63961c7589564b9c94bd5` 与构建前后及根代理独立重算一致。Receiver 仍为上述 code38、APK SHA `01beca356daf6e5630fbce9ff5c24a3b61f5ca75b08f22ce40c1ab08a29037c7`、source `f1040de83a41e04aa659af916a99fd52055ac5d1` / sourceInputs `d031a6ef77fba52bfc07da019e3d1b636145983f8db171b18b3f8fb26fc88042`，同一发布证书、sourceModified=false。
+
+独立审计 `artifacts/wired-mode-v4-portable-audit.json` 为 PASS，18 项 predicates 全 true：ZIP/stage 49 项路径、长度、SHA 一致；EXE 版本、Receiver exact release、Native/Legacy 实物哈希与来源通过；README 与工作区字节及冻结提交换行归一化内容一致，SHA-256 `6c40935231473778934d8332dca8135feaeaf3652af774003ac975c40f0fa656`，本地候选版本/API24 门槛正确，10 本地链接全部有效；禁止文件及已知 secret marker 均为 0。根代理另行打开 ZIP 逐项重算全部文件并复核 package/EXE/component/README 哈希、元数据与输入快照，验收 PASS。metadata workingTreeDirty=true 仅由保留的三个既有用户缓存造成；冻结时受跟踪文件无修改。过时的未交付封包、审计及本轮临时构建日志已清理，有效工具/编译缓存和历史旧包保留。
+
+使用本轮功能需同步更新 PC1.10.5 与随包 Receiver38。离线结果保持 Rust151 passed/0 failed/1原有辅助忽略、Android44全部通过、实际新 APK 读取1/1、浏览器 AOA25及音质17专项断言通过；旧全量前端 harness 不计通过。Direct 仍暂不作为新默认，但会持久保存用户选择；发现/预选不自动播放，任一端手动断开不重连。Direct 需 Android7/API24+，ADB/LAN 仍支持 Android6。更多厂商物理切换、WinUSB权限、原地升级、真实96k采集、Oboe/AudioTrack播放与声学表现仍 NOT_TESTED，后续扩大默认及适配范围需相应硬件证据，本轮未绕过这些限制。
