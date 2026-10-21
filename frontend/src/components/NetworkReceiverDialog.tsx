@@ -45,12 +45,19 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const listenerCall = useRef(onSetOfferListener);
   listenerCall.current = onSetOfferListener;
   const listeningStarted = useRef(false);
+  const offersActiveRef = useRef(offers.active);
+  offersActiveRef.current = offers.active;
   useEffect(() => {
     if (listeningStarted.current) return;
     if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive || disabled) return;
     if (!localAddress || !bindingReference || offers.active) return;
     listeningStarted.current = true;
     void listenerCall.current(localAddress, true, bindingReference, true);
+    // The first bind may be blocked by the Windows firewall prompt; retry visibly soon after.
+    const retry = window.setTimeout(() => {
+      if (!offersActiveRef.current) void listenerCall.current(localAddress, true, bindingReference);
+    }, 1500);
+    return () => window.clearTimeout(retry);
   }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, disabled, localAddress, bindingReference, offers.active]);
   useEffect(() => {
     if (audioSessionActive && listeningStarted.current) {
