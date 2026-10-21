@@ -771,18 +771,16 @@ function App() {
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {panel === "aoa" && <AoaDialog disabled={false} lastUsbDirectTargetId={snapshot.settings.lastUsbDirectTargetId} lastUsbDirectBindingReference={snapshot.settings.lastUsbDirectBindingReference} onStart={startAoa} onCancelStart={cancelAoaStart} onClose={() => void closeAoaDialog()} />}
-    {confirm && <ConfirmDialog
-      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? strings.app.switchReceiverUpgradeTitle : strings.app.switchReceiverInstallTitle : confirm.kind === "network" ? strings.app.switchNetworkTitle : confirm.kind === "aoa" ? strings.app.aoaInterruptTitle : confirm.kind === "wiredMode" ? strings.app.switchWiredModeTitle : confirm.kind === "device" ? strings.app.switchDeviceTitle : confirm.kind === "transport" ? strings.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? strings.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? strings.app.switchAudioBackendTitle : strings.app.switchPlaybackTitle}
-      body={confirm.kind === "receiverUsb" ? pendingReceiverOperation ? strings.app.receiverInstallOrCheck(pendingReceiverOperation.targetVersionCode) : strings.app.receiverOperation
-        : confirm.kind === "network" ? strings.app.networkConfirmation
-        : confirm.kind === "aoa" ? strings.app.aoaInterruptBody
-        : confirm.kind === "wiredMode" ? strings.app.switchWiredModeBody
-        : confirm.kind === "device" && lanSession ? strings.app.switchLanDevice(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone)
-          : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? strings.app.switchConnectionSettings
-            : confirm.kind === "audioBackend" ? strings.app.switchBackend
-            : confirm.kind === "device" ? strings.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone, snapshot.output === "phone")
-              : strings.app.switchPlayback}
-      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "aoa" ? strings.app.disconnectAndStart : confirm.kind === "wiredMode" ? strings.app.disconnectAndSave : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
+    {confirm && (() => {
+      // Every interrupting switch uses one confirmation: a single consequence line and one primary
+      // action, instead of a separate dialog per kind.
+      const installing = confirm.kind === "receiverUsb";
+      return <ConfirmDialog
+        title={installing ? strings.app.confirmInstallTitle : strings.app.confirmInterruptTitle}
+        body={installing ? strings.app.confirmInstallBody : strings.app.confirmInterruptBody}
+        confirmLabel={strings.app.confirmInterruptAction}
+        busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />;
+    })()}
   </div>;
 }
 
