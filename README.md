@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本地开发候选版本为 PC 1.10.4 + Receiver 0.17.3/code 37，离线回归与审查已通过，真机和音频效果仍未验证；AOA 与 Oboe 属于实验功能，公开下载以 Releases 为准。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本地候选为 PC 1.10.5 + Receiver 0.17.4-v3-flow-candidate/code 38，尚非公开发布，真机和音频效果仍未验证；公开下载以 Releases 为准。
 
 ## 使用要求
 
@@ -22,20 +22,13 @@
 
 ## USB Direct AOA（实验性）
 
-USB Direct 使用 Android Open Accessory（AOA）模式，不是 USB/ADB 的别名。它有独立的认证会话与密钥；三种音质档都走该会话的 v2 音频格式，不能因为 Standard 是 PCM16 就把它当作旧 ADB/v1 会话。用户可在 AnPod 的 USB Direct 窗口中选择受支持的手机并明确确认切换 USB 模式；该操作只发送模式切换请求，不会自动开始播放，也不回退到 ADB 或 LAN。
+本地候选为 PC 1.10.5 + Receiver 0.17.4-v3-flow-candidate/code 38；尚非公开发布，也未通过实机验证。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
 
-当前开发组合为 Receiver 0.17.3-v3-flow-candidate / code 37 与 PC 1.10.4，尚不是公开发布版本。不要用旧版 PC/Receiver 组合尝试播放。只有安装声明 AnPod / AnPod USB Direct 配件身份且包含匹配 AOA 会话实现的 Receiver 后，才可按以下实验步骤操作：
+1. 首次使用先通过 USB/ADB 安装 Receiver 并完成配对，再在 USB 下选择持久化的 ADB 或 USB Direct 模式。打开 Direct 主按钮或手机卡片可进入配置页。
+2. AnPod 自动刷新只读发现的设备；发现唯一设备时会预选。需要物理切换 USB 模式时，展开切换选项并按提示操作；切换仅支持已验证的 iQOO 11，且须明确允许停止电脑上的全局 ADB server。然后在手机 Receiver 中允许配件权限。
+3. 选择已配对的接收端，或使用同一设备的已认证记忆，再明确点击“开始连接”才会播放。初次连接始终手动发起；意外断线仅在同一连接方式内有界恢复，不会自动切换 Direct、ADB 或 LAN；任一端手动停止后不会重连。
 
-1. 先通过现有路径完成 PC 与 Receiver 配对。手机端 Android 版本需为 API 24 或更高；App 的 minSdk 仍为 23，原 USB/ADB 与 LAN/UDP 路径不受此限制。
-2. 在 PC AnPod 打开“USB Direct”，就绪的 AOA 设备会优先显示；切换选项可折叠展开，配置与其他连接操作互斥，切换期间也会阻止并发连接。首次切换前须明确勾选“允许停止本机 ADB server”；这会影响电脑上所有 ADB 调试连接。确认后，AnPod 校验 `VID_2D95&PID_6013&MI_02`，运行 `adb kill-server`，再对该 USB 接口尝试一次 WinUSB 切换。失败会显示错误，不会回退到 ADB 或 LAN。
-3. 切换后在手机前台打开 Receiver 并确认 Android 配件权限。手机重新枚举后，选择 accessory target 和已保存的配对 binding，再由 PC 手动点击连接。Receiver 等待主机 HELLO 最多约 30 秒；授权或连接失败会显示错误，不会回退到 ADB/LAN。
-4. USB/ADB、LAN 与 AOA 会话都支持“均衡/低延迟”切换。AOA 需要 Receiver 提供 `0x200` 能力，每次切换模式都会重新认证，并创建新密钥与队列；旧 Receiver 缺少该能力时会提示更新。音质档和格式仍需结束会话并重新连接。高解析播放要求 Windows 实际输出为 96 kHz；检测到 48 kHz 时会明确提示，不会重采样或静默降级。复合 18D1:2D01 accessory 设备只允许使用 MI_00，MI_01 是 ADB 接口，音频路径不会打开它。取消或拔线结束当前会话；要回原 USB 模式，按手机和线缆提示断开并重新连接。
-
-源码 checkout 也保留 `./packaging/enter-usb-direct.ps1` 作为备用手动入口；按提示输入 `SWITCH AOA`。独立便携包把脚本和 helper 放在 `USB-Direct/` 目录。脚本仍复用 `AnPod_AOA_Phase2_Probe/Windows/AoaHost.cs`。
-
-产品切换仅支持指定机型，必须由用户选择并确认，模式切换本身不会开始音频。现有 `AnPod_AOA_Phase2_Probe/Windows/Run-AoaPhase2.ps1 -Mode Switch` 使用 `AnPod Lab` / `AOA Bulk Probe` 身份，只用于独立回显探针；它不是产品播放器，不能与 `AnPod` / `AnPod USB Direct` 混用。代码与离线检查不代表真机通过；AOA 真机权限、拔插恢复、Windows 实际 WinUSB 访问、音频播放和声学表现仍未测试，见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
-
-连接规则：每次初次连接都由 PC 用户手动点击发起，包括只有一个设备的 LAN offer；记忆设备不会自动连接。只有已建立会话意外断线，才按同一 transport、target、binding、profile、mode 与 output 做有界重连；PC 或手机手动断开会取消重连。初次连接失败不会后台重试，USB Direct 失败也不会回退到 ADB。
+ADB 仅支持 Standard（48 kHz、16 bit），切换到有效 ADB 连接会自动使用 Standard。Direct 与 LAN 支持三档音质；HiRes 要求真实 96 kHz 采集且不做采样率转换，手机输出能力尚未实机验证。音频偏好未设置时默认使用 Oboe；已手选的 AudioTrack 会保留，也作为 Oboe 不可用时的兼容回退。AOA 权限、实际播放和声学表现仍为 NOT_TESTED，见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
 
 ## 无线 UDP 快速开始
 
