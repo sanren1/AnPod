@@ -510,7 +510,8 @@ function App() {
       try {
         apply(await invokeApp<Snapshot>("start_network_audio", {
           localAddress: choices.localAddress, peer: candidates[0].endpoint,
-          bindingReference: choices.bindingReference, backgroundAuthorizationRequired: true,
+          // A phone that answered discovery is awake; do not demand the standby capability (that is only for the explicit background flow).
+          bindingReference: choices.bindingReference, backgroundAuthorizationRequired: false,
         }));
         lastOfferListenerChoice.current = { localAddress: choices.localAddress, bindingReference: choices.bindingReference };
         setPanel(null);
