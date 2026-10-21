@@ -1324,18 +1324,7 @@ impl HostSession {
             sequence,
             self.format_v2.is_some(),
         )?;
-        if ack.result == RESULT_USER_STOPPED {
-            if ack.state != ReceiverState::Stopped
-                || !self
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
-            {
-                return Err("P5-C Receiver terminal cause was invalid.".into());
-            }
-            self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
-            self.state = ReceiverState::Stopped;
-        }
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1398,6 +1387,7 @@ impl HostSession {
             sequence,
             self.format_v2.is_some(),
         )?;
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1480,6 +1470,7 @@ impl HostSession {
             sequence,
             self.format_v2.is_some(),
         )?;
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1501,6 +1492,23 @@ impl HostSession {
         self.last_command = Some(frame);
         self.last_ack = Some(ack_frame);
         Ok(ack)
+    }
+
+    fn record_terminal_cause(&mut self, ack: &Ack) -> Result<(), String> {
+        if ack.result != RESULT_USER_STOPPED {
+            return Ok(());
+        }
+        if ack.state != ReceiverState::Stopped
+            || !self
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
+        {
+            return Err("P5-C Receiver terminal cause was invalid.".into());
+        }
+        self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+        self.state = ReceiverState::Stopped;
+        Ok(())
     }
 
     fn close_local(&mut self) {
@@ -2255,10 +2263,16 @@ fn execute_background_trust_command(
             } else {
                 session.query_background_trust_until(deadline, &cancellation)
             };
-            let connection_failed = session.state() == ReceiverState::Stopped;
+            let receiver_user_stopped =
+                session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
+            let connection_failed =
+                !receiver_user_stopped && session.state() == ReceiverState::Stopped;
             let error = result.as_ref().err().cloned();
             let _ = reply.send(result);
-            if connection_failed {
+            if receiver_user_stopped {
+                enabled.store(false, Ordering::Release);
+                BackgroundTrustCommandOutcome::Stop
+            } else if connection_failed {
                 BackgroundTrustCommandOutcome::ConnectionFailed(error.unwrap_or_else(|| {
                     "P5-C control channel closed during background trust query.".into()
                 }))
@@ -2279,7 +2293,9 @@ fn execute_background_trust_command(
             } else {
                 session.revoke_background_trust_until(deadline, &cancellation)
             };
-            if result.is_ok() {
+            let receiver_user_stopped =
+                session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
+            if result.is_ok() || receiver_user_stopped {
                 enabled.store(false, Ordering::Release);
                 let _ = reply.send(result);
                 BackgroundTrustCommandOutcome::Stop
@@ -2575,6 +2591,10 @@ fn run_session_owner(
                         break;
                     }
                 }
+            }
+            if finish_receiver_user_stop(&mut session, &status) {
+                last_error = None;
+                stop_owner = true;
             }
             session.close_local();
             drop(session);
@@ -3027,12 +3047,8 @@ fn run_session_owner(
                 }
             }
         }
-        if session.terminal_cause() == Some(TerminalCause::ReceiverUserStop) {
-            let mut current = status.lock().expect("P5-D session status lock poisoned");
-            current.state = SessionLifecycleState::Stopped;
-            current.session_id = None;
-            current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
-            current.last_error = None;
+        if finish_receiver_user_stop(&mut session, &status) {
+            last_error = None;
             stop_owner = true;
         }
         let receiver_user_stopped =
@@ -3631,16 +3647,18 @@ pub(crate) fn decode_ack_with_format(
     v2_audio: bool,
 ) -> Result<Ack, String> {
     let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
+    let terminal_ack = payload_len == 13 && frame[CONTROL_HEADER_BYTES + 9] == RESULT_USER_STOPPED;
     if frame[5] != ACK
         || u64::from_be_bytes(frame[20..28].try_into().unwrap()) != expected_sequence
-        || match command {
-            PLAYBACK_PROGRESS_QUERY => payload_len != if v2_audio { 91 } else { 83 },
-            BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
-                payload_len != 30
-            }
-            BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE => payload_len != 55,
-            _ => payload_len != 13,
-        }
+        || (!terminal_ack
+            && match command {
+                PLAYBACK_PROGRESS_QUERY => payload_len != if v2_audio { 91 } else { 83 },
+                BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
+                    payload_len != 30
+                }
+                BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE => payload_len != 55,
+                _ => payload_len != 13,
+            })
     {
         return Err("P5-C ACK sequence or type was invalid.".into());
     }
@@ -3655,7 +3673,13 @@ pub(crate) fn decode_ack_with_format(
     if result > RESULT_USER_STOPPED {
         return Err("P5-C ACK result code was invalid.".into());
     }
-    let playback_progress = if command == PLAYBACK_PROGRESS_QUERY {
+    let udp_port = u16::from_be_bytes([payload[11], payload[12]]);
+    if result == RESULT_USER_STOPPED
+        && (payload_len != 13 || state != ReceiverState::Stopped || udp_port != 0)
+    {
+        return Err("P5-C Receiver terminal cause was invalid.".into());
+    }
+    let playback_progress = if command == PLAYBACK_PROGRESS_QUERY && !terminal_ack {
         Some(decode_playback_progress_with_format(
             &payload[13..],
             v2_audio,
@@ -3663,10 +3687,11 @@ pub(crate) fn decode_ack_with_format(
     } else {
         None
     };
-    let background_authorization = if matches!(
-        command,
-        BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL
-    ) {
+    let background_authorization = if !terminal_ack
+        && matches!(
+            command,
+            BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL
+        ) {
         let request_id: [u8; 16] = payload[13..29].try_into().unwrap();
         let status = payload[29];
         if status > AUTH_CANCELLED {
@@ -3676,27 +3701,28 @@ pub(crate) fn decode_ack_with_format(
     } else {
         None
     };
-    let background_trust = if matches!(command, BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE) {
-        let commitment: [u8; 32] = payload[13..45].try_into().unwrap();
-        let kind = payload[45];
-        let persistence = payload[46];
-        let remaining_ms = u64::from_be_bytes(payload[47..55].try_into().unwrap());
-        if !valid_background_trust(kind, persistence, remaining_ms) {
-            return Err("P5-C background trust fields were invalid.".into());
-        }
-        Some(BackgroundTrustSnapshot {
-            commitment,
-            kind,
-            persistence,
-            remaining_ms,
-        })
-    } else {
-        None
-    };
+    let background_trust =
+        if !terminal_ack && matches!(command, BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE) {
+            let commitment: [u8; 32] = payload[13..45].try_into().unwrap();
+            let kind = payload[45];
+            let persistence = payload[46];
+            let remaining_ms = u64::from_be_bytes(payload[47..55].try_into().unwrap());
+            if !valid_background_trust(kind, persistence, remaining_ms) {
+                return Err("P5-C background trust fields were invalid.".into());
+            }
+            Some(BackgroundTrustSnapshot {
+                commitment,
+                kind,
+                persistence,
+                remaining_ms,
+            })
+        } else {
+            None
+        };
     Ok(Ack {
         result,
         state,
-        udp_port: u16::from_be_bytes([payload[11], payload[12]]),
+        udp_port,
         playback_progress,
         background_authorization,
         background_trust,

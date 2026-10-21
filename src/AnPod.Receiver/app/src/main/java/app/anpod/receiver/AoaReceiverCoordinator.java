@@ -202,6 +202,11 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         return message.toString();
     }
 
+    void reportPlaybackFailure(AoaSessionContext context, IOException error) {
+        if (audio != context) return;
+        fail(error);
+    }
+
     /** Safe on the main thread: invalidates and signals only; joining and key destruction happen elsewhere. */
     void cancel(String reason) {
         synchronized (lifecycle) {

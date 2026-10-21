@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Usb } from "lucide-react";
 import { strings } from "../strings";
 import { bindingReferenceLabel, invokeApp } from "../appRuntime";
@@ -19,15 +19,19 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
   const [bindingReference, setBindingReference] = useState("");
   const [loading, setLoading] = useState(true);
   const [switchListLoading, setSwitchListLoading] = useState(true);
+  const [switchSectionOpen, setSwitchSectionOpen] = useState(true);
   const [switchConfirmed, setSwitchConfirmed] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [switchComplete, setSwitchComplete] = useState(false);
+  const [switchHasSucceeded, setSwitchHasSucceeded] = useState(false);
   const [hasAoaTargetsAfterSwitch, setHasAoaTargetsAfterSwitch] = useState(false);
   const [switchListError, setSwitchListError] = useState("");
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [errorSummary, setErrorSummary] = useState("");
   const [errorDetails, setErrorDetails] = useState("");
+  const switchSectionTouched = useRef(false);
+  const switchSummaryRef = useRef<HTMLElement | null>(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -46,6 +50,7 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
       ]);
       setTargets(nextTargets);
       setBindings(nextBindings);
+      if (!switchSectionTouched.current) setSwitchSectionOpen(nextTargets.length === 0 && !switchHasSucceeded);
     } catch (error) {
       setTargets([]);
       setBindings([]);
@@ -88,6 +93,9 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
       setSwitchTargetId("");
       setSwitchConfirmed(false);
       setSwitchComplete(true);
+      setSwitchHasSucceeded(true);
+      switchSummaryRef.current?.focus();
+      setSwitchSectionOpen(false);
     } catch (error) {
       const details = String(error);
       setErrorSummary(/0x80070005|E_ACCESSDENIED|Access is denied/i.test(details) ? strings.aoaDialog.switchAccessDenied : strings.aoaDialog.switchFailed);
@@ -124,13 +132,13 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
 
   const busy = disabled || loading || switchListLoading || starting || cancelling || switching;
   return <Modal title={strings.aoaDialog.title} onClose={() => { if (switching) return; if (starting) void cancelStart(); else onClose(); }} className="aoa-dialog">
-    <p className="dialog-description">{strings.aoaDialog.description}</p>
+    <p className="dialog-description">{targets.length ? strings.aoaDialog.readyDescription : strings.aoaDialog.description}</p>
     {errorSummary && <ErrorDetails className="aoa-error" summary={errorSummary} details={errorDetails} />}
     {starting && <p className="dialog-description" role="status" aria-live="polite">{cancelling ? strings.aoaDialog.cancelling : strings.aoaDialog.starting}</p>}
     {switching && <p className="dialog-description" role="status" aria-live="polite">{strings.aoaDialog.switching}</p>}
     {switchComplete && <p className="dialog-description" role="status" aria-live="polite">{hasAoaTargetsAfterSwitch ? strings.aoaDialog.switchReady : strings.aoaDialog.switchComplete}</p>}
-    <section className="aoa-switch-section" aria-labelledby="aoa-switch-title">
-      <h3 id="aoa-switch-title">{strings.aoaDialog.switchTitle}</h3>
+    <details className="aoa-switch-section" open={switchSectionOpen} onToggle={event => setSwitchSectionOpen(event.currentTarget.open)}>
+      <summary ref={switchSummaryRef} onClick={() => { switchSectionTouched.current = true; }}>{strings.aoaDialog.switchTitle}</summary>
       <p>{strings.aoaDialog.switchSupport}</p>
       {switchListError && <ErrorDetails className="aoa-error" summary={strings.aoaDialog.switchLoadFailed} details={switchListError} />}
       <label className="aoa-field">
@@ -150,7 +158,7 @@ export function AoaDialog({ disabled, onStart, onCancelStart, onClose }: {
           <Usb size={16} aria-hidden="true" />{switching ? strings.aoaDialog.switching : strings.aoaDialog.switchAction}
         </button>
       </div>
-    </section>
+    </details>
     <hr className="aoa-divider" />
     <h3 className="aoa-section-title">{strings.aoaDialog.connectTitle}</h3>
     <label className="aoa-field">

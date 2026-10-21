@@ -1147,6 +1147,106 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void lateAoaStopCompletionDoesNotInterruptRecoveryInEitherOrder() throws Exception {
+        for (boolean completionFirst : new boolean[] {true, false}) {
+            ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+            String owner = "aoa-stop-race-" + completionFirst;
+            long generation = 91;
+            assertTrue(service.uiOperation.begin(owner));
+            assertTrue(service.uiOperation.running(owner));
+            service.currentOperationGeneration = generation;
+            setInstanceField(service, "networkBootstrapGeneration",
+                    new java.util.concurrent.atomic.AtomicLong(generation));
+            service.aoaOwnerId = owner;
+            service.aoaOwnerGeneration = generation;
+            service.aoaAccessory = accessoryForTest();
+            setInstanceField(service, "aoaRecoveryDeadlineElapsedMs",
+                    android.os.SystemClock.elapsedRealtime() + 10_000);
+            setInstanceField(service, "aoaRecoveryAttempt", 1);
+            AoaSessionContext context = new AoaSessionContext(910, new byte[32],
+                    UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+            ReceiverService.AudioSession session = new ReceiverService.AudioSession(910,
+                    ReceiverService.AudioRequest.aoa(context), owner, generation);
+            session.cancelled = true;
+            session.stopReason = "AoaSessionStopped";
+            ReceiverService.currentAudio = session;
+            try {
+                if (!completionFirst) service.scheduleAoaRecovery(owner, generation, "restart requested");
+                invokeFinishAudio(service, session, "AoaSessionStopped");
+                if (completionFirst) service.scheduleAoaRecovery(owner, generation, "restart requested");
+                service.aoaAccessory = null;
+                assertEquals(generation, service.currentOperationGeneration);
+                assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            } finally {
+                ((android.os.Handler) getInstanceField(service, "handler")).removeCallbacksAndMessages(null);
+                setInstanceField(service, "aoaRecoveryDeadlineElapsedMs", 0L);
+                context.destroy();
+                service.onDestroy();
+            }
+        }
+    }
+
+    @Test
+    public void aoaPlaybackFailureIsReportedToItsCoordinatorAndOldContextCannotFailNewOne() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-playback-failure-owner";
+        long generation = 92;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation));
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        AoaSessionContext currentContext = new AoaSessionContext(920, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        AoaSessionContext oldContext = new AoaSessionContext(919, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        CountDownLatch allowClose = new CountDownLatch(1);
+        allowClose.countDown();
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(new AoaAccessoryIo(
+                new DelayedCloseInput(new CountDownLatch(1), allowClose), new IdleOutput(), () -> { }),
+                new PairingProtocol.BindingMaterial(new byte[16], new byte[16], new byte[32]),
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String id, long token) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, 5000);
+        setInstanceField(coordinator, "audio", currentContext);
+        setInstanceField(coordinator, "playbackStarted", true);
+        setInstanceField(coordinator, "playbackEverStarted", true);
+        service.aoaCoordinator = coordinator;
+        try {
+            ReceiverService.AudioSession oldSession = new ReceiverService.AudioSession(919,
+                    ReceiverService.AudioRequest.aoa(oldContext), owner, generation);
+            ReceiverService.currentAudio = oldSession;
+            invokeFinishAudio(service, oldSession, "AudioEngineFailed: old session");
+            assertEquals("old context must not affect the active coordinator", "",
+                    coordinator.failureMessage());
+            assertEquals(generation, service.currentOperationGeneration);
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+
+            ReceiverService.AudioSession currentSession = new ReceiverService.AudioSession(920,
+                    ReceiverService.AudioRequest.aoa(currentContext), owner, generation);
+            ReceiverService.currentAudio = currentSession;
+            invokeFinishAudio(service, currentSession, "AudioEngineFailed: output unavailable");
+            assertTrue(coordinator.awaitTermination(2, TimeUnit.SECONDS));
+            assertTrue(coordinator.failureMessage().contains("AudioEngineFailed: output unavailable"));
+            assertTrue(coordinator.shouldRecoverUnexpectedFailure());
+        } finally {
+            coordinator.cancel("test-finished");
+            coordinator.awaitTermination(2, TimeUnit.SECONDS);
+            oldContext.destroy();
+            service.onDestroy();
+        }
+    }
+
+    @Test
     public void phoneStopDoesNotDeferWhileP5cCoordinatorIsOnlyListening() throws Exception {
         PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
                 new byte[16], new byte[16], new byte[32]);
@@ -1195,6 +1295,24 @@ public final class ReceiverServiceRobolectricTest {
         Field field = ReceiverService.class.getDeclaredField(name);
         field.setAccessible(true);
         field.set(null, value);
+    }
+
+    private static void invokeFinishAudio(ReceiverService service, ReceiverService.AudioSession session,
+            String failure) throws Exception {
+        Method finish = ReceiverService.class.getDeclaredMethod("finishAudio",
+                ReceiverService.AudioSession.class, String.class);
+        finish.setAccessible(true);
+        finish.invoke(service, session, failure);
+    }
+
+    private static UsbAccessory accessoryForTest() {
+        return org.robolectric.util.ReflectionHelpers.callConstructor(UsbAccessory.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "1"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, ""),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "test-serial"));
     }
 
     private static void setInstanceField(Object receiver, String name, Object value) throws Exception {

@@ -184,6 +184,20 @@ public final class P5cLoopbackEndpoint {
                 close.setDaemon(true);
                 close.start();
             }
+            if (Arrays.asList(args).contains("--request-user-stop-on-stdin")) {
+                Thread stop = new Thread(() -> {
+                    try {
+                        if (System.in.read() < 0) throw new IOException("missing user-stop signal");
+                        System.out.println("USER_STOP_REQUESTED=" + endpoint.requestUserStop());
+                        System.out.flush();
+                        Thread.sleep(1_000);
+                        endpoint.close();
+                    } catch (IOException error) { throw new RuntimeException(error); }
+                    catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+                });
+                stop.setDaemon(true);
+                stop.start();
+            }
             Arrays.stream(args).filter(value -> value.startsWith("--drop-after-ms=")).findFirst().ifPresent(value -> {
                 long delay = Long.parseLong(value.substring("--drop-after-ms=".length()));
                 Thread drop = new Thread(() -> dropFirstAuthenticatedConnection(endpoint, delay), "P5-C test disconnect");

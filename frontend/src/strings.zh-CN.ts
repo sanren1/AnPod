@@ -234,6 +234,7 @@ export const zhCN = {
   aoaDialog: {
     title: "USB Direct（实验）",
     description: "切换 USB 模式后，请在手机确认授权；再选择设备和已配对接收端，点“开始连接”。",
+    readyDescription: "选择设备和已配对接收端，点“开始连接”。",
     switchTitle: "切换 USB 模式",
     switchSupport: "仅支持 iQOO 11（V2243A）。请先安装 Receiver 并完成配对；切换后需在手机上确认配件授权。",
     switchTarget: "已连接的手机",

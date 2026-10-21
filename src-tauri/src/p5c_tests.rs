@@ -87,6 +87,311 @@ fn background_authorization_ack_enforces_exact_length_and_status_range() {
 }
 
 #[test]
+fn extension_commands_accept_only_canonical_user_stopped_ack() {
+    let make_ack = |command: u8, result: u8, state: u8, port: u16, sequence: u64| {
+        let mut frame = vec![0; CONTROL_HEADER_BYTES + 13 + CONTROL_TAG_BYTES];
+        frame[5] = ACK;
+        frame[20..28].copy_from_slice(&0u64.to_be_bytes());
+        frame[28..30].copy_from_slice(&13u16.to_be_bytes());
+        frame[30] = command;
+        frame[31..39].copy_from_slice(&sequence.to_be_bytes());
+        frame[39] = result;
+        frame[40] = state;
+        frame[41..43].copy_from_slice(&port.to_be_bytes());
+        frame
+    };
+
+    for command in [
+        PLAYBACK_PROGRESS_QUERY,
+        BACKGROUND_START_REQUEST,
+        BACKGROUND_TRUST_QUERY,
+    ] {
+        let ack = decode_ack_with_format(
+            &make_ack(command, RESULT_USER_STOPPED, 5, 0, 7),
+            0,
+            command,
+            7,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ack.result, RESULT_USER_STOPPED);
+        assert_eq!(ack.state, ReceiverState::Stopped);
+        assert_eq!(ack.udp_port, 0);
+        assert!(ack.playback_progress.is_none());
+        assert!(ack.background_authorization.is_none());
+        assert!(ack.background_trust.is_none());
+    }
+
+    let progress = make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 5, 0, 7);
+    assert!(decode_ack_with_format(&progress, 1, PLAYBACK_PROGRESS_QUERY, 7, true).is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 5, 0, 8),
+        0,
+        PLAYBACK_PROGRESS_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 2, 0, 7),
+        0,
+        PLAYBACK_PROGRESS_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(BACKGROUND_START_REQUEST, RESULT_USER_STOPPED, 5, 1, 7),
+        0,
+        BACKGROUND_START_REQUEST,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(BACKGROUND_TRUST_QUERY, RESULT_OK, 5, 0, 7),
+        0,
+        BACKGROUND_TRUST_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+}
+
+#[test]
+fn session_rejects_user_stopped_ack_without_terminal_cause_capability() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    let session_id = 0x0102_0304_0506_0708;
+    let control_tx = [0x31; 32];
+    let control_rx = [0x42; 32];
+    let (stream, server) = {
+        let server_keys = (control_tx, control_rx);
+        let session_id = session_id;
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let request = read_frame(
+                &mut tcp,
+                &server_keys.0,
+                HOST_TO_RECEIVER_CONTROL,
+                session_id,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(request[5], PLAYBACK_PROGRESS_QUERY);
+            let mut payload = [0u8; 13];
+            payload[0] = PLAYBACK_PROGRESS_QUERY;
+            payload[9] = RESULT_USER_STOPPED;
+            payload[10] = 5;
+            let ack = encode_control(
+                &server_keys.1,
+                RECEIVER_TO_HOST_CONTROL,
+                session_id,
+                0,
+                ACK,
+                &payload,
+            )
+            .unwrap();
+            write_frame(&mut tcp, &ack, &CancellationToken::new()).unwrap();
+        });
+        let stream = TcpStream::connect(peer).unwrap();
+        (stream, server)
+    };
+    let mut host = HostSession {
+        tcp: Some(stream),
+        udp_socket: None,
+        sender: None,
+        float_sender: None,
+        pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+        queue: Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            false,
+        )),
+        float_queue: None,
+        keys: SessionKeys {
+            audio: [0; 32],
+            control_tx,
+            control_rx,
+        },
+        parameters: AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        format_v2: None,
+        session_id,
+        binding_commitment: [0; 32],
+        remote_udp: None,
+        command_sequence: 0,
+        ack_sequence: 0,
+        last_command: None,
+        last_ack: None,
+        last_heartbeat: Instant::now(),
+        state: ReceiverState::ReceiverRunning,
+        capabilities: Some(ReceiverCapabilities {
+            control_major: 3,
+            audio_major: 1,
+            management_compatible: true,
+            audio_compatible: true,
+            compatible: true,
+            capability_bits: CAP_AUTHENTICATED_STATUS,
+            version_code: 1,
+        }),
+        terminal_cause: None,
+        connection_intent: None,
+        background_request_id: None,
+        background_authorization_required: false,
+        background_authorized: false,
+        cancellation: CancellationToken::new(),
+    };
+    let error = host.command(PLAYBACK_PROGRESS_QUERY, &[]).err().unwrap();
+    assert!(error.contains("terminal cause"));
+    assert_eq!(host.terminal_cause(), None);
+    server.join().unwrap();
+}
+
+fn host_with_user_stopped_ack(
+    capability_bits: u32,
+    expected_command: u8,
+) -> (HostSession, thread::JoinHandle<()>) {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    let session_id = 0x0102_0304_0506_0708;
+    let control_tx = [0x31; 32];
+    let control_rx = [0x42; 32];
+    let server = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let request = read_frame(
+            &mut tcp,
+            &control_tx,
+            HOST_TO_RECEIVER_CONTROL,
+            session_id,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(request[5], expected_command);
+        let mut payload = [0u8; 13];
+        payload[0] = expected_command;
+        payload[1..9].copy_from_slice(&request[20..28]);
+        payload[9] = RESULT_USER_STOPPED;
+        payload[10] = 5;
+        let ack = encode_control(
+            &control_rx,
+            RECEIVER_TO_HOST_CONTROL,
+            session_id,
+            0,
+            ACK,
+            &payload,
+        )
+        .unwrap();
+        write_frame(&mut tcp, &ack, &CancellationToken::new()).unwrap();
+    });
+    let stream = TcpStream::connect(peer).unwrap();
+    let host = HostSession {
+        tcp: Some(stream),
+        udp_socket: None,
+        sender: None,
+        float_sender: None,
+        pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+        queue: Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            false,
+        )),
+        float_queue: None,
+        keys: SessionKeys {
+            audio: [0; 32],
+            control_tx,
+            control_rx,
+        },
+        parameters: AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        format_v2: None,
+        session_id,
+        binding_commitment: [0; 32],
+        remote_udp: None,
+        command_sequence: 0,
+        ack_sequence: 0,
+        last_command: None,
+        last_ack: None,
+        last_heartbeat: Instant::now(),
+        state: ReceiverState::ReceiverRunning,
+        capabilities: Some(ReceiverCapabilities {
+            control_major: 3,
+            audio_major: 1,
+            management_compatible: true,
+            audio_compatible: true,
+            compatible: true,
+            capability_bits,
+            version_code: 1,
+        }),
+        terminal_cause: None,
+        connection_intent: None,
+        background_request_id: None,
+        background_authorization_required: false,
+        background_authorized: false,
+        cancellation: CancellationToken::new(),
+    };
+    (host, server)
+}
+
+#[test]
+fn user_stopped_ack_is_recorded_in_all_command_deadline_paths() {
+    let (mut host, server) =
+        host_with_user_stopped_ack(CAP_TERMINAL_CAUSE, PLAYBACK_PROGRESS_QUERY);
+    let ack = host
+        .command_until(
+            PLAYBACK_PROGRESS_QUERY,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(ack.result, RESULT_USER_STOPPED);
+    assert_eq!(host.state(), ReceiverState::Stopped);
+    assert_eq!(host.terminal_cause(), Some(TerminalCause::ReceiverUserStop));
+    server.join().unwrap();
+
+    let trust_caps = CAP_BACKGROUND_TRUST_MANAGEMENT | CAP_TERMINAL_CAUSE;
+    let (mut host, server) = host_with_user_stopped_ack(trust_caps, BACKGROUND_TRUST_QUERY);
+    assert!(host
+        .query_background_trust_until(
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .is_err());
+    assert_eq!(host.state(), ReceiverState::Stopped);
+    assert_eq!(host.terminal_cause(), Some(TerminalCause::ReceiverUserStop));
+    server.join().unwrap();
+
+    let (mut host, server) =
+        host_with_user_stopped_ack(CAP_BACKGROUND_TRUST_MANAGEMENT, BACKGROUND_TRUST_QUERY);
+    let error = host
+        .query_background_trust_until(
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("terminal cause"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(host.terminal_cause(), None);
+    server.join().unwrap();
+}
+
+#[test]
 fn background_trust_ack_checks_shape_echo_fields_and_unsigned_duration() {
     let make_ack =
         |length: u16, commitment: [u8; 32], kind: u8, persistence: u8, remaining: u64| {
@@ -2586,6 +2891,103 @@ fn verify_background_trust_session_owner(classes: &Path) {
     );
 }
 
+fn verify_management_owner_stops_on_receiver_user_stop(classes: &Path) {
+    let (_, java) = java_paths();
+    let mut child = Command::new(java)
+        .arg("-cp")
+        .arg(classes)
+        .arg("app.anpod.receiver.P5cLoopbackEndpoint")
+        .arg("--background-trust-management")
+        .arg("--capabilities-incompatible")
+        .arg("--request-user-stop-on-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let peer = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        line.trim()
+            .strip_prefix("PORT=")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+    ));
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let mut owner = SessionOwner::start_on_interface(
+        &interface,
+        peer,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let active = wait_for_owner(&owner, |snapshot| {
+        snapshot.state == SessionLifecycleState::Authenticated
+            && snapshot.session_id.is_some()
+            && snapshot
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| !caps.compatible)
+    });
+    child.stdin.as_mut().unwrap().write_all(b"stop").unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "USER_STOP_REQUESTED=true");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(owner.query_background_trust(
+            active.generation,
+            Instant::now() + Duration::from_secs(3),
+            CancellationToken::new(),
+        ))
+        .unwrap_err();
+    assert!(
+        error.contains("Receiver rejected"),
+        "unexpected query result: {error}"
+    );
+
+    let stopped = wait_for_owner(&owner, |snapshot| {
+        snapshot.state == SessionLifecycleState::Stopped
+            && snapshot.terminal_cause == Some(TerminalCause::ReceiverUserStop)
+    });
+    assert_eq!(stopped.attempts, active.attempts);
+    assert_eq!(stopped.last_error, None);
+    thread::sleep(Duration::from_millis(100));
+    let final_status = owner.snapshot();
+    assert_eq!(
+        final_status.attempts, active.attempts,
+        "user stop must not reconnect"
+    );
+    assert_eq!(final_status.state, SessionLifecycleState::Stopped);
+    assert_eq!(
+        final_status.terminal_cause,
+        Some(TerminalCause::ReceiverUserStop)
+    );
+    assert_eq!(
+        final_status.last_error, None,
+        "user stop must not publish a query error"
+    );
+    owner.stop();
+
+    let output = finish_background_trust_endpoint(child, stdout);
+    assert!(
+        output.contains("TRUST_QUERIES=1"),
+        "the user-stop ACK must follow the management query: {output}"
+    );
+}
+
 fn verify_cancelled_after_delayed_management_capability(classes: &Path) {
     let (_, java) = java_paths();
     let mut child = Command::new(java)
@@ -2666,6 +3068,7 @@ fn background_trust_management_java_rust_loopback_contract() {
     let classes = compile_java_endpoint();
     verify_background_trust_management(&classes);
     verify_background_trust_session_owner(&classes);
+    verify_management_owner_stops_on_receiver_user_stop(&classes);
     verify_cancelled_after_delayed_management_capability(&classes);
     let _ = fs::remove_dir_all(classes);
 }

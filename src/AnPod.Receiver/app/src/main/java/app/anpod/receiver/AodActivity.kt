@@ -437,8 +437,7 @@ private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = when (teleme
 private fun protocolLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.transport) {
     AodTelemetrySnapshot.Transport.USB_DIRECT -> "USB Direct"
     AodTelemetrySnapshot.Transport.WIFI_UDP -> "UDP"
-    AodTelemetrySnapshot.Transport.USB_ADB -> "USB ADB"
-    AodTelemetrySnapshot.Transport.WIFI_ADB -> "Wi-Fi ADB"
+    AodTelemetrySnapshot.Transport.USB_ADB, AodTelemetrySnapshot.Transport.WIFI_ADB -> "ADB"
     else -> "—"
 }
 

@@ -14,15 +14,18 @@ fs.mkdirSync(out, {recursive:true});
  const errors=[];
  page.on('pageerror',e=>errors.push(e.message));
  await page.addInitScript(() => {
+  if(location.search.includes('lang=en'))Object.defineProperty(navigator,'language',{configurable:true,get:()=> 'en-US'});
   let id=0;const callbacks=new Map(),listeners=new Map();window.reviewCopiedText='';Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.reviewCopiedText=value;}}});
   const device={serial:'TESTUSB',transport:'usb',state:'device',manufacturer:'Google',model:'Pixel 8 Pro',androidVersion:'15',apiLevel:'35',displayName:'Google Pixel 8 Pro',statusText:'可连接',connectable:true};
   const secondDevice={...device,serial:'TESTSECOND',transport:'usb',displayName:'Long Google Pixel Wireless Device Name',androidVersion:'14'};
   let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewBackgroundStartError='';let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
   let reviewReceiverManagementBusy=false;let reviewManagementSlotConflicts=0;
   let reviewAoaStartResolve=null;
+  let reviewAoaTargets=[{id:'opaque-target-a',label:'AnPod 配件设备'}];let reviewAoaSwitchTargets=[{id:'switch-phone-a',label:'iQOO 11 (V2243A)'}];
   let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
+  window.reviewSetAoaTargets=targets=>{reviewAoaTargets=structuredClone(targets);};
   window.reviewManagementSlotConflicts=()=>reviewManagementSlotConflicts;
   window.reviewManagementSlotBusy=()=>reviewReceiverManagementBusy;
   window.reviewChangeUsbDevices=devices=>{snapshot.devices=structuredClone(devices);emit();};
@@ -127,8 +130,12 @@ fs.mkdirSync(out, {recursive:true});
      return structuredClone(reviewUsbStatuses[args.serial]);
     }
     if(cmd==='refresh_devices')return structuredClone(snapshot);
+   if(cmd==='begin_usb_direct_configuration')return {snapshot:structuredClone(snapshot),configurationId:1};
+   if(cmd==='end_usb_direct_configuration')return structuredClone(snapshot);
    if(cmd==='receiver_binding_references')return [...reviewBindings];
-   if(cmd==='list_aoa_targets')return [{id:'opaque-target-a',label:'AnPod 配件设备'}];
+   if(cmd==='list_aoa_targets')return structuredClone(reviewAoaTargets);
+   if(cmd==='list_aoa_switch_targets')return structuredClone(reviewAoaSwitchTargets);
+   if(cmd==='switch_aoa_mode'){window.reviewAoaSwitchArgs=args;return new Promise(resolve=>window.reviewCompleteAoaSwitch=result=>resolve(result));}
    if(cmd==='start_aoa_audio'){window.reviewAoaStartArgs=args;return new Promise(resolve=>{reviewAoaStartResolve=resolve;});}
    if(cmd==='network_interfaces')return structuredClone(reviewInterfaces);
    if(cmd==='start_network_audio'){if(reviewBackgroundStartError&&args.backgroundAuthorizationRequired){const message=reviewBackgroundStartError;reviewBackgroundStartError='';throw new Error(message);}if(args.backgroundAuthorizationRequired&&(!args.bindingReference||args.bootstrapSerial))throw new Error('后台授权目标缺少有效绑定');if(args.bootstrapSerial&&!reviewBindings.includes('new-phone-binding'))reviewBindings.push('new-phone-binding');snapshot={...snapshot,state:'connected',message:'Receiver 已认证',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:args.bindingReference||'new-phone-binding',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:44,versionCode:reviewUsbStatuses[args.bootstrapSerial]?.versionCode??null},canDisconnect:true,connectionTransport:'wireless',transport:'wifi',output:'computer',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();return structuredClone(snapshot);}
@@ -155,12 +162,34 @@ fs.mkdirSync(out, {recursive:true});
  });
  await page.goto(process.env.ANPOD_UI_URL || 'http://127.0.0.1:1420');
  await page.locator('.app-shell').waitFor();
+ await page.waitForFunction(()=>window.reviewCalls?.get_snapshot===1&&window.reviewCalls?.refresh_devices===1);
  const results={errors,layouts:[],focusStable:null};
  if(process.env.ANPOD_AOA_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.getByRole('button',{name:'USB Direct（实验）',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   await dialog.waitFor();
+  const switchDetails=dialog.locator('details.aoa-switch-section');
+  const switchSummary=switchDetails.locator('summary');
+  await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===false);
+  results.readyAoaPrioritizesConnection=!(await switchDetails.evaluate(el=>el.open))
+    &&await dialog.getByLabel('USB Direct 设备').isVisible()
+    &&await dialog.getByLabel('已配对接收端').isVisible()
+    &&await dialog.getByRole('button',{name:'开始连接'}).isVisible();
+  await switchSummary.focus();await switchSummary.press('Enter');
+  results.keyboardDisclosureKeepsConsent=await switchDetails.evaluate(el=>el.open)
+    &&await dialog.getByText(/允许暂时停止本机 ADB 服务（其管理的全部调试连接都会断开）；手机的 ADB\/MTP 也会暂时断开。/).isVisible();
+  await switchSummary.press('Enter');
+  await page.locator('.app-shell').evaluate(el=>el.classList.add('large-text'));
+  results.readyAoaFits360LargeText=await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.querySelector('.aoa-dialog').scrollWidth<=document.querySelector('.aoa-dialog').clientWidth);
+  await page.screenshot({path:`${out}/astra-ui-aoa-ready-360-large.png`});
+  await switchSummary.click();await page.evaluate(()=>window.reviewEmit());
+  results.manualDisclosureSurvivesRerender=await switchDetails.evaluate(el=>el.open)&&await switchSummary.evaluate(el=>document.activeElement===el);
+  const switchTarget=dialog.getByLabel('已连接的手机');
+  await switchTarget.focus();
+  await switchTarget.selectOption('switch-phone-a');
+  results.manualSelectionKeepsDisclosureOpen=await switchDetails.evaluate(el=>el.open)&&await switchTarget.evaluate(el=>document.activeElement===el);
+  await switchSummary.click();
   const target=dialog.getByLabel('USB Direct 设备');
   const binding=dialog.getByLabel('已配对接收端');
   results.aoaNeedsExplicitChoices=await target.inputValue()===''&&await binding.inputValue()===''&&await dialog.getByRole('button',{name:'开始连接'}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===undefined);
@@ -173,6 +202,26 @@ fs.mkdirSync(out, {recursive:true});
   await dialog.getByRole('button',{name:'取消连接'}).click();
   await page.waitForFunction(()=>window.reviewCalls.cancel_operation===1&&document.querySelector('dialog[open]')===null);
   results.cancelUsesExistingOperation=await page.evaluate(()=>window.reviewCalls.cancel_operation===1&&window.reviewRead().sessionTransport===null);
+  await page.evaluate(()=>window.reviewSetAoaTargets([]));
+  await page.getByRole('button',{name:'USB Direct（实验）',exact:true}).click();
+  const firstSwitchDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
+  const firstSwitch=firstSwitchDialog.locator('details.aoa-switch-section');
+  await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===true);
+  results.noTargetKeepsSwitchStepsDiscoverable=await firstSwitch.getByLabel('已连接的手机').isVisible();
+  const previousAoaStarts=await page.evaluate(()=>window.reviewCalls.start_aoa_audio||0);
+  await firstSwitch.getByLabel('已连接的手机').selectOption('switch-phone-a');
+  await firstSwitch.getByRole('checkbox').check();
+  const switchAction=firstSwitch.getByRole('button',{name:'切换 USB 模式',exact:true});
+  await switchAction.focus();await switchAction.press('Enter');
+  await page.waitForFunction(()=>window.reviewAoaSwitchArgs!==undefined);
+  results.switchingKeepsStatusAndDetailsVisible=await firstSwitch.evaluate(el=>el.open)
+    &&await firstSwitchDialog.locator('[role="status"]').filter({hasText:'正在切换 USB 模式…'}).isVisible();
+  await page.evaluate(()=>{window.reviewSetAoaTargets([{id:'opaque-target-a',label:'AnPod 配件设备'}]);window.reviewCompleteAoaSwitch({success:true,message:'ok',requiresRefresh:true});});
+  await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===false);
+  results.successFocusIsVisible=await firstSwitchDialog.evaluate(dialog=>dialog.contains(document.activeElement)&&!!document.activeElement?.getClientRects().length);
+  results.successCollapsesWithoutConnecting=await firstSwitchDialog.getByRole('button',{name:'开始连接'}).isDisabled()
+    &&await page.evaluate(previous=>window.reviewCalls.start_aoa_audio===previous&&window.reviewCalls.switch_aoa_mode===1,previousAoaStarts);
+  await firstSwitchDialog.getByRole('button',{name:'关闭'}).click();
   await page.evaluate(()=>window.reviewActivateAoa());
   results.actualAoaConnectionIsVisible=await page.locator('.device-select').innerText().then(text=>text.includes('USB Direct'));
   await page.getByRole('button',{name:'打开设置'}).click();
@@ -183,10 +232,44 @@ fs.mkdirSync(out, {recursive:true});
     &&!(await settings.innerText()).includes('UDP 使用 Receiver 后端')
     &&await page.getByRole('button',{name:'均衡'}).isDisabled()
     &&await page.getByRole('button',{name:'低延迟'}).isDisabled();
+  await page.goto(`${(process.env.ANPOD_UI_URL || 'http://127.0.0.1:1420').replace(/\/$/,'')}?lang=en`);
+  await page.locator('.app-shell').waitFor();
+  await page.getByRole('button',{name:'USB Direct (experimental)',exact:true}).click();
+  const englishDialog=page.getByRole('dialog',{name:'USB Direct (experimental)'});
+  const englishSwitch=englishDialog.locator('details.aoa-switch-section');
+  await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===false);
+  await englishSwitch.locator('summary').press('Enter');
+  results.englishDisclosureAndConsent=await englishDialog.getByLabel('USB Direct device').isVisible()
+    &&await englishDialog.getByRole('button',{name:'Connect',exact:true}).isVisible()
+    &&await englishDialog.getByText(/Allow briefly stopping this PC's ADB server \(all debugging connections it manages will disconnect\); this phone's ADB\/MTP will also briefly disconnect\./).isVisible();
+  await englishSwitch.locator('summary').press('Enter');
+  results.englishKeyboardCollapse=!(await englishSwitch.evaluate(el=>el.open));
+  await page.locator('.app-shell').evaluate(el=>el.classList.add('large-text'));
+  await page.setViewportSize({width:375,height:640});
+  results.englishFits375LargeText=await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.querySelector('.aoa-dialog').scrollWidth<=document.querySelector('.aoa-dialog').clientWidth);
+  fs.writeFileSync(`${out}/astra-ui-result.json`,JSON.stringify({
+   readyAoaPrioritizesConnection:results.readyAoaPrioritizesConnection,
+   keyboardDisclosureKeepsConsent:results.keyboardDisclosureKeepsConsent,
+   readyAoaFits360LargeText:results.readyAoaFits360LargeText,
+   manualDisclosureSurvivesRerender:results.manualDisclosureSurvivesRerender,
+   aoaNeedsExplicitChoices:results.aoaNeedsExplicitChoices,
+   noTargetKeepsSwitchStepsDiscoverable:results.noTargetKeepsSwitchStepsDiscoverable,
+   switchingKeepsStatusAndDetailsVisible:results.switchingKeepsStatusAndDetailsVisible,
+   successFocusIsVisible:results.successFocusIsVisible,
+   successCollapsesWithoutConnecting:results.successCollapsesWithoutConnecting,
+   explicitTargetAndBindingReachBackend:results.explicitTargetAndBindingReachBackend,
+   cancelUsesExistingOperation:results.cancelUsesExistingOperation,
+   englishDisclosureAndConsent:results.englishDisclosureAndConsent,
+   englishKeyboardCollapse:results.englishKeyboardCollapse,
+   englishFits375LargeText:results.englishFits375LargeText,
+   errors
+  },null,2));
+  await englishDialog.locator('details.aoa-switch-section summary').focus();
+  await page.screenshot({path:`${out}/astra-ui-aoa-english-375.png`});
   fs.writeFileSync(`${out}/aoa-result.json`,JSON.stringify(results,null,2));
-  console.log(JSON.stringify({aoaNeedsExplicitChoices:results.aoaNeedsExplicitChoices,explicitTargetAndBindingReachBackend:results.explicitTargetAndBindingReachBackend,opaqueTargetIdIsNotDisplayed:results.opaqueTargetIdIsNotDisplayed,cancelUsesExistingOperation:results.cancelUsesExistingOperation,actualAoaConnectionIsVisible:results.actualAoaConnectionIsVisible,activeAoaLocksBackendAndMode:results.activeAoaLocksBackendAndMode,errors}));
+  console.log(JSON.stringify({readyAoaPrioritizesConnection:results.readyAoaPrioritizesConnection,keyboardDisclosureKeepsConsent:results.keyboardDisclosureKeepsConsent,noTargetKeepsSwitchStepsDiscoverable:results.noTargetKeepsSwitchStepsDiscoverable,switchingKeepsStatusAndDetailsVisible:results.switchingKeepsStatusAndDetailsVisible,manualDisclosureSurvivesRerender:results.manualDisclosureSurvivesRerender,manualSelectionKeepsDisclosureOpen:results.manualSelectionKeepsDisclosureOpen,successFocusIsVisible:results.successFocusIsVisible,successCollapsesWithoutConnecting:results.successCollapsesWithoutConnecting,englishDisclosureAndConsent:results.englishDisclosureAndConsent,englishKeyboardCollapse:results.englishKeyboardCollapse,errors}));
   await browser.close();assert.deepEqual(errors,[]);
-  for(const key of ['aoaNeedsExplicitChoices','explicitTargetAndBindingReachBackend','opaqueTargetIdIsNotDisplayed','cancelUsesExistingOperation','actualAoaConnectionIsVisible','activeAoaLocksBackendAndMode'])assert.equal(results[key],true,key);
+  for(const key of ['readyAoaPrioritizesConnection','keyboardDisclosureKeepsConsent','readyAoaFits360LargeText','manualDisclosureSurvivesRerender','manualSelectionKeepsDisclosureOpen','aoaNeedsExplicitChoices','noTargetKeepsSwitchStepsDiscoverable','switchingKeepsStatusAndDetailsVisible','successFocusIsVisible','successCollapsesWithoutConnecting','explicitTargetAndBindingReachBackend','opaqueTargetIdIsNotDisplayed','cancelUsesExistingOperation','englishDisclosureAndConsent','englishKeyboardCollapse','englishFits375LargeText'])assert.equal(results[key],true,key);
   return;
  }
  if(process.env.ANPOD_AUDIO_QUALITY_ONLY){

@@ -731,6 +731,26 @@ fn run_owner_loop<W: RecordWriter>(
                 PLAYBACK_PROGRESS_QUERY,
                 &[],
             )?;
+            if ack.result == RESULT_USER_STOPPED {
+                if ack.state != ReceiverState::Stopped
+                    || snapshot
+                        .lock()
+                        .map_err(|_| "AOA snapshot poisoned.")?
+                        .capabilities
+                        .capability_bits
+                        & CAP_TERMINAL_CAUSE
+                        == 0
+                {
+                    return Err(
+                        "AOA Receiver returned an invalid authenticated terminal cause.".into(),
+                    );
+                }
+                let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
+                view.state = ReceiverState::Stopped;
+                view.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+                stop_queue(queue);
+                return Ok(());
+            }
             if ack.result != RESULT_OK {
                 return Err("AOA playback progress query was rejected.".into());
             }

@@ -3197,6 +3197,20 @@ public final class ReceiverService extends Service {
             return;
         }
         if (!uiOperation.owns(session.ownerId) || session.networkGeneration != currentOperationGeneration) return;
+        if (session.request.aoaContext != null) {
+            if ("AoaSessionStopped".equals(session.stopReason)) return;
+            AoaReceiverCoordinator coordinator;
+            synchronized (networkCoordinatorLock) {
+                coordinator = session.ownerId.equals(aoaOwnerId)
+                        && session.networkGeneration == aoaOwnerGeneration ? aoaCoordinator : null;
+            }
+            if (coordinator != null) {
+                if (failure != null && !failure.isEmpty() && !"AudioSessionEnded".equals(failure))
+                    coordinator.reportPlaybackFailure(session.request.aoaContext, new IOException(failure));
+                return;
+            }
+            if (aoaRecoveryDeadlineElapsedMs != 0) return;
+        }
         if (session.request.udpContext != null && "NetworkSessionStopped".equals(failure)) {
             networkAudioState = networkCoordinator != null ? "prepared" : "stopped";
             if (networkCoordinator != null) {

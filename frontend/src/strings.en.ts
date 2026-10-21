@@ -237,6 +237,7 @@ export const en: typeof zhCN = {
   aoaDialog: {
     title: "USB Direct (experimental)",
     description: "After switching USB mode, approve access on the phone. Then choose a device and paired receiver and press Connect.",
+    readyDescription: "Choose a device and paired receiver, then press Connect.",
     switchTitle: "Switch USB mode",
     switchSupport: "Supports iQOO 11 (V2243A). Install Receiver and pair it first; after switching, approve accessory access on the phone.",
     switchTarget: "Connected phone",

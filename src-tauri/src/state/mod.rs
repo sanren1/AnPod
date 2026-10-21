@@ -2745,6 +2745,7 @@ impl AppState {
             self.recovering.store(false, Ordering::Release);
             return;
         }
+        drop(session);
         for attempt in 0..3 {
             if token.is_cancelled() {
                 break;
@@ -2850,7 +2851,6 @@ impl AppState {
         }
         self.finish_operation(operation_generation);
         if !token.is_cancelled() {
-            drop(session);
             self.finish_aoa_terminal(
                 session_generation,
                 app,

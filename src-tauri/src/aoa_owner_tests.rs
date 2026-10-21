@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
     network::PcmQueue,
-    p5c::{self, ReceiverState, ACK, CAPABILITIES_INFO, CAP_AUDIO_V2, CAP_AUTHENTICATED_STATUS},
+    p5c::{
+        self, ReceiverState, TerminalCause, ACK, CAPABILITIES_INFO, CAP_AUDIO_V2,
+        CAP_AUTHENTICATED_STATUS, CAP_PLAYBACK_PROGRESS, CAP_TERMINAL_CAUSE,
+        PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED,
+    },
     protocol::PacketDecoder,
     security::{test_binding_material, ReceiverHandshakeV2},
 };
@@ -107,6 +111,22 @@ fn retry_until_accepted(mut push: impl FnMut() -> bool) {
 }
 
 fn send_capabilities(tx: &Sender<Record>, keys: &SessionKeys, session_id: u64, request: &Record) {
+    send_capabilities_with_bits(
+        tx,
+        keys,
+        session_id,
+        request,
+        CAP_AUTHENTICATED_STATUS | CAP_AUDIO_V2,
+    );
+}
+
+fn send_capabilities_with_bits(
+    tx: &Sender<Record>,
+    keys: &SessionKeys,
+    session_id: u64,
+    request: &Record,
+    capability_bits: u32,
+) {
     p5c::verify_control_frame(
         &request.body,
         &keys.host_to_receiver_control,
@@ -120,7 +140,7 @@ fn send_capabilities(tx: &Sender<Record>, keys: &SessionKeys, session_id: u64, r
     payload[8..10].copy_from_slice(&MANAGEMENT_CONTROL_MAJOR.to_be_bytes());
     payload[10] = AUDIO_PROTOCOL_MAJOR;
     payload[11] = 0;
-    payload[12..16].copy_from_slice(&(CAP_AUTHENTICATED_STATUS | CAP_AUDIO_V2).to_be_bytes());
+    payload[12..16].copy_from_slice(&capability_bits.to_be_bytes());
     payload[16..20].copy_from_slice(&1u32.to_be_bytes());
     let response = p5c::encode_control(
         &keys.receiver_to_host_control,
@@ -132,6 +152,37 @@ fn send_capabilities(tx: &Sender<Record>, keys: &SessionKeys, session_id: u64, r
     )
     .unwrap();
     send_record(tx, RecordType::Control, response);
+}
+
+fn send_user_stopped_ack(
+    tx: &Sender<Record>,
+    keys: &SessionKeys,
+    session_id: u64,
+    request: &Record,
+) {
+    p5c::verify_control_frame(
+        &request.body,
+        &keys.host_to_receiver_control,
+        HOST_TO_RECEIVER_CONTROL,
+        session_id,
+    )
+    .unwrap();
+    let command_sequence = u64::from_be_bytes(request.body[20..28].try_into().unwrap());
+    let mut payload = [0u8; 13];
+    payload[0] = request.body[5];
+    payload[1..9].copy_from_slice(&command_sequence.to_be_bytes());
+    payload[9] = RESULT_USER_STOPPED;
+    payload[10] = 5;
+    let ack = p5c::encode_control(
+        &keys.receiver_to_host_control,
+        RECEIVER_TO_HOST_CONTROL,
+        session_id,
+        4,
+        ACK,
+        &payload,
+    )
+    .unwrap();
+    send_record(tx, RecordType::Control, ack);
 }
 
 fn send_ack(
@@ -351,6 +402,45 @@ fn run_stalled_receiver(
     while !cancelled.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
+}
+
+fn run_user_stopped_progress_receiver(
+    rx: ChannelReceiver<Record>,
+    tx: Sender<Record>,
+    material: crate::security::BindingMaterial,
+) {
+    let hello = read_record(&rx, RecordType::Handshake);
+    let (await_finish, challenge) =
+        ReceiverHandshakeV2::accept_hello(material.derive_aoa_transport(), &hello.body).unwrap();
+    let session_id = u64::from_be_bytes(hello.body[72..80].try_into().unwrap());
+    send_record(&tx, RecordType::Handshake, challenge);
+    let finish = read_record(&rx, RecordType::Handshake);
+    let (ready, authenticated) = await_finish.accept_finish(&finish.body).unwrap();
+    send_record(&tx, RecordType::Handshake, ready);
+    let keys = authenticated.into_keys();
+
+    let caps = read_record(&rx, RecordType::Control);
+    send_capabilities_with_bits(
+        &tx,
+        &keys,
+        session_id,
+        &caps,
+        CAP_AUTHENTICATED_STATUS | CAP_AUDIO_V2 | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE,
+    );
+    for (sequence, command, state) in [
+        (1, BIND, ReceiverState::TransportConnected),
+        (2, SELECT_MODE, ReceiverState::TransportConnected),
+        (3, START, ReceiverState::ReceiverRunning),
+    ] {
+        let request = read_record(&rx, RecordType::Control);
+        assert_eq!(request.body[5], command);
+        send_ack(&tx, &keys, session_id, sequence, &request, state, 0);
+    }
+    let format_record = read_record(&rx, RecordType::Audio);
+    assert_eq!(format_record.kind, RecordType::Audio);
+    let progress = read_record(&rx, RecordType::Control);
+    assert_eq!(progress.body[5], PLAYBACK_PROGRESS_QUERY);
+    send_user_stopped_ack(&tx, &keys, session_id, &progress);
 }
 
 fn run_stale_block_receiver(
@@ -610,6 +700,54 @@ fn dropping_owner_cancels_and_joins_an_idle_reader() {
     drop(owner);
     assert!(cancelled.load(Ordering::Acquire));
     assert!(matches!(&queue, SessionAudioQueue::Pcm16(q) if q.is_stopped()));
+    peer.join().unwrap();
+}
+
+#[test]
+fn user_stopped_progress_ack_is_terminal_and_does_not_fail_owner() {
+    let format = AudioFormatV2::for_profile(1, 0).unwrap();
+    let material = test_binding_material();
+    let server_material = material.duplicate_for_session();
+    let (to_server_tx, to_server_rx) = mpsc::channel();
+    let (to_host_tx, to_host_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        run_user_stopped_progress_receiver(to_server_rx, to_host_tx, server_material)
+    });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let queue = SessionAudioQueue::Pcm16(Arc::new(PcmQueue::for_session(
+        PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        false,
+    )));
+    let owner = AoaOwner::connect_io(
+        FakeReader {
+            rx: to_host_rx,
+            cancelled: cancelled.clone(),
+        },
+        FakeWriter { tx: to_server_tx },
+        FakeCancel(cancelled),
+        material,
+        format,
+        queue,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let snapshot = loop {
+        let snapshot = owner.snapshot();
+        if snapshot.terminal_cause.is_some() || std::time::Instant::now() >= deadline {
+            break snapshot;
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(snapshot.state, ReceiverState::Stopped);
+    assert_eq!(
+        snapshot.terminal_cause,
+        Some(TerminalCause::ReceiverUserStop)
+    );
+    assert!(snapshot.last_error.is_none());
+    drop(owner);
     peer.join().unwrap();
 }
 
