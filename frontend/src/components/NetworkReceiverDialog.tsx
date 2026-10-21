@@ -705,6 +705,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
                 ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.offers.length === 1 ? strings.network.confirmRequestOnPc : strings.network.waitPhoneReceive
                 : bindings.length === 0 ? strings.network.firstUseBindOverUsb : strings.network.phoneCanStartOneTap}</small>
             </div>
+            {!offers.active && <button className="dialog-secondary" type="button" disabled={busy || audioSessionActive || !localAddress || !bindingReference} onClick={() => { listeningStarted.current = true; void onSetOfferListener(localAddress, true, bindingReference); }}>{strings.network.startListening}</button>}
 
           </div>
           {offers.active && <>
