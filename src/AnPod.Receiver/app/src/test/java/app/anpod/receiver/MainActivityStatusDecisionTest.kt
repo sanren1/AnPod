@@ -5,6 +5,19 @@ import org.junit.Test
 
 class MainActivityStatusDecisionTest {
     @Test
+    fun mainStatusDistinguishesConnectedPausedAndPreparedStates() {
+        fun label(state: String, standby: Boolean = false, attention: Boolean = false) = chooseMainStateLabel(
+            state, "idle", snapshotAvailable = true, backgroundStandbyEnabled = standby,
+            connectionPending = false, needsAttention = attention
+        )
+
+        assertEquals(R.string.aod_connected, label("authenticated"))
+        assertEquals(R.string.paused, label("paused"))
+        assertEquals(R.string.state_waiting_for_computer, label("prepared"))
+        assertEquals(R.string.state_needs_attention, label("paused", attention = true))
+    }
+
+    @Test
     fun activeSessionGuidanceWinsWhenWirelessSetupIsUnavailable() {
         fun next(serviceState: String, playbackAdvancing: Boolean? = null) = chooseMainNextStep(
             serviceState, playbackAdvancing, "listening", true, "untilRevoked",

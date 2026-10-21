@@ -663,6 +663,29 @@ private fun ReceiverScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    var errorDetailsExpanded by remember(diagnostic) { mutableStateOf(false) }
+                    if (diagnostic.isNotEmpty()) {
+                        TextButton(
+                            onClick = { errorDetailsExpanded = !errorDetailsExpanded },
+                            modifier = Modifier.heightIn(min = 48.dp)
+                        ) {
+                            Text(stringResource(R.string.show_error_details))
+                        }
+                        if (errorDetailsExpanded) {
+                            Text(diagnostic, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            TextButton(onClick = { onCopyDiagnostics(diagnostic) },
+                                modifier = Modifier.heightIn(min = 48.dp)) {
+                                Text(stringResource(R.string.copy_diagnostics))
+                            }
+                        }
+                        if (notificationPermissionDenied) {
+                            TextButton(onClick = onOpenNotificationSettings,
+                                modifier = Modifier.heightIn(min = 48.dp)) {
+                                Text(stringResource(R.string.open_notification_settings))
+                            }
+                        }
+                    }
                 }
             }
 
@@ -696,6 +719,8 @@ private fun ReceiverScreen(
                 Text(stringResource(if (showMoreMethods) R.string.hide_other_connection_methods else R.string.other_connection_methods))
             }
             if (showMoreMethods) {
+                OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
+
                 OutlinedButton(
                     onClick = onConnectUsbDirect,
                 enabled = !running && !connectionPending && !usbPermissionPending
@@ -718,8 +743,6 @@ private fun ReceiverScreen(
             else if (!usbDirectAvailable) Text(stringResource(R.string.usb_direct_connect_hint),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-
-            OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -813,32 +836,6 @@ private fun ReceiverScreen(
                     } else {
                         Text(stringResource(R.string.network_recovery_help), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
-                    }
-                }
-            }
-
-            var errorDetailsExpanded by remember(diagnostic) { mutableStateOf(false) }
-            if (diagnostic.isNotEmpty()) {
-                Text(
-                    if (notificationPermissionDenied) stringResource(R.string.notification_permission_next_step)
-                    else if (networkChoiceNeeded) stringResource(R.string.network_choice_next_step)
-                    else if (snapshot?.backgroundGrantKind == "unavailable") stringResource(R.string.background_authorization_failed)
-                    else stringResource(R.string.operation_error_summary),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error
-                )
-                TextButton(onClick = { errorDetailsExpanded = !errorDetailsExpanded }, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Text(stringResource(R.string.show_error_details))
-                }
-                if (errorDetailsExpanded) {
-                    Text(diagnostic, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = { onCopyDiagnostics(diagnostic) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Text(stringResource(R.string.copy_diagnostics))
-                    }
-                }
-                if (notificationPermissionDenied) {
-                    TextButton(onClick = onOpenNotificationSettings, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Text(stringResource(R.string.open_notification_settings))
                     }
                 }
             }
@@ -1021,17 +1018,29 @@ private fun InterfacePicker(
 }
 
 @Composable
-private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean): String = when {
-    needsAttention -> stringResource(R.string.state_needs_attention)
-    snapshot == null || connectionPending || snapshot.serviceState == "starting"
-            || snapshot.operationState == "starting" || snapshot.operationState == "stopping" ->
-        stringResource(R.string.state_connecting)
-    snapshot.serviceState == "receiverRunning" || snapshot.serviceState == "streaming" ->
-        stringResource(R.string.state_receiving)
-    snapshot.serviceState == "paused" -> stringResource(R.string.state_needs_attention)
-    snapshot.backgroundStandbyEnabled || snapshot.serviceState == "prepared" || snapshot.serviceState == "authenticated" ->
-        stringResource(R.string.state_waiting_for_computer)
-    else -> stringResource(R.string.state_not_connected)
+private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean): String =
+    stringResource(chooseMainStateLabel(
+        snapshot?.serviceState, snapshot?.operationState, snapshot != null,
+        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention
+    ))
+
+internal fun chooseMainStateLabel(
+    serviceState: String?,
+    operationState: String?,
+    snapshotAvailable: Boolean,
+    backgroundStandbyEnabled: Boolean,
+    connectionPending: Boolean,
+    needsAttention: Boolean
+): Int = when {
+    needsAttention -> R.string.state_needs_attention
+    !snapshotAvailable || connectionPending || serviceState == "starting"
+            || operationState == "starting" || operationState == "stopping" ->
+        R.string.state_connecting
+    serviceState == "receiverRunning" || serviceState == "streaming" -> R.string.state_receiving
+    serviceState == "paused" -> R.string.paused
+    serviceState == "authenticated" -> R.string.aod_connected
+    backgroundStandbyEnabled || serviceState == "prepared" -> R.string.state_waiting_for_computer
+    else -> R.string.state_not_connected
 }
 
 @Composable
@@ -1047,6 +1056,7 @@ private fun nextStep(
     snapshot == null -> stringResource(R.string.next_step_reading_status)
     notificationPermissionDenied -> stringResource(R.string.notification_permission_next_step)
     diagnostic.contains("InvalidReceiverInterface") && networkChoiceNeeded -> stringResource(R.string.network_choice_next_step)
+    snapshot.backgroundGrantKind == "unavailable" -> stringResource(R.string.background_authorization_failed)
     diagnostic.isNotEmpty() -> stringResource(R.string.next_step_retry_after_check)
     connectionPending || snapshot?.serviceState == "starting" -> stringResource(R.string.next_step_wait_connecting)
     else -> stringResource(chooseMainNextStep(

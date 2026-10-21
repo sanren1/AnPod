@@ -140,12 +140,12 @@
     <string name="next_step_wait_auto">正在等待电脑；已允许这台电脑自动连接。</string>
     <string name="next_step_wait_and_allow">电脑连接时，请在手机通知中选择是否允许。</string>
     <string name="next_step_choose_computer">请在电脑上选择这台手机。</string>
-    <string name="next_step_play_on_computer">连接成功后，请在电脑上开始播放。</string>
+    <string name="next_step_play_on_computer">请在电脑上开始播放。</string>
     <string name="next_step_resume_playback">播放已暂停；继续播放电脑上的声音即可。</string>
     <string name="next_step_audio_received">手机播放进度正在推进。</string>
     <string name="next_step_check_computer_playback">播放进度暂未变化；请确认电脑正在播放。</string>
     <string name="next_step_start_receiving">点击“连接电脑”，再到电脑选择这台手机。</string>
-    <string name="next_step_retry_after_check">请检查手机和电脑的网络后重试，或展开查看详情。</string>
+    <string name="next_step_retry_after_check">请检查连接后重试，或展开查看详情。</string>
     <string name="network_choice_next_step">网络可能已变化，请在下方选择手机正在使用的网络。</string>
     <string name="network_recovery_title">选择正在使用的网络</string>
     <string name="network_recovery_help">请选择手机连接电脑时使用的网络。</string>

@@ -140,12 +140,12 @@
     <string name="next_step_wait_auto">Waiting for the computer. It can connect automatically.</string>
     <string name="next_step_wait_and_allow">When the computer connects, choose whether to allow it in the phone notification.</string>
     <string name="next_step_choose_computer">Choose this phone on the computer.</string>
-    <string name="next_step_play_on_computer">Connected. Start playback on the computer.</string>
+    <string name="next_step_play_on_computer">Start playback on the computer.</string>
     <string name="next_step_resume_playback">Playback is paused. Resume audio on the computer.</string>
     <string name="next_step_audio_received">Phone playback progress is moving.</string>
     <string name="next_step_check_computer_playback">Playback has not advanced. Check that audio is playing on the computer.</string>
     <string name="next_step_start_receiving">Tap “Connect to computer”, then choose this phone on the computer.</string>
-    <string name="next_step_retry_after_check">Check the phone and computer network, then try again or view the details.</string>
+    <string name="next_step_retry_after_check">Check the connection and try again, or view the details.</string>
     <string name="network_choice_next_step">The network may have changed. Choose the network this phone is using below.</string>
     <string name="network_recovery_title">Choose the network in use</string>
     <string name="network_recovery_help">Choose the network the phone uses to connect to the computer.</string>

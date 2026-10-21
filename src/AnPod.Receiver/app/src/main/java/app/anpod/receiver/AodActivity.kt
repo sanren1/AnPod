@@ -427,12 +427,13 @@ private fun Divider() {
     Text("|", color = Color(0xFF2F3B3F), fontSize = 14.sp)
 }
 
-private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.status) {
-    AodTelemetrySnapshot.DisplayStatus.RECEIVING -> "Receiving"
-    AodTelemetrySnapshot.DisplayStatus.CONNECTED -> "Connected"
-    AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> "Reconnecting"
-    else -> "Disconnected"
-}
+@Composable
+private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = stringResource(when (telemetry?.status) {
+    AodTelemetrySnapshot.DisplayStatus.RECEIVING -> R.string.state_receiving
+    AodTelemetrySnapshot.DisplayStatus.CONNECTED -> R.string.aod_connected
+    AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> R.string.aod_reconnecting
+    else -> R.string.state_not_connected
+})
 
 private fun protocolLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.transport) {
     AodTelemetrySnapshot.Transport.USB_DIRECT -> "USB Direct"

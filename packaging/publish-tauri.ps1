@@ -20,24 +20,29 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $componentSourceBySha256 = @{
     'dbdf5fcc250e2d6711d16807ec97e479cd46c346cfddcc004db326a9b8abe94e' = [ordered]@{
+        component = 'Native'
         sourceCommit = '393628dd2a43a221154b8226d70c03de2629cb66'
         provenance = 'Phase 2 Native artifact built from the audited source commit.'
     }
     '0676594acbbb9489a6f53f661b57a3700544e6e0560f666b59163ea581d2bec7' = [ordered]@{
+        component = 'Legacy'
         sourceCommit = '52795df94699204b7a3212803487c392217f95c3'
         provenance = 'Phase 7 Legacy server built from the audited source commit.'
     }
 }
 
 function Get-AnPodComponentBuildMetadata {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('Native', 'Legacy')][string]$Component,
+        [string]$ExpectedSha256
+    )
 
     $sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     $source = $componentSourceBySha256[$sha256]
-    if ($source) {
-        return [ordered]@{ sha256 = $sha256; sourceCommit = $source.sourceCommit; provenance = $source.provenance }
-    }
-    return [ordered]@{ sha256 = $sha256; sourceCommit = $null; provenance = 'Source provenance is not registered for this SHA-256.' }
+    if (-not $source -or $source.component -ne $Component) { throw "$Component component SHA-256 is not registered for that role: $sha256" }
+    if ($ExpectedSha256 -and $sha256 -ne $ExpectedSha256) { throw "$Component component changed after validation: $Path" }
+    return [ordered]@{ sha256 = $sha256; sourceCommit = $source.sourceCommit; provenance = $source.provenance }
 }
 
 $config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
@@ -297,6 +302,10 @@ if ($IncludeReceiverRelease) {
 
 $missing = @($required | Where-Object { $source = if ($_ -eq 'audio_capture.dll') { $nativeSource } elseif ($_ -eq 'server') { $legacyPayloadSource } else { $deps }; -not (Test-Path -LiteralPath (Join-Path $source $_) -PathType Leaf) })
 if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ', ')" }
+if ($IncludeReceiverRelease) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $nativeSource 'audio_capture.dll') -Component Native
+    $legacyMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $legacyPayloadSource 'server') -Component Legacy
+}
 
 if (-not $ReuseExistingBuild) {
     Push-Location (Join-Path $root 'frontend')
@@ -366,6 +375,10 @@ if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force 
 New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { $source = if ($name -eq 'audio_capture.dll') { $nativeSource } elseif ($name -eq 'server') { $legacyPayloadSource } else { $deps }; Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $packageDir $name) }
+if ($IncludeReceiverRelease) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $packageDir 'audio_capture.dll') -Component Native -ExpectedSha256 $nativeMetadata.sha256
+    $legacyMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $packageDir 'server') -Component Legacy -ExpectedSha256 $legacyMetadata.sha256
+}
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
 $readmeSupportFiles = @(
     'docs\aod-preview.jpg',
@@ -412,8 +425,6 @@ if ($ReceiverCandidate -eq 'v3' -and $IncludeReceiverCandidate) {
     [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 }
 if ($IncludeReceiverRelease) {
-    $nativeMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'audio_capture.dll')
-    $legacyMetadata = Get-AnPodComponentBuildMetadata (Join-Path $packageDir 'server')
     $buildMetadata = [ordered]@{
         schemaVersion = 1
         candidate = 'receiver-release'
