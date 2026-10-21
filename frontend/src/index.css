@@ -329,3 +329,12 @@ button:disabled { cursor: default; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
 @media (max-width: 390px) { .main-scroll { padding-inline: 12px; } .output-card { padding-inline: 10px; } .status-device { display: none; } }
 @media (max-width: 390px) { .audio-quality-status div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
+/* Playback mode collapses into a one-line summary; open by default so the choice stays visible. */
+.mode-disclosure { border-top: 1px solid var(--line); padding-top: 6px; }
+.mode-disclosure > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; font-weight: 650; }
+.mode-disclosure > summary::-webkit-details-marker { display: none; }
+.mode-disclosure > summary strong { margin-left: auto; color: var(--muted); font-weight: 600; }
+.mode-disclosure > summary::after { content: "▾"; color: var(--muted); font-size: 12px; }
+.mode-disclosure[open] > summary::after { content: "▴"; }
+.mode-disclosure .mode-section { border-top: none; padding-top: 0; }
+.mode-disclosure .mode-switch { width: 100%; }

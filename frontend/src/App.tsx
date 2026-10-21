@@ -748,14 +748,20 @@ function App() {
       /> : <p className="status-description" role="status">{strings.app.waitingForRequest}</p> : null}
       {receiverUpdateNeeded && (active || cleanupPending) && snapshot.sessionTransport !== "aoa" && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{strings.app.upgradePhone}</button>}
 
-      <section className="mode-section" aria-label={strings.app.playbackMode}>
-        <div className="mode-row"><h2>{strings.app.playbackMode}</h2><div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
-          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
-          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
-        </div></div>
-        <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
-        {aoaPlaybackRestartUnavailable && <p className="dialog-footnote">{strings.app.aoaPlaybackModeUpdate}</p>}
-      </section>
+      <details className="mode-disclosure" open>
+        <summary>
+          <span>{strings.app.playbackMode}</span>
+          <strong>{snapshot.settings.playbackMode === "Balanced" ? strings.app.balanced : strings.app.lowLatency}</strong>
+        </summary>
+        <div className="mode-section" aria-label={strings.app.playbackMode}>
+          <div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
+            <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
+            <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
+          </div>
+          <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
+          {aoaPlaybackRestartUnavailable && <p className="dialog-footnote">{strings.app.aoaPlaybackModeUpdate}</p>}
+        </div>
+      </details>
     </main>
 
     <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />{strings.app.help}</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />{strings.app.diagnostics}</button></footer>
