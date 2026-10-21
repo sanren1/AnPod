@@ -1,51 +1,60 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { QRCodeSVG } from "qrcode.react";
-import {
-  Activity, AudioLines, Check, ChevronDown, CircleHelp, Computer, Copy,
-  ExternalLink, Info, LoaderCircle, Search, Settings2,
-  Smartphone, Usb, Wifi, X,
-} from "lucide-react";
-import type { ReactNode } from "react";
-
-type Device = {
-  serial: string; transport: "usb" | "wifi" | "unknown"; state: string;
-  manufacturer: string; model: string; androidVersion: string; apiLevel: string;
-  displayName: string; statusText: string; connectable: boolean;
-};
-type Settings = {
-  schemaVersion: number; autoConnectLastDevice: boolean; lastDeviceId: string | null;
-  minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
-  autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
-  playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
-};
-type Snapshot = {
-  state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "reconnecting" | "error";
-  message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null;
-  transport: "usb" | "wifi"; output: "computer" | "phone"; settings: Settings;
-  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string; version: string;
-};
-type Credentials = { instanceName: string; password: string; payload: string };
-type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };
-
-const isDesktop = "__TAURI_INTERNALS__" in window;
-const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
-  if (!isDesktop) return Promise.reject(new Error("请从 AnPod 桌面程序打开此界面。"));
-  return invoke<T>(command, args);
-};
-const byTransport = (snapshot: Snapshot) => snapshot.devices.filter(device => device.transport === snapshot.transport || device.transport === "unknown");
+import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
+import { strings } from "./strings";
+import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
+import { isDesktop, invokeApp, byTransport, hasActiveSession, bindingLabel, readableStatus, needsReceiverUpdate, endpointFitsInterface } from "./appRuntime";
+import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
+import { DeviceDialog } from "./components/DeviceDialog";
+import { SettingsDialog } from "./components/SettingsDialog";
+import { PairDialog } from "./components/PairDialog";
+import { HelpDialog } from "./components/HelpDialog";
+import { DiagnosticsDialog } from "./components/DiagnosticsDialog";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { ErrorDetails } from "./components/Modal";
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "help" | "diagnostics" | null>(null);
-  const [confirm, setConfirm] = useState<{ kind: "transport" | "playback"; value: string } | null>(null);
+  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "receiver" | "setup" | "help" | "diagnostics" | null>(null);
+  const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "device" | "network" | "receiverUsb"; value: string } | null>(null);
+  const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
+  const [pendingReceiverOperation, setPendingReceiverOperation] = useState<ReceiverUsbOperation | null>(null);
+  const [receiverOperationBusy, setReceiverOperationBusy] = useState(false);
+  const [receiverManagerSerial, setReceiverManagerSerial] = useState("");
+  const [receiverOperationResult, setReceiverOperationResult] = useState<ReceiverUsbOperationResult | null>(null);
+  const [receiverOperationProgress, setReceiverOperationProgress] = useState<ReceiverInstallProgress | null>(null);
+  const receiverOperationLock = useRef(false);
+  const receiverConfirmationStarted = useRef(false);
+  const appMounted = useRef(true);
+  const receiverOperationUnlisten = useRef<(() => void) | null>(null);
+  const panelRef = useRef(panel);
+  panelRef.current = panel;
+  const [networkDialogError, setNetworkDialogError] = useState("");
+  const [backgroundStartMode, setBackgroundStartMode] = useState(false);
+  const [backgroundChoicePrefill, setBackgroundChoicePrefill] = useState({ localAddress: "", bindingReference: "" });
+  const [networkChoiceNeedsConfirmation, setNetworkChoiceNeedsConfirmation] = useState({ interfaceAddress: false, bindingReference: false });
   const [localSelected, setLocalSelected] = useState<string | null>(null);
   const [largeText, setLargeText] = useState(false);
   const [notice, setNotice] = useState("");
+  const [noticeDetail, setNoticeDetail] = useState("");
   const [working, setWorking] = useState(false);
 
-  const apply = (value: Snapshot) => { setSnapshot(value); setLocalSelected(value.selectedSerial); };
+  useEffect(() => {
+    appMounted.current = true;
+    return () => {
+      appMounted.current = false;
+      receiverOperationUnlisten.current?.();
+      receiverOperationUnlisten.current = null;
+    };
+  }, []);
+  const snapshotRefreshGeneration = useRef(0);
+  const lastOfferListenerChoice = useRef<{ localAddress: string; bindingReference: string } | null>(null);
+
+  const apply = (value: Snapshot) => {
+    snapshotRefreshGeneration.current++;
+    setSnapshot(value);
+    setLocalSelected(value.selectedSerial);
+  };
   useEffect(() => {
     let disposed = false;
     const cleanups: (() => void)[] = [];
@@ -62,12 +71,29 @@ function App() {
       apply(refreshed);
       const show = await listen("anpod://show-window", () => { void invokeApp("show_main_window"); });
       retain(show);
-      const pairing = await listen<string>("anpod://pairing-progress", event => setNotice(event.payload));
+      const pairing = await listen<string>("anpod://pairing-progress", event => { setNotice(event.payload); setNoticeDetail(""); });
       retain(pairing);
     };
-    void attach().catch(error => { if (!disposed) setNotice(String(error)); });
+    void attach().catch(error => { if (!disposed) { setNotice(strings.app.operationNotCompleted); setNoticeDetail(String(error)); } });
     return () => { disposed = true; cleanups.splice(0).forEach(cleanup => cleanup()); };
   }, []);
+
+  useEffect(() => {
+    if (panel !== "network") return;
+    let disposed = false;
+    const refreshOffers = async () => {
+      const generation = ++snapshotRefreshGeneration.current;
+      try {
+        const next = await invokeApp<Snapshot>("get_snapshot");
+        if (!disposed && generation === snapshotRefreshGeneration.current) setSnapshot(next);
+      } catch (error) {
+        if (!disposed && generation === snapshotRefreshGeneration.current) setNetworkDialogError(String(error));
+      }
+    };
+    void refreshOffers();
+    const timer = window.setInterval(() => void refreshOffers(), 1000);
+    return () => { disposed = true; window.clearInterval(timer); snapshotRefreshGeneration.current++; };
+  }, [panel]);
 
   useEffect(() => {
     if (!snapshot || snapshot.settings.appearanceTheme !== "System") return;
@@ -80,8 +106,44 @@ function App() {
 
   const devices = useMemo(() => snapshot ? byTransport(snapshot) : [], [snapshot]);
   const selected = devices.find(device => device.serial === localSelected) ?? devices.find(device => device.connectable);
-  const active = !!snapshot?.canDisconnect;
-  const notify = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 4200); };
+  const active = hasActiveSession(snapshot);
+  const lanSession = active && snapshot?.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp";
+  const wirelessUdpMode = !!snapshot && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp";
+  const udpBackendFixed = !!snapshot && ((snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp")
+    || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp"));
+  const canDisconnect = !!snapshot?.canDisconnect;
+  const cleanupPending = canDisconnect && snapshot?.state === "error";
+  const receiverUpdateNeeded = snapshot?.state === "error" && needsReceiverUpdate(`${snapshot.message} ${snapshot.statusDetail}`)
+    || snapshot?.state === "managementOnly" && snapshot.sessionCapabilities?.audioCompatible === false;
+  const controlsDisabled = working || snapshot?.busy === true || cleanupPending || receiverOperationBusy;
+  const activeDevice = snapshot?.devices.find(device => device.serial === snapshot.sessionSerial);
+  const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
+  const deviceChoices = useMemo(() => {
+    if (!snapshot?.sessionSerial || devices.some(device => device.serial === snapshot.sessionSerial)) return devices;
+    const current = snapshot.devices.find(device => device.serial === snapshot.sessionSerial) ?? {
+      serial: snapshot.sessionSerial, transport: snapshot.sessionTransport === "lan" ? "unknown" : snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
+      androidVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? strings.app.connectedPhone,
+      statusText: strings.app.staleDeviceScan, connectable: false,
+    };
+    return [current, ...devices];
+  }, [snapshot, devices]);
+  const announce = (message: string, detail = "") => {
+    setNotice(message);
+    setNoticeDetail(detail);
+    window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
+  };
+  const notify = (message: string) => announce(needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted, message);
+  const openReceiverUpgrade = () => {
+    setBackgroundStartMode(false);
+    setReceiverManagerSerial(snapshot?.sessionSerial ?? selected?.serial ?? "");
+    setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver");
+  };
+  const openNetworkDialog = (backgroundStart = false, choices = { localAddress: "", bindingReference: "" }) => {
+    setBackgroundStartMode(backgroundStart);
+    setBackgroundChoicePrefill(choices);
+    setNetworkDialogError("");
+    setPanel("network");
+  };
 
   const refresh = async () => {
     setWorking(true);
@@ -90,40 +152,342 @@ function App() {
     finally { setWorking(false); }
   };
 
-  const setOption = async (kind: "transport" | "playback", value: string) => {
+  const setOption = async (kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback", value: string) => {
     if (!snapshot) return;
+    if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
+    if (kind === "audioBackend" && ((snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp")
+      || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp"))) return;
+    const current = kind === "transport" ? snapshot.connectionTransport
+      : kind === "wirelessProtocol" ? snapshot.settings.wirelessProtocol
+        : kind === "audioBackend" ? snapshot.settings.audioBackend
+          : snapshot.settings.playbackMode === "LowLatency" ? "lowLatency" : "balanced";
+    if (value === current) return;
+    if (active && kind === "playback" && lanSession) {
+      setWorking(true);
+      try { apply(await invokeApp<Snapshot>("reconfigure_session", { kind, value })); }
+      catch (error) {
+        let message = String(error);
+        try { apply(await invokeApp<Snapshot>("get_snapshot")); }
+        catch (refreshError) { message += strings.app.refreshFailureSuffix(String(refreshError)); }
+        notify(message);
+      }
+      finally { setWorking(false); }
+      return;
+    }
     if (active) { setConfirm({ kind, value }); return; }
     setWorking(true);
     try {
-      if (kind === "transport") await invokeApp("update_setting", { key: "preferredTransport", value: value === "wifi" ? "Wifi" : "Usb" });
-      else await invokeApp("update_setting", { key: "playbackMode", value: value === "lowLatency" ? "LowLatency" : "Balanced" });
-      apply(await invokeApp<Snapshot>("refresh_devices"));
-      setNotice("");
+      const key = kind === "playback" ? "playbackMode" : kind;
+      const savedValue = kind === "playback" ? value === "lowLatency" ? "LowLatency" : "Balanced" : value;
+      let next = await invokeApp<Snapshot>("update_setting", { key, value: savedValue });
+      apply(next);
+      let refreshFailure = "";
+      if (kind === "transport" || kind === "wirelessProtocol") {
+        try { next = await invokeApp<Snapshot>("refresh_devices"); apply(next); }
+        catch (error) { refreshFailure = String(error); }
+      }
+      if (refreshFailure) announce(strings.app.settingsSavedRefreshFailed, refreshFailure); else setNotice("");
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
   };
 
+  const performReceiverUsbOperation = async (operation: ReceiverUsbOperation) => {
+    const operationId = crypto.randomUUID();
+    let unlisten: (() => void) | null = null;
+    let commandStarted = false;
+    setWorking(true); setReceiverOperationBusy(true); setNetworkDialogError(""); setReceiverOperationResult(null);
+    setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "checking" });
+    try {
+      const stopListening = await listen<ReceiverInstallProgress>("anpod://receiver-install-progress", event => {
+        const payload = event.payload;
+        if (payload.operationId !== operationId || payload.serial !== operation.serial) return;
+        if (payload.stage === "completed") return;
+        setReceiverOperationProgress(current => {
+          if (current?.operationId !== operationId || current.serial !== operation.serial
+            || current.stage === "completed" || current.stage === "failed") return current;
+          const order = { checking: 0, transferring: 1, verifying: 2, completed: 3, failed: 3 };
+          return order[payload.stage] >= order[current.stage] ? payload : current;
+        });
+      });
+      let listening = true;
+      unlisten = () => {
+        if (!listening) return;
+        listening = false;
+        stopListening();
+        if (receiverOperationUnlisten.current === unlisten) receiverOperationUnlisten.current = null;
+      };
+      receiverOperationUnlisten.current = unlisten;
+      if (!appMounted.current) { unlisten(); return; }
+      const command = operation.kind === "upgrade" ? "receiver_upgrade_usb" : "receiver_install";
+      const args = operation.kind === "upgrade"
+        ? { serial: operation.serial, bindingReference: operation.bindingReference, operationId }
+        : { serial: operation.serial, operationId };
+      commandStarted = true;
+      const status = await invokeApp<ReceiverStatus>(command, args);
+      if (!appMounted.current) return;
+      if (!status.installed || status.versionCode !== operation.targetVersionCode) {
+        throw new Error(strings.app.usbVersionVerificationFailed(operation.targetVersionCode));
+      }
+      setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "completed" });
+      setReceiverOperationResult({ serial: operation.serial, kind: operation.kind, targetVersionCode: operation.targetVersionCode, status });
+      setReceiverManagerSerial(operation.serial);
+      if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
+      try {
+        const next = await invokeApp<Snapshot>("refresh_devices");
+        if (appMounted.current) apply(next);
+      }
+      catch (error) { if (appMounted.current) setNetworkDialogError(strings.app.receiverVersionVerifiedRefreshFailed(status.versionCode, String(error))); }
+      if (appMounted.current) announce(strings.app.receiverVersionVerifiedReconnect(status.versionCode));
+    } catch (error) {
+      if (appMounted.current) {
+        if (commandStarted) setReceiverOperationProgress({ operationId, serial: operation.serial, stage: "failed" });
+        else setReceiverOperationProgress(null);
+        setNetworkDialogError(String(error));
+        setReceiverManagerSerial(operation.serial);
+        if (panelRef.current === operation.returnPanel) setPanel(operation.returnPanel);
+      }
+    } finally {
+      unlisten?.();
+      receiverOperationLock.current = false;
+      receiverConfirmationStarted.current = false;
+      if (appMounted.current) { setReceiverOperationBusy(false); setWorking(false); }
+    }
+  };
+
+  const requestReceiverUsbOperation = (operation: ReceiverUsbOperation) => {
+    if (receiverOperationLock.current) return;
+    setReceiverOperationResult(null); setNetworkDialogError("");
+    setReceiverOperationProgress(null);
+    if (active && snapshot) {
+      const targetMatches = snapshot.sessionTransport === "lan"
+        ? operation.bindingReference === snapshot.sessionReceiverBinding
+        : operation.serial === snapshot.sessionSerial;
+      if (!targetMatches) {
+        setNetworkDialogError(strings.app.differentCurrentSessionTarget);
+        return;
+      }
+      receiverOperationLock.current = true;
+      receiverConfirmationStarted.current = false;
+      setPendingReceiverOperation(operation);
+      setPanel(null);
+      setConfirm({ kind: "receiverUsb", value: "" });
+      return;
+    }
+    receiverOperationLock.current = true;
+    void performReceiverUsbOperation(operation);
+  };
+
   const applyConfirmed = async () => {
     if (!confirm) return;
+    if (confirm.kind === "receiverUsb") {
+      if (receiverConfirmationStarted.current) return;
+      receiverConfirmationStarted.current = true;
+    }
     setWorking(true);
     try {
-      const next = await invokeApp<Snapshot>("reconfigure_session", { kind: confirm.kind, value: confirm.value });
-      apply(next);
+      if (confirm.kind === "network") {
+        if (!pendingNetworkStart) throw new Error(strings.app.staleNetworkParameters);
+        const stopped = await invokeApp<OperationResult>("disconnect");
+        apply(stopped.snapshot);
+        if (!stopped.success) throw new Error(stopped.message);
+        apply(await invokeApp<Snapshot>("start_network_audio", { ...pendingNetworkStart }));
+        if (pendingNetworkStart.backgroundAuthorizationRequired && pendingNetworkStart.bindingReference)
+          lastOfferListenerChoice.current = { localAddress: pendingNetworkStart.localAddress, bindingReference: pendingNetworkStart.bindingReference };
+        setPanel(null);
+      } else if (confirm.kind === "receiverUsb") {
+        if (!pendingReceiverOperation) throw new Error(strings.app.staleUsbOperation);
+        const operation = pendingReceiverOperation;
+        setConfirm(null); setPendingReceiverOperation(null);
+        setPanel(operation.returnPanel);
+        await performReceiverUsbOperation(operation);
+      } else if (confirm.kind === "device") {
+        const result = await invokeApp<OperationResult>("switch_device", { serial: confirm.value });
+        apply(result.snapshot);
+        if (!result.success) notify(result.message);
+      } else {
+        const next = await invokeApp<Snapshot>("reconfigure_session", { kind: confirm.kind, value: confirm.value });
+        apply(next);
+        if (!hasActiveSession(next) && next.connectionTransport === "wireless" && next.settings.wirelessProtocol === "udp"
+          && (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend")) {
+          openNetworkDialog();
+        }
+      }
       setConfirm(null);
-    } catch (error) { notify(String(error)); }
+      setPendingNetworkStart(null);
+    } catch (error) {
+      if (confirm.kind === "network" || confirm.kind === "receiverUsb") {
+        setNetworkDialogError(String(error));
+        if (confirm.kind === "receiverUsb") setPanel(pendingReceiverOperation?.returnPanel ?? "receiver");
+      }
+      else {
+        let message = String(error);
+        if (confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" || confirm.kind === "playback") {
+          try { apply(await invokeApp<Snapshot>("get_snapshot")); }
+          catch (refreshError) { message += strings.app.refreshFailureSuffix(String(refreshError)); }
+        }
+        notify(message);
+      }
+      setConfirm(null);
+      setPendingNetworkStart(null);
+      if (confirm.kind === "receiverUsb") setPendingReceiverOperation(null);
+    }
+    finally {
+      if (confirm.kind === "receiverUsb") {
+        receiverOperationLock.current = false;
+        receiverConfirmationStarted.current = false;
+      }
+      setWorking(false);
+    }
+  };
+
+  const startNetwork = async (request: NetworkStartRequest) => {
+    setNetworkDialogError("");
+    if (cleanupPending) { setNetworkDialogError(strings.app.cleanupBeforeNetworkStart); return; }
+    if (active) {
+      setPendingNetworkStart(request);
+      setConfirm({ kind: "network", value: "" });
+      return;
+    }
+    setWorking(true);
+    try {
+      apply(await invokeApp<Snapshot>("start_network_audio", { ...request }));
+      if (request.backgroundAuthorizationRequired && request.bindingReference)
+        lastOfferListenerChoice.current = { localAddress: request.localAddress, bindingReference: request.bindingReference };
+      setPanel(null);
+    } catch (error) { setNetworkDialogError(String(error)); }
+    finally { setWorking(false); }
+  };
+
+  const resolveWirelessChoice = async (localAddress: string, bindingReference?: string) => {
+    let selectedAddress = localAddress;
+    let selectedBinding = bindingReference;
+    const addressWasSpecified = !!selectedAddress;
+    const bindingWasSpecified = !!selectedBinding;
+    const [availableInterfaces, availableBindings] = await Promise.all([
+      invokeApp<PrivateIpv4Interface[]>("network_interfaces"),
+      invokeApp<string[]>("receiver_binding_references"),
+    ]);
+    const availableAddress = (address: string | null | undefined) => !!address && availableInterfaces.some(value => value.address === address);
+    const availableBinding = (binding: string | null | undefined) => !!binding && availableBindings.includes(binding);
+    const snapshotAddress = snapshot?.wirelessConnectionOffers.interfaceAddress;
+    const snapshotBinding = snapshot?.wirelessConnectionOffers.automaticBinding;
+    const rememberedChoice = lastOfferListenerChoice.current;
+    const addressChoiceInvalidated = !selectedAddress && !localAddress && (!!snapshotAddress || !!rememberedChoice?.localAddress)
+      && !availableAddress(snapshotAddress) && !availableAddress(rememberedChoice?.localAddress);
+    const bindingChoiceInvalidated = !selectedBinding && !bindingReference && (!!snapshotBinding || !!rememberedChoice?.bindingReference)
+      && !availableBinding(snapshotBinding) && !availableBinding(rememberedChoice?.bindingReference);
+    if (!availableAddress(selectedAddress)) selectedAddress = "";
+    if (!availableBinding(selectedBinding)) selectedBinding = "";
+    if (!selectedAddress && !addressWasSpecified && availableAddress(snapshotAddress)) selectedAddress = snapshotAddress!;
+    if (!selectedBinding && !bindingWasSpecified && availableBinding(snapshotBinding)) selectedBinding = snapshotBinding!;
+    if (!selectedAddress && !addressWasSpecified && availableAddress(rememberedChoice?.localAddress)) selectedAddress = rememberedChoice!.localAddress;
+    if (!selectedBinding && !bindingWasSpecified && availableBinding(rememberedChoice?.bindingReference)) selectedBinding = rememberedChoice!.bindingReference;
+    if (!selectedAddress && !addressWasSpecified && !addressChoiceInvalidated && availableInterfaces.length === 1) selectedAddress = availableInterfaces[0].address;
+    if (!selectedBinding && !bindingWasSpecified && !bindingChoiceInvalidated && availableBindings.length === 1) selectedBinding = availableBindings[0];
+    return { selectedAddress, selectedBinding, addressChoiceInvalidated, bindingChoiceInvalidated, availableInterfaces, availableBindings };
+  };
+
+  const startBackgroundConnection = async () => {
+    if (!snapshot || working || snapshot.busy || active) return;
+    setWorking(true); setNetworkDialogError("");
+    try {
+      const choice = await resolveWirelessChoice("", undefined);
+      setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
+      const choices = { localAddress: choice.selectedAddress, bindingReference: choice.selectedBinding ?? "" };
+      if (!choices.bindingReference && choice.availableBindings.length === 0) {
+        setBackgroundStartMode(false);
+        setPanel("setup");
+        return;
+      }
+      if (!choices.localAddress || !choices.bindingReference) {
+        openNetworkDialog(true, choices);
+        return;
+      }
+      const local = choice.availableInterfaces.find(value => value.address === choices.localAddress);
+      const candidates = (await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress: choices.localAddress }))
+        .filter(candidate => endpointFitsInterface(candidate.endpoint, local));
+      if (candidates.length !== 1) {
+        openNetworkDialog(true, choices);
+        return;
+      }
+      try {
+        apply(await invokeApp<Snapshot>("start_network_audio", {
+          localAddress: choices.localAddress, peer: candidates[0].endpoint,
+          bindingReference: choices.bindingReference, backgroundAuthorizationRequired: true,
+        }));
+        lastOfferListenerChoice.current = { localAddress: choices.localAddress, bindingReference: choices.bindingReference };
+        setPanel(null);
+      } catch (error) {
+        setNetworkDialogError(String(error));
+        openNetworkDialog(true, choices);
+        setNetworkDialogError(String(error));
+      }
+    } catch (error) {
+      openNetworkDialog(true);
+      setNetworkDialogError(String(error));
+    } finally { setWorking(false); }
+  };
+
+  const setOfferListener = async (localAddress: string, allowed: boolean, bindingReference?: string) => {
+    if (!snapshot || (allowed && (active || working || snapshot.busy))) return;
+    if (allowed) setWorking(true);
+    setNetworkDialogError("");
+    try {
+      let selectedAddress = localAddress;
+      let selectedBinding = bindingReference;
+      if (allowed) {
+        const choice = await resolveWirelessChoice(selectedAddress, selectedBinding);
+        selectedAddress = choice.selectedAddress;
+        selectedBinding = choice.selectedBinding;
+        if (!selectedBinding && choice.availableBindings.length === 0) { setPanel("setup"); return; }
+        if (!selectedAddress || !selectedBinding) {
+          setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
+          openNetworkDialog(false); return;
+        }
+      }
+      await invokeApp<HostDiscoverySnapshot>("set_wireless_connection_offers", {
+        localAddress: selectedAddress, allowed, bindingReference: selectedBinding,
+      });
+      if (allowed) {
+        lastOfferListenerChoice.current = { localAddress: selectedAddress, bindingReference: selectedBinding! };
+        setNetworkChoiceNeedsConfirmation({ interfaceAddress: false, bindingReference: false });
+      }
+      const generation = ++snapshotRefreshGeneration.current;
+      const next = await invokeApp<Snapshot>("get_snapshot");
+      if (generation === snapshotRefreshGeneration.current) apply(next);
+    } catch (error) {
+      if (panel === "network") setNetworkDialogError(String(error)); else notify(String(error));
+    }
+    finally { if (allowed) setWorking(false); }
+  };
+
+  const acceptOffer = async (offerId: string, bindingReference: string) => {
+    if (!snapshot || active || working || snapshot.busy || !bindingReference) return;
+    setWorking(true);
+    setNetworkDialogError("");
+    try {
+      const next = await invokeApp<Snapshot>("accept_wireless_connection_offer", { offerId, bindingReference });
+      apply(next);
+      setPanel(null);
+    } catch (error) { setNetworkDialogError(String(error)); }
     finally { setWorking(false); }
   };
 
   const setOutput = async (output: "computer" | "phone") => {
     if (!snapshot) return;
+    if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
+    if (output === "phone" && snapshot.state === "managementOnly") return;
+    if (output === "phone" && !active && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
+      openNetworkDialog(); return;
+    }
     if (output === "phone" && !active && !selected) {
-      if (snapshot.transport === "wifi") setPanel("pair"); else setPanel("help");
+      setPanel(snapshot.connectionTransport === "wireless" ? "pair" : "help");
       return;
     }
     if (output === "phone" && !active && selected) {
       setWorking(true);
       try {
-        const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("connect_device", { serial: localSelected ?? selected.serial });
+        const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("connect_device", { serial: selected.serial });
         apply(result.snapshot);
         if (!result.success) notify(result.message);
       } catch (error) { notify(String(error)); }
@@ -141,236 +505,170 @@ function App() {
     try {
       const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("disconnect");
       apply(result.snapshot);
-      setNotice("");
+      if (result.success) setNotice(""); else notify(result.message);
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
   };
 
-  if (!snapshot) return <main className="loading-shell"><AudioLines size={25} /><span>正在启动 AnPod…</span></main>;
-  const empty = devices.length === 0;
-  const stateLabels: Record<Snapshot["state"], string> = {
-    noDevice: empty ? "尚未连接手机" : "等待手机授权", unauthorized: "等待手机授权",
-    ready: "准备就绪", connecting: "正在连接", connected: "已连接 · 电脑播放",
-    streaming: "正在手机播放", reconnecting: "正在重新连接", error: "连接失败",
+  const runMainAction = () => {
+    if (!snapshot) return;
+    if (snapshot.state === "connecting" || snapshot.state === "reconnecting") {
+      void invokeApp<Snapshot>("cancel_operation").then(apply).catch(error => notify(String(error)));
+    } else if (snapshot.wirelessConnectionOffers.active) {
+      void setOfferListener(snapshot.wirelessConnectionOffers.interfaceAddress ?? "", false);
+    } else if (cleanupPending || (active && (snapshot.state === "managementOnly" || snapshot.output === "phone"))) {
+      void disconnect();
+    } else if (receiverUpdateNeeded && !active) {
+      openReceiverUpgrade();
+    } else if (!active && wirelessUdpMode) {
+      void startBackgroundConnection();
+    } else if (active || selected?.connectable) {
+      void setOutput("phone");
+    } else {
+      setPanel(snapshot.connectionTransport === "usb" ? "help" : "pair");
+    }
   };
+
+  const connectOnly = async () => {
+    if (!snapshot) return;
+    if (snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
+      openNetworkDialog(); return;
+    }
+    if (!selected?.connectable) return;
+    setWorking(true);
+    try {
+      const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("connect_device_only", { serial: selected.serial });
+      apply(result.snapshot);
+      if (!result.success) notify(result.message);
+    } catch (error) { notify(String(error)); }
+    finally { setWorking(false); }
+  };
+
+  const chooseDevice = (device: Device) => {
+    setPanel(null);
+    if (canDisconnect) {
+      if (device.serial === snapshot.sessionSerial) return;
+      setConfirm({ kind: "device", value: device.serial });
+      return;
+    }
+    if (device.serial === localSelected) return;
+    setLocalSelected(device.serial);
+    void invokeApp<Snapshot>("select_device", { serial: device.serial }).then(apply).catch(error => notify(String(error)));
+  };
+
+  if (!snapshot) return <main className="loading-shell"><AudioLines size={25} /><span>{strings.app.loading}</span></main>;
+  const empty = devices.length === 0;
+  const cancellingConnection = snapshot.state === "connecting" || snapshot.state === "reconnecting";
+  const statusTitle = readableStatus(snapshot, cleanupPending);
+  const statusDetail = snapshot.state === "streaming"
+    ? snapshot.output !== "phone" ? strings.app.outputComputer
+      : snapshot.playbackDiagnostics?.playbackAdvancing === true
+      ? strings.app.playbackProgress
+      : strings.app.receivingAudio
+    : lanSession
+    ? snapshot.state === "managementOnly" ? strings.app.receiverManagementOnly
+      : snapshot.state === "phoneReady" ? snapshot.output === "computer" ? strings.app.receiverComputer : strings.app.receiverAwaitingPlayback
+      : snapshot.state === "paused" ? strings.app.receiverPaused
+      : snapshot.state === "reconnecting" ? strings.app.directNetworkRecovering
+          : snapshot.state === "error" ? snapshot.statusDetail || snapshot.message || strings.app.retryDisconnectOrDiagnostics
+            : snapshot.output === "computer" ? strings.app.networkSessionComputer : strings.app.networkSessionPhone
+    : snapshot.statusDetail;
+  const mainActionCanStop = snapshot.wirelessConnectionOffers.active || cleanupPending
+    || (active && (snapshot.output === "phone" || snapshot.state === "managementOnly"));
+  const mainActionDisabled = !cancellingConnection && !mainActionCanStop
+    && (receiverOperationBusy || working || snapshot.busy);
+  const mainActionLabel = cancellingConnection ? strings.app.connectCancel
+    : snapshot.wirelessConnectionOffers.active ? strings.app.stopReceiving
+      : cleanupPending ? strings.app.retryDisconnect
+        : receiverUpdateNeeded && !active ? strings.app.upgradePhone
+        : active && snapshot.state === "managementOnly" ? strings.app.disconnectManagement
+          : active && snapshot.output === "phone" ? strings.app.stop
+              : !active && wirelessUdpMode ? working || snapshot.busy ? strings.app.processing : strings.app.backgroundStart
+              : active || selected?.connectable ? working || snapshot.busy ? strings.app.processing : strings.app.playToPhone
+              : snapshot.connectionTransport === "usb" ? strings.app.connectUsbPhone : strings.app.addWirelessPhone;
+  const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
 
   return <div className={`app-shell ${largeText ? "large-text" : ""}`}>
     <header className="topbar">
-      <div className="brand"><img src="/icon.png" alt="" /><div><strong>AnPod</strong><span>电脑声音，手机播放</span></div></div>
-      <button className="icon-button" aria-label="打开设置" title="设置" onClick={() => setPanel("settings")}><Settings2 size={18} /></button>
+      <div className="brand"><img src="/icon.png" alt="" /><div><strong>AnPod</strong><span>{strings.app.tagline}</span></div></div>
+      <button className="icon-button" aria-label={strings.app.openSettings} title={strings.app.settings} onClick={() => setPanel("settings")}><Settings2 size={18} /></button>
     </header>
 
     <main className="main-scroll">
-      <div className={`status-line state-${snapshot.state}`} role="status" aria-live="polite">
+      <section className="device-section" aria-label={strings.app.targetPhone}>
+        <div className="section-title"><h1>{strings.app.targetPhone}</h1></div>
+        <div className="device-card">
+          <button className="device-select" onClick={() => wirelessUdpMode ? openNetworkDialog() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : strings.app.choosePairedReceiver : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
+            <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
+            <span className="device-copy">
+              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? bindingLabel(snapshot.wirelessConnectionOffers.automaticBinding) : strings.app.chooseReceiverPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
+              <span>{active ? strings.app.connectedPhone : cleanupPending ? strings.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? strings.app.wireless : strings.app.usb}</span>
+              {cleanupPending && <span className="device-live-state" role="status">{strings.app.retryCleanup}</span>}
+            </span>
+            <ChevronDown size={18} aria-hidden="true" />
+          </button>
+          <div className="device-actions">
+            {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{strings.app.switchToComputer}</button>}
+          </div>
+        </div>
+      </section>
+
+      <section className="connection-section" aria-label={strings.app.connectionMode}>
+        <div className="section-title"><h2>{strings.app.connectionMode}</h2></div>
+        <div className="transport-switch" role="group" aria-label={strings.app.connectionMode}>
+          <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} aria-hidden="true" />{strings.app.usb}</button>
+          <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</button>
+        </div>
+      </section>
+
+      <div className={`status-line state-${snapshot.state}`}>
         <span className="status-dot" aria-hidden="true" />
-        <span>{stateLabels[snapshot.state]}</span>
-        {snapshot.deviceName && <span className="status-device">{snapshot.deviceName}</span>}
-        <span className="transport-tag">{snapshot.transport.toUpperCase()}</span>
+        <span role="status" aria-live="polite">{statusTitle}</span>
       </div>
+      <button className="primary-button main-action" type="button" disabled={mainActionDisabled} onClick={runMainAction}>
+        {mainActionLabel}
+      </button>
+      {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{strings.app.backgroundStartIdleHint}</p>}
+      {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
+        className="status-description actionable-error"
+        summary={cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted}
+        details={failureDetail}
+      /> : <p className="status-description" role="status">{strings.app.waitingForRequest}</p> : null}
+      {receiverUpdateNeeded && (active || cleanupPending) && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{strings.app.upgradePhone}</button>}
 
-      <section className="playback-section" aria-label="声音输出">
-        <div className="section-title"><h1>声音输出</h1><button className="text-button" onClick={() => void refresh()} disabled={working} aria-label="刷新设备"><LoaderCircle className={working ? "spin" : ""} size={15} />刷新</button></div>
-        <div className="output-grid" role="group" aria-label="选择声音输出">
-          <button className={`output-card ${snapshot.output === "computer" ? "selected" : ""}`} aria-pressed={snapshot.output === "computer"} onClick={() => void setOutput("computer")} disabled={working || (!active && snapshot.output === "computer")}>
-            <span className="output-heading"><Computer size={18} aria-hidden="true" /><span className="output-name">电脑</span></span><span className="output-caption">本机扬声器</span>
-          </button>
-          <button className={`output-card ${snapshot.output === "phone" ? "selected" : ""}`} aria-pressed={snapshot.output === "phone"} onClick={() => void setOutput("phone")} disabled={working}>
-            <span className="output-heading"><Smartphone size={18} aria-hidden="true" /><span className="output-name">手机</span></span><span className="output-caption">{selected?.displayName ?? "选择手机连接播放"}</span>
-          </button>
-        </div>
-        <p className="status-description">{snapshot.statusDetail}</p>
-        <div className="session-row">
-          <span>{snapshot.state === "connecting" ? "正在建立安全连接" : active ? "手机连接保持中" : empty ? "声音继续从电脑播放" : "选择手机卡片即可连接并播放"}</span>
-          {snapshot.state === "connecting" || snapshot.state === "reconnecting"
-            ? <button className="text-button cancel-button" onClick={() => void invokeApp("cancel_operation").then(value => apply(value as Snapshot))}>取消连接</button>
-            : active && <button className="text-button" onClick={() => void disconnect()} disabled={working}>断开连接</button>}
-        </div>
-      </section>
-
-      <section className="connection-section" aria-label="连接手机">
-        <div className="transport-switch" role="group" aria-label="连接方式">
-          <button aria-pressed={snapshot.transport === "usb"} disabled={working} onClick={() => void setOption("transport", "usb")}><Usb size={16} />USB</button>
-          <button aria-pressed={snapshot.transport === "wifi"} disabled={working} onClick={() => void setOption("transport", "wifi")}><Wifi size={16} />Wi-Fi</button>
-        </div>
-        <div className="section-title device-heading"><h2>连接手机</h2><button className="text-button" disabled={snapshot.transport === "wifi" && active} title={snapshot.transport === "wifi" && active ? "请先断开当前手机，再添加手机" : undefined} onClick={() => setPanel("pair")}>{snapshot.transport === "wifi" ? "添加手机" : "连接帮助"}</button></div>
-        <button className="device-select" onClick={() => setPanel("device")} disabled={working || active} aria-haspopup="dialog" aria-label="选择连接手机；打开设备列表">
-          <span className="device-icon"><Smartphone size={17} /></span>
-          <span className="device-copy"><strong>{selected?.displayName ?? (empty ? "未检测到手机" : "选择手机")}</strong><span>{selected ? [selected.androidVersion && `Android ${selected.androidVersion}`, selected.statusText].filter(Boolean).join(" · ") : snapshot.transport === "wifi" ? "通过扫码、配对码或手动地址添加" : "连接 USB 手机后刷新设备列表"}</span></span>
-          <ChevronDown size={18} aria-hidden="true" />
-        </button>
-      </section>
-
-      <section className="mode-section" aria-label="播放模式">
-        <div className="mode-row"><h2>播放模式</h2><div className="mode-switch" role="group" aria-label="播放模式">
-          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={working} onClick={() => void setOption("playback", "balanced")}>均衡</button>
-          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={working} onClick={() => void setOption("playback", "lowLatency")}>低延迟</button>
+      <section className="mode-section" aria-label={strings.app.playbackMode}>
+        <div className="mode-row"><h2>{strings.app.playbackMode}</h2><div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
+          <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
+          <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
         </div></div>
-        <p>{snapshot.settings.playbackMode === "Balanced" ? "优先播放稳定，适合长时间收听。" : "缩短缓冲，适合互动和游戏声音。"}</p>
+        <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
       </section>
     </main>
 
-    <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />连接帮助</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />诊断</button></footer>
-    {notice && <div className="toast" role="status">{notice}</div>}
+    <footer className="footer"><button onClick={() => setPanel("help")}><CircleHelp size={15} />{strings.app.help}</button><span>v{snapshot.version}</span><button onClick={() => setPanel("diagnostics")}><Activity size={15} />{strings.app.diagnostics}</button></footer>
+    {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{strings.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
-    {panel === "device" && <DeviceDialog devices={devices} selected={localSelected} onSelect={serial => { void invokeApp<Snapshot>("select_device", { serial }).then(value => { apply(value); setPanel(null); }).catch(error => notify(String(error))); }} onRefresh={refresh} onClose={() => setPanel(null)} />}
-    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} onSave={async (key, value) => {
+    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={!active || snapshot.sessionConnectionTransport === "wireless" ? () => setPanel("setup") : null} onClose={() => setPanel(null)} />}
+    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} busy={controlsDisabled} onSetOption={(kind, value) => void setOption(kind, value)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onSave={async (key, value) => {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
       catch (error) { notify(String(error)); }
     }} onClose={() => setPanel(null)} />}
-    {panel === "pair" && <PairDialog transport={snapshot.transport} initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel("device"); }} />}
-    {panel === "help" && <HelpDialog transport={snapshot.transport} onClose={() => setPanel(null)} />}
+    {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} receiverOperationProgress={receiverOperationProgress} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { setBackgroundStartMode(false); if (!receiverOperationBusy) { setReceiverOperationResult(null); setReceiverOperationProgress(null); } setPanel(null); }} />}
+    {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
+    {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} />}
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} />}
     {confirm && <ConfirmDialog
-      title={confirm.kind === "transport" ? "切换连接方式？" : "切换播放模式？"}
-      body="切换时会短暂中断声音，AnPod 会清理当前连接后重新连接同一部手机。"
-      confirmLabel="断开并重新连接" busy={working} onCancel={() => setConfirm(null)} onConfirm={() => void applyConfirmed()} />}
+      title={confirm.kind === "receiverUsb" ? pendingReceiverOperation?.kind === "upgrade" ? strings.app.switchReceiverUpgradeTitle : strings.app.switchReceiverInstallTitle : confirm.kind === "network" ? strings.app.switchNetworkTitle : confirm.kind === "device" ? strings.app.switchDeviceTitle : confirm.kind === "transport" ? strings.app.switchTransportTitle : confirm.kind === "wirelessProtocol" ? strings.app.switchWirelessProtocolTitle : confirm.kind === "audioBackend" ? strings.app.switchAudioBackendTitle : strings.app.switchPlaybackTitle}
+      body={confirm.kind === "receiverUsb" ? pendingReceiverOperation ? strings.app.receiverInstallOrCheck(pendingReceiverOperation.targetVersionCode) : strings.app.receiverOperation
+        : confirm.kind === "network" ? strings.app.networkConfirmation
+        : confirm.kind === "device" && lanSession ? strings.app.switchLanDevice(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone)
+          : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" ? strings.app.switchConnectionSettings
+            : confirm.kind === "audioBackend" ? strings.app.switchBackend
+            : confirm.kind === "device" ? strings.app.switchPhoneContinue(snapshot.devices.find(device => device.serial === confirm.value)?.displayName ?? strings.app.selectedPhone, snapshot.output === "phone")
+              : strings.app.switchPlayback}
+      confirmLabel={confirm.kind === "receiverUsb" ? strings.app.stopAndContinue : confirm.kind === "network" ? strings.app.disconnectAndStart : confirm.kind === "device" ? strings.app.interruptAndSwitch : confirm.kind === "transport" || confirm.kind === "wirelessProtocol" || confirm.kind === "audioBackend" ? strings.app.confirmSwitch : strings.app.reconfigure} busy={working} onCancel={() => { if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => void applyConfirmed()} />}
   </div>;
 }
 
-function Modal({ title, children, onClose, className = "" }: { title: string; children: ReactNode; onClose: () => void; className?: string }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const onCloseRef = useRef(onClose);
-  useEffect(() => { onCloseRef.current = onClose; });
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (!dialog.open) dialog.showModal();
-    const key = (event: KeyboardEvent) => { if (event.key === "Escape") { event.preventDefault(); onCloseRef.current(); } };
-    dialog.addEventListener("keydown", key);
-    return () => { dialog.removeEventListener("keydown", key); if (dialog.open) dialog.close(); };
-  }, []);
-  return <dialog ref={ref} aria-label={title} className={`modal ${className}`} onCancel={event => { event.preventDefault(); onClose(); }} onClick={event => { if (event.target === ref.current) onClose(); }}>
-    <div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>{children}
-  </dialog>;
-}
-
-function DeviceDialog({ devices, selected, onSelect, onRefresh, onClose }: { devices: Device[]; selected: string | null; onSelect: (id: string) => void; onRefresh: () => void; onClose: () => void }) {
-  return <Modal title="选择手机" onClose={onClose} className="device-dialog">
-    <div className="dialog-tools"><span>只显示当前连接方式的设备</span><button className="text-button" onClick={onRefresh}><Search size={15} />刷新</button></div>
-    <div className="device-list">{devices.map(device => <button className="device-option" key={device.serial} onClick={() => onSelect(device.serial)} disabled={!device.connectable} aria-pressed={selected === device.serial}>
-      <Smartphone size={18} /><span><strong>{device.displayName}</strong><small>{device.statusText}{device.transport !== "unknown" ? ` · ${device.transport.toUpperCase()}` : ""}</small></span>{selected === device.serial && <Check size={17} />}
-    </button>)}</div>
-    {devices.length === 0 && <div className="empty-note"><Info size={17} /><span>尚未发现设备。{" "} {" “添加手机”可通过扫码、配对码或 IP:端口地址添加。"}</span></div>}
-    <button className="dialog-secondary" onClick={onClose}>完成</button>
-  </Modal>;
-}
-
-function SettingsDialog({ snapshot, largeText, onLargeText, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
-  const settings = snapshot.settings;
-  const update = (key: keyof Settings, value: boolean | string) => { void onSave(key, value); };
-  return <Modal title="设置" onClose={onClose} className="settings-dialog">
-    <h3>连接</h3>
-    <SettingToggle disabled={snapshot.busy} title="自动连接上次使用的手机" description="设备重新出现时尝试连接" checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
-    <SettingToggle disabled={snapshot.busy} title="无线连接恢复" description="无线掉线后进行有限次数的重连" checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />
-    <h3>窗口和外观</h3>
-    <SettingToggle disabled={snapshot.busy} title="关闭时最小化到托盘" description="从托盘菜单可以重新打开 AnPod" checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
-    <SettingToggle title="放大文字" description="增加界面文字尺寸" checked={largeText} onChange={onLargeText} />
-    <label className="select-setting"><span>主题</span><select disabled={snapshot.busy} value={settings.appearanceTheme} onChange={event => update("appearanceTheme", event.target.value)}><option value="System">跟随系统</option><option value="Light">浅色</option><option value="Dark">深色</option></select></label>
-    {snapshot.busy && <p className="dialog-footnote">正在连接，暂时无法更改设置。</p>}
-    <p className="dialog-footnote">配置保存在本机，不包含配对码或握手令牌。</p>
-  </Modal>;
-}
-
-function SettingToggle({ title, description, checked, disabled = false, onChange }: { title: string; description: string; checked: boolean; disabled?: boolean; onChange: (value: boolean) => void }) {
-  return <label className="setting-toggle"><span><strong>{title}</strong><small>{description}</small></span><input type="checkbox" checked={checked} disabled={disabled} onChange={event => onChange(event.target.checked)} /></label>;
-}
-
-function PairDialog({ transport, initialEndpoint, onClose, onDone }: { transport: "usb" | "wifi"; initialEndpoint: string; onClose: () => void; onDone: () => void }) {
-  const [tab, setTab] = useState<"qr" | "code" | "address">("qr");
-  const [credentials, setCredentials] = useState<Credentials | null>(null);
-  const [endpoint, setEndpoint] = useState(initialEndpoint);
-  const [code, setCode] = useState("");
-  const [message, setMessage] = useState("正在生成安全配对码…");
-  const [busy, setBusy] = useState(false);
-  const [qrStarted, setQrStarted] = useState(false);
-  const [error, setError] = useState("");
-  const taskGeneration = useRef(0);
-  useEffect(() => {
-    ++taskGeneration.current;
-    return () => { ++taskGeneration.current; };
-  }, [transport, tab]);
-  useEffect(() => {
-    if (transport !== "wifi" || tab !== "qr") return;
-    const generation = taskGeneration.current;
-    void invokeApp<Credentials>("qr_credentials").then(value => { if (taskGeneration.current === generation) setCredentials(value); }).catch(reason => { if (taskGeneration.current === generation) setError(String(reason)); });
-    return () => { void invokeApp("cancel_qr_pairing"); };
-  }, [transport, tab]);
-  const currentTask = () => taskGeneration.current;
-  const finish = async (command: string, args: Record<string, unknown>) => {
-    const generation = currentTask();
-    setBusy(true); setError("");
-    try {
-      const result = await invokeApp<{ success: boolean; message: string; snapshot?: Snapshot }>(command, args);
-      if (generation !== taskGeneration.current) return;
-      setMessage(result.message);
-      if (result.success) await onDone();
-      else setError(result.message);
-    } catch (reason) { if (generation === taskGeneration.current) setError(String(reason)); }
-    finally { if (generation === taskGeneration.current) { setBusy(false); setCode(""); } }
-  };
-  const discover = async () => {
-    const generation = currentTask();
-    setBusy(true); setError("");
-    try {
-      const result = await invokeApp<MdnsResults>("discover_wifi");
-      if (generation !== taskGeneration.current) return;
-      const found = result.services.filter(service => service.kind === "connect");
-      if (found.length === 1) setEndpoint(found[0].endpoint);
-      else if (found.length > 1) setMessage(`发现 ${found.length} 台手机，请确认后选择连接地址。`);
-      else setMessage("没有发现手机；请手动输入无线调试的连接地址。配对端口和连接端口不同。");
-    } catch (reason) { if (generation === taskGeneration.current) setError(String(reason)); }
-    finally { if (generation === taskGeneration.current) setBusy(false); }
-  };
-  return <Modal title={transport === "wifi" ? "添加无线手机" : "连接 USB 手机"} onClose={onClose} className="pair-dialog">
-    {transport === "wifi" ? <>
-      <div className="tabs" role="tablist" aria-label="添加方式"><button role="tab" aria-selected={tab === "qr"} onClick={() => setTab("qr")}>扫码配对</button><button role="tab" aria-selected={tab === "code"} onClick={() => setTab("code")}>配对码</button><button role="tab" aria-selected={tab === "address"} onClick={() => setTab("address")}>手动地址</button></div>
-      {tab === "qr" && <div className="qr-pane">
-        {credentials ? <div className="qr-frame"><QRCodeSVG value={credentials.payload} size={174} level="Q" includeMargin /></div> : <div className="qr-frame qr-wait"><LoaderCircle className="spin" /></div>}
-        <p className="qr-help">在手机「无线调试」中选择“使用二维码配对设备”并扫描。配对码仅保存在当前窗口。</p>
-        <p className="pair-progress" role="status" aria-live="polite">{message}</p>
-        {!qrStarted && <button className="primary-button" disabled={!credentials || busy} onClick={() => {
-          if (!credentials) return;
-          const generation = currentTask();
-          setQrStarted(true); setBusy(true);
-          void invokeApp<{ success: boolean; message: string }>("pair_qr", { instanceName: credentials.instanceName, password: credentials.password })
-            .then(async result => { if (generation !== taskGeneration.current) return; setMessage(result.message); if (result.success) await onDone(); else { setError(result.message); setQrStarted(false); setCredentials(null); void invokeApp<Credentials>("qr_credentials").then(value => { if (generation === taskGeneration.current) setCredentials(value); }); } })
-            .catch(reason => { if (generation === taskGeneration.current) { setError(String(reason)); setQrStarted(false); } }).finally(() => { if (generation === taskGeneration.current) setBusy(false); });
-        }}>{busy ? "等待手机扫描…" : "开始扫码配对"}</button>}
-        {qrStarted && <button className="dialog-secondary" onClick={() => { ++taskGeneration.current; void invokeApp("cancel_qr_pairing"); setQrStarted(false); setBusy(false); setMessage("配对已取消。"); }}>取消配对</button>}
-      </div>}
-      {tab === "code" && <form className="form-pane" onSubmit={event => { event.preventDefault(); void finish("pair_wifi", { endpoint, code }); }}>
-        <label>手机配对地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.0.2.20:37001" /></label>
-        <label>6 位配对码<input value={code} onChange={event => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" aria-describedby="pair-code-hint" placeholder="123456" /></label>
-        <small id="pair-code-hint">配对码来自手机的“使用配对码配对设备”页面。</small>
-        <button className="primary-button" disabled={busy || code.length !== 6}>{busy ? "正在配对…" : "配对并添加"}</button>
-      </form>}
-      {tab === "address" && <form className="form-pane" onSubmit={event => { event.preventDefault(); void finish("connect_wifi", { endpoint }); }}>
-        <label>无线调试连接地址<input value={endpoint} onChange={event => setEndpoint(event.target.value)} autoComplete="off" placeholder="192.0.2.20:5555" /></label>
-        <small>请使用手机无线调试主页面显示的连接端口，不要使用配对端口。</small>
-        <button className="text-button discover-button" type="button" onClick={() => void discover()} disabled={busy}><Search size={15} />搜索局域网设备</button>
-        <button className="primary-button" disabled={busy || !endpoint.trim()}>{busy ? "正在连接…" : "连接地址"}</button>
-      </form>}
-    </> : <div className="help-pane"><p>1. 在手机开发者选项中开启 USB 调试。</p><p>2. 使用支持数据传输的 USB 线连接电脑。</p><p>3. 解锁手机并允许此电脑进行 USB 调试。</p><button className="primary-button" onClick={async () => { await onDone(); }}>刷新设备列表</button></div>}
-    {error && <p className="inline-error" role="alert">{error}</p>}
-  </Modal>;
-}
-
-function HelpDialog({ transport, onClose }: { transport: "usb" | "wifi"; onClose: () => void }) {
-  return <Modal title="连接帮助" onClose={onClose} className="help-dialog">
-    {transport === "usb" ? <><h3>USB 调试</h3><ol><li>在手机开发者选项中开启 USB 调试。</li><li>用支持数据的线连接手机和电脑。</li><li>解锁手机，在授权提示中允许此电脑。</li></ol></> : <><h3>无线调试</h3><ol><li>让电脑和手机连接同一可互访网络。</li><li>在手机无线调试中扫描二维码，或输入配对端口和 6 位码。</li><li>连接地址使用无线调试主页面的连接端口。</li></ol></>}
-    <p>手机端无需安装可见 App。配对仅授予 ADB 权限，不会自动开始播放。</p><button className="dialog-secondary" onClick={onClose}>完成</button>
-  </Modal>;
-}
-
-function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose: () => void }) {
-  const text = [`状态：${snapshot.message}`, `连接方式：${snapshot.transport.toUpperCase()}`, `设备：${snapshot.deviceName ?? "无"}`, `输出：${snapshot.output === "phone" ? "手机" : "电脑"}`, `可见设备：${snapshot.devices.length}`, `版本：${snapshot.version}`].join("\n");
-  return <Modal title="诊断" onClose={onClose} className="diagnostics-dialog">
-    <p>本次运行状态</p><pre>{text}</pre><div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(text)}><Copy size={15} />复制诊断</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>查看日志文件夹<ExternalLink size={14} /></button></div>
-  </Modal>;
-}
-
-function ConfirmDialog({ title, body, confirmLabel, busy, onConfirm, onCancel }: { title: string; body: string; confirmLabel: string; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
-  return <Modal title={title} onClose={onCancel} className="confirm-dialog"><p>{body}</p><div className="dialog-actions"><button className="dialog-secondary" onClick={onCancel} disabled={busy}>取消</button><button className="primary-button" onClick={onConfirm} disabled={busy}>{busy ? "正在切换…" : confirmLabel}</button></div></Modal>;
-}
 
 export default App;

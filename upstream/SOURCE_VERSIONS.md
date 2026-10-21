@@ -21,8 +21,11 @@ are deliberately not used (plan §2.2.1) — a rebuild must produce the same cod
 | `client/native/audio_capture.cpp` | `src/AnPod.Native/audio_capture.cpp` | Rewritten in place; see `PATCHES.md` |
 | *(new)* | `src/AnPod.Native/audio_capture.h` | New public ABI header (upstream had none) |
 | `server/src/main/java/com/ysbing/audioshare/Main.java` | `src/AnPod.AndroidServer/src/main/java/com/anpod/server/Main.java` | Package renamed, header validation added |
+| `server/src/main/java/com/ysbing/audioshare/Main.java` | `src/AnPod.Receiver/app/src/main/java/app/anpod/receiver/ReceiverService.java` | AudioTrack playback path adapted for an installed Android service; lifecycle and diagnostics are AnPod changes, see `PATCHES.md` |
 | `server/src/main/java/com/ysbing/audioshare/Options.java` | `src/AnPod.AndroidServer/src/main/java/com/anpod/server/Options.java` | Package renamed, length limits added |
 | `server/build.gradle` | `src/AnPod.AndroidServer/build.gradle` | Payload copy target changed to `deps/server` |
+| *(new Android app)* | `src/AnPod.Receiver/` | AnPod Receiver APK, service lifecycle, protected health provider and build entry; includes the AudioShare-derived playback adaptation above |
+| *(new shared protocol source)* | `src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java` | AnPod PCM frame alignment helper shared by both Android playback paths; not copied from upstream |
 | `client/lib/services/adb_service.dart` | `src/AnPod.Desktop/Services/AdbRunner.cs` + `ConnectionManager.cs` | Ported to C#, not reused at runtime |
 | `client/lib/services/audio_capture.dart` | `src/AnPod.Desktop/Services/NativeAudioCapture.cs` | Ported to C#, not reused at runtime |
 | `client/lib/data_source.dart` | `src/AnPod.Desktop/Services/ConnectionManager.cs` | Ported to C#, not reused at runtime |

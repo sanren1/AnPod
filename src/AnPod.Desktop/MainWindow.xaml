@@ -157,9 +157,6 @@
                 </Grid>
                 <TextBlock Text="{Binding PlaybackModeHint}" Margin="0,4,0,0" FontSize="12" LineHeight="16"
                            Foreground="{DynamicResource MutedForegroundBrush}" TextWrapping="Wrap" />
-                <TextBlock Text="请先断开连接以切换播放模式或连接方式。" Margin="0,3,0,0" FontSize="12.5"
-                           Foreground="{DynamicResource MutedForegroundBrush}"
-                           Visibility="{Binding IsConnectionChangeHintVisible, Converter={StaticResource BoolToVisibility}}" />
             </StackPanel>
         </ScrollViewer>
 

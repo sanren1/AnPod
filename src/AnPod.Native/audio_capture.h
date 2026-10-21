@@ -14,6 +14,8 @@
 #ifndef ANPOD_AUDIO_CAPTURE_H
 #define ANPOD_AUDIO_CAPTURE_H
 
+#include <stdint.h>
+
 #if defined(_WIN32)
 #  define ANPOD_API __declspec(dllexport)
 #  define ANPOD_CALL __cdecl
@@ -49,6 +51,7 @@
 /* Streaming */
 #define ANPOD_ERR_DEVICE_INVALIDATED    1300  /* endpoint changed / removed    */
 #define ANPOD_ERR_SEND_FAILED           1301
+#define ANPOD_ERR_PCM_CALLBACK           1302
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +63,8 @@ extern "C" {
  * the call; the callee must copy it immediately and must not block.
  */
 typedef void (ANPOD_CALL *ConnectCallback)(const char* connectCode);
+typedef void (ANPOD_CALL *PcmCallback)(const int16_t* interleavedPcm, uint32_t frameCount,
+    uint32_t sampleRate, uint16_t channels, uint64_t frameIndex, void* userData);
 
 /*
  * Initialises WASAPI loopback capture on the current default render endpoint.
@@ -80,6 +85,18 @@ ANPOD_API int ANPOD_CALL AudioCapture_Initialize(void);
  * the listener keeps waiting.
  */
 ANPOD_API int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback);
+
+/*
+ * Selects the PCM sink before Start. A non-NULL callback replaces TCP output;
+ * it is called on the WASAPI capture thread and must return promptly. PCM and
+ * userData are valid only for the callback duration. Passing NULL clears the
+ * callback and waits for an active callback to finish. Cleanup also joins the
+ * capture thread before returning, closing the callback lifetime.
+ */
+ANPOD_API int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData);
+
+/* Returns the negotiated output PCM format after Initialize, before capture starts. */
+ANPOD_API int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channels);
 
 /* Starts the capture thread. Call after the callback has fired. 1 = ok. */
 ANPOD_API int ANPOD_CALL AudioCapture_Start(void);
@@ -138,6 +155,9 @@ ANPOD_API const char* ANPOD_CALL AudioCapture_GetLastErrorMessage(void);
 
 /* Clears the pending error. */
 ANPOD_API void ANPOD_CALL AudioCapture_ClearLastError(void);
+
+/* Total PCM payload bytes accepted by successful TCP send calls this session. */
+ANPOD_API uint64_t ANPOD_CALL AudioCapture_GetSentPcmBytes(void);
 
 #ifdef __cplusplus
 }

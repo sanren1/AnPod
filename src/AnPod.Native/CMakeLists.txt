@@ -26,12 +26,18 @@ set_target_properties(audio_capture PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"
 )
 
-# ws2_32 / winmm / ole32 are also pulled in via #pragma comment for MSVC, but
-# listing them keeps MinGW and any other toolchain working.
-target_link_libraries(audio_capture PRIVATE ws2_32 winmm ole32 uuid)
+if(MSVC)
+    set_property(TARGET audio_capture PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+endif()
 
-# WASAPI (IAudioClient) and SRWLOCK both require a Vista+ target. MSVC's default
-# is high enough already; MinGW defaults to XP, which hides the declarations.
+# ws2_32 / winmm / ole32 / avrt are also pulled in via #pragma comment for MSVC, but
+# listing them keeps MinGW and any other toolchain working.
+target_link_libraries(audio_capture PRIVATE ws2_32 winmm ole32 avrt uuid)
+
+# WASAPI stream auto-conversion flags require Windows 7 or later. Keep the
+# compile-time target aligned with that runtime floor.
 target_compile_definitions(audio_capture PRIVATE _WIN32_WINNT=0x0601)
 
 if(MSVC)

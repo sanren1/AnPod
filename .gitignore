@@ -52,6 +52,10 @@ adbkey.pub
 *.pem
 *.pfx
 *.p12
+*.jks
+# Release signing material must never live inside the repository
+/AnPod-release-key/
+/*-release-key/
 *.pkt
 *.dmp
 
@@ -63,3 +67,13 @@ src-tauri/icons/ios/
 src-tauri/icons/icon.icns
 src-tauri/icons/Square*.png
 src-tauri/icons/StoreLogo.png
+
+# Local project instructions and private planning records
+/AGENTS.md
+/AGENTS.override.md
+/plan.md
+/AnPod_plan_v2.md
+/AnPod 审查与优化报告.md
+/AnPod_handoff_*.md
+# Internal implementation plan and design references
+AnPod_AOD_Plan/

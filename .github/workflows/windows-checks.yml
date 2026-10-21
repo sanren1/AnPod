@@ -1,0 +1,116 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      ANDROID_HOME: C:\Android\android-sdk
+      ANDROID_SDK_ROOT: C:\Android\android-sdk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check version consistency
+        shell: pwsh
+        run: ./tests/AnPod.Version.Check.ps1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          cache: false
+          build-warnings: ''
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check Android SDK for AGP 8.7.3
+        shell: pwsh
+        run: |
+          $requiredSdkFiles = @(
+            @{ Path = "$env:ANDROID_HOME\platforms\android-35\android.jar"; Component = 'Android SDK Platform 35' },
+            @{ Path = "$env:ANDROID_HOME\build-tools\34.0.0\aapt.exe"; Component = 'Android SDK Build-Tools 34.0.0' }
+          )
+          foreach ($required in $requiredSdkFiles) {
+            if (-not (Test-Path -LiteralPath $required.Path)) {
+              throw "Missing $($required.Component) at '$($required.Path)'; install it in the Windows runner image."
+            }
+          }
+
+      - name: Compile and lint Android receiver
+        working-directory: src/AnPod.Receiver
+        shell: pwsh
+        run: .\gradlew.bat :app:compileDebugKotlin :app:compileDebugJavaWithJavac :app:testDebugUnitTest :app:lintDebug --no-daemon
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check Java protocol vectors, PCM framing, and audio focus state
+        shell: pwsh
+        run: ./packaging/check-java-offline.ps1
+
+      - name: Test pure desktop logic
+        run: dotnet run --project tests/AnPod.Core.Tests -c Release
+
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Clippy
+        # Bin target only: under --tests the harness replaces main(), so every
+        # command reachable only from it reports as dead code.
+        # Runtime files in deps/ are intentionally ignored by Git and unused by
+        # clippy; strip the bundle resources so tauri-build does not require them.
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Test Rust on Windows
+        # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: >-
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --
+          --test-threads=1
+          --skip receiver::tests::p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested
+          --skip receiver::tests::reads_the_artifact_written_by_windows_powershell_when_requested
+
+  audit:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri

@@ -1,186 +1,92 @@
 <p align="center">
-  <img src="frontend/public/icon.png" alt="AnPod 图标" width="160">
+  <img src="icon.png" alt="AnPod 图标" width="160">
 </p>
 
 <h1 align="center">AnPod</h1>
 
-<p align="center">把 Windows 的声音，送到 Android 手机播放。</p>
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。当前预览版：PC 1.8.7 + Receiver 0.15.7（code 32），包含手机常显（AOD）预览。
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4" alt="Windows 10 / 11 x64">
-  <img src="https://img.shields.io/badge/Tauri-2-24C8D8" alt="Tauri 2">
-  <img src="https://img.shields.io/badge/Android-6.0%2B-3DDC84" alt="Android 6.0 及以上">
-</p>
+## 使用要求
 
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#延迟测试">延迟测试</a> ·
-  <a href="#源码构建">源码构建</a> ·
-  <a href="#常见问题">常见问题</a> ·
-  <a href="https://github.com/sanren1/AnPod/issues">反馈问题</a>
-</p>
+- Windows 10/11 x64；需 Microsoft Edge WebView2 Runtime，便携包不包含该运行时。
+- Android 6.0 或更高版本。
+- USB 首次连接需要开启 USB 调试并在手机上授权电脑。
+- 无线 UDP 需要电脑和手机网络可互访，并在手机安装本版附带的 Receiver APK。
+- 默认使用 Receiver 手机应用接收；Legacy 兼容方式和无线调试 ADB 可在高级设置中选择。
 
-AnPod 将 Windows 当前默认播放设备的声音实时传到 Android 手机。音频通过 WASAPI Loopback 采集，经 USB 或 Wi-Fi ADB 转发；手机端无需安装可见 App。
+## USB 快速开始
 
-## 功能
+1. 启动 PC 端 AnPod，用 USB 连接手机并授权调试。
+2. 按提示安装或升级手机应用，然后选择手机并点击“播放到手机”。
+3. 点击“停止”或“切回电脑”结束播放；也可在手机停止接收。
 
-- USB 和 Wi-Fi ADB 连接，支持无线调试二维码、配对码和手动地址。
-- 手机播放、电脑播放切换；断开或暂停后恢复此前未静音的电脑音频端点。
-- 均衡和低延迟播放模式，支持确认后重连切换。
-- 设备重新出现后自动连接；Wi-Fi 音频会话掉线后进行有限次数恢复。
-- 系统托盘、主题、大字体和本地诊断日志。
+## 无线 UDP 快速开始
 
-## 运行要求
+1. 首次使用先用 USB 连接手机，按 PC 端“首次设置”完成配对和手机应用安装。
+2. 手机点“开启后台等待”；连接请求到来时允许本次或 8 小时，也可明确选择记住电脑，直到取消。后台等待需主动开启，不会随开机自动启动。
+3. PC 选择“无线”，点击“连接手机”。多个目标或原选择失效时，按提示选择手机和网络。
 
-| 项目 | 要求 |
-| --- | --- |
-| 电脑 | Windows 10/11 x64 |
-| WebView | Microsoft Edge WebView2 Runtime；便携包不包含该运行时 |
-| 手机 | Android 6.0+；无线调试配对需要 Android 11+ |
-| USB | 支持数据传输的 USB 线，已开启并授权 USB 调试 |
-| Wi-Fi | 手机与电脑处于可互访的网络，无线调试已开启 |
+手机也可主动发起：电脑开启等待连接，手机点“开始接收”。授权可在两端查看、取消；关闭后台连接不等于撤销已保存的授权。
 
-AnPod 需要可用的 Windows 默认音频输出设备。手机不会显示为 Windows 音频设备。ADB 授权会授予电脑 ADB 调试能力；请只连接信任的电脑和手机。
+## 手机常显（AOD）
 
-## 快速开始
+手机端提供“伪 AOD”常显：纯黑横屏，显示大号时钟、由真实 PCM 驱动的双线波形，以及状态、协议、接收码率、接收端缓冲延迟、UDP 缺帧率五项指标。
 
-从 `artifacts/` 解压完整 ZIP 到可写目录并运行 `AnPod.exe`。`adb.exe`、Platform-Tools DLL、`audio_capture.dll` 和 Android `server` 载荷必须与 EXE 同目录；请勿单独移动 EXE。包内含第三方许可与通知。首次运行需要系统已安装 WebView2 Runtime。
+- 仅手机端控制：在 Receiver 主界面打开“常显（AOD）”，可点“预览常显”立即进入；PC 没有 AOD 开关，也不新增控制协议。
+- 双线波形分别对应立体声的两个声道，共用同一条基线、没有文字标记；右声道反相，所以即使左右声道音频完全一致，也会一条向上、一条向下。
+- 指标口径：Recv 为音频 payload 码率，Latency 为接收端可观测缓冲，Loss 为 UDP 缺帧率（USB/ADB 显示 `—`）。
+- 只显示当前有效会话；数字静音仍保持显示，波形回到中心直线。连续约 15 秒没有 PCM 才会退出，因此在 PC 上切换“均衡/低延迟”不会让常显退出重进。
+- 退出后可从通知的“打开常显”重进；手机不在前台时受 Android 后台启动限制，不会自动弹出。
+- 时钟、波形与底部指标栏作为一个整体缓慢漂移（横向约 ±16dp、纵向约 ±9dp），不会长期停在同一批像素上；停留约 6 秒无操作后右上角“退出”淡出，触摸任意位置恢复。
+- AMOLED 纯黑、遵从系统亮度；长时间常亮仍有耗电与烧屏风险，锁屏/灭屏后不显示。
+- 右侧上下滑动调整手机媒体音量，从第一段滑动就生效，操作时显示系统音量条；实体音量键继续可用。
+- 连接、切换播放模式等操作在后台完成，不会弹出手机界面。
 
-### USB 连接
+完整说明、指标口径与限制见 [`docs/AOD.md`](docs/AOD.md)。
 
-1. 在手机开发者选项中开启 **USB 调试**，用数据线连接电脑，并在手机上确认调试授权。
-2. 在 AnPod 中选择 **USB** 和目标手机；自动连接后默认保持电脑输出。
-3. 点击 **手机输出** 开始播放。选择 **电脑输出** 可恢复电脑播放并保持手机连接。
+![手机常显预览](docs/aod-preview.jpg)
 
-结束时断开连接，或从托盘菜单退出程序。
+## 升级
 
-### Wi-Fi 连接
+手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。1.5.0 起 Receiver 使用独立的发布密钥签名；从 1.4.0 及更早的 debug 预览包切过来需要先卸载一次（配对会一起清掉，需重新走 USB 配对），此后同签名的版本可原地升级。密钥与打包流程见 [`packaging/SIGNING.md`](packaging/SIGNING.md)。
 
-1. 手机和电脑接入可互访的网络，在手机开发者选项中开启 **无线调试**。
-2. 在 AnPod 中选择 **Wi-Fi → 添加手机**，使用二维码、配对码或连接地址添加设备。
-3. 使用二维码时，在手机无线调试页面选择扫码配对，扫描 AnPod 弹窗中的二维码。使用配对码时，填写手机配对弹窗中的地址和 6 位配对码。
-4. 配对后选择目标手机，再点击 **手机输出**。需要手动连接时，使用无线调试主页面的连接地址。
+每次出包都会递增 Receiver `versionCode`，并同步更新 PC 端的 `AUDITED_RECEIVER_ARTIFACTS`。不要用同 `versionCode` 的 APK 覆盖安装：部分手机（vivo 等）会要求确认“已安装相同版本”，且 PC 会按精确哈希判定为未核验。PC 与手机请使用同一套发布包。
 
-**配对端口和连接端口不同。** 配对负责授权，连接负责建立 ADB 链路。已连接时，修改连接方式或播放模式需确认重连；添加无线手机前需先断开当前连接。Windows 移动热点也可提供网络，但网络必须允许设备互访。
+## 版本与变更
 
-## 延迟测试
+手机 APK 随 PC 便携包提供，两端需配套使用。各版本改动与制品见 [GitHub Releases](https://github.com/sanren1/AnPod/releases) 和提交历史。
 
-2026-10-11 对 AnPod 1.0.4 进行了 USB 真机声学回录测试。测试环境为 Windows x64、Android 16（API 36）、手机内置扬声器和同一套电脑耳机/麦克风，音频为 48 kHz 双声道 PCM16。设备型号、序列号和音频端点标识已省略。
+## 延迟测试记录
 
-每组播放 10 个短扫频测试音，约 24 秒；同步采集电脑 WASAPI Loopback 和麦克风回录，用每个音频包的 QPC 时间戳及波形相关匹配计算时差。另测电脑耳机输出作为基线，并独立复核匹配样点。
+PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 匹配并经独立复核。
 
-| 播放路径 | 回录延迟中位数 | P95 | 范围 | 相对电脑耳机基线的中位数差值 |
-| --- | ---: | ---: | ---: | ---: |
-| 电脑耳机基线 | 71.1 ms | 71.2 ms | 71.0–71.2 ms | — |
-| 手机低延迟 | 177.6 ms | 178.2 ms | 177.1–178.2 ms | +106.4 ms |
-| 手机均衡 | 274.1 ms | 274.8 ms | 273.5–274.8 ms | +203.0 ms |
+下表是 **1.2.1 的历史测量**。后续版本尚未重新测量，因此这些数字不能当作当前版本的延迟结论。
 
-本次低延迟模式比均衡模式快约 **96.5 ms**。手机接受的 AudioTrack 有效缓冲分别为 720 帧（15 ms）和 7688 帧（约 160.2 ms）；缓冲大小不等于实际播放延迟。均衡模式的 AudioTrack 欠载计数在测试期间为 0；低延迟模式开始测试时增加 1 次，之后未增长。全部正式测试音片段均无采集断点或时间戳错误。
+| 连接与档位 | 中位数 | P95 |
+| --- | ---: | ---: |
+| USB · 均衡 | 156.720 ms | 157.111 ms |
+| USB · 低延迟 | 123.269 ms | 125.299 ms |
+| 无线 UDP · 均衡 | 310.645 ms | 314.294 ms |
+| 无线 UDP · 低延迟 | 187.394 ms | 200.240 ms |
+| 电脑本机 · 基准 | 71.699 ms | 71.778 ms |
 
-> 回录延迟包含麦克风硬件、驱动和音频处理的耗时。基线差值是两条播放路径的比较，不能视为手机的绝对出声延迟或纯 AnPod 传输耗时。结果来自单台设备的短时测试，不代表其他设备、Wi-Fi、长期延迟漂移或持续播放稳定性。原始录音、日志和设备转储仅保留在本地，不上传仓库。
+电脑本机基准是独立路径，仅作参照，不与四档结果相减。测量包含声学与麦克风链路，是端到端时差，并非纯传输延迟。无线 UDP 低延迟组有两次低匹配分，仅供参考；这不代表音乐音质通过。
 
-## 源码构建
+完整口径见 [测试记录](https://github.com/sanren1/AnPod/blob/preview/tests/manual-checklist-v2.md#2026-10-17-anpod-121-四档延迟与电脑基准短测)。
 
-主要桌面应用使用 Tauri 2、Rust、React、TypeScript 和 Vite。Windows 原生音频采集继续使用 C++ WASAPI DLL，Android 服务使用 Java。需要：
+## 已知问题
 
-- Rust stable（至少 1.90）、Cargo 和 MSVC x64 C++ Build Tools。
-- Node.js 与 npm。
-- JDK 17 与 Android SDK API 34 / Build-Tools，用于重建 Android 服务。
-- Android SDK Platform-Tools，用于准备 ADB 运行文件。
+- 低延迟档长时播放可能出现短时卡顿，日常优先使用均衡档。
+- 常显仍是预览功能：长时间烧屏与功耗、通知兜底、锁屏/灭屏不显示等仍待完整真机验收。
+- 音乐音质与长期稳定性尚未验收；短时延迟测试不能替代实听。
+- Receiver 使用正式发布签名，与更早的 debug 预览包不能互相覆盖安装；从旧包升级需先卸载一次。
 
-准备本机运行依赖：
+## 下载与反馈
 
-```powershell
-# 在 Visual Studio x64 Native Tools PowerShell 中执行
-powershell -ExecutionPolicy Bypass -File packaging\build-native.ps1
-powershell -ExecutionPolicy Bypass -File packaging\build-android.ps1
-```
+公开版本发布后可从 [GitHub Releases](https://github.com/sanren1/AnPod/releases) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
 
-将受信任 Platform-Tools 同一发行包中的 `adb.exe`、`AdbWinApi.dll`、`AdbWinUsbApi.dll` 和该发行包的 `NOTICE.txt` 放入 `deps/`（NOTICE 文件命名为 `PLATFORM_TOOLS_NOTICE.txt`）。其余两个文件由上面的脚本生成。运行依赖不会提交到 Git，文件说明见 [deps/README.md](deps/README.md)。
+## 开发
 
-构建前端：
+源码构建依赖 Rust stable、Node.js/npm、MSVC x64 C++ 工具；重建 Receiver 另需 JDK 17 与 Android SDK。前端使用 `cd frontend; npm ci; npm run build`。便携包入口见 [`packaging/publish-tauri.ps1`](packaging/publish-tauri.ps1)，构建前请阅读其中参数及脚本要求。旧 WPF 实现保留在 `src/AnPod.Desktop/`。
 
-```powershell
-cd frontend
-npm ci
-npm run build
-```
-
-从仓库根目录创建 Windows x64 便携包：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File packaging\publish-tauri.ps1 -Version 1.0.4
-```
-
-ZIP 和解压目录会写入 `artifacts/`。脚本会检查运行依赖、构建 React 前端和 Rust 桌面程序，并将许可证、上游记录和运行文件放进同一目录。打包脚本只构建 Tauri 主应用；WPF 回退版本保留在 `src/AnPod.Desktop/`，其旧打包入口为 `packaging/publish.ps1`。
-
-开发运行时由 Tauri 启动 Vite，在仓库根目录中执行：
-
-```powershell
-npm run tauri --prefix frontend -- dev
-```
-
-图标由根目录 `icon.png` 统一生成给 Tauri、网页 UI 和 WPF 回退程序：
-
-```powershell
-python packaging\make-icon.py
-```
-
-脚本需要 Python Pillow。它会裁去透明空白并保留原图比例；Windows 桌面 ICO 与 PNG 会更新，Android/iOS 模板图标不属于 Windows 发布源。
-
-## 检查
-
-```powershell
-# 纯逻辑自检
-dotnet run --project tests/AnPod.Core.Tests -c Release
-
-# Tauri Rust 编译与单元检查
-cargo test --manifest-path src-tauri/Cargo.toml --locked
-```
-
-可选 UI 检查见 [前端检查说明](frontend/README.md)。连接、音频质量、延迟与掉线恢复仍需按 [手动检查清单](tests/manual-checklist.md) 在目标 Windows / Android 设备上验收。
-
-## 工作原理
-
-```text
-Windows 默认输出设备
-       │ WASAPI Loopback
-       ▼
-audio_capture.dll ── PCM16 ── 本机 TCP ── ADB reverse ── Android AudioTrack
-```
-
-| 路径 | 内容 |
-| --- | --- |
-| `frontend/` | React / TypeScript 界面 |
-| `src-tauri/` | Tauri 命令、生命周期与 Windows 桌面配置 |
-| `src/AnPod.Native/` | C++ WASAPI 音频采集源码 |
-| `src/AnPod.AndroidServer/` | 手机端 Java 音频服务源码 |
-| `src/AnPod.Desktop/` | 保留的 WPF 回退实现 |
-| `packaging/` | 原生/Android 构建、图标和便携包脚本 |
-| `tests/` | 自检、前端检查与人工设备验收清单 |
-
-## 配置和日志
-
-用户配置及静音恢复记录位于 `%LocalAppData%\AnPod\`，日志位于 `%LocalAppData%\AnPod\logs\`。可以在应用的诊断面板打开日志目录。提交诊断信息前请检查其中的设备标识和网络地址。
-
-## 常见问题
-
-| 问题 | 排查方式 |
-| --- | --- |
-| USB 手机未出现 | 检查数据线、USB 调试授权和设备驱动。 |
-| 配对成功但未连接 | 使用无线调试主页面的连接端口，而非配对弹窗中的端口。 |
-| 搜索不到无线设备 | 确认网络可互访、无线调试已开启；mDNS 不可用时手动填写连接地址。 |
-| 手机没有声音 | 选择手机输出，检查手机媒体音量、音频路由及 Windows 默认播放设备。 |
-| 播放延迟明显 | 尝试低延迟模式并确认重连；实际效果取决于设备和链路，见上面的实测限制。 |
-| 程序异常结束后电脑静音 | 重启 AnPod 恢复记录的静音状态，或在系统音量设置中手动取消静音。 |
-| 提示缺少运行依赖 | 按 [deps/README.md](deps/README.md) 准备依赖，再重新构建或打包。 |
-
-## 参与贡献
-
-欢迎通过 [Issues](https://github.com/sanren1/AnPod/issues) 反馈问题，或通过 Pull Request 提交改动。请附上复现步骤、连接方式、系统版本和相关检查结果；尚未真机验证的行为应明确标注。
-
-提交或推送前，检查全部待提交文件和 Git 暂存差异，删除本机绝对路径、用户名、设备序列号、音频端点 ID、真实网络地址、配对凭据和密钥。文档与测试使用明确的虚构设备标识及文档示例地址；原始录音、诊断转储、用户配置、工具链和构建产物留在本地。图片也应检查 EXIF、文本块等元数据，提交作者信息使用公开身份或匿名身份。第三方许可要求的署名和项目公开链接应保留。
-
-## 许可与致谢
-
-音频采集与 Android 播放服务基于 ysbing/AudioShare 的 LGPL-3.0-or-later 源码修改而来。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、`LICENSES/` 与 `upstream/`。项目自有代码尚未声明独立许可证；再分发时应逐项核对第三方许可与通知要求。
+第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码以 **GPL-3.0-or-later** 发布，完整文本见 [`LICENSE`](LICENSE)；其中改编自 AudioShare 的部分仍按 LGPL-3.0-or-later 说明处理。

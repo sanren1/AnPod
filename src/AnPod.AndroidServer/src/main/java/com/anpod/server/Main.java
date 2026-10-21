@@ -171,6 +171,9 @@ public final class Main {
         }
 
         AudioTrack audioTrack = builder.build();
+        Pcm16FrameStream pcm = new Pcm16FrameStream(channelsForMask(channelMask));
+        Pcm16FrameStream.PlaybackHeadTracker playbackHead = new Pcm16FrameStream.PlaybackHeadTracker();
+        long[] totalFramesWritten = {0};
 
         try {
             // A track that failed to initialise reports it here rather than by
@@ -191,32 +194,60 @@ public final class Main {
             int frameBytes = channelsForMask(channelMask) * 2;
             int minBufferFrames = Math.max(1, (minBuffer + frameBytes - 1) / frameBytes);
             String actualMode = requestedMode;
-            int requestedEffectiveFrames = capacityFrames;
-            int requestedStartFrames = capacityFrames;
+            int requestedEffectiveFrames = -1;
+            int acceptedEffectiveFrames = -1;
+            int requestedStartFrames = -1;
+            int acceptedStartFrames = -1;
             boolean lowLatencyBufferApplied = false;
+            boolean startThresholdRequestLimited = false;
             if ("low-latency".equals(requestedMode)) {
-                if (Build.VERSION.SDK_INT >= 24) {
-                    requestedEffectiveFrames = Math.min(capacityFrames, Math.max(1, sampleRate * 15 / 1000));
-                    int accepted = audioTrack.setBufferSizeInFrames(requestedEffectiveFrames);
-                    if (accepted < 0) {
+                if (Build.VERSION.SDK_INT >= 24 && capacityFrames > 0) {
+                    int desiredFrames = Math.max(1,
+                            sampleRate * Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS / 1000);
+                    requestedEffectiveFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                            sampleRate, capacityFrames, true);
+                    acceptedEffectiveFrames = audioTrack.setBufferSizeInFrames(requestedEffectiveFrames);
+                    if (acceptedEffectiveFrames < 0) {
                         actualMode = "balanced-fallback";
-                        log("BUFFER_SIZE_REQUEST_REJECTED result=" + accepted + "; retaining system buffer");
+                        log("BUFFER_SIZE_REQUEST_REJECTED requested=" + requestedEffectiveFrames
+                                + " result=" + acceptedEffectiveFrames + "; retaining system buffer");
                     } else {
                         lowLatencyBufferApplied = true;
-                        if (accepted != requestedEffectiveFrames) {
+                        if (acceptedEffectiveFrames != requestedEffectiveFrames || capacityFrames < desiredFrames) {
                             actualMode = "low-latency-limited";
-                            log("BUFFER_SIZE_LIMITED requested=" + requestedEffectiveFrames + " accepted=" + accepted);
+                            log("BUFFER_SIZE_LIMITED requested=" + requestedEffectiveFrames
+                                    + " accepted=" + acceptedEffectiveFrames);
                         }
                     }
-                    if (Build.VERSION.SDK_INT >= 31 && !"balanced-fallback".equals(actualMode)) {
-                        requestedStartFrames = Math.min(requestedEffectiveFrames, Math.max(1, sampleRate * 5 / 1000));
-                        int threshold = audioTrack.setStartThresholdInFrames(requestedStartFrames);
-                        if (threshold < 0) log("START_THRESHOLD_REQUEST_REJECTED result=" + threshold);
-                    }
+                    if (Build.VERSION.SDK_INT >= 31 && acceptedEffectiveFrames > 0
+                            && !"balanced-fallback".equals(actualMode)) {
+                        requestedStartFrames = Math.min(acceptedEffectiveFrames, Math.max(1,
+                                sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
+                        acceptedStartFrames = audioTrack.setStartThresholdInFrames(requestedStartFrames);
+                        startThresholdRequestLimited = acceptedStartFrames < 0
+                                || acceptedStartFrames != requestedStartFrames;
+                        if (acceptedStartFrames < 0) log("START_THRESHOLD_REQUEST_REJECTED result=" + acceptedStartFrames);
+                    } else if (Build.VERSION.SDK_INT >= 31 && acceptedEffectiveFrames == 0)
+                        startThresholdRequestLimited = true;
                 } else {
                     actualMode = "balanced-fallback";
                     log("LOW_LATENCY_UNSUPPORTED api=" + Build.VERSION.SDK_INT + "; retaining system buffer");
                 }
+            } else if (Build.VERSION.SDK_INT >= 24 && capacityFrames > 0) {
+                int desiredFrames = Math.max(1,
+                        sampleRate * Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS / 1000);
+                requestedEffectiveFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                        sampleRate, capacityFrames, false);
+                acceptedEffectiveFrames = audioTrack.setBufferSizeInFrames(requestedEffectiveFrames);
+                if (acceptedEffectiveFrames < 0) {
+                    actualMode = "balanced-fallback";
+                    log("BALANCED_BUFFER_REQUEST_REJECTED requested=" + requestedEffectiveFrames
+                            + " result=" + acceptedEffectiveFrames + "; retaining system buffer");
+                } else if (capacityFrames < desiredFrames || acceptedEffectiveFrames != requestedEffectiveFrames) {
+                    actualMode = "balanced-limited";
+                }
+            } else {
+                actualMode = "balanced-system";
             }
 
             int effectiveFrames = audioTrack.getBufferSizeInFrames();
@@ -227,9 +258,12 @@ public final class Main {
                 log("BUFFER_SIZE_ACTUAL requested=" + requestedEffectiveFrames + " actual=" + effectiveFrames);
             }
             if (Build.VERSION.SDK_INT >= 31 && lowLatencyBufferApplied
-                    && startThresholdFrames != requestedStartFrames) {
+                    && (startThresholdFrames != requestedStartFrames || startThresholdRequestLimited)) {
+                actualMode = "low-latency-limited";
                 log("START_THRESHOLD_LIMITED requested=" + requestedStartFrames + " actual=" + startThresholdFrames);
             }
+            if ("balanced".equals(actualMode) && effectiveFrames != requestedEffectiveFrames)
+                actualMode = "balanced-limited";
             int preRollFrames = lowLatencyBufferApplied
                     ? (startThresholdFrames > 0
                             ? Math.min(effectiveFrames, startThresholdFrames) : effectiveFrames)
@@ -241,50 +275,141 @@ public final class Main {
                     + " minBufferBytes=" + minBuffer
                     + " capacityFrames=" + capacityFrames
                     + " effectiveFrames=" + effectiveFrames
-                    + " effectiveRequestFrames=" + requestedEffectiveFrames
+                    + " requestedBufferFrames=" + requestedEffectiveFrames
+                    + " acceptedBufferFrames=" + acceptedEffectiveFrames
+                    + " requestedStartThresholdFrames=" + requestedStartFrames
+                    + " acceptedStartThresholdFrames=" + acceptedStartFrames
                     + " preRollFrames=" + preRollFrames
                     + " startThresholdFrames=" + startThresholdFrames
                     + " performance=" + getActualPerformanceMode(audioTrack));
 
+            playbackHead.reset(audioTrack.getPlaybackHeadPosition());
+
             attachPlayerContext(audioTrack);
 
-            byte[] readBuffer = new byte[Math.max(Pcm16FrameStream.FRAME_BYTES, minBuffer + 3)];
-            Pcm16FrameStream pcm = new Pcm16FrameStream();
+            int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
+                    audioTrack.getSampleRate(), lowLatencyBufferApplied);
+            int backlogTriggerFrames = Pcm16FrameStream.backlogTriggerFrames(
+                    audioTrack.getSampleRate(), lowLatencyBufferApplied);
+            int driftReserveBytes = Pcm16FrameStream.driftReserveFrames(audioTrack.getSampleRate()) * frameBytes;
+            byte[] readBuffer = new byte[Math.max(frameBytes,
+                    minBuffer + frameBytes - 1 + driftReserveBytes)];
+            byte[] adjustedReadScratch = new byte[readBuffer.length];
+            int sourceReadBytes = Math.min(readBuffer.length - driftReserveBytes,
+                    backlogTargetFrames * frameBytes);
+            pcm.setBacklogLimit(backlogTargetFrames, backlogTriggerFrames,
+                    (audioTrack.getSampleRate() * 3 + 999) / 1000);
+            log("PCM_BACKLOG targetFrames=" + backlogTargetFrames
+                    + " triggerFrames=" + backlogTriggerFrames);
             int preRollTargetBytes = preRollFrames * frameBytes;
             int preRolledBytes = 0;
             while (preRolledBytes < preRollTargetBytes) {
                 int read = pcm.readFrames(input, readBuffer,
-                        Math.min(readBuffer.length, preRollTargetBytes - preRolledBytes));
+                        Math.min(readBuffer.length - driftReserveBytes, preRollTargetBytes - preRolledBytes));
                 if (read < 0) break;
-                writeFrames(audioTrack, readBuffer, read);
+                writeFrames(pcm, audioTrack, readBuffer, read, frameBytes, totalFramesWritten);
                 preRolledBytes += read;
             }
 
             audioTrack.play();
+            long initialDriftNanos = System.nanoTime();
             int initialUnderruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+            long initialPlayedFrames = playbackHead.update(audioTrack.getPlaybackHeadPosition(), initialDriftNanos);
+            long lastDriftPlayedFrames = initialPlayedFrames;
+            int lastDriftUnderruns = initialUnderruns;
+            pcm.beginDriftCorrection(audioTrack.getSampleRate(), backlogTargetFrames, initialDriftNanos);
             log("PLAYING preRollFrames=" + (preRolledBytes / frameBytes)
+                    + " pendingFrames=" + Pcm16FrameStream.pendingFrames(totalFramesWritten[0], initialPlayedFrames)
                     + " underruns=" + initialUnderruns);
             long lastUnderrunLog = System.currentTimeMillis();
 
             while (!Thread.currentThread().isInterrupted()) {
-                int bytesRead = pcm.readFrames(input, readBuffer, readBuffer.length);
-                if (bytesRead < 0) {
+                long droppedBeforeRead = pcm.getDroppedBacklogFrames();
+                long nowNanos = System.nanoTime();
+                long playedFrames = lastDriftPlayedFrames;
+                int underruns = lastDriftUnderruns;
+                boolean observationAvailable = true;
+                try {
+                    playedFrames = playbackHead.update(audioTrack.getPlaybackHeadPosition(), nowNanos);
+                    underruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+                } catch (RuntimeException unavailable) {
+                    observationAvailable = false;
+                    pcm.beginDriftCorrection(audioTrack.getSampleRate(), backlogTargetFrames, nowNanos);
+                }
+                boolean playbackAdvancing = observationAvailable && playbackHead.isAdvancing(nowNanos);
+                boolean underrunChanged = lastDriftUnderruns >= 0 && underruns >= 0
+                        && underruns != lastDriftUnderruns;
+                int sourceReadAdjustmentFrames = playbackAdvancing && !underrunChanged
+                        ? pcm.driftReadFrameAdjustment(nowNanos) : 0;
+                int sourceReadLimit = sourceReadBytes + sourceReadAdjustmentFrames * frameBytes;
+                int alignedSourceReadLimit = sourceReadLimit - sourceReadLimit % frameBytes;
+                int sourceBytesRead = pcm.readFrames(input, readBuffer, alignedSourceReadLimit);
+                if (sourceReadAdjustmentFrames != 0 && sourceBytesRead >= 0) {
+                    int totalRead = sourceBytesRead;
+                    while (totalRead < alignedSourceReadLimit) {
+                        int additionalRead = pcm.readFrames(input, adjustedReadScratch,
+                                alignedSourceReadLimit - totalRead);
+                        if (additionalRead < 0) break;
+                        System.arraycopy(adjustedReadScratch, 0, readBuffer, totalRead, additionalRead);
+                        totalRead += additionalRead;
+                    }
+                    sourceBytesRead = totalRead;
+                }
+                if (sourceBytesRead < 0) {
                     break;
                 }
-                writeFrames(audioTrack, readBuffer, bytesRead);
+                int appliedSourceReadAdjustmentFrames = sourceBytesRead == alignedSourceReadLimit
+                        ? sourceReadAdjustmentFrames : 0;
+                nowNanos = System.nanoTime();
+                try {
+                    playedFrames = playbackHead.update(audioTrack.getPlaybackHeadPosition(), nowNanos);
+                    underruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+                    observationAvailable = true;
+                } catch (RuntimeException unavailable) {
+                    observationAvailable = false;
+                    pcm.beginDriftCorrection(audioTrack.getSampleRate(), backlogTargetFrames, nowNanos);
+                }
+                int outputBytes = sourceBytesRead;
+                if (observationAvailable) {
+                    playbackAdvancing = playbackHead.isAdvancing(nowNanos);
+                    boolean discontinuity = pcm.getDroppedBacklogFrames() != droppedBeforeRead
+                            || (lastDriftUnderruns >= 0 && underruns >= 0 && underruns != lastDriftUnderruns);
+                    boolean headAdvanced = playedFrames > lastDriftPlayedFrames;
+                    if (discontinuity || !playbackAdvancing || headAdvanced
+                            || appliedSourceReadAdjustmentFrames != 0) {
+                        outputBytes = pcm.correctDrift(readBuffer, sourceBytesRead,
+                                input.available() / frameBytes,
+                                Pcm16FrameStream.pendingFrames(totalFramesWritten[0], playedFrames),
+                                backlogTargetFrames, nowNanos, playbackAdvancing, discontinuity,
+                                appliedSourceReadAdjustmentFrames);
+                    }
+                    lastDriftPlayedFrames = playedFrames;
+                    lastDriftUnderruns = underruns;
+                }
+                writeFrames(pcm, audioTrack, readBuffer, outputBytes, frameBytes, totalFramesWritten);
                 long now = System.currentTimeMillis();
-                if (Build.VERSION.SDK_INT >= 24 && now - lastUnderrunLog >= 5000) {
-                    log("UNDERRUNS count=" + audioTrack.getUnderrunCount());
+                if (now - lastUnderrunLog >= 5000) {
+                    try {
+                        long diagnosticPlayedFrames = playbackHead.update(audioTrack.getPlaybackHeadPosition());
+                        int diagnosticUnderruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+                        log("PLAYBACK underruns=" + diagnosticUnderruns
+                                + " pendingFrames=" + Pcm16FrameStream.pendingFrames(totalFramesWritten[0], diagnosticPlayedFrames)
+                                + " droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
+                    } catch (RuntimeException unavailable) {
+                        log("PLAYBACK diagnostics=unavailable droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
+                    }
                     lastUnderrunLog = now;
                 }
             }
         } finally {
-            if (Build.VERSION.SDK_INT >= 24) {
-                try {
-                    log("UNDERRUNS final=" + audioTrack.getUnderrunCount());
-                } catch (Throwable unavailable) {
-                    log("UNDERRUNS final=unavailable");
-                }
+            try {
+                long playedFrames = playbackHead.update(audioTrack.getPlaybackHeadPosition());
+                int underruns = Build.VERSION.SDK_INT >= 24 ? audioTrack.getUnderrunCount() : -1;
+                log("PLAYBACK finalUnderruns=" + underruns
+                        + " pendingFrames=" + Pcm16FrameStream.pendingFrames(totalFramesWritten[0], playedFrames)
+                        + " droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
+            } catch (Throwable unavailable) {
+                log("PLAYBACK final=unavailable droppedBacklogFrames=" + pcm.getDroppedBacklogFrames());
             }
             // Teardown must never replace the real failure. Under app_process
             // there is no ActivityThread application, so AudioTrack.stop() can
@@ -388,8 +513,13 @@ public final class Main {
         return channelMask == AudioFormat.CHANNEL_OUT_MONO ? 1 : 2;
     }
 
-    private static void writeFrames(final AudioTrack track, byte[] buffer, int length) throws IOException {
-        Pcm16FrameStream.writeFrames((data, offset, count) -> track.write(data, offset, count), buffer, length);
+    private static void writeFrames(Pcm16FrameStream pcm, final AudioTrack track, byte[] buffer,
+            int length, int frameBytes, long[] totalFramesWritten) throws IOException {
+        pcm.writeFramesForChannels((data, offset, count) -> {
+            int written = track.write(data, offset, count);
+            if (written > 0) totalFramesWritten[0] += written / frameBytes;
+            return written;
+        }, buffer, length);
     }
 
     private static String getActualPerformanceMode(AudioTrack track) {

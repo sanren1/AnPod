@@ -8,12 +8,13 @@
  *
  *   1. Listener binds to 127.0.0.1 instead of INADDR_ANY.
  *   2. Handshake connect code is verified against an expected token.
- *   3. Format fallback validates the sample subtype/bit depth instead of
- *      reinterpreting unknown data as float32 (which produced noise).
+ *   3. Shared-mode capture requests fixed 48 kHz stereo PCM16 and reports an
+ *      initialization error instead of silently changing the stream format.
  *   4. Sends carry a timeout; an incomplete packet ends the session so the
  *      unframed PCM stream can only resume after a fresh handshake.
  *   5. Endpoint invalidation is reported so the caller can rebuild the session.
- *   6. Diagnostics exports and balanced timeBeginPeriod/CoUninitialize.
+ *   6. Diagnostics exports, per-session PCM byte counts and balanced
+ *      timeBeginPeriod/CoUninitialize.
  *
  * Everything else - including the 1 ms polling loop - is intentionally left as
  * upstream, per plan §3.4.7.
@@ -29,12 +30,15 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <avrt.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <mmreg.h>
 #include <mmsystem.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <mutex>
 
 #include "audio_capture.h"
 #include "send_exact.h"
@@ -42,16 +46,11 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "avrt.lib")
 
-/*
- * KSDATAFORMAT_SUBTYPE_* normally comes from <ksmedia.h>, which drags in a lot
- * of unrelated media headers. The two GUIDs we need are stable ABI, so they are
- * declared locally instead.
- */
+/* KSDATAFORMAT_SUBTYPE_PCM without pulling in the larger ksmedia.h header. */
 static const GUID kSubtypePcm =
     { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
-static const GUID kSubtypeIeeeFloat =
-    { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
 /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT, likewise avoiding ksmedia.h. */
 static const DWORD kStereoChannelMask = 0x1 | 0x2;
@@ -66,6 +65,10 @@ static HANDLE g_hListenThread = NULL;
 static volatile BOOL g_bRunning = FALSE;
 static volatile BOOL g_bListening = FALSE;
 static volatile BOOL g_bConnected = FALSE;
+static volatile LONG64 g_sentPcmBytes = 0;
+static std::mutex g_pcmCallbackMutex;
+static PcmCallback g_pcmCallback = NULL;
+static void* g_pcmCallbackUserData = NULL;
 
 /* What the capture thread forwards. FALSE keeps the socket alive but feeds the
    peer silence, so a session can be muted without being torn down. */
@@ -74,10 +77,7 @@ static volatile BOOL g_bStreamingEnabled = TRUE;
 static BOOL g_bComInitialized = FALSE;
 static BOOL g_bWsaInitialized = FALSE;
 
-/* Source format actually negotiated with WASAPI. */
-static int g_nSourceChannels = 2;
-static BOOL g_bSourceIsPcm16 = FALSE;   /* FALSE => 32-bit float */
-static UINT32 g_nSampleRate = 48000;
+static const UINT32 kOutputSampleRate = 48000;
 
 /* Format reported to the Android side. Always stereo PCM16. */
 static const UINT16 kOutputChannels = 2;
@@ -153,6 +153,7 @@ static const char* DefaultMessageForCode(int code)
         case ANPOD_ERR_HANDSHAKE_TIMEOUT: return "handshake timed out";
         case ANPOD_ERR_DEVICE_INVALIDATED:return "Windows audio output device changed";
         case ANPOD_ERR_SEND_FAILED:       return "audio socket send failed";
+        case ANPOD_ERR_PCM_CALLBACK:      return "PCM sink callback failed";
         default:                          return "unknown audio capture error";
     }
 }
@@ -160,20 +161,22 @@ static const char* DefaultMessageForCode(int code)
 /* -------------------------------------------------------------- socket I/O */
 
 /* A short or timed-out send breaks the unframed PCM byte stream; fail the session. */
-static int SendPacket(SOCKET sock, const char* data, int len)
+static int SendPacket(SOCKET sock, const char* data, int len, BOOL countPcm = FALSE)
 {
     if (sock == INVALID_SOCKET) return -1;
     return SendExactBytes(len, [sock, data](int offset, int remaining) {
         const int sent = send(sock, data + offset, remaining, 0);
         if (sent == SOCKET_ERROR && WSAGetLastError() == WSAETIMEDOUT) return 0;
         return sent;
+    }, [countPcm](int sent) {
+        if (countPcm) InterlockedAdd64(&g_sentPcmBytes, sent);
     });
 }
 
 static BOOL SendFormatHeader(SOCKET sock)
 {
     BYTE header[8];
-    UINT32 sampleRate = g_nSampleRate;
+    UINT32 sampleRate = kOutputSampleRate;
     UINT16 channels = kOutputChannels;
     UINT16 bits = kOutputBitsPerSample;
 
@@ -292,77 +295,27 @@ static DWORD WINAPI ListenThread(LPVOID lpParam)
 
 /* ----------------------------------------------------------- capture thread */
 
-/* Converts one WASAPI buffer into interleaved stereo PCM16. */
-static void ConvertToStereoPcm16(
-    const BYTE* source,
-    UINT32 frames,
-    short* destination)
+/* WASAPI converts each shared-mode capture buffer to the requested format. */
+static void CopyStereoPcm16(const BYTE* source, UINT32 frames, short* destination)
 {
-    const int channels = g_nSourceChannels;
-
-    if (g_bSourceIsPcm16)
-    {
-        const short* src = (const short*)source;
-
-        if (channels == 2)
-        {
-            memcpy(destination, src, (size_t)frames * 2 * sizeof(short));
-        }
-        else if (channels == 1)
-        {
-            for (UINT32 i = 0; i < frames; ++i)
-            {
-                destination[i * 2 + 0] = src[i];
-                destination[i * 2 + 1] = src[i];
-            }
-        }
-        else
-        {
-            /* Surround: take the front pair. A proper downmix is out of scope
-               for v1 (plan §10) but silence would be worse. */
-            for (UINT32 i = 0; i < frames; ++i)
-            {
-                destination[i * 2 + 0] = src[i * channels + 0];
-                destination[i * 2 + 1] = src[i * channels + 1];
-            }
-        }
-
-        return;
-    }
-
-    const float* src = (const float*)source;
-
-    for (UINT32 i = 0; i < frames; ++i)
-    {
-        float left;
-        float right;
-
-        if (channels == 2)
-        {
-            left = src[i * 2 + 0];
-            right = src[i * 2 + 1];
-        }
-        else if (channels == 1)
-        {
-            left = right = src[i];
-        }
-        else
-        {
-            left = src[i * channels + 0];
-            right = src[i * channels + 1];
-        }
-
-        if (left > 1.0f) left = 1.0f; else if (left < -1.0f) left = -1.0f;
-        if (right > 1.0f) right = 1.0f; else if (right < -1.0f) right = -1.0f;
-
-        destination[i * 2 + 0] = (short)(left * 32767.0f);
-        destination[i * 2 + 1] = (short)(right * 32767.0f);
-    }
+    memcpy(destination, source, (size_t)frames * kOutputChannels * sizeof(short));
 }
 
 static DWORD WINAPI CaptureThread(LPVOID lpParam)
 {
     (void)lpParam;
+    uint64_t nextFrameIndex = 0;
+    DWORD mmcssTaskIndex = 0;
+    HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    if (mmcssHandle == NULL)
+    {
+        char message[128];
+        snprintf(message, sizeof(message),
+            "capture thread could not join MMCSS Pro Audio (error %lu)", GetLastError());
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+        g_bRunning = FALSE;
+        return 1;
+    }
 
     /* 1 ms timer resolution so Sleep(1) does not become a 15.6 ms burst that
        underruns the Android AudioTrack. Balanced in the exit path below. */
@@ -375,11 +328,24 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
     {
         SetLastErrorState(ANPOD_ERR_OUT_OF_MEMORY, "out of memory allocating conversion buffer");
         timeEndPeriod(1);
+        if (mmcssHandle != NULL && !AvRevertMmThreadCharacteristics(mmcssHandle))
+        {
+            char message[128];
+            snprintf(message, sizeof(message),
+                "capture thread could not leave MMCSS Pro Audio (error %lu)", GetLastError());
+            SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+        }
         return 1;
     }
 
-    /* Format header first: Android sizes its AudioTrack from it. */
-    if (g_clientSocket != INVALID_SOCKET)
+    PcmCallback pcmCallback = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        pcmCallback = g_pcmCallback;
+    }
+
+    /* Format header first only for the legacy TCP sink. */
+    if (pcmCallback == NULL && g_clientSocket != INVALID_SOCKET)
     {
         if (!SendFormatHeader(g_clientSocket))
         {
@@ -457,19 +423,39 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
             }
             else
             {
-                ConvertToStereoPcm16(pData, frames, outBuf);
+                CopyStereoPcm16(pData, frames, outBuf);
             }
 
             /* Release before sending so the engine can keep filling while we
                are blocked on the socket (avoids DATA_DISCONTINUITY). */
             g_pCaptureClient->ReleaseBuffer(numFramesAvailable);
 
-            if (g_clientSocket != INVALID_SOCKET)
+            if (frames > UINT64_MAX - nextFrameIndex)
+            {
+                SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sample frame index exhausted");
+                g_bRunning = FALSE;
+                break;
+            }
+
+            BOOL forwardedToPcmSink = FALSE;
+            {
+                std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+                if (g_pcmCallback != NULL)
+                {
+                    g_pcmCallback((const int16_t*)outBuf, frames, kOutputSampleRate,
+                        kOutputChannels, nextFrameIndex, g_pcmCallbackUserData);
+                    forwardedToPcmSink = TRUE;
+                }
+            }
+            nextFrameIndex += frames;
+
+            if (!forwardedToPcmSink && g_clientSocket != INVALID_SOCKET)
             {
                 int result = SendPacket(
                     g_clientSocket,
                     (const char*)outBuf,
-                    (int)(frames * 2 * sizeof(short)));
+                    (int)(frames * 2 * sizeof(short)),
+                    TRUE);
 
                 if (result < 0)
                 {
@@ -502,104 +488,23 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
 
     HeapFree(GetProcessHeap(), 0, outBuf);
     timeEndPeriod(1);
+    if (mmcssHandle != NULL && !AvRevertMmThreadCharacteristics(mmcssHandle))
+    {
+        char message[128];
+        snprintf(message, sizeof(message),
+            "capture thread could not leave MMCSS Pro Audio (error %lu)", GetLastError());
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+    }
     return 0;
 }
 
 /* ------------------------------------------------------------------ exports */
-
-/*
- * Decides whether a negotiated mix format can be converted to stereo PCM16.
- * Returns TRUE and fills the source-format globals on success.
- *
- * The upstream code assumed "not PCM16 => float32" and produced noise for any
- * other format. Unsupported depths are now rejected (plan §3.4.6).
- */
-static BOOL AnalyseMixFormat(const WAVEFORMATEX* format)
-{
-    if (format == NULL || format->nChannels == 0)
-    {
-        return FALSE;
-    }
-
-    BOOL isFloat = FALSE;
-    BOOL isPcm = FALSE;
-
-    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
-    {
-        isFloat = TRUE;
-    }
-    else if (format->wFormatTag == WAVE_FORMAT_PCM)
-    {
-        isPcm = TRUE;
-    }
-    else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-             (size_t)format->cbSize >= (sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)))
-    {
-        const WAVEFORMATEXTENSIBLE* ext = (const WAVEFORMATEXTENSIBLE*)format;
-
-        if (IsEqualGUID(ext->SubFormat, kSubtypeIeeeFloat))
-        {
-            isFloat = TRUE;
-        }
-        else if (IsEqualGUID(ext->SubFormat, kSubtypePcm))
-        {
-            isPcm = TRUE;
-        }
-    }
-
-    if (isFloat)
-    {
-        if (format->wBitsPerSample != 32)
-        {
-            return FALSE;
-        }
-
-        g_bSourceIsPcm16 = FALSE;
-    }
-    else if (isPcm)
-    {
-        if (format->wBitsPerSample != 16)
-        {
-            /* 24/32-bit integer PCM would need a real converter. */
-            return FALSE;
-        }
-
-        /* A 24-in-32 container would silently misalign; reject it. */
-        if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
-        {
-            const WAVEFORMATEXTENSIBLE* ext = (const WAVEFORMATEXTENSIBLE*)format;
-            if (ext->Samples.wValidBitsPerSample != 0 &&
-                ext->Samples.wValidBitsPerSample != 16)
-            {
-                return FALSE;
-            }
-        }
-
-        g_bSourceIsPcm16 = TRUE;
-    }
-    else
-    {
-        return FALSE;
-    }
-
-    if (format->nSamplesPerSec < 8000 || format->nSamplesPerSec > 192000)
-    {
-        return FALSE;
-    }
-
-    g_nSourceChannels = format->nChannels;
-    g_nSampleRate = format->nSamplesPerSec;
-    return TRUE;
-}
 
 static void ResetSessionState()
 {
     g_bConnected = FALSE;
     g_bStreamingEnabled = TRUE;
     g_connectCodeBuf[0] = '\0';
-    g_nSourceChannels = 2;
-    g_bSourceIsPcm16 = FALSE;
-    g_nSampleRate = 48000;
 }
 
 int ANPOD_CALL AudioCapture_Initialize(void)
@@ -662,76 +567,38 @@ int ANPOD_CALL AudioCapture_Initialize(void)
         return 0;
     }
 
-    WAVEFORMATEX* pwfx = NULL;
-    hr = g_pAudioClient->GetMixFormat(&pwfx);
-
-    if (FAILED(hr) || pwfx == NULL)
-    {
-        SetLastErrorState(ANPOD_ERR_GET_MIX_FORMAT, DefaultMessageForCode(ANPOD_ERR_GET_MIX_FORMAT));
-        pDevice->Release();
-        AudioCapture_Cleanup();
-        return 0;
-    }
-
-    /*
-     * Preferred path: ask WASAPI for exactly what the protocol needs -
-     * 48 kHz stereo PCM16. Shared mode resamples and downmixes for us, which
-     * avoids the drift that caused periodic underruns with a 44.1 kHz source.
-     */
+    /* Request the protocol format; shared-mode flags let Windows convert the
+       endpoint mix format while capture remains 48 kHz stereo PCM16. */
     WAVEFORMATEXTENSIBLE target = {};
     target.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     target.Format.nChannels = kOutputChannels;
-    target.Format.nSamplesPerSec = 48000;
+    target.Format.nSamplesPerSec = kOutputSampleRate;
     target.Format.wBitsPerSample = kOutputBitsPerSample;
     target.Format.nBlockAlign = (WORD)(kOutputChannels * kOutputBitsPerSample / 8);
-    target.Format.nAvgBytesPerSec = 48000 * target.Format.nBlockAlign;
+    target.Format.nAvgBytesPerSec = kOutputSampleRate * target.Format.nBlockAlign;
     target.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
     target.SubFormat = kSubtypePcm;
     target.Samples.wValidBitsPerSample = kOutputBitsPerSample;
     target.dwChannelMask = kStereoChannelMask;
 
     hr = g_pAudioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         0, 0, (WAVEFORMATEX*)&target, NULL);
 
-    if (SUCCEEDED(hr))
+    if (FAILED(hr))
     {
-        g_nSourceChannels = kOutputChannels;
-        g_bSourceIsPcm16 = TRUE;
-        g_nSampleRate = 48000;
-    }
-    else
-    {
-        /* Fallback: use the device mix format, but only if it is one we can
-           actually convert. */
-        if (!AnalyseMixFormat(pwfx))
-        {
-            SetLastErrorState(
-                ANPOD_ERR_UNSUPPORTED_FORMAT,
-                DefaultMessageForCode(ANPOD_ERR_UNSUPPORTED_FORMAT));
-            CoTaskMemFree(pwfx);
-            pDevice->Release();
-            AudioCapture_Cleanup();
-            return 0;
-        }
-
-        hr = g_pAudioClient->Initialize(
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0, 0, pwfx, NULL);
-
-        if (FAILED(hr))
-        {
-            SetLastErrorState(
-                ANPOD_ERR_AUDIO_CLIENT_INIT,
-                DefaultMessageForCode(ANPOD_ERR_AUDIO_CLIENT_INIT));
-            CoTaskMemFree(pwfx);
-            pDevice->Release();
-            AudioCapture_Cleanup();
-            return 0;
-        }
+        char message[128];
+        snprintf(message, sizeof(message),
+            "WASAPI could not initialize 48 kHz stereo PCM16 shared-mode capture (HRESULT 0x%08lX)",
+            (unsigned long)hr);
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+        pDevice->Release();
+        AudioCapture_Cleanup();
+        return 0;
     }
 
-    CoTaskMemFree(pwfx);
     pDevice->Release();
 
     UINT32 bufferFrameCount = 0;
@@ -761,6 +628,16 @@ int ANPOD_CALL AudioCapture_Initialize(void)
 
 int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
 {
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        if (g_pcmCallback != NULL)
+        {
+            SetLastErrorState(ANPOD_ERR_SOCKET_LISTEN, "TCP listener cannot be used with the PCM sink");
+            return 0;
+        }
+    }
+
+    g_bRunning = FALSE;
     g_connectCallback = callback;
     g_bListening = FALSE;
     g_bConnected = FALSE;
@@ -794,6 +671,8 @@ int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
         CloseHandle(g_hListenThread);
         g_hListenThread = NULL;
     }
+
+    InterlockedExchange64(&g_sentPcmBytes, 0);
 
     if (!g_bWsaInitialized)
     {
@@ -844,6 +723,43 @@ int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
     return 1;
 }
 
+int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData)
+{
+    std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+    if (g_bRunning)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sink can only change while capture is stopped");
+        return 0;
+    }
+    if (callback != NULL && (g_bListening || g_bConnected))
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sink cannot be selected while the TCP listener is active");
+        return 0;
+    }
+    if ((callback == NULL) != (userData == NULL))
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "callback and userData must both be null or non-null");
+        return 0;
+    }
+    g_pcmCallback = callback;
+    g_pcmCallbackUserData = userData;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
+int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channels)
+{
+    if (g_pAudioClient == NULL || sampleRate == NULL || channels == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM format is unavailable before audio initialization");
+        return 0;
+    }
+    *sampleRate = kOutputSampleRate;
+    *channels = kOutputChannels;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
 int ANPOD_CALL AudioCapture_Start(void)
 {
     if (g_pAudioClient == NULL)
@@ -860,6 +776,8 @@ int ANPOD_CALL AudioCapture_Start(void)
         return 0;
     }
 
+    SetLastErrorState(ANPOD_OK, NULL);
+    InterlockedExchange64(&g_sentPcmBytes, 0);
     g_bRunning = TRUE;
     g_hCaptureThread = CreateThread(NULL, 0, CaptureThread, NULL, 0, NULL);
 
@@ -871,7 +789,6 @@ int ANPOD_CALL AudioCapture_Start(void)
         return 0;
     }
 
-    SetLastErrorState(ANPOD_OK, NULL);
     return 1;
 }
 
@@ -914,7 +831,7 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
 
     if (g_hCaptureThread != NULL)
     {
-        WaitForSingleObject(g_hCaptureThread, 2000);
+        WaitForSingleObject(g_hCaptureThread, INFINITE);
         CloseHandle(g_hCaptureThread);
         g_hCaptureThread = NULL;
     }
@@ -963,6 +880,14 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
         g_bComInitialized = FALSE;
     }
 
+    InterlockedExchange64(&g_sentPcmBytes, 0);
+
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        g_pcmCallback = NULL;
+        g_pcmCallbackUserData = NULL;
+    }
+
     g_connectCallback = NULL;
     g_bConnected = FALSE;
     g_connectCodeBuf[0] = '\0';
@@ -988,6 +913,11 @@ int ANPOD_CALL AudioCapture_IsConnected(char* outBuf, int bufSize)
     }
 
     return 1;
+}
+
+uint64_t ANPOD_CALL AudioCapture_GetSentPcmBytes(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_sentPcmBytes, 0, 0);
 }
 
 void ANPOD_CALL AudioCapture_SetConnectToken(const char* token)

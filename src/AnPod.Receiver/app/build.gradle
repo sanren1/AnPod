@@ -1,0 +1,97 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+if (project.hasProperty('receiverBuildDir')) {
+    layout.buildDirectory.set(file(project.property('receiverBuildDir')))
+}
+
+def releaseStoreFile = System.getenv('ANPOD_RECEIVER_RELEASE_STORE_FILE')
+def releaseStorePassword = System.getenv('ANPOD_RECEIVER_RELEASE_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('ANPOD_RECEIVER_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('ANPOD_RECEIVER_RELEASE_KEY_PASSWORD')
+def candidateDebugStoreFile = System.getenv('ANPOD_RECEIVER_DEBUG_KEYSTORE')
+def releaseSigningValues = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+def hasAnyReleaseSigningValue = releaseSigningValues.any { it != null && !it.isBlank() }
+
+if (hasAnyReleaseSigningValue && releaseSigningValues.any { it == null || it.isBlank() }) {
+    throw new GradleException('Receiver release signing requires all ANPOD_RECEIVER_RELEASE_* environment variables; no secret values were printed.')
+}
+
+android {
+    namespace 'app.anpod.receiver'
+    compileSdk 35
+
+    buildFeatures {
+        buildConfig true
+        compose true
+    }
+
+    defaultConfig {
+        applicationId 'app.anpod.receiver'
+        minSdk 23
+        targetSdk 35
+        versionCode 32
+        versionName '0.15.7-v3-flow-candidate'
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
+
+    if (hasAnyReleaseSigningValue) {
+        signingConfigs {
+            localRelease {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // The Android Gradle Plugin's local debug key is for testing only.
+        }
+        release {
+            minifyEnabled false
+            if (hasAnyReleaseSigningValue) signingConfig signingConfigs.localRelease
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+if (candidateDebugStoreFile) {
+    android.signingConfigs.debug.storeFile = file(candidateDebugStoreFile)
+}
+
+android.sourceSets.main.java.srcDir('../../AnPod.AndroidProtocol/src/main/java')
+
+dependencies {
+    implementation platform('androidx.compose:compose-bom:2025.06.00')
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.compose.material3:material3'
+
+    androidTestImplementation files(
+        "${android.sdkDirectory}/platforms/android-35/optional/android.test.base.jar",
+        "${android.sdkDirectory}/platforms/android-35/optional/android.test.runner.jar"
+    )
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+    testImplementation 'androidx.test:core:1.6.1'
+}

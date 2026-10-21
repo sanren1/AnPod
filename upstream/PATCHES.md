@@ -11,6 +11,16 @@ Base revision: `70db6b531db2c21b5a41a289722aa3996de67ebe`
 
 ## A. `audio_capture.cpp` — native WASAPI capture
 
+### A0. Optional PCM callback sink *(P3 prototype)*
+
+The additive `AudioCapture_SetPcmCallback` C ABI selects a borrowed PCM callback
+before capture starts. When present, the capture thread routes converted PCM to
+that callback instead of the legacy TCP socket; with no callback the original
+TCP path remains unchanged. Callback/user-data lifetime is protected by a
+mutex, and cleanup joins the capture thread before clearing the registration.
+The Rust P3 prototype callback performs a nonblocking copy to a preallocated,
+bounded queue. Product connection flows do not select this sink yet.
+
 Each item maps to a defect identified in plan §3.4.
 
 ### A1. Listener binds to loopback only *(§3.4.3)*
@@ -120,9 +130,9 @@ The socket stays open, the peer stays connected, its `AudioTrack` stays alive
 and primed, and resuming is seamless with no re-handshake. Reset to `TRUE` by
 `ResetSessionState` so a new session always starts audible.
 
-This is the one export that is **required** rather than optional on the managed
-side (see `NativeAudioCapture`): an old DLL would silently ignore the call and
-keep playing, which is a worse failure than refusing to load.
+These exports are **required** by the managed side (`NativeAudioCapture`): an
+old DLL would silently ignore the call and keep playing, which is a worse
+failure than refusing to load.
 
 ### A11. Deliberately unchanged
 
@@ -131,6 +141,13 @@ keep playing, which is a worse failure than refusing to load.
 * The 48 kHz stereo PCM16 preferred-format negotiation.
 * `SO_SNDBUF = 32 KiB`, `TCP_NODELAY`.
 * Release-before-send ordering.
+
+### A12. Per-session PCM byte counter
+
+`AudioCapture_GetSentPcmBytes` is an additive C ABI export. Each successful TCP
+write of PCM payload bytes increments the counter, including partial writes;
+the 8-byte format header is excluded. The counter resets before a new capture
+and after cleanup. All original exports remain available.
 
 ---
 
@@ -236,6 +253,71 @@ diagnostic. Pre-roll reads are limited to the actual read-array size even when
 the effective playback buffer is larger. The checks in `tests/` exercise
 fragmented frames, partial writes and large pre-roll targets.
 
+### B9. Installed Receiver service adaptation
+
+`src/AnPod.Receiver/app/src/main/java/app/anpod/receiver/ReceiverService.java`
+adapts the AudioTrack playback path from `Main.java` to an installed Android
+`Service`. The 8-byte little-endian header, abstract `LocalSocket` handshake,
+PCM16 format and playback modes remain compatible with the Windows native
+capture implementation. AnPod changes add the `mediaPlayback` foreground
+service lifecycle, audio focus, cancellation-owned session resources, and a
+protected provider for playback readiness and actual buffer/underrun metrics.
+Resource creation and use belong to the audio worker; stop closes its socket
+and cancels it, while that worker releases its own `AudioTrack` and audio focus.
+
+`src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java`
+is new AnPod code, shared by the installed Receiver and `app_process` path. It preserves complete PCM16
+frames across socket reads and partial AudioTrack writes; it is not copied
+from the upstream repository.
+
+### B10. Internal UDP parser and playback adapter *(P4-A, not enabled)*
+
+The new `UdpSessionContext`, `UdpPacketDecoder`, `UdpPcmQueue`, and `UdpReceiver`
+classes are AnPod code and add no third-party dependency. A caller inside the
+app process must supply the already authenticated peer, session ID, key, and
+local bind address in memory. The adapter validates and decrypts only Format
+and Audio packets, then presents aligned PCM through a queue-backed
+`InputStream` to the existing `Pcm16FrameStream` and AudioTrack worker. The
+network thread owns only its UDP socket and short-lived packet handling; the
+existing audio worker owns AudioTrack and focus. No Intent, exported component,
+discovery, pairing, network control message, or product flow starts this path.
+
+### B11. Offline binding and authenticated key derivation *(P5-A, in-memory)*
+
+`src-tauri/src/security.rs`, Android `PairingProtocol`, and Android
+`BindingStore` are new AnPod code. They define the versioned 69-byte device
+binding, Windows current-user DPAPI storage, Android app-private `AtomicFile`
+storage, matching in-memory mutual-authentication messages, transcript-bound
+proofs, and four direction/purpose-separated HKDF-SHA256 outputs. The Android
+record uses app-private storage and is not encrypted at rest.
+
+Rust dependencies added for the protocol are `hkdf 0.12.4` and `hmac 0.12.1`
+(`MIT OR Apache-2.0`); `subtle 2.6.1` (`BSD-3-Clause`) is pulled transitively
+for constant-time HMAC verification. Windows DPAPI uses the existing `windows`
+crate with its Cryptography feature enabled; Android uses the platform
+`AtomicFile` and JCA APIs.
+
+### B12. USB binding stream and remote confirmation *(P5-B, no product entry)*
+
+`receiver::provision` accepts an explicit DPAPI binding path and reuses its
+persisted material on retry. It sends the ANPB record only through stdin to
+the existing selected USB ADB child, then verifies the fixed provider status
+URI against the record commitment while rechecking current user and installed
+APK bytes. The existing DUMP-protected `ReceiverStateProvider` accepts only
+the fixed binding URI and write mode, uses one bounded in-progress pipe
+worker, validates exact record length/version, and writes under the fixed
+app-private files directory. Same-record writes confirm idempotently;
+different records conflict without replacement. The Rust entry is not
+registered with Tauri IPC. No real-device ADB or Android storage test is
+claimed.
+
+### B13. Shared TCP/USB PCM backlog trim *(P6-B)*
+
+The existing AnPod PCM stream path trims stale queued frames when the consumer
+falls behind and applies a short fade at the trim boundary. This is new AnPod
+code in the shared Android protocol helper; it adds no dependency and does not
+change the Native DLL protocol or the legacy Android service wire format.
+
 ## C. Not modified
 
 * The 8-byte little-endian format header layout.
@@ -249,6 +331,9 @@ fragmented frames, partial writes and large pre-roll targets.
 ## D. Rebuilding
 
 The corresponding source for the LGPL portions is exactly the contents of
-`src/AnPod.Native/` and `src/AnPod.AndroidServer/` in this repository. Build
-instructions are in `README.md`; `packaging/build-native.ps1` and
-`packaging/build-android.ps1` reproduce the binaries from source.
+`src/AnPod.Native/`, `src/AnPod.AndroidServer/`, and the AudioShare-derived
+playback implementation in `src/AnPod.Receiver/` in this repository. The
+shared PCM helper in `src/AnPod.AndroidProtocol/` is new AnPod code. Build
+instructions are in `README.md`; `packaging/build-native.ps1`,
+`packaging/build-android.ps1`, and `packaging/build-receiver.ps1` reproduce the
+native library and both Android paths from source.

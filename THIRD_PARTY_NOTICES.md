@@ -9,8 +9,13 @@ pinned revisions plus the exact list of modified files live in
 
 ## 1. ysbing/AudioShare — LGPL-3.0-or-later
 
-Used for: the Windows WASAPI capture algorithm (`src/AnPod.Native/`) and the
-Android `app_process` playback service (`src/AnPod.AndroidServer/`).
+Used for: the Windows WASAPI capture algorithm (`src/AnPod.Native/`), the
+Android `app_process` playback service (`src/AnPod.AndroidServer/`), and the
+installed Android Receiver playback implementation in
+`src/AnPod.Receiver/`. The Receiver's AudioTrack playback path is adapted from
+AudioShare `Main.java`; its service, provider, activity, session lifecycle and
+diagnostics are AnPod changes. Shared PCM frame alignment is AnPod code in
+`src/AnPod.AndroidProtocol/`.
 
 ```
 AudioShare
@@ -21,8 +26,11 @@ Pinned revision: 70db6b531db2c21b5a41a289722aa3996de67ebe
 ```
 
 **This is modified LGPL source.** The modifications are enumerated in
-`upstream/PATCHES.md`, and the complete corresponding source is the contents of
-`src/AnPod.Native/` and `src/AnPod.AndroidServer/` in this repository.
+`upstream/PATCHES.md`. The corresponding modified LGPL sources are the contents
+of `src/AnPod.Native/`, `src/AnPod.AndroidServer/`, and the AudioShare-derived
+playback implementation in `src/AnPod.Receiver/` in this repository. The
+Receiver build entry is `packaging/build-receiver.ps1`; its shared AnPod
+protocol code is in `src/AnPod.AndroidProtocol/`.
 
 ### LGPL compliance notes for redistribution
 
@@ -67,11 +75,61 @@ MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
 `LICENSES/` where available. Each Rust crate retains the licence terms recorded
 in its published package; see the lockfile for exact versions.
 
+The P3 localhost UDP prototype adds Rust crates `aes-gcm` 0.11.1 for
+AES-256-GCM authenticated encryption, `sha2` 0.10.9 for SHA-256, and
+`getrandom` 0.3.4 for session material. Each is dual-licensed MIT or
+Apache-2.0; exact locked versions are listed in `src-tauri/Cargo.lock`. No
+cryptographic implementation source is copied into AnPod.
+
+The P5-A/B pairing and USB binding code adds Rust crates `hmac` 0.12.1 and
+`hkdf` 0.12.4 (MIT OR Apache-2.0) for HMAC-SHA256 proofs and RFC 5869
+HKDF-SHA256 session key derivation. `subtle` 2.6.1 (BSD-3-Clause) is a
+transitive dependency used by HMAC tag verification. Exact locked versions
+are in `src-tauri/Cargo.lock`; no cryptographic implementation source is
+copied into AnPod. The Android Receiver UI uses AndroidX Activity Compose
+1.10.1 and Jetpack Compose Material 3 with BOM 2025.06.00 (Apache-2.0); the
+BOM pins its Compose UI, Foundation, and Runtime artifacts. Licence terms are
+included in `LICENSES/Apache-2.0.txt`. Android protocol and binding code use
+platform JCA, `AtomicFile`, and `ParcelFileDescriptor` APIs. Original crate
+copyright notices and MIT license texts are included in `LICENSES/` as
+`aes-gcm-MIT.txt`, `getrandom-MIT.txt`, `hkdf-MIT.txt`, `hmac-MIT.txt`, and
+`sha2-MIT.txt`; the complete original BSD-3-Clause text for transitive crate
+`subtle` 2.6.1 is included as `subtle-BSD-3-Clause.txt`. Shared Apache-2.0
+terms are in `LICENSES/Apache-2.0.txt`.
+
+The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
+queue and applies a short fade when trimming backlog. This is AnPod-owned code
+and adds no dependency or change to the Native DLL protocol.
+
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional
 .NET 8 application and is not part of the Tauri portable package.
 
 ## 5. Project code
 
-AnPod's own code has no declared project-wide licence. Third-party notices do
-not grant a licence to the rest of the project.
+AnPod's own code is released under the GNU General Public License, version 3 or
+later (GPL-3.0-or-later). The full text is in `LICENSE` at the repository root;
+the SPDX identifier is also recorded in `src-tauri/Cargo.toml`.
+
+The Windows DLL (`src/AnPod.Native/`), the legacy payload
+(`src/AnPod.AndroidServer/`) and the AudioShare-derived playback implementation
+in `src/AnPod.Receiver/` keep their LGPL-3.0-or-later terms from section 1. A
+Receiver APK combines those files with AnPod code, so the APK as a whole is
+conveyed under GPL-3.0-or-later; the Corresponding Source is this repository at
+the commit recorded in the package's `build-metadata.json`, and the LGPL origins
+stay separable and rebuildable through `packaging/build-native.ps1`,
+`packaging/build-android.ps1` and `packaging/build-receiver.ps1`.
+
+Requirements that still apply to every published package:
+
+1. Ship `LICENSE`, this notice and `LICENSES/` beside the binaries.
+2. Keep the source revision reachable from a public location.
+3. Keep `audio_capture.dll` a separately loadable file next to `AnPod.exe` so a
+   recipient can replace the LGPL library without rebuilding the covered work.
+
+## 6. AOD 字体
+
+The Receiver AOD screen bundles **Rubik** under the SIL Open Font License 1.1.
+Copyright 2015 The Rubik Project Authors (https://github.com/googlefonts/rubik).
+The license text ships as `LICENSES/Rubik-OFL.txt` and inside the APK at
+`assets/licenses/Rubik-OFL.txt`.
