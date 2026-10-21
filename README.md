@@ -22,6 +22,8 @@
 
 ## USB Direct AOA（实验性）
 
+USB Direct 需要 Android 7.0（API 24）或更高；ADB/LAN 仍支持 Android 6.0。
+
 本地候选为 PC 1.10.5 + Receiver 0.17.4-v3-flow-candidate/code 38；尚非公开发布，也未通过实机验证。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
 
 1. 首次使用先通过 USB/ADB 安装 Receiver 并完成配对，再在 USB 下选择持久化的 ADB 或 USB Direct 模式。打开 Direct 主按钮或手机卡片可进入配置页。

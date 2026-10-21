@@ -663,3 +663,5 @@ Receiver38 签名候选已完成：`artifacts/wired-mode-v4-receiver-release/rec
 PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈希/source 校验保持；SIGNING 候选记录补齐 36/37/38。指定 `ANPOD_RECEIVER_ARTIFACT_DIR` 为新 APK 目录的实际 exact artifact-read **1 passed**，fmt/diff whitespace 检查通过。桌面来源提交与便携包结果将在构建后登记。
 
 封包收尾发现 README 仍列旧候选 PC 1.10.4/Receiver37，首轮 PC1.10.5 未交付产物及其过时审计已作废删除；历史旧版未动。README 已同步 PC1.10.5/Receiver38、首次 ADB 安装配对、Direct 偏好/发现、配件授权与手动开始、Oboe 默认/AudioTrack 备用和真实限制，10 个本地链接通过。独立复算浏览器检查脚本的显式断言数为 AOA **25**、音质 **17**，更正先前执行摘要的 24 项计数（实际检查均通过，未改生产代码或降低断言）。重封审计新增 README 与冻结源码及版本内容一致性检查，不只检查链接。
+
+最终文档增量复核另发现 Direct 的 Android API24 门槛在说明精简时遗漏，已补回“Direct Android7/API24+，ADB/LAN Android6+”；该门槛与程序一致，未放宽设备能力。相关未交付封包继续作废，待门槛说明复核通过后从新冻结提交重封。业务代码、版本、APK及其输入快照均未变化，不重复无关自动测试。
