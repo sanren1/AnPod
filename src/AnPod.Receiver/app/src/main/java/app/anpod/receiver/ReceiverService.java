@@ -751,9 +751,9 @@ public final class ReceiverService extends Service {
     String startFromUi(String address, int prefixLength, String requestId,
             boolean backgroundStandby, boolean keepReceiveIntent) {
         if (requestId == null || requestId.isEmpty()) return "启动请求无效，请重试。";
-        if (keepReceiveIntent && !applicationIsVisible()) return "请在 Receiver 前台界面中开始接收。";
+        if (keepReceiveIntent && !applicationIsVisible()) return "请在 AnPod 界面中点击“连接电脑”。";
         if (backgroundStandby && !applicationIsVisible()) return "请在 Receiver 前台界面中启用后台待机。";
-        if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 Receiver 通知，再开始接收。";
+        if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 AnPod 通知，再连接电脑。";
         if (!uiOperation.canBegin() || currentAudio != null || networkCoordinator != null) return "已有接收会话正在运行。";
         try {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();

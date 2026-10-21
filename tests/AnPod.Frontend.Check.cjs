@@ -78,7 +78,7 @@ fs.mkdirSync(out, {recursive:true});
    const active=scenario!=='noSession';
    const values={sampleRate:48000,channels:2,receiverSampleRate:udp?44100:48000,receiverChannels:2,pcDroppedFrames:0,pcQueuedFrames:null,udpJitterTargetFrames:udp?480:null,udpExpiredFrames:udp?0:null,udpQueuedFrames:udp?96:null,tcpDroppedBacklogFrames:null,trackPendingFrames:192,underrunCount:scenario==='underrun'?4:0,underrunIncrement:scenario==='underrun'?2:null,playbackAdvancing:scenario==='paused'||scenario==='noProgress'?false:scenario==='missingProgress'||scenario==='oldUdp'||scenario==='noSession'?null:true,requestedBufferFrames:192,acceptedBufferFrames:240,effectiveBufferFrames:256,capacityFrames:768,startThresholdFrames:192,preRollFrames:96};
    const state=scenario==='noSession'?'noDevice':scenario==='paused'?'paused':scenario==='recovering'?'reconnecting':scenario==='cleanupError'?'error':scenario==='usb'||scenario==='udp'||scenario==='oldUdp'||scenario==='noProgress'||scenario==='missingProgress'||scenario==='underrun'?'streaming':'connected';
-   snapshot={...snapshot,state,message:scenario==='cleanupError'?'模拟断开失败':active?'已连接 · 手机播放':'尚未连接',deviceName:active?'测试接收端':null,devices:[],selectedSerial:null,sessionSerial:active&&!udp?'TESTUSB':null,sessionReceiverBinding:active&&udp?'phoneA-abcdef':null,sessionTransport:active?(udp?'lan':'usb'):null,sessionConnectionTransport:active?(udp?'wireless':'usb'):null,sessionWirelessProtocol:udp?'udp':null,sessionCapabilities:udp?{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:scenario==='oldUdp'?4:12,versionCode:7}:null,playbackDiagnostics:scenario==='noSession'||scenario==='oldUdp'?null:values,connectionTransport:udp?'wireless':'usb',transport:udp?'wifi':'usb',output:scenario==='paused'||state==='streaming'?'phone':'computer',canDisconnect:active,busy:false,networkRecoverySecondsRemaining:scenario==='recovering'?17:null,statusDetail:scenario==='cleanupError'?'模拟断开错误，重试断开可继续清理。':'模拟诊断快照',settings:{...snapshot.settings,preferredTransport:udp?'Wifi':'Usb',wirelessProtocol:'udp'}};emit();
+   snapshot={...snapshot,state,message:scenario==='cleanupError'?'模拟断开失败':active?'已连接 · 手机播放':'尚未连接',deviceName:active?'测试手机':null,devices:[],selectedSerial:null,sessionSerial:active&&!udp?'TESTUSB':null,sessionReceiverBinding:active&&udp?'phoneA-abcdef':null,sessionTransport:active?(udp?'lan':'usb'):null,sessionConnectionTransport:active?(udp?'wireless':'usb'):null,sessionWirelessProtocol:udp?'udp':null,sessionCapabilities:udp?{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:scenario==='oldUdp'?4:12,versionCode:7}:null,playbackDiagnostics:scenario==='noSession'||scenario==='oldUdp'?null:values,connectionTransport:udp?'wireless':'usb',transport:udp?'wifi':'usb',output:scenario==='paused'||state==='streaming'?'phone':'computer',canDisconnect:active,busy:false,networkRecoverySecondsRemaining:scenario==='recovering'?17:null,statusDetail:scenario==='cleanupError'?'模拟断开错误，重试可继续清理。':'模拟诊断快照',settings:{...snapshot.settings,preferredTransport:udp?'Wifi':'Usb',wirelessProtocol:'udp'}};emit();
   };
   window.reviewDiagnosticsInjectPrivateMarkers=()=>{snapshot.deviceName='DEVICE_MARKER 192.168.77.23';snapshot.message='MESSAGE_MARKER FAKE_KEY_alpha SESSION_ID_beta';snapshot.statusDetail='DETAIL_MARKER 192.168.77.24 fake-key-gamma';snapshot.devices=[{serial:'SERIAL_MARKER 192.168.77.25'}];snapshot.sessionSerial='SERIAL_MARKER SESSION_ID_delta';snapshot.sessionReceiverBinding='REFERENCE_MARKER fake-key-epsilon';emit();};
   window.reviewSetUdpReady=()=>{window.reviewSet('ready','wifi');snapshot.sessionGeneration=null;snapshot.settings.wirelessProtocol='udp';snapshot.connectionTransport='wireless';snapshot.transport='wifi';emit();};
@@ -187,7 +187,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.waitForFunction(()=>document.querySelector('.aoa-dialog details.aoa-switch-section')?.open===false);
   results.readyAoaPrioritizesConnection=!(await switchDetails.evaluate(el=>el.open))
     &&await dialog.getByLabel('USB Direct 设备').isVisible()
-    &&await dialog.getByLabel('已配对接收端').isVisible()
+    &&await dialog.getByLabel('已配对手机').isVisible()
     &&await dialog.getByRole('button',{name:'开始连接'}).isVisible();
   await switchSummary.focus();await switchSummary.press('Enter');
   results.keyboardDisclosureKeepsConsent=await switchDetails.evaluate(el=>el.open)
@@ -204,7 +204,7 @@ fs.mkdirSync(out, {recursive:true});
   results.manualSelectionKeepsDisclosureOpen=await switchDetails.evaluate(el=>el.open)&&await switchTarget.evaluate(el=>document.activeElement===el);
   await switchSummary.click();
   const target=dialog.getByLabel('USB Direct 设备');
-  const binding=dialog.getByLabel('已配对接收端');
+  const binding=dialog.getByLabel('已配对手机');
   results.uniqueTargetPreselectedButBindingExplicit=await target.inputValue()==='opaque-target-a'&&await binding.inputValue()===''&&await dialog.getByRole('button',{name:'开始连接'}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===undefined);
   await binding.selectOption('phoneB-abcdef');
   await dialog.getByRole('button',{name:'开始连接'}).click();
@@ -221,7 +221,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.evaluate(()=>window.reviewSetAoaTargets([{id:'opaque-target-b',label:'新接入配件设备'}]));
   await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.value==='opaque-target-b');
   results.removedTargetDoesNotReuseBinding=await replacementDialog.getByLabel('USB Direct 设备').inputValue()==='opaque-target-b'
-    &&await replacementDialog.getByLabel('已配对接收端').inputValue()===''
+    &&await replacementDialog.getByLabel('已配对手机').inputValue()===''
     &&await replacementDialog.getByRole('button',{name:'开始连接'}).isDisabled()
     &&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===1);
   await replacementDialog.getByRole('button',{name:'关闭'}).click();
@@ -230,14 +230,14 @@ fs.mkdirSync(out, {recursive:true});
   const rememberedDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.value==='opaque-target-b'&&document.querySelectorAll('.aoa-dialog select')[2]?.value==='phoneA-abcdef');
   results.remembersExactTargetAndBinding=await rememberedDialog.getByLabel('USB Direct 设备').inputValue()==='opaque-target-b'
-    &&await rememberedDialog.getByLabel('已配对接收端').inputValue()==='phoneA-abcdef';
+    &&await rememberedDialog.getByLabel('已配对手机').inputValue()==='phoneA-abcdef';
   await rememberedDialog.getByRole('button',{name:'关闭'}).click();
   await page.evaluate(()=>{window.reviewSetDirectMemory(null,null);window.reviewSetAoaTargets([{id:'target-one',label:'第一台配件设备'},{id:'target-two',label:'第二台配件设备'}]);window.reviewSetAoaBindings(['phoneA-abcdef','phoneB-abcdef']);});
   await page.getByRole('button',{name:'连接 USB Direct',exact:true}).click();
   const ambiguousDialog=page.getByRole('dialog',{name:'USB Direct（实验）'});
   await page.waitForFunction(()=>document.querySelectorAll('.aoa-dialog select')[1]?.options.length===3&&document.querySelectorAll('.aoa-dialog select')[2]?.options.length===3);
   results.multipleTargetsNeverGuessBinding=await ambiguousDialog.getByLabel('USB Direct 设备').inputValue()===''
-    &&await ambiguousDialog.getByLabel('已配对接收端').inputValue()===''
+    &&await ambiguousDialog.getByLabel('已配对手机').inputValue()===''
     &&await ambiguousDialog.getByRole('button',{name:'开始连接'}).isDisabled()
     &&await page.evaluate(()=>window.reviewCalls.start_aoa_audio===1);
   await ambiguousDialog.getByRole('button',{name:'关闭'}).click();
@@ -476,7 +476,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.evaluate(()=>window.reviewDiagnosticsScenario('cleanupError'));
   await openDiagnostics();
   results.cleanupFailureIsActionableAndRawErrorStaysCollapsed=await dialog.locator('.diagnostic-overview').innerText().then(text=>text.includes('断开未完成，点主按钮重试'))&&!await dialog.locator('.diagnostic-details').innerText().then(text=>text.includes('模拟断开错误'));
-  results.cleanupFailureKeepsMainRetryAction=await page.locator('.main-action').innerText()==='重试断开';
+  results.cleanupFailureKeepsMainRetryAction=await page.locator('.main-action').innerText()==='重试';
   await dialog.locator('details > summary').click();
   results.cleanupFailureDetailsRetainOriginalMessage=await dialog.locator('.diagnostic-details').innerText().then(text=>text.includes('模拟断开错误'));
   await dialog.getByRole('button',{name:'关闭',exact:true}).click();
@@ -859,10 +859,10 @@ fs.mkdirSync(out, {recursive:true});
   await page.getByRole('button',{name:'连接手机',exact:true}).click();
   await page.waitForFunction(()=>window.reviewListenerCalls.length===1);
   results.singleClickStartsOnUniqueSelections=await page.evaluate(()=>window.reviewListenerCalls[0]?.localAddress==='192.168.50.2'&&window.reviewListenerCalls[0]?.bindingReference==='phoneA-abcdef'&&window.reviewListenerCalls[0]?.allowed===true);
-  results.listenerStatusAndStopAction=await page.getByRole('button',{name:'停止接收',exact:true}).isEnabled()&&await page.evaluate(()=>window.reviewRead().wirelessConnectionOffers.automaticBinding==='phoneA-abcdef');
-  results.listeningStatusAndStopLabel=await page.locator('.status-line').innerText().then(text=>text==='等待手机开始接收')&&await page.getByRole('button',{name:'停止接收',exact:true}).count()===1;
+  results.listenerStatusAndStopAction=await page.getByRole('button',{name:'断开连接',exact:true}).isEnabled()&&await page.evaluate(()=>window.reviewRead().wirelessConnectionOffers.automaticBinding==='phoneA-abcdef');
+  results.listeningStatusAndStopLabel=await page.locator('.status-line').innerText().then(text=>text==='等待手机连接电脑')&&await page.getByRole('button',{name:'断开连接',exact:true}).count()===1;
   await page.screenshot({path:`${out}/wireless-listening-auto.png`});
-  await page.getByRole('button',{name:'停止接收',exact:true}).click();
+  await page.getByRole('button',{name:'断开连接',exact:true}).click();
   await page.waitForFunction(()=>window.reviewListenerCalls.length===2);
   results.stopCancelsListener=await page.evaluate(()=>window.reviewListenerCalls[1]?.allowed===false&&!window.reviewRead().wirelessConnectionOffers.active);
   await page.evaluate(()=>window.reviewFailNextListener('模拟监听失败'));
@@ -873,8 +873,8 @@ fs.mkdirSync(out, {recursive:true});
   await page.waitForFunction(()=>window.reviewListenerCalls.length===4&&window.reviewRead().wirelessConnectionOffers.active);
   results.listenerRetryUsesCorrectBinding=await page.evaluate(()=>window.reviewListenerCalls[3]?.localAddress==='192.168.50.2'&&window.reviewListenerCalls[3]?.bindingReference==='phoneA-abcdef');
   await page.evaluate(()=>window.reviewSetBusy());
-  results.listenerCanStopWhileBackendBusy=await page.getByRole('button',{name:'停止接收',exact:true}).isEnabled();
-  await page.getByRole('button',{name:'停止接收',exact:true}).click();
+  results.listenerCanStopWhileBackendBusy=await page.getByRole('button',{name:'断开连接',exact:true}).isEnabled();
+  await page.getByRole('button',{name:'断开连接',exact:true}).click();
   results.listenerStopReachesBackendWhileBusy=await page.evaluate(()=>window.reviewListenerCalls.at(-1)?.allowed===false&&!window.reviewRead().wirelessConnectionOffers.active);
   await page.evaluate(()=>window.reviewSetBusy(false));
 
@@ -904,12 +904,12 @@ fs.mkdirSync(out, {recursive:true});
   results.userSelectionsSurviveRefresh=await dialog.getByLabel('电脑网络接口').inputValue()==='192.168.60.2'&&await dialog.getByLabel('已配对手机').inputValue()==='phoneD-abcdef';
   await dialog.getByRole('button',{name:'开始监听',exact:true}).click();
   results.listenerUsesExplicitChoices=await page.evaluate(()=>window.reviewListenerCalls.at(-1)?.localAddress==='192.168.60.2'&&window.reviewListenerCalls.at(-1)?.bindingReference==='phoneD-abcdef');
-  await dialog.getByText(/手机点击“开始接收”后自动认证/).waitFor();
+  await dialog.getByText(/手机点击“连接电脑”后自动认证/).waitFor();
   results.automaticModeDoesNotOfferPerRequestApproval=await dialog.getByRole('button',{name:'接受并连接所选手机',exact:true}).count()===0;
   await page.evaluate(()=>window.reviewWirelessOffers([{id:'ambiguous-a',endpoint:'192.168.60.9:49772'},{id:'ambiguous-b',endpoint:'192.168.60.10:49772'}],true,'phoneD-abcdef'));
   results.multipleAutomaticTargetsRemainSelectable=await dialog.getByRole('button',{name:'接受并连接所选手机',exact:true}).isVisible();
   await dialog.getByRole('button',{name:'关闭',exact:true}).click();
-  await page.getByRole('button',{name:'停止接收',exact:true}).click();
+  await page.getByRole('button',{name:'断开连接',exact:true}).click();
 
   await page.locator('.device-select').click();
   const manualDialog=page.getByRole('dialog',{name:'连接手机'});
@@ -1193,8 +1193,8 @@ fs.mkdirSync(out, {recursive:true});
  await page.evaluate(()=>window.reviewCompletePair());await page.waitForTimeout(100);
  results.stalePairStaysClosed=await page.locator('dialog[open]').count()===0;
  await page.evaluate(()=>window.reviewSet('error','usb'));
- results.cleanupRetryEnabled=await page.getByRole('button',{name:'重试断开',exact:true}).isEnabled();
- await page.getByRole('button',{name:'重试断开',exact:true}).click();
+ results.cleanupRetryEnabled=await page.getByRole('button',{name:'重试',exact:true}).isEnabled();
+ await page.getByRole('button',{name:'重试',exact:true}).click();
  await page.waitForFunction(()=>!window.reviewRead().canDisconnect);
  results.cleanupRetryWorks=await page.evaluate(()=>window.reviewCalls.disconnect===1);
   await page.evaluate(()=>{window.reviewCalls={};window.reviewCommandArgs={};});
@@ -1239,10 +1239,10 @@ fs.mkdirSync(out, {recursive:true});
   await page.waitForFunction(()=>!window.reviewRead().canDisconnect);
   results.stopDuringBusyDisconnects=await page.evaluate(()=>window.reviewCalls.disconnect===2);
   await page.evaluate(()=>{window.reviewCalls={};window.reviewSetActiveError();});
-  results.activeErrorKeepsDisconnectRetry=await page.getByRole('button',{name:'重试断开',exact:true}).isEnabled()&&await page.locator('.status-description').innerText().then(text=>text.includes('连接还未完全断开')&&!text.includes('模拟播放失败详情'));
+  results.activeErrorKeepsDisconnectRetry=await page.getByRole('button',{name:'重试',exact:true}).isEnabled()&&await page.locator('.status-description').innerText().then(text=>text.includes('连接还未完全断开')&&!text.includes('模拟播放失败详情'));
   await page.locator('.status-description details summary').click();
   results.errorDetailsRemainAvailableOnDemand=await page.locator('.status-description').innerText().then(text=>text.includes('模拟播放失败详情')&&text.includes('电脑声音保持输出'));
-  await page.getByRole('button',{name:'重试断开',exact:true}).click();
+  await page.getByRole('button',{name:'重试',exact:true}).click();
   await page.waitForFunction(()=>!window.reviewRead().canDisconnect);
   await page.evaluate(()=>{window.reviewCalls={};window.reviewCommandArgs={};});
   await page.evaluate(()=>window.reviewSetUdpStreaming());
@@ -1255,8 +1255,8 @@ fs.mkdirSync(out, {recursive:true});
   await page.getByRole('button',{name:'低延迟',exact:true}).click();
   results.udpModeReconfiguresWithoutConfirm=await page.locator('dialog[open]').count()===0&&await page.evaluate(()=>window.reviewCalls.reconfigure_session===1&&window.reviewRead().settings.playbackMode==='LowLatency');
   await page.evaluate(()=>window.reviewSetManagementOnly());
-  results.managementSessionDoesNotOfferPlayback=await page.getByRole('button',{name:'断开管理连接',exact:true}).isEnabled()&&await page.getByRole('button',{name:'播放到手机',exact:true}).count()===0&&await page.locator('.status-line').innerText().then(text=>text.includes('暂不支持播放'));
-  await page.getByRole('button',{name:'断开管理连接',exact:true}).click();
+  results.managementSessionDoesNotOfferPlayback=await page.getByRole('button',{name:'断开连接',exact:true}).isEnabled()&&await page.getByRole('button',{name:'播放到手机',exact:true}).count()===0&&await page.locator('.status-line').innerText().then(text=>text.includes('暂不支持播放'));
+  await page.getByRole('button',{name:'断开连接',exact:true}).click();
   await page.waitForFunction(()=>!window.reviewRead().canDisconnect);
   await page.evaluate(()=>window.reviewSet('noDevice','usb'));
   await page.getByRole('button',{name:'连接 USB 手机',exact:true}).click();
@@ -1266,7 +1266,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.evaluate(()=>window.reviewSetUdpReady());
   await page.getByRole('button',{name:'连接帮助',exact:true}).click();
   const udpHelpDialog=page.getByRole('dialog',{name:'连接帮助'});
-  results.udpHelpDescribesPhoneRestartAndUsbCheck=await udpHelpDialog.getByText(/重新打开手机上的 AnPod 并点击“开始接收”/).isVisible()&&await udpHelpDialog.getByText(/如仍无法连接，可通过 USB 检查 Receiver/).isVisible()&&!await udpHelpDialog.getByText(/需要通过 USB 重新启动/).count();
+  results.udpHelpDescribesPhoneRestartAndUsbCheck=await udpHelpDialog.getByText(/重新打开手机上的 AnPod 并点击“连接电脑”/).isVisible()&&await udpHelpDialog.getByText(/如仍无法连接，可通过 USB 检查 Receiver/).isVisible()&&!await udpHelpDialog.getByText(/需要通过 USB 重新启动/).count();
   await udpHelpDialog.getByRole('button',{name:'完成',exact:true}).click();
   await page.evaluate(()=>{window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'}]);window.reviewSet('ready','usb');});
   await page.getByRole('button',{name:'无线',exact:true}).click();
@@ -1338,7 +1338,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.waitForFunction(()=>window.reviewListenerCalls.at(-1)?.allowed===true);
   results.backgroundAuthFailureKeepsManualOfferPath=await page.evaluate(before=>window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired===true&&window.reviewListenerCalls.at(-1)?.allowed===true&&(window.reviewCalls.query_background_trust||0)===before,trustQueriesBeforeFailure);
   await fallbackDialog.getByRole('button',{name:'关闭',exact:true}).click();
-  await page.getByRole('button',{name:'停止接收',exact:true}).click();
+  await page.getByRole('button',{name:'断开连接',exact:true}).click();
   await page.waitForFunction(()=>window.reviewCalls.set_wireless_connection_offers>=2);
   results.udpListenerCanStop=await page.evaluate(()=>window.reviewListenerCalls.at(-1)?.allowed===false);
 
