@@ -12,8 +12,9 @@ The 1.10.1 crash-fix package and PC 1.10.2 control flow are historical
 baselines. PC 1.10.2 added owner suppression around USB Direct configuration,
 a separately confirmed option to stop the local ADB server before one fresh,
 identity-checked WinUSB attempt, and latency-mode availability for connected
-USB/ADB sessions. The 1.10.3 candidate flow and its verification status are
-recorded at the end of this document. No physical accessory transfer or audio
+USB/ADB sessions. The 1.10.3 candidate flow and verification are recorded as a
+previous candidate below. PC 1.10.4 review corrections and final offline
+results are recorded at the end. No physical accessory transfer or audio
 playback has been tested for the current candidate.
 
 The Receiver must have the matching accessory-mode application installed. The
@@ -506,7 +507,7 @@ verified signer remains
 exact artifact passed the Rust artifact-read test. Package inspection does not
 verify installation, upgrade, permission UX, or playback on a device.
 
-## Current 1.10.3 / Receiver 0.17.2 code 36 behavior and verification
+## Previous PC 1.10.3 / Receiver 0.17.2 code 36 behavior and verification
 
 Every initial connection requires a manual PC click, including when there is
 only one LAN offer. Remembered authorization does not automatically connect.
@@ -542,4 +543,40 @@ and checks, five focused test groups, APK artifact reading, and the serial
 locked/offline suite passed (145 passed, 0 failed, 1 ignored). Real-device AOA
 permissions and attach/detach behavior, Windows hardware access, installation
 or upgrade, playback, acoustic quality, and long-duration stability remain
+`NOT_TESTED`.
+
+## PC 1.10.4 / Receiver 0.17.3 code 37 review corrections and final offline validation
+
+The review found three session-lifecycle defects: PC AOA session restoration
+could re-enter a held session lock; an old Android `AoaSessionStopped` callback
+could terminate a newer coordinator; and the canonical 13-byte
+`USER_STOPPED` acknowledgement was rejected by PC length checks and mistaken
+for a failed AOA progress response, causing reconnect. The corrections release
+the prior lock before retry, limit stop cleanup to its owning coordinator,
+report genuine playback failures against their context, and validate the exact
+stop acknowledgement alongside capability, authentication, session, and
+sequence. The regular `OK` response-length rules remain unchanged.
+
+The USB Direct window prioritizes a ready AOA device and keeps its switch
+controls collapsible while preserving explicit consent before stopping the
+PC-wide ADB server. Connecting still requires a PC click. AOD labels an
+otherwise unknown wired or wireless ADB transport simply as `ADB`.
+
+Final offline verification: Android `ReceiverServiceRobolectricTest` and
+`AoaReceiverCoordinatorTest` passed 41 tests in one complete run (35 + 6; both
+XML suites report 0 failures, errors, and skipped tests). Rust formatting and
+offline checks passed; the final serial offline suite passed 149, with 0
+failures and 1 ignored. The three focused regressions are included in that
+suite: shared terminal cause and owner cleanup, direct TCP deadline/request,
+and Java trust management-owner handling. The DPAPI hardlink case passed with
+the required elevation and no product fallback. Frontend TypeScript, Vite, and
+the AOA-focused Playwright suite passed 14 assertions, including 360/375-wide
+layouts, large text, keyboard access, explicit connect, consent, focus, and the
+native marker. Evidence: `.tmp-frontend-check/astra-ui-run/astra-ui-result.json`
+and two screenshots. Astra's final read-only review passed; the original three
+P1 findings and two UX items are closed, with no remaining evidenced P1/P2.
+
+`AppState::recover_aoa_session_locked` was not invoked at runtime in this verification, so the
+tests do not establish runtime recovery through that entrypoint. Physical AOA,
+audio playback/quality, installation/upgrade, and long-duration behavior remain
 `NOT_TESTED`.

@@ -617,3 +617,22 @@ Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connec
 保持用户要求跳过实机核查；真实 WinUSB 权限、USB/ADB 设备影响、手机安装升级、Oboe/AudioTrack 播放、拔插及声学表现仍为 **NOT_TESTED**。P5-C 主动停止无主机 ACK 的收尾使用现有 5 秒超时，未单独运行等待该超时的 loopback 用例。保留三个用户 Android 缓存目录及历史可回退制品。
 
 便携交付：`artifacts/AnPod-1.10.3-tauri-win-x64-portable.zip`，18,454,241 bytes，SHA-256 `3f359dd78bffc68a31dbe07a1f6c76f5994988f9f8b831d7425c576505e452dd`；EXE ProductVersion 1.10.3，SHA-256 `6e037bdf3195a9beeac6ca79c856083d4b9f85aec6f1273db51eea6fb8c23ddf`。PC 构建来源 `f89963aa5c1fbfe5645f40bc7e65a124e937c8d7`，desktopInputsSha256 `b27281c1e9d780652dda0564e91f9a7af58c9c27841d1331c8bf511063525439` 与冻结输入重算一致。独立包审计 `artifacts/connection-v3-portable-audit.json` 为 PASS：49 个 ZIP/stage 条目逐项路径、长度、哈希一致；Receiver exact release、Native/Legacy provenance 和版本通过；README 本地链接 10 个可解析、0 个失效；无密钥、缓存、日志或 secret marker。metadata 的 workingTreeDirty=true 仅由保留的三个用户缓存目录造成，受跟踪源码无改动。使用新版功能须同步升级随包 Receiver code 36。上述离线结果不改变实机 NOT_TESTED 状态。
+
+## 独立 Astra 审查与改进（2026-10-21）
+
+按用户要求，以完全独立、无历史上下文的 GPT 6 astra high 审查 `550351f`（重点 `afeddcc..HEAD`）。本次审查发现以下三个真实缺陷，取代上一轮“无未解决具体 P1/P2”的结论；既有离线测试通过不代表覆盖了这些执行路径。
+
+- [SUBAGENT] Rust：AOA 恢复持有旧 session 锁后重复获取造成死锁；扩展命令的规范主动停止 ACK 被长度规则和 AOA 遥测分支误判为链路故障。释放锁后才重试，保留取消及 generation 约束；严格解析终止 ACK 并维持认证、能力和序列检查。
+- [SUBAGENT] Android：旧 AOA 音频完成回调可能终止 coordinator 正在重建的会话。由 coordinator 管理清理/恢复，真正播放引擎故障仍须上报；用两种回调次序验证。无法区分有线/无线的 AOD 协议使用真实短标签 `ADB`。
+- [SUBAGENT] UI：已有 USB Direct 目标或切换成功后折叠模式切换区，突出设备、配对和开始连接；保留展开入口和必要授权说明，不自动连接、不增加确认步骤或长文。
+- [SERIAL] 三项完成后合验、交回独立 Astra 复核，再构建 PC 1.10.4 与新版签名 Receiver。最终版本、测试及制品结果待冻结后登记。
+
+全部执行代理仍使用 GPT 6 luna high；最多三个并行代理，不嵌套。UI/UX 按用户新增约束保持简单、直观、符合第一直觉、文本简短。实机核查继续按要求跳过，旧版本与三个既有缓存保留。
+
+上述改进已完成。独立 GPT 6 astra high 最终只读复核确认原 3 项 P1 与 2 项 UX 均闭合，本次范围无残余已证实 P1/P2。复核期间还修正了两条带期限命令遗漏的终止原因处理：三条命令共用 `record_terminal_cause`；管理和活动会话在公共收尾处优先识别手机主动停止，清理误报错误并停止重连。普通扩展 ACK 长度、认证、会话、方向与严格序列要求保持不变。
+
+最终离线验收：Rust `cargo fmt --check`、`cargo check --offline` 及串行全套 **149 passed、0 failed、1 ignored**（包含新增 deadline/TCP 与管理 owner Java loopback 回归）；Windows DPAPI 文件夹具需提升测试权限。Android 同一冻结源码整类复验 **41 项全部通过**（ReceiverService 35、AOA coordinator 6，无失败/错误/跳过）。前端 TypeScript/Vite 与 AOA 专项 **14 项通过**，覆盖中英文、360/375px 大字、键盘、展开标记、焦点、授权说明和显式连接；证据在 `.tmp-frontend-check/astra-ui-run/`，未宣称旧完整 UI harness 全部通过。
+
+恢复死锁的锁作用域已独立核对，但没有为 Windows AppState/AppHandle 新建复杂测试框架，实际恢复分支未做运行时调用；真实 USB、手机安装升级、播放及声学表现仍为 **NOT_TESTED**。目标交付 PC **1.10.4** 与 Receiver **0.17.3-v3-flow-candidate / code 37**。
+
+冻结业务来源 `17394730ee6edad41339ebb66869a41bc92b4ece`。Receiver release 构建通过，产物 `artifacts/astra-review-receiver-release/receiver.apk`，SHA-256 `379d66041630c65f2ecfab2dedbf649441687759bfdd5d41746079be0fb4dbac`，版本 0.17.3/code 37、minSdk 23、targetSdk 35；签名 SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。metadata 的 sourceCommit 匹配冻结业务来源，sourceModified=false，sourceInputsSha256 `a8406d957fd36b36de98cc82eb7f6fdddb9f50211ed1f694898429e96d670752` 与构建前后及根代理重算一致。aapt/apksigner 核验通过；便携包来源、哈希及内容审计待完成后登记。

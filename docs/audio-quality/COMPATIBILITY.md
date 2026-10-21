@@ -51,35 +51,36 @@
   `VID_2D95&PID_6013&MI_02`, runs `adb kill-server`, then makes one WinUSB
   attempt. Failure is surfaced and retains suppression. At that baseline,
   existing USB/ADB and LAN sessions allowed balanced/low-latency switching;
-  AOA remained locked. The 1.10.3 candidate behavior is recorded below.
+  AOA remained locked. The 1.10.3 candidate behavior is recorded as a prior
+  baseline below.
   Quality/format changes still require a new session. The wireless offer
   listener stays running and pauses accepting offers during this flow; the
   saved preference is retained.
-- PC 1.10.3 / Receiver 0.17.2 code 36 requires an explicit PC click
+- Previous PC 1.10.3 / Receiver 0.17.2 code 36 requires an explicit PC click
   for every initial connection, including a single LAN offer; remembered
   authorization does not start a connection. Only an unexpected drop from an
   established session may trigger bounded reconnect, constrained to the same
   transport, target, binding, profile, mode, and output. A manual disconnect
   cancels it; an initial failure is not retried in the background, and AOA
   failure does not fall back to ADB.
-- Balanced and low-latency mode switching is supported on every transport. AOA
-  requires Receiver capability `0x200` and a newly authenticated session with
-  fresh keys and queue; an older Receiver without this capability prompts for
-  an update. Hi-Res requires actual 96 kHz Windows output. A 48 kHz source
-  produces a clear prompt, with no resampling or silent downgrade. AOD's USB
-  Direct receive statistics use actual PCM ingress and are shared by Oboe and
-  AudioTrack.
-- Receiver `0.17.2-v3-flow-candidate` / code 36 release APK: SHA-256
+- In the 1.10.3 candidate, balanced and low-latency mode switching was
+  supported on every transport. AOA requires Receiver capability `0x200` and a
+  newly authenticated session with fresh keys and queue; an older Receiver
+  without this capability prompts for an update. Hi-Res requires actual 96 kHz
+  Windows output. A 48 kHz source produces a clear prompt, with no resampling
+  or silent downgrade. AOD's USB Direct receive statistics use actual PCM
+  ingress and are shared by Oboe and AudioTrack.
+- Previous Receiver `0.17.2-v3-flow-candidate` / code 36 release APK: SHA-256
   `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`, signer
   SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`,
   source commit `ce81f03b54285691b3ce602461180516b60a1d4b`,
   `sourceModified=false`, and source-input SHA-256
   `2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`.
-- Offline verification on the signed source snapshot: Android
+- Offline verification for the signed 1.10.3 source snapshot: Android
   `ReceiverServiceRobolectricTest` passed 33/33 and
   `AoaReceiverCoordinatorTest` passed 6/6 in the same run (XML: 0 failures,
   errors, or skipped tests). Earlier 32/32 and 8/8 runs are separate and are
-  not added to these counts. Frontend TypeScript, Vite, and the Playwright
+  not added to those counts. Frontend TypeScript, Vite, and the Playwright
   matrix for four transports, modes, manual offers, and quality passed. The
   older broad UI harness remains partial because some assertions target the
   previous UI. Rust formatting/checks, five focused test groups, APK artifact
@@ -89,6 +90,42 @@
 - Source and offline loopback work does not claim hardware playback, quality,
   long-duration stability or APK upgrade verification. These remain
   `NOT_TESTED` pending real-device validation.
+
+## PC 1.10.4 / Receiver 0.17.3 code 37 review corrections and final offline validation
+
+The review found three session-lifecycle defects: PC AOA session restoration
+could re-enter a held session lock; an old Android `AoaSessionStopped` callback
+could terminate a newer coordinator; and the canonical 13-byte
+`USER_STOPPED` acknowledgement was rejected by PC length checks and mistaken
+for a failed AOA progress response, causing reconnect. The corrections release
+the prior lock before retry, limit stop cleanup to its owning coordinator,
+report genuine playback failures against their context, and validate the exact
+stop acknowledgement alongside capability, authentication, session, and
+sequence. The regular `OK` response-length rules remain unchanged.
+
+The USB Direct window prioritizes a ready AOA device and keeps its switch
+controls collapsible while preserving explicit consent before stopping the
+PC-wide ADB server. Connecting still requires a PC click. AOD labels an
+otherwise unknown wired or wireless ADB transport simply as `ADB`.
+
+Final offline verification: Android `ReceiverServiceRobolectricTest` and
+`AoaReceiverCoordinatorTest` passed 41 tests in one complete run (35 + 6; both
+XML suites report 0 failures, errors, and skipped tests). Rust formatting and
+offline checks passed; the final serial offline suite passed 149, with 0
+failures and 1 ignored. The three focused regressions are included in that
+suite: shared terminal cause and owner cleanup, direct TCP deadline/request,
+and Java trust management-owner handling. The DPAPI hardlink case passed with
+the required elevation and no product fallback. Frontend TypeScript, Vite, and
+the AOA-focused Playwright suite passed 14 assertions, including 360/375-wide
+layouts, large text, keyboard access, explicit connect, consent, focus, and the
+native marker. Evidence: `.tmp-frontend-check/astra-ui-run/astra-ui-result.json`
+and two screenshots. Astra's final read-only review passed; the original three
+P1 findings and two UX items are closed, with no remaining evidenced P1/P2.
+
+`AppState::recover_aoa_session_locked` was not invoked at runtime in this verification, so the
+tests do not establish runtime recovery through that entrypoint. Physical AOA,
+audio playback/quality, installation/upgrade, and long-duration behavior remain
+`NOT_TESTED`.
 
 The shared fixed vectors are in `tests/audio-v2-vectors.txt`; Rust and Java
 checks independently compare descriptor, handshake, transcript, keys and packet
