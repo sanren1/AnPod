@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
 import { strings } from "./strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
-import { isDesktop, invokeApp, byTransport, hasActiveSession, bindingLabel, actualConnectionLabel, readableStatus, needsReceiverUpdate, endpointFitsInterface } from "./appRuntime";
+import { isDesktop, invokeApp, byTransport, hasActiveSession, bindingLabel, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, endpointFitsInterface, CAP_AOA_SESSION_RESTART } from "./appRuntime";
 import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
 import { DeviceDialog } from "./components/DeviceDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -128,6 +128,8 @@ function App() {
   const receiverUpdateNeeded = snapshot?.state === "error" && needsReceiverUpdate(`${snapshot.message} ${snapshot.statusDetail}`)
     || snapshot?.state === "managementOnly" && snapshot.sessionCapabilities?.audioCompatible === false;
   const controlsDisabled = working || snapshot?.busy === true || cleanupPending || receiverOperationBusy;
+  const aoaPlaybackRestartUnavailable = aoaSession && !controlsDisabled && snapshot.sessionCapabilities !== null
+    && (snapshot.sessionCapabilities.capabilityBits & CAP_AOA_SESSION_RESTART) === 0;
   const activeDevice = snapshot?.sessionTransport === "aoa" ? undefined
     : snapshot?.devices.find(device => device.serial === snapshot.sessionSerial);
   const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
@@ -145,7 +147,8 @@ function App() {
     setNoticeDetail(detail);
     window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
   };
-  const notify = (message: string) => announce(needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted, message);
+  const notify = (message: string) => announce(needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired
+    : message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted, message);
   const openReceiverUpgrade = () => {
     setBackgroundStartMode(false);
     setReceiverManagerSerial(snapshot?.sessionSerial ?? selected?.serial ?? "");
@@ -670,6 +673,8 @@ function App() {
               : active || selected?.connectable ? working || snapshot.busy ? strings.app.processing : strings.app.playToPhone
               : snapshot.connectionTransport === "usb" ? strings.app.connectUsbPhone : strings.app.addWirelessPhone;
   const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
+  const failureSummary = cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired
+    : failureDetail.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(failureDetail)) : strings.app.operationNotCompleted;
 
   return <div className={`app-shell ${largeText ? "large-text" : ""}`}>
     <header className="topbar">
@@ -717,7 +722,7 @@ function App() {
       {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{strings.app.backgroundStartIdleHint}</p>}
       {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
         className="status-description actionable-error"
-        summary={cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired : strings.app.operationNotCompleted}
+        summary={failureSummary}
         details={failureDetail}
       /> : <p className="status-description" role="status">{strings.app.waitingForRequest}</p> : null}
       {receiverUpdateNeeded && (active || cleanupPending) && snapshot.sessionTransport !== "aoa" && <button className="primary-button" type="button" disabled={working || snapshot.busy || receiverOperationBusy} onClick={openReceiverUpgrade}>{strings.app.upgradePhone}</button>}
@@ -728,6 +733,7 @@ function App() {
           <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
         </div></div>
         <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
+        {aoaPlaybackRestartUnavailable && <p className="dialog-footnote">{strings.app.aoaPlaybackModeUpdate}</p>}
       </section>
     </main>
 

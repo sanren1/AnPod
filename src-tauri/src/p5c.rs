@@ -51,6 +51,7 @@ pub(crate) const ACK: u8 = 127;
 pub(crate) const RESULT_OK: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
 const RESULT_FAILED: u8 = 2;
+pub(crate) const RESULT_USER_STOPPED: u8 = 3;
 pub(crate) const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
 pub(crate) const AUDIO_PROTOCOL_MAJOR: u8 = 1;
 const CAP_RECEIVER_UI: u32 = 0x0000_0001;
@@ -60,8 +61,10 @@ const CAP_CONNECTION_INTENT: u32 = 0x0000_0010;
 const CAP_BACKGROUND_START_AUTH: u32 = 0x0000_0020;
 const CAP_BACKGROUND_TRUST_MANAGEMENT: u32 = 0x0000_0040;
 pub(crate) const CAP_AUDIO_V2: u32 = 0x0000_0080;
+pub(crate) const CAP_TERMINAL_CAUSE: u32 = 0x0000_0100;
+pub(crate) const CAP_AOA_SESSION_RESTART: u32 = 0x0000_0200;
 const IMPLEMENTED_CAPABILITIES: u32 =
-    CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS;
+    CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
 const AUTH_PENDING: u8 = 0;
 const AUTH_ONCE: u8 = 1;
@@ -237,6 +240,7 @@ pub(crate) struct HostSession {
     last_heartbeat: Instant,
     state: ReceiverState,
     capabilities: Option<ReceiverCapabilities>,
+    terminal_cause: Option<TerminalCause>,
     connection_intent: Option<([u8; 16], bool)>,
     background_request_id: Option<[u8; 16]>,
     background_authorization_required: bool,
@@ -385,6 +389,7 @@ impl HostSession {
             last_heartbeat: Instant::now(),
             state: ReceiverState::Authenticated,
             capabilities: None,
+            terminal_cause: None,
             connection_intent: endpoint.connection_intent,
             background_request_id: endpoint.background_request_id,
             background_authorization_required: endpoint.background_authorization_required,
@@ -494,6 +499,7 @@ impl HostSession {
             last_heartbeat: Instant::now(),
             state: ReceiverState::Authenticated,
             capabilities: None,
+            terminal_cause: None,
             connection_intent: endpoint.connection_intent,
             background_request_id: endpoint.background_request_id,
             background_authorization_required: endpoint.background_authorization_required,
@@ -1171,12 +1177,26 @@ impl HostSession {
 
     pub(crate) fn heartbeat(&mut self) -> Result<ReceiverState, String> {
         let ack = self.command(HEARTBEAT, &[])?;
-        if ack.result != RESULT_OK {
+        if ack.result == RESULT_USER_STOPPED {
+            if ack.state != ReceiverState::Stopped
+                || !self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
+            {
+                return Err("Receiver returned an invalid authenticated terminal cause.".into());
+            }
+            self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+        } else if ack.result != RESULT_OK {
             return Err("P5-C heartbeat was rejected.".into());
         }
         self.last_heartbeat = Instant::now();
         self.state = ack.state;
         Ok(self.state)
+    }
+
+    pub(crate) fn terminal_cause(&self) -> Option<TerminalCause> {
+        self.terminal_cause
     }
 
     fn playback_progress(&mut self) -> Result<Option<PlaybackDiagnostics>, String> {
@@ -1304,6 +1324,18 @@ impl HostSession {
             sequence,
             self.format_v2.is_some(),
         )?;
+        if ack.result == RESULT_USER_STOPPED {
+            if ack.state != ReceiverState::Stopped
+                || !self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
+            {
+                return Err("P5-C Receiver terminal cause was invalid.".into());
+            }
+            self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+            self.state = ReceiverState::Stopped;
+        }
         if ack
             .background_trust
             .as_ref()
@@ -1688,6 +1720,13 @@ pub(crate) enum SessionLifecycleState {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalCause {
+    ReceiverUserStop,
+    HostStop,
+    TransportFailure,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SessionSnapshot {
     pub(crate) state: SessionLifecycleState,
@@ -1697,6 +1736,7 @@ pub(crate) struct SessionSnapshot {
     pub(crate) capabilities: Option<ReceiverCapabilities>,
     pub(crate) paused: bool,
     pub(crate) last_error: Option<String>,
+    pub(crate) terminal_cause: Option<TerminalCause>,
     pub(crate) playback_diagnostics: Option<PlaybackDiagnostics>,
     pub(crate) negotiated_format: Option<AudioFormatV2>,
     pub(crate) recovery_seconds_remaining: Option<u64>,
@@ -1906,6 +1946,7 @@ impl SessionOwner {
             capabilities: None,
             paused: false,
             last_error: None,
+            terminal_cause: None,
             playback_diagnostics: None,
             negotiated_format: None,
             recovery_seconds_remaining: None,
@@ -2318,7 +2359,10 @@ fn run_session_owner(
                     break;
                 }
                 last_error = Some(error);
-                if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+                // An owner may recover only after it has actually established a live
+                // session. An explicit discovery/receive intent does not turn a failed
+                // first connection into background retry policy.
+                if last_active_at.is_none() {
                     break 'owner;
                 }
                 publish_session(
@@ -2373,6 +2417,9 @@ fn run_session_owner(
             break 'owner;
         }
         let capabilities = session.capabilities().cloned();
+        let terminal_cause_supported = capabilities
+            .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_TERMINAL_CAUSE != 0);
         status
             .lock()
             .expect("P5-D session status lock poisoned")
@@ -2429,10 +2476,26 @@ fn run_session_owner(
                     break;
                 }
                 if Instant::now() >= next_heartbeat {
-                    if let Err(error) = session.heartbeat() {
-                        management_error = Some(error);
-                        restart = true;
-                        break;
+                    match session.heartbeat() {
+                        Ok(ReceiverState::Stopped)
+                            if finish_receiver_user_stop(&mut session, &status) =>
+                        {
+                            stop_owner = true;
+                            break;
+                        }
+                        Ok(ReceiverState::Stopped) => {
+                            management_error = Some(
+                                "Receiver stopped without an authenticated terminal cause.".into(),
+                            );
+                            restart = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            management_error = Some(error);
+                            restart = true;
+                            break;
+                        }
                     }
                     next_heartbeat = Instant::now() + timing.heartbeat_interval;
                     continue;
@@ -2519,6 +2582,19 @@ fn run_session_owner(
                 break 'owner;
             }
             last_error = management_error.clone();
+            if management_error.is_some() && (last_active_at.is_none() || !terminal_cause_supported)
+            {
+                publish_session(
+                    &status,
+                    SessionLifecycleState::Stopped,
+                    generation,
+                    attempts,
+                    None,
+                    paused,
+                    last_error.clone(),
+                );
+                break 'owner;
+            }
             publish_session(
                 &status,
                 SessionLifecycleState::Reconnecting,
@@ -2553,6 +2629,9 @@ fn run_session_owner(
         }
         if let Err(error) = session.authorize_background_start() {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
             publish_session(
                 &status,
@@ -2567,8 +2646,11 @@ fn run_session_owner(
         }
         if let Err(error) = session.bind_audio().and_then(|_| session.select_mode()) {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
-            if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+            if last_active_at.is_none() {
                 break 'owner;
             }
             publish_session(
@@ -2649,8 +2731,11 @@ fn run_session_owner(
             }
         }) {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
-            if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+            if last_active_at.is_none() {
                 break 'owner;
             }
             publish_session(
@@ -2741,6 +2826,22 @@ fn run_session_owner(
             last_session_bytes = sent;
             if Instant::now() >= next_heartbeat {
                 match session.heartbeat() {
+                    Ok(ReceiverState::Stopped)
+                        if session.terminal_cause() == Some(TerminalCause::ReceiverUserStop) =>
+                    {
+                        let mut current = status.lock().expect("P5-D session status lock poisoned");
+                        current.state = SessionLifecycleState::Stopped;
+                        current.session_id = None;
+                        current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+                        stop_owner = true;
+                        break;
+                    }
+                    Ok(ReceiverState::Stopped) => {
+                        last_error = Some(
+                            "P5-C receiver stopped without an authenticated terminal cause.".into(),
+                        );
+                        break;
+                    }
                     Ok(state) => {
                         match session.playback_progress() {
                             Ok(Some(mut diagnostics)) => {
@@ -2880,6 +2981,9 @@ fn run_session_owner(
                     break;
                 }
                 Ok(OwnerCommand::Reconnect) => {
+                    if finish_receiver_user_stop(&mut session, &status) {
+                        stop_owner = true;
+                    }
                     session.close_local();
                     endpoint_changed = true;
                     break;
@@ -2908,6 +3012,10 @@ fn run_session_owner(
                     if let Err(error) = session.stop() {
                         last_error = Some(error);
                     }
+                    status
+                        .lock()
+                        .expect("P5-D session status lock poisoned")
+                        .terminal_cause = Some(TerminalCause::HostStop);
                     stop_owner = true;
                     break;
                 }
@@ -2919,6 +3027,16 @@ fn run_session_owner(
                 }
             }
         }
+        if session.terminal_cause() == Some(TerminalCause::ReceiverUserStop) {
+            let mut current = status.lock().expect("P5-D session status lock poisoned");
+            current.state = SessionLifecycleState::Stopped;
+            current.session_id = None;
+            current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+            current.last_error = None;
+            stop_owner = true;
+        }
+        let receiver_user_stopped =
+            session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
         session.close_local();
         let sent = session.pcm_payload_bytes_sent();
         pcm_payload_bytes_sent
@@ -2947,6 +3065,24 @@ fn run_session_owner(
                 .lock()
                 .expect("P5-D session status lock poisoned")
                 .recovery_started_at = recovery_started_at;
+        }
+        if receiver_user_stopped || stop_owner {
+            break 'owner;
+        }
+        if !endpoint_changed && !terminal_cause_supported {
+            last_error = Some(
+                "Receiver disconnected without terminal-cause capability; update it or reconnect manually.".into(),
+            );
+            publish_session(
+                &status,
+                SessionLifecycleState::Stopped,
+                generation,
+                attempts,
+                None,
+                paused,
+                last_error.clone(),
+            );
+            break 'owner;
         }
         publish_session(
             &status,
@@ -2988,6 +3124,14 @@ fn run_session_owner(
     *float_queue
         .lock()
         .expect("P5-D Float32 queue lock poisoned") = None;
+    {
+        let mut current = status.lock().expect("P5-D session status lock poisoned");
+        if current.terminal_cause.is_none() {
+            if last_error.is_some() {
+                current.terminal_cause = Some(TerminalCause::TransportFailure);
+            }
+        }
+    }
     publish_session(
         &status,
         SessionLifecycleState::Stopped,
@@ -3008,6 +3152,18 @@ fn lifecycle_from_receiver(state: ReceiverState) -> SessionLifecycleState {
         ReceiverState::Paused => SessionLifecycleState::Paused,
         ReceiverState::Stopped => SessionLifecycleState::Stopped,
     }
+}
+
+fn finish_receiver_user_stop(session: &mut HostSession, status: &Mutex<SessionSnapshot>) -> bool {
+    if session.terminal_cause() != Some(TerminalCause::ReceiverUserStop) {
+        return false;
+    }
+    let mut current = status.lock().expect("P5-D session status lock poisoned");
+    current.state = SessionLifecycleState::Stopped;
+    current.session_id = None;
+    current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+    current.last_error = None;
+    true
 }
 
 fn publish_session(
@@ -3495,6 +3651,10 @@ pub(crate) fn decode_ack_with_format(
         return Err("P5-C ACK did not match its command.".into());
     }
     let state = ReceiverState::from_wire(payload[10])?;
+    let result = payload[9];
+    if result > RESULT_USER_STOPPED {
+        return Err("P5-C ACK result code was invalid.".into());
+    }
     let playback_progress = if command == PLAYBACK_PROGRESS_QUERY {
         Some(decode_playback_progress_with_format(
             &payload[13..],
@@ -3534,7 +3694,7 @@ pub(crate) fn decode_ack_with_format(
         None
     };
     Ok(Ack {
-        result: payload[9],
+        result,
         state,
         udp_port: u16::from_be_bytes([payload[11], payload[12]]),
         playback_progress,

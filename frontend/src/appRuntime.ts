@@ -52,7 +52,12 @@ export const readableStatus = (snapshot: Snapshot, cleanupPending: boolean) => {
   } satisfies Record<Snapshot["state"], string>)[snapshot.state];
 };
 export const CAP_PLAYBACK_PROGRESS = 1 << 3;
+export const CAP_AOA_SESSION_RESTART = 1 << 9;
 export const needsReceiverUpdate = (message: string) => message.includes("RECEIVER_UPDATE_REQUIRED:");
+export const windowsRateMismatchHz = (message: string) => {
+  const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];
+  return rate ? Number(rate) : null;
+};
 export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());

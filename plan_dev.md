@@ -594,3 +594,24 @@ PC 1.10.1 portable ZIP 已生成：`artifacts/AnPod-1.10.1-tauri-win-x64-portabl
 用户流程要求：USB Direct 配置窗口打开前建立临时 owner suppression；关闭窗口释放临时 owner。一旦用户明确同意并触发有效模式切换，建立独立 sticky suppression；失败、关闭窗口或 AOA 连接/断开后均保留。仅显式普通 USB/LAN 连接或重新启用自动连接清除 sticky。既有普通 USB/ADB 与 LAN 活跃会话允许均衡/低延迟切换，AOA 会话仍锁定，质量与格式依然锁定。模式切换需先明确勾选允许停止本机 ADB server（会影响本机所有 ADB 调试连接），随后重新校验指定设备 `VID_2D95&PID_6013&MI_02`，再运行 `adb kill-server` 并尝试一次 WinUSB 切换；失败显示错误且保持 sticky suppression。无线 offer 监听只暂停接受请求，持久偏好不变。
 
 PC 1.10.2 与配套前端实现已完成。后端 `cargo fmt`、`cargo check` 和 4 个定向 CPU tests 全部通过，覆盖配置 owner 生命周期、播放模式 capability 与 AOA 锁定分离、ADB 停止确认路径，以及手动/自动 offer suppression 区分。前端 TypeScript 与 Vite build 通过；mock IPC smoke 共 16 项均为 true（`mockedIpcOnly=true`），截图 4 张，包含底部滚动操作，结果记录于 `.tmp-frontend-check/aoa-controls-v2-smoke.json`。独立代码 review PASS，无未解决 P1/P2。源码提交 `bf0b27603e7038e299b86a84109b04f20a544755` 后完成便携包：`artifacts/AnPod-1.10.2-tauri-win-x64-portable.zip`，18,459,254 bytes，SHA-256 `2f0349cc4e3a7c30f5a419fd36fe5303b154731ce8c99e34e069d314d5224b36`。构建 metadata 的 build/desktop source commit 均匹配该提交，desktopInputsSha256 与冻结源码重算一致。独立审计 `artifacts/usb-direct-controls-v2-portable-audit.json` 全部 PASS：49 个 ZIP/stage 条目集合及各项 SHA-256 一致，Receiver exact release 版本/哈希/签名与来源通过，Native/Legacy provenance 通过，README 10 个本地文件/目录链接均解析，无 secret/cache/log；metadata `workingTreeDirty=true` 仅由保留的三个用户 Android 缓存造成。实机 AOA、ADB 设备影响、播放、延迟和声学表现仍为 **NOT_TESTED**；包级离线审计不会改变此状态。
+
+## 连接策略与 USB Direct 运行修订（2026-10-21）
+
+目标候选：PC 1.10.3，Receiver 0.17.2 / code 36。以下新规则取代上一候选的空闲自动连接与 AOA 播放模式锁定规则。
+
+- 首次连接须在 PC 明确点击确认；启动、发现设备与收到手机请求都不自动建连。
+- 只恢复已建立后意外中断的会话，保留原连接方式、目标、绑定、音质、播放模式与输出；有界重试，不跨 AOA、ADB、LAN 回退。
+- PC 或手机主动断开撤销恢复资格。跨端主动停止须由认证控制状态明确表达，不能仅靠 EOF 或错误文案推断。
+- 检查 USB/ADB、无线 ADB、LAN、AOA 的均衡/低延迟操作；AOA 动态切换须保持密钥、序号及重放保护正确，并识别远端能力。
+- 修复 AOA 主动停止的队列生命周期、AOD 协议标识和实际接收 PCM 速率，覆盖 Oboe 与 AudioTrack 路径。
+- 保留 Hi-Res 对真实 96 kHz Windows 采集的要求，在占用手机前核查；主界面显示简短可操作提示，细节放展开区，不自动升采样或降档。
+
+执行分工：connection_policy_v3 负责 PC 会话策略与状态集成；aoa_runtime_v3 串行处理 AOA/P5-C 与 Receiver 协议、播放器和遥测；ui_connection_v3 负责 PC 操作可用性与精简文案。实现及独立代码复核已完成，无未解决的具体 P1/P2。AOA 改模式使用能力位 `0x200` 和认证 STOP 重启，再创建新会话、密钥与队列；主动停止原因通过能力位 `0x100` 和认证 ACK 表达。缺少能力的旧 Receiver 不猜测 EOF 为意外断线并自动重连。
+
+PC 离线验收：`cargo fmt --check`、`cargo check --offline`、5 个跨端/恢复定向用例和新 APK artifact-read 均通过；JDK 17 环境完整串行 Rust suite 为 **145 passed、0 failed、1 ignored**。前端 TypeScript、Vite build 与针对 USB/ADB、无线 ADB、LAN、AOA 模式切换、手动接受请求、音质提示的 Playwright 矩阵通过；旧全量 UI harness 因旧断言仅部分执行，不计全量通过。证据见 `.tmp-frontend-check/connection-v3-check.json` 及其引用文件。
+
+Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connection-v3-receiver-release/receiver.apk`，SHA-256 `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`；来源 `ce81f03b54285691b3ce602461180516b60a1d4b`，`sourceModified=false`，sourceInputsSha256 `2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`；签名 SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。精确 artifact 读取校验通过。当前等待 PC 便携包构建及包内容审计。
+
+同一冻结 Android 输入最终离线复验：`ReceiverServiceRobolectricTest` **33/33**、`AoaReceiverCoordinatorTest` **6/6**，均无失败、错误或跳过；测试前后输入快照与签名 APK metadata 一致。
+
+保持用户要求跳过实机核查；真实 WinUSB 权限、USB/ADB 设备影响、手机安装升级、Oboe/AudioTrack 播放、拔插及声学表现仍为 **NOT_TESTED**。P5-C 主动停止无主机 ACK 的收尾使用现有 5 秒超时，未单独运行等待该超时的 loopback 用例。保留三个用户 Android 缓存目录及历史可回退制品。

@@ -185,7 +185,18 @@ pub(crate) fn validate_float_format_for_session(
         || format.capture_channels != u32::from(expected.channels)
         || format.capture_sample_format != FLOAT_CAPTURE_FORMAT_FLOAT
     {
-        return Err(format!("Windows mix/capture format does not match the authenticated PCM24 session (expected {} Hz stereo Float32; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
+        let rate_mismatch = if expected.profile == 3
+            && expected.sample_rate == 96_000
+            && format.mix_sample_rate != 96_000
+        {
+            format!(
+                "FORMAT_RATE_MISMATCH: actualHz={}; ",
+                format.mix_sample_rate
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!("{rate_mismatch}Windows mix/capture format does not match the authenticated PCM24 session (expected {} Hz stereo Float32; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
     }
     Ok(())
 }

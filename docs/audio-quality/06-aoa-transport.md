@@ -8,11 +8,13 @@ platform I/O owners, and the product USB permission/state entrypoints. It does
 not reuse the AOA 4096-byte echo probe, ADB TCP, or the LAN UDP context. The
 current candidate also supports an explicit, confirmed USB mode switch from
 the PC app for the supported iQOO 11 V2243A; the switch does not start audio.
-The 1.10.1 crash-fix package is historical; PC 1.10.2 adds owner suppression
-around USB Direct configuration, a separately confirmed option to stop the
-local ADB server before one fresh, identity-checked WinUSB attempt, and
-latency-mode availability for connected USB/ADB sessions. No physical
-accessory transfer or audio playback has been tested for the current candidate.
+The 1.10.1 crash-fix package and PC 1.10.2 control flow are historical
+baselines. PC 1.10.2 added owner suppression around USB Direct configuration,
+a separately confirmed option to stop the local ADB server before one fresh,
+identity-checked WinUSB attempt, and latency-mode availability for connected
+USB/ADB sessions. The 1.10.3 candidate flow and its verification status are
+recorded at the end of this document. No physical accessory transfer or audio
+playback has been tested for the current candidate.
 
 The Receiver must have the matching accessory-mode application installed. The
 PC app can send AOA vendor requests 51/52/53 to the explicitly selected and
@@ -21,6 +23,8 @@ confirmed supported pre-switch interface. The user then grants
 PC connection with a selected accessory and saved binding. USB mode switching
 does not grant accessory permission or start audio. A detach, permission
 revocation, or user cancellation ends the current session.
+
+## Historical PC 1.10.2 USB Direct control-flow baseline
 
 Opening the USB Direct configuration flow establishes a temporary owner
 suppression before showing the window. Closing the window releases this
@@ -480,9 +484,8 @@ Windows PnP/WinUSB hardware access, real playback, throughput, acoustic
 latency, and long-duration stability remain `NOT_TESTED`. Source and synthetic
 gates do not establish those results.
 
-PC 1.10.2 control-flow changes are being prepared for package review. The
-portable audit will not establish hardware mode switching, ADB-server impact
-on devices, physical playback, or acoustic quality.
+The following PC 1.10.2 artifact records describe previous candidates. The
+current Receiver release artifact and verification status are recorded below.
 
 The previous Receiver candidate was `0.17.0-v3-flow-candidate` / code 34, built from
 source commit `8ca9638db128f99e36769f42de18ed9244f457c2` with
@@ -494,7 +497,7 @@ loaded and read this exact APK through the artifact test. Signature and APK
 inspection do not verify device installation, in-place upgrade, permission
 behavior, or playback.
 
-The current Receiver crash-fix candidate is `0.17.1-v3-flow-candidate` / code
+The previous Receiver crash-fix candidate was `0.17.1-v3-flow-candidate` / code
 35, built from source `2bd998d65fe650bb225c09d7353c5c2ba39febfc` with
 `sourceModified=false`. Its release-signed APK SHA-256 is
 `8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f`; the
@@ -502,3 +505,41 @@ verified signer remains
 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`. The
 exact artifact passed the Rust artifact-read test. Package inspection does not
 verify installation, upgrade, permission UX, or playback on a device.
+
+## Current 1.10.3 / Receiver 0.17.2 code 36 behavior and verification
+
+Every initial connection requires a manual PC click, including when there is
+only one LAN offer. Remembered authorization does not automatically connect.
+Only an unexpected drop from an established session starts bounded reconnect,
+with the same transport, target, binding, profile, mode, and output. A manual
+disconnect from the PC or phone cancels reconnect. An initial failure is not
+retried in the background, and AOA does not fall back to ADB.
+
+Balanced and low-latency switching is supported on USB/ADB, LAN, and AOA. AOA
+requires Receiver capability `0x200`; a mode change creates a newly
+authenticated session with fresh keys and queue. An older Receiver without the
+capability prompts for an update. Hi-Res requires actual 96 kHz Windows output;
+at 48 kHz the app gives a clear prompt without resampling or silent downgrade.
+AOD identifies USB Direct accurately and shows receive statistics only from
+real PCM ingress, shared by Oboe and AudioTrack.
+
+The signed release APK is `artifacts/connection-v3-receiver-release/receiver.apk`:
+version `0.17.2-v3-flow-candidate` / code 36, minSdk 23, targetSdk 35, SHA-256
+`0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`, signer
+SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`.
+Its metadata records source commit `ce81f03b54285691b3ce602461180516b60a1d4b`,
+`sourceModified=false`, and source-input SHA-256
+`2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`.
+
+Offline verification on the signed source snapshot: `ReceiverServiceRobolectricTest`
+passed 33/33 and `AoaReceiverCoordinatorTest` passed 6/6 in the same run (their
+XML reports show 0 failures, errors, or skipped tests). Earlier 32/32 and 8/8
+runs are separate and are not added to these counts. Frontend TypeScript and
+Vite checks passed, as did the Playwright matrix covering four transports,
+modes, manual offer handling, and quality selection. The older broad UI harness
+remains partial because some assertions target the previous UI. Rust formatting
+and checks, five focused test groups, APK artifact reading, and the serial
+locked/offline suite passed (145 passed, 0 failed, 1 ignored). Real-device AOA
+permissions and attach/detach behavior, Windows hardware access, installation
+or upgrade, playback, acoustic quality, and long-duration stability remain
+`NOT_TESTED`.

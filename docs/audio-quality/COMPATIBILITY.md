@@ -40,19 +40,52 @@
   ADB routes remain available there. Windows accessory access is restricted to
   the selected WinUSB accessory interface; on composite 18D1:2D01 devices,
   MI_01 remains ADB and is not opened by the audio path.
-- PC 1.10.2 USB Direct setup suppresses automatic connection before its
-  configuration window opens. Closing the window releases this temporary
-  owner. Once a confirmed switch attempt begins, a separate sticky suppression
+- Historical baseline (PC 1.10.2): USB Direct setup suppressed automatic
+  connection before its configuration window opened. Closing the window
+  released the temporary owner. Once a confirmed switch attempt began, a
+  separate sticky suppression
   survives failure and AOA connection/disconnection; only an explicit normal
   USB/LAN connection or re-enabling automatic connection clears it. Before an
   attempt, stopping the local ADB server requires explicit consent and affects every ADB debugging connection
   on that PC. After consent, the app rereads and validates the iQOO 11
   `VID_2D95&PID_6013&MI_02`, runs `adb kill-server`, then makes one WinUSB
-  attempt. Failure is surfaced and retains suppression. Existing USB/ADB and
-  LAN sessions allow balanced/low-latency switching; AOA remains locked.
+  attempt. Failure is surfaced and retains suppression. At that baseline,
+  existing USB/ADB and LAN sessions allowed balanced/low-latency switching;
+  AOA remained locked. The 1.10.3 candidate behavior is recorded below.
   Quality/format changes still require a new session. The wireless offer
   listener stays running and pauses accepting offers during this flow; the
   saved preference is retained.
+- PC 1.10.3 / Receiver 0.17.2 code 36 requires an explicit PC click
+  for every initial connection, including a single LAN offer; remembered
+  authorization does not start a connection. Only an unexpected drop from an
+  established session may trigger bounded reconnect, constrained to the same
+  transport, target, binding, profile, mode, and output. A manual disconnect
+  cancels it; an initial failure is not retried in the background, and AOA
+  failure does not fall back to ADB.
+- Balanced and low-latency mode switching is supported on every transport. AOA
+  requires Receiver capability `0x200` and a newly authenticated session with
+  fresh keys and queue; an older Receiver without this capability prompts for
+  an update. Hi-Res requires actual 96 kHz Windows output. A 48 kHz source
+  produces a clear prompt, with no resampling or silent downgrade. AOD's USB
+  Direct receive statistics use actual PCM ingress and are shared by Oboe and
+  AudioTrack.
+- Receiver `0.17.2-v3-flow-candidate` / code 36 release APK: SHA-256
+  `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`, signer
+  SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`,
+  source commit `ce81f03b54285691b3ce602461180516b60a1d4b`,
+  `sourceModified=false`, and source-input SHA-256
+  `2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`.
+- Offline verification on the signed source snapshot: Android
+  `ReceiverServiceRobolectricTest` passed 33/33 and
+  `AoaReceiverCoordinatorTest` passed 6/6 in the same run (XML: 0 failures,
+  errors, or skipped tests). Earlier 32/32 and 8/8 runs are separate and are
+  not added to these counts. Frontend TypeScript, Vite, and the Playwright
+  matrix for four transports, modes, manual offers, and quality passed. The
+  older broad UI harness remains partial because some assertions target the
+  previous UI. Rust formatting/checks, five focused test groups, APK artifact
+  reading, and the serial locked/offline suite passed (145 passed, 0 failed,
+  1 ignored). Hardware playback, quality, long-duration stability, and APK
+  upgrade verification remain `NOT_TESTED`.
 - Source and offline loopback work does not claim hardware playback, quality,
   long-duration stability or APK upgrade verification. These remain
   `NOT_TESTED` pending real-device validation.

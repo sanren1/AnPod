@@ -20,7 +20,7 @@ async fn usb_direct_configuration_suppression_is_owned_by_its_configuration_id()
 }
 
 #[test]
-fn playback_mode_capability_excludes_usb_direct_and_quality_lock_remains_separate() {
+fn playback_mode_capability_includes_supported_sessions_and_quality_lock_remains_separate() {
     let state = AppState::new();
     {
         let mut view = state.view.lock().unwrap();
@@ -30,18 +30,18 @@ fn playback_mode_capability_excludes_usb_direct_and_quality_lock_remains_separat
     let standard_usb = state.snapshot();
     assert!(standard_usb.can_change_playback_mode);
     assert!(!standard_usb.can_change_modes);
-
     state.view.lock().unwrap().session_transport = Some("aoa".into());
     assert!(!state.snapshot().can_change_playback_mode);
-}
-
-#[test]
-fn wireless_offer_suppression_blocks_all_offers_during_configuration_but_only_auto_after_aoa() {
-    assert!(network_offer_suppressed(true, false, false));
-    assert!(network_offer_suppressed(true, true, true));
-    assert!(network_offer_suppressed(false, true, true));
-    assert!(!network_offer_suppressed(false, true, false));
-    assert!(!network_offer_suppressed(false, false, false));
+    state.view.lock().unwrap().session_capabilities = Some(ReceiverCapabilities {
+        control_major: 1,
+        audio_major: 2,
+        management_compatible: true,
+        audio_compatible: true,
+        compatible: true,
+        capability_bits: 0x200,
+        version_code: 36,
+    });
+    assert!(state.snapshot().can_change_playback_mode);
 }
 
 #[tokio::test]
@@ -491,8 +491,6 @@ fn settings_keep_schema_one_names_and_defaults() {
     );
     assert_eq!(new_saved.wireless_protocol, "udp");
     assert_eq!(new_saved.audio_backend, "receiver");
-    assert_eq!(selected_transport_allows_auto_adb(&old_saved), true);
-    assert_eq!(selected_transport_allows_auto_adb(&new_saved), true);
     let explicit_udp_wifi = normalize_settings(
         serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Wifi", "wirelessProtocol": "udp"
@@ -500,7 +498,6 @@ fn settings_keep_schema_one_names_and_defaults() {
         .unwrap(),
     );
     assert_eq!(explicit_udp_wifi.wireless_protocol, "udp");
-    assert!(!selected_transport_allows_auto_adb(&explicit_udp_wifi));
     assert_eq!(
         reconfigure_selection("transport", "wireless", &old_saved),
         Ok(ReconfigureSelection::WirelessAdb)
@@ -729,15 +726,6 @@ fn native_disconnect_is_detected_when_adb_scan_fails() {
     assert!(session_is_lost(None, false, false));
     assert!(!session_is_lost(None, false, true));
     assert!(session_is_lost(Some(false), false, true));
-}
-
-#[test]
-fn receiver_health_monitor_skips_known_local_or_transport_failures() {
-    assert!(receiver_health_needed(true, Some(true), false, true));
-    assert!(!receiver_health_needed(false, Some(true), false, true));
-    assert!(!receiver_health_needed(true, Some(false), false, true));
-    assert!(!receiver_health_needed(true, Some(true), true, true));
-    assert!(!receiver_health_needed(true, Some(true), false, false));
 }
 
 #[test]

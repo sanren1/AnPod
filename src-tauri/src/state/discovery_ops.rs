@@ -576,8 +576,6 @@ impl AppState {
                 return Err(error);
             }
         };
-        self.auto_connect_suppressed_after_aoa_switch
-            .store(false, Ordering::Release);
         self.start_network_audio_inner(
             app,
             &address.to_string(),

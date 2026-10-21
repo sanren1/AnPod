@@ -116,15 +116,6 @@ pub(crate) fn session_is_lost(
     process_exited || !audio_connected || device_present == Some(false)
 }
 
-pub(crate) fn receiver_health_needed(
-    installed_receiver: bool,
-    device_present: Option<bool>,
-    process_exited: bool,
-    audio_connected: bool,
-) -> bool {
-    installed_receiver && !session_is_lost(device_present, process_exited, audio_connected)
-}
-
 pub(crate) fn merge_usb_playback_diagnostics(
     mut diagnostics: PlaybackDiagnostics,
     format: Option<PcmFormat>,
@@ -869,16 +860,6 @@ pub(crate) enum ReconfigureSelection {
 }
 pub(crate) fn wireless_adb_enabled(settings: &AppSettings) -> bool {
     settings.wireless_protocol == "adb"
-}
-pub(crate) fn selected_transport_allows_auto_adb(settings: &AppSettings) -> bool {
-    !settings.preferred_transport.eq_ignore_ascii_case("wifi") || wireless_adb_enabled(settings)
-}
-pub(crate) fn network_offer_suppressed(
-    configuring_usb_direct: bool,
-    aoa_auto_connect_suppressed: bool,
-    automatic: bool,
-) -> bool {
-    configuring_usb_direct || (aoa_auto_connect_suppressed && automatic)
 }
 pub(crate) fn reconfigure_selection(
     kind: &str,

@@ -69,7 +69,8 @@ fn authenticated_pcm24_format_is_checked_against_each_actual_native_mix_before_s
 
     actual.mix_sample_rate = 48_000;
     actual.capture_sample_rate = 48_000;
-    assert!(super::validate_float_format_for_session(&actual, hires).is_err());
+    let mismatch = super::validate_float_format_for_session(&actual, hires).unwrap_err();
+    assert!(mismatch.starts_with("FORMAT_RATE_MISMATCH: actualHz=48000; "));
     assert!(super::validate_float_format_for_session(&actual, hifi).is_ok());
 
     actual.capture_channels = 1;

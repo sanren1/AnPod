@@ -5,10 +5,10 @@ export type Device = {
 };
 export type AoaTarget = { id: string; label: string };
 export type Settings = {
-  schemaVersion: number; autoConnectLastDevice: boolean; lastDeviceId: string | null;
+  schemaVersion: number; lastDeviceId: string | null;
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
   wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
-  autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
+  lastWirelessEndpoint: string | null;
   lastReceiverEndpoint: string | null;
   audioQuality: "standard" | "hifi" | "hires";
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";

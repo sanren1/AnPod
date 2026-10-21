@@ -33,9 +33,6 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       </dl>
       <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
     </fieldset>
-    <h3>{strings.app.settingsConnection}</h3>
-    <SettingToggle disabled={snapshot.busy} title={strings.app.autoConnect} description={strings.app.autoConnectDescription} checked={settings.autoConnectLastDevice} onChange={value => update("autoConnectLastDevice", value)} />
-    <SettingToggle disabled={snapshot.busy} title={strings.app.wirelessRecovery} description={strings.app.wirelessRecoveryDescription} checked={settings.autoReconnectWifi} onChange={value => update("autoReconnectWifi", value)} />
     <section className="settings-advanced" aria-labelledby="settings-advanced-title">
       <h3 id="settings-advanced-title">{strings.app.advancedConnection}</h3>
       <label className="select-setting"><span>{strings.app.wirelessProtocol}</span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>

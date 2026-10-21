@@ -92,6 +92,11 @@ pub struct ReceiverStatus {
     pub foreground: bool,
     pub healthy: bool,
     pub audio_active: bool,
+    pub operation_owner_id: Option<String>,
+    pub operation_generation: Option<u64>,
+    pub terminal_cause: Option<String>,
+    pub terminal_owner_id: Option<String>,
+    pub terminal_generation: Option<u64>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
     pub error: Option<String>,
     pub message: String,
@@ -126,6 +131,14 @@ pub struct PlaybackDiagnostics {
 }
 
 impl ReceiverStatus {
+    pub fn was_stopped_by_user_for(&self, owner_id: Option<&str>, generation: Option<u64>) -> bool {
+        self.terminal_cause.as_deref() == Some("USER_STOP")
+            && owner_id.is_some()
+            && owner_id == self.terminal_owner_id.as_deref()
+            && generation.is_some()
+            && generation == self.terminal_generation
+    }
+
     pub fn monitoring_error(&self) -> Option<String> {
         if self.healthy && self.service_active && self.error.is_none() {
             None
@@ -160,6 +173,13 @@ struct AuditedReceiverArtifact {
 // Every shipped APK must be added here after release, or the next version cannot
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e",
+        version_code: 36,
+        version_name: "0.17.2-v3-flow-candidate",
+        source_commit: "ce81f03b54285691b3ce602461180516b60a1d4b",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
     AuditedReceiverArtifact {
         sha256: "8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f",
         version_code: 35,
@@ -421,6 +441,11 @@ struct Health {
     foreground: bool,
     healthy: bool,
     audio_active: bool,
+    operation_owner_id: Option<String>,
+    operation_generation: Option<u64>,
+    terminal_cause: Option<String>,
+    terminal_owner_id: Option<String>,
+    terminal_generation: Option<u64>,
     playback_diagnostics: PlaybackDiagnostics,
     error: String,
 }
@@ -1623,6 +1648,11 @@ async fn status_with(
             foreground: false,
             healthy: false,
             audio_active: false,
+            operation_owner_id: None,
+            operation_generation: None,
+            terminal_cause: None,
+            terminal_owner_id: None,
+            terminal_generation: None,
             playback_diagnostics: None,
             error: None,
             message: "Receiver 尚未安装。".into(),
@@ -2372,6 +2402,11 @@ fn status_from_health(health: Health) -> ReceiverStatus {
         foreground: health.foreground,
         healthy: health.healthy,
         audio_active: health.audio_active,
+        operation_owner_id: health.operation_owner_id,
+        operation_generation: health.operation_generation,
+        terminal_cause: health.terminal_cause,
+        terminal_owner_id: health.terminal_owner_id,
+        terminal_generation: health.terminal_generation,
         playback_diagnostics: Some(health.playback_diagnostics),
         error: (!health.error.is_empty()).then_some(health.error),
         message,
@@ -2399,6 +2434,20 @@ fn parse_health(output: &str) -> Option<Health> {
             .get("audioActive")
             .and_then(|value| parse_bool(value))
             .unwrap_or(false),
+        operation_owner_id: fields
+            .get("operationOwnerId")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        operation_generation: parse_optional_metric(fields.get("operationGeneration")),
+        terminal_cause: fields
+            .get("terminalCause")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        terminal_owner_id: fields
+            .get("terminalOwnerId")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        terminal_generation: parse_optional_metric(fields.get("terminalGeneration")),
         playback_diagnostics: PlaybackDiagnostics {
             receiver_sample_rate: parse_optional_metric(fields.get("actualSampleRate")),
             receiver_channels: parse_optional_metric(fields.get("actualChannels")),

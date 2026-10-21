@@ -3,10 +3,11 @@ use crate::{
     aoa_winusb::{AoaCancel, AoaReader, AoaStream, AoaWriter},
     network::float_to_pcm24,
     p5c::{
-        self, Ack, ReceiverCapabilities, ReceiverState, SessionAudioQueue, AUDIO_PROTOCOL_MAJOR,
-        BIND, CAPABILITIES_QUERY, CAP_AUDIO_V2, CAP_PLAYBACK_PROGRESS, HEARTBEAT,
-        HOST_TO_RECEIVER_CONTROL, MANAGEMENT_CONTROL_MAJOR, PAUSE, PLAYBACK_PROGRESS_QUERY,
-        RECEIVER_TO_HOST_CONTROL, RESULT_OK, RESUME, SELECT_MODE, START, STOP,
+        self, Ack, ReceiverCapabilities, ReceiverState, SessionAudioQueue, TerminalCause,
+        AUDIO_PROTOCOL_MAJOR, BIND, CAPABILITIES_QUERY, CAP_AUDIO_V2, CAP_PLAYBACK_PROGRESS,
+        HEARTBEAT, HOST_TO_RECEIVER_CONTROL, MANAGEMENT_CONTROL_MAJOR, PAUSE,
+        PLAYBACK_PROGRESS_QUERY, RECEIVER_TO_HOST_CONTROL, RESULT_OK, RESULT_USER_STOPPED, RESUME,
+        SELECT_MODE, START, STOP,
     },
     protocol::{
         AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
@@ -14,6 +15,8 @@ use crate::{
     receiver::PlaybackDiagnostics,
     security::{BindingMaterial, HostHandshakeV2, SessionKeys},
 };
+
+use crate::p5c::{CAP_AOA_SESSION_RESTART, CAP_TERMINAL_CAUSE};
 use std::{
     io,
     sync::{
@@ -63,7 +66,10 @@ impl CancelIo for AoaCancel {
 enum OwnerCommand {
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
-    Stop(SyncSender<Result<(), String>>),
+    Stop {
+        restart: bool,
+        reply: SyncSender<Result<(), String>>,
+    },
     Abort,
 }
 
@@ -84,6 +90,7 @@ pub(crate) struct AoaSnapshot {
     pub(crate) last_error: Option<String>,
     pub(crate) playback_progress: Option<PlaybackDiagnostics>,
     pub(crate) pcm_payload_bytes_sent: u64,
+    pub(crate) terminal_cause: Option<TerminalCause>,
 }
 
 impl AoaOwner {
@@ -239,6 +246,7 @@ impl AoaOwner {
             last_error: None,
             playback_progress: None,
             pcm_payload_bytes_sent: 0,
+            terminal_cause: None,
         }));
         let worker_snapshot = snapshot.clone();
         let worker_bytes = Arc::new(AtomicU64::new(0));
@@ -303,12 +311,46 @@ impl AoaOwner {
         self.request(OwnerCommand::Resume)
     }
     pub(crate) fn stop(mut self) -> Result<(), String> {
-        let result = self.request(OwnerCommand::Stop);
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+            && self.snapshot().terminal_cause.is_some()
+        {
+            return self.join_after_terminal();
+        }
+        let result = self.request(|reply| OwnerCommand::Stop {
+            restart: false,
+            reply,
+        });
+        if result.is_err() && self.snapshot().terminal_cause.is_some() {
+            return self.join_after_terminal();
+        }
         if result.is_err() {
             stop_queue(&self.audio_queue);
             self.cancel.cancel_io();
         }
         self.join_worker().and(result)
+    }
+    pub(crate) fn stop_for_restart(mut self) -> Result<(), String> {
+        let result = self.request(|reply| OwnerCommand::Stop {
+            restart: true,
+            reply,
+        });
+        if result.is_err() {
+            stop_queue(&self.audio_queue);
+            self.cancel.cancel_io();
+        }
+        self.join_worker().and(result)
+    }
+
+    pub(crate) fn supports_session_restart(&self) -> bool {
+        self.snapshot().capabilities.capability_bits & CAP_AOA_SESSION_RESTART != 0
+    }
+    fn join_after_terminal(&mut self) -> Result<(), String> {
+        self.worker
+            .take()
+            .ok_or_else(|| "AOA owner worker was already joined.".to_string())?
+            .join()
+            .map(|_| ())
+            .map_err(|_| "AOA owner worker panicked.".to_string())
     }
     fn request(
         &self,
@@ -572,6 +614,9 @@ fn run_owner_worker<W: RecordWriter>(
         if let Ok(mut state) = snapshot.lock() {
             state.last_error = Some(error.clone());
             state.state = ReceiverState::Stopped;
+            if state.capabilities.capability_bits & CAP_TERMINAL_CAUSE != 0 {
+                state.terminal_cause = Some(TerminalCause::TransportFailure);
+            }
         }
     }
     cancel.cancel_io();
@@ -643,6 +688,22 @@ fn run_owner_loop<W: RecordWriter>(
                 HEARTBEAT,
                 &[],
             )?;
+            if ack.result == RESULT_USER_STOPPED
+                && ack.state == ReceiverState::Stopped
+                && snapshot
+                    .lock()
+                    .map_err(|_| "AOA snapshot poisoned.")?
+                    .capabilities
+                    .capability_bits
+                    & CAP_TERMINAL_CAUSE
+                    != 0
+            {
+                let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
+                view.state = ReceiverState::Stopped;
+                view.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+                stop_queue(queue);
+                return Ok(());
+            }
             if ack.result != RESULT_OK || ack.state == ReceiverState::Stopped {
                 return Err("AOA Receiver rejected heartbeat or stopped the session.".into());
             }
@@ -826,20 +887,32 @@ fn process_command<W: RecordWriter>(
     pending: &mut Option<PendingBlock>,
     snapshot: &Arc<Mutex<AoaSnapshot>>,
 ) -> Result<bool, String> {
-    let (kind, expected, response) = match command {
-        OwnerCommand::Pause(tx) => (PAUSE, ReceiverState::Paused, Some(tx)),
+    let (kind, expected, response, restart) = match command {
+        OwnerCommand::Pause(tx) => (PAUSE, ReceiverState::Paused, Some(tx), false),
         OwnerCommand::Resume(tx) => {
             if queue_is_stopped(queue) {
                 let _ = tx.send(Err("A stopped AOA queue requires a fresh session.".into()));
                 return Ok(false);
             }
             clear_queue(queue);
-            (RESUME, ReceiverState::ReceiverRunning, Some(tx))
+            (RESUME, ReceiverState::ReceiverRunning, Some(tx), false)
         }
-        OwnerCommand::Stop(tx) => {
+        OwnerCommand::Stop { restart, reply } => {
+            if restart
+                && snapshot
+                    .lock()
+                    .map_err(|_| "AOA snapshot poisoned.")?
+                    .capabilities
+                    .capability_bits
+                    & CAP_AOA_SESSION_RESTART
+                    == 0
+            {
+                let _ = reply.send(Err("AOA Receiver does not support session restart.".into()));
+                return Ok(false);
+            }
             stop_queue(queue);
             *pending = None;
-            (STOP, ReceiverState::Stopped, Some(tx))
+            (STOP, ReceiverState::Stopped, Some(reply), restart)
         }
         OwnerCommand::Abort => return Ok(true),
     };
@@ -859,6 +932,7 @@ fn process_command<W: RecordWriter>(
         *pending = None;
         clear_queue(queue);
     }
+    let mut terminal_stop = false;
     let result = exchange_command(
         writer,
         records,
@@ -868,9 +942,30 @@ fn process_command<W: RecordWriter>(
         command_sequence,
         ack_sequence,
         kind,
-        &[],
+        if restart { &[1] } else { &[] },
     )
     .and_then(|ack| {
+        if ack.result == RESULT_USER_STOPPED {
+            if ack.state != ReceiverState::Stopped
+                || snapshot
+                    .lock()
+                    .map_err(|_| "AOA snapshot poisoned.")?
+                    .capabilities
+                    .capability_bits
+                    & CAP_TERMINAL_CAUSE
+                    == 0
+            {
+                return Err(
+                    "AOA Receiver returned an invalid authenticated terminal cause.".into(),
+                );
+            }
+            terminal_stop = true;
+            *state = ReceiverState::Stopped;
+            let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
+            view.state = ReceiverState::Stopped;
+            view.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+            return Ok(());
+        }
         require_ack(
             &ack,
             expected,
@@ -881,9 +976,20 @@ fn process_command<W: RecordWriter>(
             },
         )?;
         *state = ack.state;
-        snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?.state = ack.state;
+        let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
+        view.state = ack.state;
+        if kind == STOP {
+            view.terminal_cause = Some(TerminalCause::HostStop);
+        }
         Ok(())
     });
+    if terminal_stop {
+        stop_queue(queue);
+        if let Some(tx) = response {
+            let _ = tx.send(Err("AOA Receiver stopped the session.".into()));
+        }
+        return Ok(true);
+    }
     let stopping = kind == STOP;
     if let Some(tx) = response {
         let _ = tx.send(result.clone());

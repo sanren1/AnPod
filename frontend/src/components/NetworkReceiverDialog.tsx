@@ -70,6 +70,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const peerManuallyEdited = useRef(false);
   const peerSelectionSource = useRef<"candidate" | "manual" | null>(null);
   const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy || backgroundTrustBusy;
+  const selectedOffer = offers.offers.find(offer => offer.id === selectedOfferId) ?? (offers.offers.length === 1 ? offers.offers[0] : null);
   const receiverProgressStage = receiverOperationProgress?.serial === serial ? receiverOperationProgress.stage : null;
   const receiverProgressLabel = receiverProgressStage === "checking" ? strings.network.receiverProgressChecking
     : receiverProgressStage === "transferring" ? strings.network.receiverProgressTransferring
@@ -676,24 +677,24 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             <div className="receiver-status-copy" role="status" aria-live="polite">
               <strong>{offers.active ? strings.network.listeningAt(offers.interfaceAddress ?? strings.network.networkInterface) : strings.network.allowBoundPhone}</strong>
               <small>{offers.active
-                ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.automaticBinding ? strings.network.autoAuthenticateBinding(bindingLabel(offers.automaticBinding)) : strings.network.autoAuthDisabled
+                ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.offers.length === 1 ? strings.network.confirmRequestOnPc : strings.network.waitPhoneReceive
                 : bindings.length === 0 ? strings.network.firstUseBindOverUsb : strings.network.phoneCanStartOneTap}</small>
             </div>
             {!offers.active && <button className="dialog-secondary" type="button" disabled={busy || audioSessionActive || !localAddress || !bindingReference} onClick={() => void onSetOfferListener(localAddress, true, bindingReference || undefined)}>{strings.network.startListening}</button>}
           </div>
-          {offers.active && (!offers.automaticBinding || offers.offers.length > 1) && <>
+          {offers.active && <>
             {offers.offers.length > 0
               ? <div className="candidate-list" aria-label={strings.network.unverifiedPhoneRequests}>
-                  {offers.offers.map(offer => <button type="button" key={offer.id} disabled={busy || audioSessionActive} aria-pressed={selectedOfferId === offer.id} onClick={() => setSelectedOfferId(offer.id)}>
-                    <span>{offer.endpoint}</span><small>{strings.network.unverifiedPhoneRequest(selectedOfferId === offer.id)}</small>
+                  {offers.offers.map(offer => <button type="button" key={offer.id} disabled={busy || audioSessionActive} aria-pressed={selectedOffer?.id === offer.id} onClick={() => setSelectedOfferId(offer.id)}>
+                    <span>{offer.endpoint}</span><small>{strings.network.unverifiedPhoneRequest(selectedOffer?.id === offer.id)}</small>
                   </button>)}
                 </div>
               : <p className="network-hint">{strings.network.waitPhoneReceive}</p>}
             <p className="network-hint">{bindings.length === 0 ? strings.network.noSavedBinding
               : bindingReference ? strings.network.useBindingWhenAccepted(bindingLabel(bindingReference))
                 : strings.network.multipleSavedBindings}</p>
-            {offers.offers.length > 1 && !selectedOfferId && <p className="network-hint">{strings.network.chooseRequestToAccept}</p>}
-            <button className="primary-button" type="button" disabled={busy || audioSessionActive || !selectedOfferId || !bindingReference || !offers.offers.some(offer => offer.id === selectedOfferId)} onClick={() => onAcceptOffer(selectedOfferId, bindingReference)}>{strings.network.acceptSelectedPhone}</button>
+            {offers.offers.length > 1 && !selectedOffer && <p className="network-hint">{strings.network.chooseRequestToAccept}</p>}
+            <button className="primary-button" type="button" disabled={busy || audioSessionActive || !selectedOffer || !bindingReference} onClick={() => selectedOffer && onAcceptOffer(selectedOffer.id, bindingReference)}>{strings.network.acceptSelectedPhone}</button>
             {audioSessionActive && <p className="network-hint">{strings.network.cannotAcceptDuringAudio}</p>}
           </>}
         </section>}

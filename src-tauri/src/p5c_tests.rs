@@ -517,14 +517,20 @@ fn spawn_fail_start_endpoint(
 
 fn spawn_recovery_window_endpoint(
     classes: &Path,
+    legacy_terminal_cause: bool,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
     let (_, java) = java_paths();
-    let mut child = Command::new(java)
+    let mut command = Command::new(java);
+    command
         .arg("-cp")
         .arg(classes)
         .arg("app.anpod.receiver.P5cLoopbackEndpoint")
         .arg("--drop-after-ms=450")
-        .arg("--close-on-stdin")
+        .arg("--close-on-stdin");
+    if legacy_terminal_cause {
+        command.arg("--capabilities-legacy-terminal-cause");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -759,7 +765,7 @@ fn rejected_handshake(classes: &Path, wrong_secret: bool) {
         }
     )
     .is_err());
-    let result = finish_endpoint(child, stdout);
+    let result = ChildGuard::new(child).finish(stdout);
     assert!(
         result.starts_with("session_failed,0,0,0,0,"),
         "unauthenticated handshake must not stop playback: {result}"
@@ -943,7 +949,10 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
         .expect("authenticated capability preflight before BIND");
     assert_eq!(capabilities.control_major, 3);
     assert_eq!(capabilities.audio_major, 1);
-    assert_eq!(capabilities.capability_bits, 3 | CAP_PLAYBACK_PROGRESS);
+    assert_eq!(
+        capabilities.capability_bits,
+        3 | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE
+    );
     assert_eq!(
         capabilities.version_code, 0,
         "localhost fixture versionCode is informational only"
@@ -1403,7 +1412,7 @@ fn thrown_start_and_stop_still_destroy_context_before_retry() {
 #[test]
 fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
     let classes = compile_java_endpoint();
-    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes);
+    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes, false);
     let mut child = ChildGuard::new(child);
     let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
     let timing = SessionTiming {
@@ -1467,6 +1476,91 @@ fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
     owner.stop();
     let _ = child.finish(stdout);
     let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn legacy_receiver_disconnect_stops_without_guessing_recovery() {
+    let classes = compile_java_endpoint();
+    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes, true);
+    let mut child = ChildGuard::new(child);
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(25); 4],
+        recovery_window: Duration::from_secs(2),
+    };
+    let mut owner = SessionOwner::start_with_endpoint(
+        SessionEndpoint::on_interface(&interface, peer),
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning
+    });
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    assert_eq!(stopped.attempts, 1, "legacy endpoint must not be retried");
+    assert_eq!(
+        stopped.terminal_cause,
+        Some(TerminalCause::TransportFailure)
+    );
+    assert!(stopped
+        .last_error
+        .as_deref()
+        .is_some_and(|message| message.contains("terminal-cause capability")));
+    owner.stop();
+    child
+        .child_mut()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"close")
+        .unwrap();
+    let result = child.finish(stdout);
+    assert!(
+        result.contains(",1,"),
+        "unexpected legacy fixture result: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn initial_connection_failure_does_not_retry_in_background() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    drop(listener);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(10); 4],
+        recovery_window: Duration::from_secs(2),
+    };
+    let mut owner = SessionOwner::start_with_timing(
+        peer,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    thread::sleep(Duration::from_millis(80));
+    assert_eq!(stopped.attempts, 1);
+    assert_eq!(owner.snapshot().attempts, 1);
+    owner.stop();
 }
 
 #[test]
