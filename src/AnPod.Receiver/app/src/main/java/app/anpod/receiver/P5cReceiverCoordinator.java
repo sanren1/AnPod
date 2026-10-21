@@ -525,6 +525,10 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     authenticatedSocket = null;
                     terminalCauseNegotiated = false;
                     discoveryResumePending = true;
+                    // If the host disappeared before the requested authenticated
+                    // terminal ACK, finish the manual stop locally after liveness
+                    // timeout instead of accepting a reconnect.
+                    if (userStopRequested) shutdownRequested = true;
                 }
                 preAuthSockets.remove(socket);
                 if (activeSocket == socket) {

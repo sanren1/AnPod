@@ -1146,6 +1146,30 @@ public final class ReceiverServiceRobolectricTest {
         service.onDestroy();
     }
 
+    @Test
+    public void phoneStopDoesNotDeferWhileP5cCoordinatorIsOnlyListening() throws Exception {
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
+                new byte[16], new byte[16], new byte[32]);
+        P5cReceiverCoordinator coordinator = P5cReceiverCoordinator.openLoopback(binding,
+                new P5cReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean start(UdpSessionContext context,
+                            P5cReceiverCoordinator.StartPermission permission) { return false; }
+                    @Override public void pause() {}
+                    @Override public void resume() {}
+                    @Override public void stop() {}
+                    @Override public boolean streaming() { return false; }
+                    @Override public void shutdown() {}
+                });
+        try {
+            coordinator.start();
+            assertFalse("a listening owner has no authenticated host to receive terminal ACK",
+                    coordinator.requestUserStop());
+        } finally {
+            coordinator.close();
+            binding.close();
+        }
+    }
+
 
     @Test
     public void idleWaveformIsFlat() {
