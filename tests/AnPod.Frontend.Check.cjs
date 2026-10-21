@@ -902,7 +902,7 @@ fs.mkdirSync(out, {recursive:true});
   await dialog.getByRole('button',{name:'刷新接口和配对信息',exact:true}).click();
   await page.waitForTimeout(100);
   results.userSelectionsSurviveRefresh=await dialog.getByLabel('电脑网络接口').inputValue()==='192.168.60.2'&&await dialog.getByLabel('已配对手机').inputValue()==='phoneD-abcdef';
-  await dialog.getByRole('button',{name:'开始监听',exact:true}).click();
+  await dialog.getByRole('button',{name:'等待手机发起连接',exact:true}).click();
   results.listenerUsesExplicitChoices=await page.evaluate(()=>window.reviewListenerCalls.at(-1)?.localAddress==='192.168.60.2'&&window.reviewListenerCalls.at(-1)?.bindingReference==='phoneD-abcdef');
   await dialog.getByText(/手机点击“连接电脑”后自动认证/).waitFor();
   results.automaticModeDoesNotOfferPerRequestApproval=await dialog.getByRole('button',{name:'接受并连接所选手机',exact:true}).count()===0;
@@ -1154,8 +1154,8 @@ fs.mkdirSync(out, {recursive:true});
    await bootstrapMethod.click();
     try { await page.waitForFunction(()=>{const dialog=document.querySelector('dialog[open][aria-label="连接手机"]');return dialog?.querySelector('.network-connect')?.disabled===false;},{timeout:5000}); }
    catch(error){console.log('Old-compatible bootstrap dialog:',await networkDialog.innerText());console.log('Old-compatible mock calls:',await page.evaluate(()=>window.reviewCalls));throw error;}
-   results.compatibleOldReceiverCanConnectWithOptionalUpgrade=await networkDialog.getByRole('button',{name:'USB 升级选项',exact:true}).isVisible()&&await networkDialog.getByRole('button',{name:'首次绑定并连接',exact:true}).isEnabled();
-   await networkDialog.getByRole('button',{name:'首次绑定并连接',exact:true}).click();
+   results.compatibleOldReceiverCanConnectWithOptionalUpgrade=await networkDialog.getByRole('button',{name:'USB 升级选项',exact:true}).isVisible()&&await networkDialog.getByRole('button',{name:'直接连接这台手机（首次）',exact:true}).isEnabled();
+   await networkDialog.getByRole('button',{name:'直接连接这台手机（首次）',exact:true}).click();
    await page.waitForFunction(()=>window.reviewCalls.start_network_audio===1);
    results.oldReceiverStartsFirstBindWithoutUpgrade=await page.evaluate(()=>window.reviewCommandArgs.start_network_audio?.bootstrapSerial==='TESTUSB'&&window.reviewRead().sessionTransport==='lan'&&window.reviewRead().sessionCapabilities?.versionCode===6);
    fs.writeFileSync(`${out}/result.json`,JSON.stringify(results,null,2));
@@ -1334,7 +1334,7 @@ fs.mkdirSync(out, {recursive:true});
   await page.getByRole('button',{name:'连接手机',exact:true}).click();
   await page.getByRole('dialog',{name:'连接手机'}).getByRole('alert').filter({hasText:'连接没有完成'}).waitFor();
   const fallbackDialog=page.getByRole('dialog',{name:'连接手机'});
-  await fallbackDialog.getByRole('button',{name:'开始监听',exact:true}).click();
+  await fallbackDialog.getByRole('button',{name:'等待手机发起连接',exact:true}).click();
   await page.waitForFunction(()=>window.reviewListenerCalls.at(-1)?.allowed===true);
   results.backgroundAuthFailureKeepsManualOfferPath=await page.evaluate(before=>window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired===true&&window.reviewListenerCalls.at(-1)?.allowed===true&&(window.reviewCalls.query_background_trust||0)===before,trustQueriesBeforeFailure);
   await fallbackDialog.getByRole('button',{name:'关闭',exact:true}).click();

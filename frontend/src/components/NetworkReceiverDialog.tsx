@@ -672,6 +672,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
         {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={error} summaryRef={alertRef} />
           : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
         {busy && !receiverOperationBusy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
+        {!receiverManagerOnly && udpMode && <p className="network-hint connect-choice-hint">{strings.network.connectChoiceHint}</p>}
         {!receiverManagerOnly && udpMode && <section className="receiver-manager offer-manager" aria-label={strings.network.offerListenerLabel}>
           <div className="receiver-status-row">
             <div className="receiver-status-copy" role="status" aria-live="polite">
