@@ -47,11 +47,11 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const listeningStarted = useRef(false);
   useEffect(() => {
     if (listeningStarted.current) return;
-    if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive) return;
+    if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive || disabled) return;
     if (!localAddress || !bindingReference || offers.active) return;
     listeningStarted.current = true;
     void listenerCall.current(localAddress, true, bindingReference, true);
-  }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, localAddress, bindingReference, offers.active]);
+  }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, disabled, localAddress, bindingReference, offers.active]);
   useEffect(() => {
     if (audioSessionActive && listeningStarted.current) {
       listeningStarted.current = false;
@@ -384,7 +384,8 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       const local = interfaces.find(value => value.address === localAddress);
       if (!isIpv4Endpoint(peer)) { setLocalError(strings.network.chooseCandidateOrIpv4); return; }
       if (!endpointFitsInterface(peer, local)) { setLocalError(strings.network.endpointOutsideSubnet); return; }
-      onStart({ localAddress, peer: peer.trim(), bindingReference, backgroundAuthorizationRequired: true });
+      // A user-initiated connect happens while the phone is awake; it must not demand the standby capability.
+      onStart({ localAddress, peer: peer.trim(), bindingReference, backgroundAuthorizationRequired: false });
       return;
     }
     if (method === "bootstrap") {
