@@ -610,8 +610,10 @@ PC 1.10.2 与配套前端实现已完成。后端 `cargo fmt`、`cargo check` �
 
 PC 离线验收：`cargo fmt --check`、`cargo check --offline`、5 个跨端/恢复定向用例和新 APK artifact-read 均通过；JDK 17 环境完整串行 Rust suite 为 **145 passed、0 failed、1 ignored**。前端 TypeScript、Vite build 与针对 USB/ADB、无线 ADB、LAN、AOA 模式切换、手动接受请求、音质提示的 Playwright 矩阵通过；旧全量 UI harness 因旧断言仅部分执行，不计全量通过。证据见 `.tmp-frontend-check/connection-v3-check.json` 及其引用文件。
 
-Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connection-v3-receiver-release/receiver.apk`，SHA-256 `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`；来源 `ce81f03b54285691b3ce602461180516b60a1d4b`，`sourceModified=false`，sourceInputsSha256 `2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`；签名 SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。精确 artifact 读取校验通过。当前等待 PC 便携包构建及包内容审计。
+Receiver 0.17.2/code 36 已用现有发布密钥签名构建：`artifacts/connection-v3-receiver-release/receiver.apk`，SHA-256 `0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e`；来源 `ce81f03b54285691b3ce602461180516b60a1d4b`，`sourceModified=false`，sourceInputsSha256 `2599b5dcc07c92303fc4bf1f082dc17ef01113c28d897276253cd41fd9199f6e`；签名 SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。精确 artifact 读取校验通过。PC 便携包构建及包内容审计已完成。
 
 同一冻结 Android 输入最终离线复验：`ReceiverServiceRobolectricTest` **33/33**、`AoaReceiverCoordinatorTest` **6/6**，均无失败、错误或跳过；测试前后输入快照与签名 APK metadata 一致。
 
 保持用户要求跳过实机核查；真实 WinUSB 权限、USB/ADB 设备影响、手机安装升级、Oboe/AudioTrack 播放、拔插及声学表现仍为 **NOT_TESTED**。P5-C 主动停止无主机 ACK 的收尾使用现有 5 秒超时，未单独运行等待该超时的 loopback 用例。保留三个用户 Android 缓存目录及历史可回退制品。
+
+便携交付：`artifacts/AnPod-1.10.3-tauri-win-x64-portable.zip`，18,454,241 bytes，SHA-256 `3f359dd78bffc68a31dbe07a1f6c76f5994988f9f8b831d7425c576505e452dd`；EXE ProductVersion 1.10.3，SHA-256 `6e037bdf3195a9beeac6ca79c856083d4b9f85aec6f1273db51eea6fb8c23ddf`。PC 构建来源 `f89963aa5c1fbfe5645f40bc7e65a124e937c8d7`，desktopInputsSha256 `b27281c1e9d780652dda0564e91f9a7af58c9c27841d1331c8bf511063525439` 与冻结输入重算一致。独立包审计 `artifacts/connection-v3-portable-audit.json` 为 PASS：49 个 ZIP/stage 条目逐项路径、长度、哈希一致；Receiver exact release、Native/Legacy provenance 和版本通过；README 本地链接 10 个可解析、0 个失效；无密钥、缓存、日志或 secret marker。metadata 的 workingTreeDirty=true 仅由保留的三个用户缓存目录造成，受跟踪源码无改动。使用新版功能须同步升级随包 Receiver code 36。上述离线结果不改变实机 NOT_TESTED 状态。
