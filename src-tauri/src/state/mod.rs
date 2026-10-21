@@ -102,7 +102,7 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     #[serde(default = "usb")]
     pub preferred_transport: String,
-    #[serde(default = "adb")]
+    #[serde(default = "aoa")]
     pub wired_mode: String,
     #[serde(default)]
     pub wireless_protocol: String,
@@ -138,8 +138,9 @@ fn usb() -> String {
 fn udp() -> String {
     "udp".into()
 }
-fn adb() -> String {
-    "adb".into()
+
+fn aoa() -> String {
+    "aoa".into()
 }
 fn receiver() -> String {
     "receiver".into()
@@ -162,7 +163,7 @@ impl Default for AppSettings {
             minimize_to_tray: true,
             launch_at_login: false,
             preferred_transport: usb(),
-            wired_mode: adb(),
+            wired_mode: "aoa".into(),
             wireless_protocol: udp(),
             audio_backend: receiver(),
             last_wireless_endpoint: None,

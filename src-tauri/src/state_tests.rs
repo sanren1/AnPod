@@ -105,7 +105,7 @@ fn sample_snapshot() -> AppSnapshot {
 fn audio_quality_defaults_and_rejects_unavailable_profiles_without_changing_playback_mode() {
     let old_settings: AppSettings = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(old_settings.audio_quality, "standard");
-    assert_eq!(old_settings.wired_mode, "adb");
+    assert_eq!(old_settings.wired_mode, "aoa");
 
     assert!(validate_audio_quality("hifi").is_ok());
     assert!(validate_audio_quality("hires").is_ok());
@@ -458,7 +458,7 @@ fn settings_keep_schema_one_names_and_defaults() {
     let value = serde_json::to_value(AppSettings::default()).unwrap();
     assert_eq!(value["schemaVersion"], 1);
     assert_eq!(value["preferredTransport"], "Usb");
-    assert_eq!(value["wiredMode"], "adb");
+    assert_eq!(value["wiredMode"], "aoa");
     assert_eq!(value["lastUsbDirectTargetId"], serde_json::Value::Null);
     assert_eq!(
         value["lastUsbDirectBindingReference"],
