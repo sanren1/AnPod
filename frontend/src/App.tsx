@@ -540,7 +540,7 @@ function App() {
     } catch (error) {
       if (panelRef.current === "network" || panelRef.current === "setup") setNetworkDialogError(String(error));
       else if (panelRef.current === null && networkStartPanel.current === null) {
-        openNetworkDialog(true, { localAddress: request.localAddress, bindingReference: request.bindingReference }, true);
+        openNetworkDialog(true, { localAddress: request.localAddress, bindingReference: request.bindingReference ?? "" }, true);
         setNetworkDialogError(String(error));
       }
     }
