@@ -2,7 +2,7 @@
 
 > 版本：1.1（工程执行基线；补充开源项目、官方指南及可复用实现调研）  
 > 制定日期：2026-10-19  
-> 当前开发：PC 1.10.14 / Receiver 0.17.6 code 40，UI/UX 规划及自动监听修复进行中，尚未出包或实机复测；本轮输入为 `dev@0f261bb`（PC 1.10.13 / Receiver 39）。UI/UX 细项见 `AnPod_UI_UX_Plan/plan.md`。下文保留历史调研、提交与制品记录，不表示历史候选是本轮制品。
+> 当前开发：PC 1.10.14 / Receiver 0.17.6 code 40，本轮 UI/UX 规划、自动监听修复及独立 Astra 审查修订已完成；签名本地候选与 18 项包审计通过，实机仍 NOT_TESTED，未远程发布。桌面构建来源 `27c7c60`、Receiver 来源 `3dfb08c`。UI/UX 细项见 `AnPod_UI_UX_Plan/plan.md` 第 14 节及本文末。下文保留历史调研、提交与制品记录，旧版本记录不代表本轮制品。
 > 适用平台：Windows 10/11 x64；Android 6.0+；重点验证 vivo iQOO 11 / Android 16 (API 36)  
 > 项目阶段：Phase 1–6c、连接策略与独立 Astra 修订，以及本轮持久化有线模式、切网清理、采集初始化和 Oboe 默认选择，均已完成源码、离线验收与独立审查；签名候选和便携包审计通过，记录见文末。真实 WASAPI capture、手机硬件输出格式/精度、AOA 权限与拔插、吞吐、声学/延迟/长时稳定性及实机原地升级仍为 **NOT_TESTED**；按用户要求跳过旧实机核查，离线门禁不改变此状态。
 
@@ -671,3 +671,24 @@ PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈�
 独立审计 `artifacts/wired-mode-v4-portable-audit.json` 为 PASS，18 项 predicates 全 true：ZIP/stage 49 项路径、长度、SHA 一致；EXE 版本、Receiver exact release、Native/Legacy 实物哈希与来源通过；README 与工作区字节及冻结提交换行归一化内容一致，SHA-256 `6c40935231473778934d8332dca8135feaeaf3652af774003ac975c40f0fa656`，本地候选版本/API24 门槛正确，10 本地链接全部有效；禁止文件及已知 secret marker 均为 0。根代理另行打开 ZIP 逐项重算全部文件并复核 package/EXE/component/README 哈希、元数据与输入快照，验收 PASS。metadata workingTreeDirty=true 仅由保留的三个既有用户缓存造成；冻结时受跟踪文件无修改。过时的未交付封包、审计及本轮临时构建日志已清理，有效工具/编译缓存和历史旧包保留。
 
 使用本轮功能需同步更新 PC1.10.5 与随包 Receiver38。离线结果保持 Rust151 passed/0 failed/1原有辅助忽略、Android44全部通过、实际新 APK 读取1/1、浏览器 AOA25及音质17专项断言通过；旧全量前端 harness 不计通过。Direct 仍暂不作为新默认，但会持久保存用户选择；发现/预选不自动播放，任一端手动断开不重连。Direct 需 Android7/API24+，ADB/LAN 仍支持 Android6。更多厂商物理切换、WinUSB权限、原地升级、真实96k采集、Oboe/AudioTrack播放与声学表现仍 NOT_TESTED，后续扩大默认及适配范围需相应硬件证据，本轮未绕过这些限制。
+## 2026-10-22 · UI/UX、自动监听与独立审查闭环
+
+本轮基于 `dev@0f261bb`，已完成 `AnPod_UI_UX_Plan/plan.md` 第 14 节的全部源码任务及本地交付验收。执行代理为 GPT 6 luna high，独立审查为全新 GPT 6 astra high。初审发现 1 项 P1、4 项 P2，修订后全部关闭；审查与源码复核证据见 `artifacts/uiux-20261022-astra-review.md`。
+
+- 自动监听由 App 统一管理；主屏等待复用快照轮询，覆盖真实后端收到请求但不主动推送事件的契约。主屏可主动连接唯一候选，空发现进入等待，歧义或已失效的网络/绑定需要明确选择。
+- 网络启动失败可见，取消覆盖主动启动、首次设置及接受手机请求；迟到结果不抢占界面。取消 ACK 等待期间禁止重复连接，已经建立的会话实际断开；手动断开不自动重播。
+- 设备区收束、首次设置入口、无线展示职责拆分、常用/高级设置、短说明和手机状态/诊断层级已完成。保留三档明确音质、实际格式、既有配对/签名/AOA 授权与默认 Oboe，不新增自动降档或 SRC。
+
+有效检查：完整浏览器流程 57 项全真、24 组布局无溢出；确认取消/界面 21 项全真；独立 QA 无线 35、向导 27、音质 19、诊断 22 项全真，各控制台错误 0。证据在 `artifacts/uiux-20261022-frontend-checks/astra-*`。发布阶段实际 `tsc -b`、Vite production build、Rust release build 与 Node 语法检查通过。前期 Rust 基线为 151 passed / 1 ignored；Android 前期全套 88 项与最新定向状态测试 2 项分别通过，不将其合称 90 项全套。实际新 APK 的 Rust exact artifact-read 1/1 通过。最后等价布尔整理及一行可选绑定类型适配由 Astra 复核，不冒称随后重跑整套浏览器回归。
+
+本地制品已通过独立 18 项审计（`artifacts/uiux-20261022-delivery-audit.json` / `.md`），根代理另行核对 ZIP 与目录全部 49 项路径、长度和 SHA-256，通过：
+
+| 制品 | 版本与来源 | SHA-256 |
+| --- | --- | --- |
+| `artifacts/AnPod-1.10.14-tauri-win-x64-portable.zip` | 18,466,063 bytes；桌面构建 `27c7c606048305fabfb2cedcc84abd72de4203c4` | `a064fdcabb0cca90d5e96e9ecf6ea381b3b282a687cdf0dd463761a13ad0baff` |
+| 包内 `AnPod.exe` | ProductVersion 1.10.14 | `08178d77270327709fb21d53bd316144172d3861a389808fe455b68404c4f21f` |
+| 包内及 `artifacts/uiux-20261022-receiver40/receiver.apk` | release / 0.17.6-v3-flow-candidate / code40；来源 `3dfb08cd0487fb2ea3b1b9d20a7c508727a73486` | `56578ab87996fb12b16d919f8c6996a86f13a4230703dd07f6f58c202bf2d01f` |
+
+桌面输入快照 `6f3cc1a17216c60087f1b267a1f8d3ad203c94eefd82f2be7da41ca8954e6f58`，Receiver 输入快照 `1130341514450fc472d43026de7a5465895927dafe69603a52ab1b5749799e3e`，均与当前输入复算一致；Receiver `sourceModified=false`，沿用发布证书 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`，aapt/apksigner、精确审计登记通过。Native/Legacy 按角色验证包内已登记哈希，README 与工作树及构建提交一致、11 个本地链接存在，Direct API24 / ADB-LAN API23 门槛与代码一致，无私钥、私有 env、构建缓存或日志混入包。
+
+构建时 `workingTreeDirty=true` 来自保留的三个原有缓存，源码输入未改；本节与 UI 规划的交付文档更新位于两个输入范围之外，不改变制品来源。新 APK 中间构建目录、过期测试尝试和临时浏览器/服务缓存已清理；有效结果、旧版制品和用户缓存保留。使用本轮变更需同步更新 PC 与随包手机应用。未推送或远程发布；真实三链路、防火墙/切网、USB 权限/热插拔、手机安装升级、硬件采集/输出、音质/延迟/长时稳定性仍 **NOT_TESTED**，按用户要求跳过旧实机核查。
