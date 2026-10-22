@@ -9,10 +9,16 @@ export function Modal({ title, children, onClose, className = "" }: { title: str
   useEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!dialog.open) dialog.showModal();
     const key = (event: KeyboardEvent) => { if (event.key === "Escape") { event.preventDefault(); onCloseRef.current(); } };
     dialog.addEventListener("keydown", key);
-    return () => { dialog.removeEventListener("keydown", key); if (dialog.open) dialog.close(); };
+    return () => {
+      dialog.removeEventListener("keydown", key);
+      if (dialog.open) dialog.close();
+      const replacementModal = [...document.querySelectorAll("dialog.modal")].some(candidate => candidate !== dialog);
+      if (!replacementModal && opener?.isConnected) opener.focus({ preventScroll: true });
+    };
   }, []);
   return <dialog ref={ref} aria-label={title} className={`modal ${className}`} onCancel={event => { event.preventDefault(); onClose(); }} onClick={event => { const dialog = ref.current; if (!dialog || event.target !== dialog) return; const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose(); }}>
     <div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label={strings.modal.close}><X size={18} /></button></div>{children}
