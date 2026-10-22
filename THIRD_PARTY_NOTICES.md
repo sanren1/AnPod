@@ -75,6 +75,15 @@ MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
 `LICENSES/` where available. Each Rust crate retains the licence terms recorded
 in its published package; see the lockfile for exact versions.
 
+The frontend also includes Motion 14.6.0. Its `motion`, `motion-dom` and
+`motion-utils` packages carry the MIT licence with the copyright notice for
+Motion B.V.; `framer-motion` carries its MIT licence with the copyright notice
+for Framer B.V. Their package manifests name Matt Perry as author. The package
+licence texts are included in `LICENSES/Motion-MIT.txt` and
+`LICENSES/Framer-Motion-MIT.txt`. Motion's `tslib` dependency resolves to
+version 2.8.1 under 0BSD, with Microsoft's copyright and licence text in
+`LICENSES/tslib-0BSD.txt`.
+
 The P3 localhost UDP prototype adds Rust crates `aes-gcm` 0.11.1 for
 AES-256-GCM authenticated encryption, `sha2` 0.10.9 for SHA-256, and
 `getrandom` 0.3.4 for session material. Each is dual-licensed MIT or

@@ -13,6 +13,7 @@ import { DiagnosticsDialog } from "./components/DiagnosticsDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { AoaDialog } from "./components/AoaDialog";
 import { ErrorDetails } from "./components/Modal";
+import { FluidSegmentedControl } from "./components/ui/FluidSegmentedControl";
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -921,10 +922,16 @@ function App() {
 
       <section className="connection-section" aria-label={strings.app.connectionMode}>
         <div className="section-title"><h2>{strings.app.connectionMode}</h2></div>
-        <div className="transport-switch" role="group" aria-label={strings.app.connectionMode}>
-          <button aria-pressed={snapshot.connectionTransport === "usb"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "usb")}><Usb size={16} aria-hidden="true" />{strings.app.usb}</button>
-          <button aria-pressed={snapshot.connectionTransport === "wireless"} disabled={controlsDisabled || snapshot.wirelessConnectionOffers.active} onClick={() => void setOption("transport", "wireless")}><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</button>
-        </div>
+        <FluidSegmentedControl
+          className="transport-switch"
+          label={strings.app.connectionMode}
+          value={snapshot.connectionTransport}
+          options={[
+            { value: "usb", label: <><Usb size={16} aria-hidden="true" />{strings.app.usb}</>, disabled: controlsDisabled || snapshot.wirelessConnectionOffers.active },
+            { value: "wireless", label: <><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</>, disabled: controlsDisabled || snapshot.wirelessConnectionOffers.active },
+          ]}
+          onValueChange={value => void setOption("transport", value)}
+        />
         {snapshot.connectionTransport === "usb" && <div className="wired-mode-section">
           <div className="mode-row"><h3>{strings.app.wiredMode}</h3><div className="transport-switch" role="group" aria-label={strings.app.wiredMode}>
             <button aria-pressed={wiredMode === "adb"} disabled={controlsDisabled} onClick={() => setWiredMode("adb")}>{strings.app.wiredModeAdb}</button>
@@ -958,10 +965,16 @@ function App() {
           <strong>{snapshot.settings.playbackMode === "Balanced" ? strings.app.balanced : strings.app.lowLatency}</strong>
         </summary>
         <div className="mode-section" aria-label={strings.app.playbackMode}>
-          <div className="mode-switch" role="group" aria-label={strings.app.playbackMode}>
-            <button aria-pressed={snapshot.settings.playbackMode === "Balanced"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "balanced")}>{strings.app.balanced}</button>
-            <button aria-pressed={snapshot.settings.playbackMode === "LowLatency"} disabled={controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes)} onClick={() => void setOption("playback", "lowLatency")}>{strings.app.lowLatency}</button>
-          </div>
+          <FluidSegmentedControl
+            className="mode-switch"
+            label={strings.app.playbackMode}
+            value={snapshot.settings.playbackMode}
+            options={[
+              { value: "Balanced", label: strings.app.balanced, disabled: controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes) },
+              { value: "LowLatency", label: strings.app.lowLatency, disabled: controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes) },
+            ]}
+            onValueChange={value => void setOption("playback", value === "Balanced" ? "balanced" : "lowLatency")}
+          />
           <p className="mode-description" role="status" aria-live="polite">{snapshot.settings.playbackMode === "Balanced" ? strings.app.balancedDescription : strings.app.lowLatencyDescription}</p>
           {aoaPlaybackRestartUnavailable && <p className="dialog-footnote">{strings.app.aoaPlaybackModeUpdate}</p>}
         </div>

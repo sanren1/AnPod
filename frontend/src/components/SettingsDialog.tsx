@@ -23,37 +23,47 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     ? `${android.sampleRate === null ? strings.app.audioFormatUnknown : `${android.sampleRate / 1000} kHz`} · ${android.encoding === null ? strings.app.audioFormatUnknown : strings.app.androidSampleFormats[android.encoding]} · ${android.channels === null ? strings.app.audioFormatUnknown : `${android.channels} ch`}`
     : strings.app.audioFormatUnknown;
   return <Modal title={strings.app.settingsTitle} onClose={onClose} className="settings-dialog">
-    <h3>{strings.app.windowAppearance}</h3>
-    <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy} value={settings.appearanceTheme} onChange={event => update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
-    <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
-    <SettingToggle disabled={snapshot.busy} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
+    <section className="settings-group settings-appearance" aria-labelledby="settings-appearance-title">
+      <h3 id="settings-appearance-title">{strings.app.windowAppearance}</h3>
+      <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy} value={settings.appearanceTheme} onChange={event => update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
+      <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
+      <SettingToggle disabled={snapshot.busy} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
+    </section>
     <details className="settings-disclosure">
       <summary><span>{strings.app.advancedConnection}<small>{strings.app.advancedSettingsHint}</small></span></summary>
-      <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
-        <legend>{strings.app.transportQuality}</legend>
-        {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
-          <span>{strings.app.audioQualityLabels[quality]}</span>
-          <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => update("audioQuality", quality)} />
-        </label>)}
-        {adbQualityOnly && <p className="dialog-footnote">{strings.app.adbStandardQualityOnly}</p>}
-        <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
-        <details className="audio-format-disclosure">
-          <summary>{strings.app.audioFormatDetails}</summary>
-          <dl className="audio-quality-status">
-            <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>
-            <div><dt>{strings.app.windowsMixFormat}</dt><dd>{mixFormat}</dd></div>
-            <div><dt>{strings.app.androidOutputFormat}</dt><dd>{outputFormat}</dd></div>
-          </dl>
-          <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
-        </details>
-      </fieldset>
-      <label className="select-setting"><span>{strings.app.wirelessProtocol}<small>{strings.app.wirelessProtocolHelp}</small></span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
-      <label className="select-setting"><span>{strings.app.receiverBackend}<small>{strings.app.receiverBackendHelp}</small></span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
-      {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
-      {aoaSession ? <p className="dialog-footnote">{strings.app.aoaReceiverBackendFixed}</p> : udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
+      <section className="settings-group settings-audio" aria-labelledby="settings-audio-title">
+        <h3 id="settings-audio-title">{strings.app.transportQuality}</h3>
+        <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
+          <legend className="visually-hidden">{strings.app.transportQuality}</legend>
+          {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
+            <span>{strings.app.audioQualityLabels[quality]}</span>
+            <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => update("audioQuality", quality)} />
+          </label>)}
+          {adbQualityOnly && <p className="dialog-footnote">{strings.app.adbStandardQualityOnly}</p>}
+          <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
+          <details className="audio-format-disclosure">
+            <summary>{strings.app.audioFormatDetails}</summary>
+            <dl className="audio-quality-status">
+              <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>
+              <div><dt>{strings.app.windowsMixFormat}</dt><dd>{mixFormat}</dd></div>
+              <div><dt>{strings.app.androidOutputFormat}</dt><dd>{outputFormat}</dd></div>
+            </dl>
+            <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
+          </details>
+        </fieldset>
+      </section>
+      <section className="settings-group settings-connection" aria-labelledby="settings-connection-title">
+        <h3 id="settings-connection-title">{strings.app.connectionMode}</h3>
+        <label className="select-setting"><span>{strings.app.wirelessProtocol}<small>{strings.app.wirelessProtocolHelp}</small></span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
+        <label className="select-setting"><span>{strings.app.receiverBackend}<small>{strings.app.receiverBackendHelp}</small></span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
+        {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
+        {aoaSession ? <p className="dialog-footnote">{strings.app.aoaReceiverBackendFixed}</p> : udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
+      </section>
     </details>
-    <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
-    {snapshot.busy && <p className="dialog-footnote">{strings.app.settingsBusy}</p>}
-    <p className="dialog-footnote">{strings.app.settingsPrivacy}</p>
+    <section className="settings-group settings-about" aria-label={strings.app.phoneApplication}>
+      <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
+      {snapshot.busy && <p className="dialog-footnote">{strings.app.settingsBusy}</p>}
+      <p className="dialog-footnote">{strings.app.settingsPrivacy}</p>
+    </section>
   </Modal>;
 }

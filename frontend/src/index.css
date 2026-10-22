@@ -1,62 +1,3 @@
-:root {
-  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  --bg: #f5f6f8;
-  --surface: #ffffff;
-  --text: #172033;
-  --muted: #52617a;
-  --line: #c9d1df;
-  --wash: #e9edf3;
-  --accent: #2454b7;
-  --accent-soft: #e8efff;
-  --positive: #16754a;
-  --warning: #a05a00;
-  --danger: #af3340;
-  color: var(--text);
-  background: var(--bg);
-  color-scheme: light;
-  font-size: 13px;
-}
-
-:root[data-theme="dark"] {
-  --bg: #171a21;
-  --surface: #20242d;
-  --text: #edf1f7;
-  --muted: #b4bece;
-  --line: #3b4351;
-  --wash: #292f3a;
-  --accent: #8aafff;
-  --accent-soft: #263859;
-  --positive: #62c995;
-  --warning: #f3b864;
-  --danger: #ff8b95;
-  color-scheme: dark;
-}
-
-* { box-sizing: border-box; }
-html, body, #root { width: 100%; height: 100%; min-width: 360px; margin: 0; }
-body { overflow: hidden; background: var(--bg); }
-button, input, select { font: inherit; }
-button { color: inherit; }
-button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 65%, transparent); outline-offset: 2px; }
-button:disabled { cursor: default; }
-::selection { background: var(--accent-soft); }
-
-.app-shell { width: 100%; height: 100%; display: grid; grid-template-rows: 68px minmax(0, 1fr) 42px; background: var(--bg); color: var(--text); }
-.topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--line); }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.brand img { display: block; width: 30px; height: 30px; object-fit: contain; }
-.brand div { display: flex; flex-direction: column; gap: 2px; }
-.brand strong { font-size: 16px; line-height: 19px; font-weight: 650; }
-.brand span { color: var(--muted); font-size: 11px; line-height: 14px; }
-.icon-button { width: 36px; height: 36px; display: inline-grid; place-items: center; border: 0; border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; }
-.icon-button:hover { background: var(--wash); color: var(--text); }
-.main-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 13px 16px 16px; }
-.main-scroll::-webkit-scrollbar { width: 9px; }
-.main-scroll::-webkit-scrollbar-thumb { background: transparent; border: 2px solid transparent; border-radius: 9px; background-clip: padding-box; }
-.main-scroll:hover::-webkit-scrollbar-thumb { background-color: #99a4b5; }
 .status-line { min-height: 27px; display: flex; align-items: center; gap: 7px; color: var(--muted); }
 .status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #8190a5; }
 .state-ready .status-dot, .state-connected .status-dot, .state-streaming .status-dot, .state-phoneReady .status-dot { background: var(--positive); }
@@ -109,10 +50,6 @@ button:disabled { cursor: default; }
 .mode-switch button { min-height: 42px; padding: 6px 8px; }
 .mode-description { margin: 2px 0 0; color: var(--muted); line-height: 19px; overflow-wrap: anywhere; }
 .backend-manager-button { min-height: 44px; padding-inline: 1px; }
-.footer { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-top: 1px solid var(--line); background: var(--surface); }
-.footer button { min-height: 34px; display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px; border: 0; border-radius: 5px; color: var(--accent); background: transparent; cursor: pointer; }
-.footer button:hover { background: var(--accent-soft); }
-.footer > span { color: var(--muted); font-size: 10px; }
 .toast { position: fixed; z-index: 5; right: 16px; bottom: 54px; max-width: min(400px, calc(100vw - 32px)); padding: 11px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: 0 8px 28px #10213a29; line-height: 19px; }
 .loading-shell { height: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); }
 .spin { animation: rotate 1s linear infinite; }
@@ -155,8 +92,7 @@ button:disabled { cursor: default; }
 .dialog-secondary, .primary-button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 7px 13px; border-radius: 7px; cursor: pointer; }
 .dialog-secondary { border: 1px solid var(--line); color: var(--text); background: var(--surface); }
 .dialog-secondary:hover { background: var(--wash); }
-.primary-button { border: 1px solid var(--accent); color: #fff; background: #2454b7; font-weight: 600; }
-:root[data-theme="dark"] .primary-button { color: #111a2b; background: #a6c1ff; }
+.primary-button { border: 1px solid var(--color-accent-strong); color: var(--on-accent); background: var(--color-accent-strong); font-weight: 600; }
 .primary-button:hover:not(:disabled) { filter: brightness(1.06); }
 .dialog-secondary:disabled, .primary-button:disabled { opacity: 0.6; cursor: default; }
 .device-dialog > .dialog-secondary { display: flex; margin: 8px 16px 0 auto; }
@@ -213,7 +149,7 @@ button:disabled { cursor: default; }
 .setup-step { width: 100%; min-height: 48px; display: flex; align-items: center; gap: 6px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--bg); font-size: .85em; text-align: left; cursor: pointer; }
 .setup-step span { width: 22px; height: 22px; flex: 0 0 22px; display: grid; place-items: center; border-radius: 50%; color: var(--muted); background: var(--wash); font-weight: 700; }
 .setup-step[aria-current="step"] { border-color: var(--accent); color: var(--text); background: var(--accent-soft); font-weight: 650; }
-.setup-step[aria-current="step"] span { color: white; background: var(--accent); }
+.setup-step[aria-current="step"] span { color: var(--on-accent); background: var(--accent); }
 .setup-wizard-step { display: grid; gap: 12px; }
 .setup-wizard-step > p:first-child { margin: 0; color: var(--muted); line-height: 1.5; }
 .setup-wizard-actions { display: grid; grid-template-columns: minmax(0, .7fr) minmax(0, 1.3fr); gap: 8px; margin-top: 2px; }
@@ -290,7 +226,7 @@ button:disabled { cursor: default; }
 .receiver-operation-progress.is-failed { border-color: var(--danger); color: var(--danger); }
 .network-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin-top: 2px; }
 .network-actions > button { min-width: 0; min-height: 44px; padding-inline: 8px; white-space: normal; }
-.network-actions .primary-button { background: #2454b7; }
+.network-actions .primary-button { background: var(--color-accent-strong); }
 .discover-button { justify-self: start; }
 .background-trust { display: grid; gap: 8px; min-width: 0; padding: 10px 0; }
 .background-trust p { margin: 0; color: var(--muted); line-height: 19px; overflow-wrap: anywhere; }
@@ -338,7 +274,6 @@ button:disabled { cursor: default; }
 
 @keyframes rotate { to { transform: rotate(360deg); } }
 @keyframes pulse { to { opacity: .42; } }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
 @media (max-width: 390px) { .main-scroll { padding-inline: 12px; } .output-card { padding-inline: 10px; } .status-device { display: none; } }
 @media (max-width: 390px) { .audio-quality-status div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 @media (max-width: 390px) { .settings-dialog .select-setting { align-items: stretch; flex-direction: column; gap: 5px; } .settings-dialog .select-setting select { width: 100%; max-width: none; } }
@@ -351,3 +286,47 @@ button:disabled { cursor: default; }
 .mode-disclosure[open] > summary::after { content: "▴"; }
 .mode-disclosure .mode-section { border-top: none; padding-top: 0; }
 .mode-disclosure .mode-switch { width: 100%; }
+
+/* Refresh the existing choice controls without changing their snapshot-confirmed behavior. */
+.fluid-segmented-control.transport-switch { min-height: 48px; border-radius: 9px; }
+.fluid-segmented-control.mode-switch { width: min(220px, 64%); min-height: 48px; border-radius: 9px; }
+.fluid-segmented-control.transport-switch > button,
+.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 7px; }
+.fluid-segmented-control.transport-switch > button[aria-pressed="true"],
+.fluid-segmented-control.mode-switch > button[aria-pressed="true"] { border-color: var(--line); background: transparent; box-shadow: none; }
+.fluid-segmented-control.transport-switch .fluid-segmented-control__selection,
+.fluid-segmented-control.mode-switch .fluid-segmented-control__selection { border-color: var(--line); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow-raised); }
+.fluid-segmented-control.transport-switch > button:disabled,
+.fluid-segmented-control.mode-switch > button:disabled { opacity: .62; }
+
+/* Settings remain in the existing dialog and retain the advanced disclosure default. */
+.settings-dialog .settings-group { margin: 8px 14px 0; padding: 10px 0 2px; border-top: 1px solid var(--line); }
+.settings-dialog .settings-appearance { margin-top: 0; border-top: 0; }
+.settings-dialog .settings-group > h3 { margin: 0 4px 7px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+.settings-dialog .settings-group .select-setting,
+.settings-dialog .settings-group .setting-toggle { margin-inline: 0; }
+.settings-dialog .settings-audio { margin-inline: 0; }
+.settings-dialog .settings-audio > h3 { margin-inline: 18px; }
+.settings-dialog .settings-about { margin-top: 8px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* Keep dialogs calm and readable while leaving their existing focus and close behavior intact. */
+.modal { border-radius: 12px; }
+.modal-head { background: var(--surface); }
+.network-active-card { border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); border-radius: 10px; }
+.setup-step { border-color: transparent; background: var(--wash); }
+.setup-step[aria-current="step"] { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.setup-step:focus-visible,
+.network-dialog button:focus-visible,
+.network-dialog select:focus-visible,
+.network-dialog input:focus-visible,
+.diagnostics-dialog button:focus-visible,
+.aoa-dialog button:focus-visible,
+.aoa-dialog select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.diagnostic-group { border-color: var(--line); background: var(--bg); }
+.diagnostics-dialog .diagnostic-group h3 { color: var(--muted); }
+
+@media (max-width: 390px) {
+  .fluid-segmented-control.mode-switch { width: min(220px, 100%); }
+  .settings-dialog .settings-group { margin-inline: 12px; }
+}
