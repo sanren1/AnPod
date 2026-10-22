@@ -261,3 +261,16 @@
 | 操作失败 | 一句可执行摘要，保留详情和复制 |
 
 三链路实机重测、防火墙授权与切网、USB 热插拔和配件权限、手机安装/原地升级、真实采集输出格式、声学/延迟/长时稳定性仍 **NOT_TESTED**；本轮按用户要求不重启旧实机核查。
+
+## 15. 2026-10-22 · Android MD3 / PC Soft Minimal 重构
+
+以 `dev@ffea50f` 为基线，在 `codex/ui-refresh` 实施两份新增规划。执行代理 GPT 6 luna high；独立源码及界面复审 GPT 6 astra high，无历史上下文派发。未更换底层协议、服务/音频状态机、密钥、绑定格式或 AOD 实现。
+
+- Android：Direct/ADB/Wi-Fi 共用唯一主操作；本地选择持久化、实际状态优先；屏幕常显后连续展开其他设置，保留播放引擎、后台等待和完整授权管理。预审四项（ADB真实标签、后台多接口恢复、模式切换残留错误、权限等待误报）及重复说明已修复。
+- PC：浅色银灰、深色石墨语义主题，两处原生按钮语义分段控件加 Motion 动效，设置视觉分组及弹窗轻量整理。保留所有原有 IPC、轮询、确认/取消、三档音质、实际格式和禁用规则。修复原有弹窗卸载不返回焦点，并提高焦点描边对比。
+- CI：用户指出的 `discovery.rs` rustfmt 排版失败已单独修复；后续提交前执行 CI 同款 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`，不改规则绕过。
+- 实际验证：前端 `tsc -b` / Vite production build、六个独立专项通过；最终默认流程和24组新布局/键盘矩阵见 `artifacts/ui-refresh-20261022/qa/`。Android完整94项JVM测试通过，lint零错误/零警告，Debug构建通过。最终独立审查记录 `artifacts/ui-refresh-20261022/review-final.md`；仅原始结果完成的范围可计PASS。
+- Receiver41：0.18.0-v3-flow-candidate，release原证书，来源 `c75856fe83579c1e0650271b0ff26e5bdebf03db`，sourceModified=false；SHA-256 `cbfdd5dad8ee3e38bc704290b1bcfc95a4b488fd2d80f8d135a4baecad804e56`。PC候选1.11.0，精确APK登记与本地打包完成后记录下文。
+- 性能范围：Motion接入增加约43,882 gzip bytes JS，单块约558 kB存在Vite体积警告。Vite开发服务器的Chrome CTA代理p50 425.3→429.5ms；p95 894.2→2659.1ms含冷依赖优化且当前样本与Gradle并发，不能作为生产WebView性能结论。未凭警告进行额外架构拆分。许可证原文已随LICENSES补齐。
+
+按用户要求不重启旧实机核查。本轮未安装或操作手机；Windows原生窗口/DPI/防火墙、三链路物理音频、USB权限与热插拔、AOD、手机横屏/动态色/大字/TalkBack、声学/延迟/长时性能仍NOT_TESTED。浏览器截图不替代这些验证；本轮仅本地候选，不远程发布。

@@ -13,6 +13,7 @@ fs.mkdirSync(out, {recursive:true});
  page.setDefaultTimeout(10000);
  const errors=[];
  page.on('pageerror',e=>errors.push(e.message));
+ page.on('console',message=>{if(message.type()==='error')errors.push(`console: ${message.text()}`);});
  await page.addInitScript(() => {
   if(location.search.includes('lang=en'))Object.defineProperty(navigator,'language',{configurable:true,get:()=> 'en-US'});
   let id=0;const callbacks=new Map(),listeners=new Map();window.reviewCopiedText='';Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.reviewCopiedText=value;}}});
@@ -183,6 +184,16 @@ fs.mkdirSync(out, {recursive:true});
  await page.locator('.app-shell').waitFor();
  await page.waitForFunction(()=>window.reviewCalls?.get_snapshot===1&&window.reviewCalls?.refresh_devices===1);
  const results={errors,layouts:[],focusStable:null};
+ if(process.env.ANPOD_UI_FOCUS_RETURN_ONLY){
+  const trigger=page.getByRole('button',{name:'打开设置',exact:true});
+  const describeFocus=()=>page.evaluate(()=>{const el=document.activeElement;return {tag:el?.tagName??null,ariaLabel:el?.getAttribute('aria-label')??null,className:typeof el?.className==='string'?el.className:null,insideOpenDialog:!!document.querySelector('dialog[open]')?.contains(el),isBody:el===document.body};});
+  await trigger.focus();results.focusBeforeOpen=await describeFocus();await page.keyboard.press('Enter');
+  const dialog=page.getByRole('dialog');await dialog.waitFor();results.focusWhileOpen=await describeFocus();
+  await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});results.focusImmediatelyAfterClose=await describeFocus();
+  await page.waitForTimeout(80);results.focusAfter80ms=await describeFocus();
+  results.triggerStillConnected=await trigger.evaluate(el=>el.isConnected);
+  fs.writeFileSync(`${out}/focus-return-result.json`,JSON.stringify(results,null,2));await browser.close();assert.deepEqual(errors,[]);return;
+ }
  if(process.env.ANPOD_AOA_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.getByRole('button',{name:'打开设置'}).click();
@@ -1254,6 +1265,93 @@ fs.mkdirSync(out, {recursive:true});
    assert.deepEqual(errors,[]);
    if(!process.env.ANPOD_SKIP_LAYOUT_MATRIX)assert.equal(layouts.filter(x=>x.horizontalOverflow||x.deviceHeight<x.deviceTextHeight||x.width!==x.size[0]).length,0);
     for(const key of ['managerDefaultIsCompact','sessionUpgradeBindingIsVisible','legacyWithoutNetworkUpdateBitStillOffersUsbUpgrade','activePlaybackRequiresSingleConfirmation','upgradeUsesSelectedBindingAndReturnedStatus','successToastIsNotFailure','successHasNoOldNetworkUpdateState','sameVersionDoesNotOfferUpgrade','newerVersionDoesNotOfferDowngrade','unknownVersionDoesNotAssumeUpdate','noOrUnauthorizedUsbIsNotSelectable','invalidTargetDoesNotOfferOperation','wrongUsbTargetIsRejectedAndRetryRemains','unrelatedSavedBindingDoesNotBlockUsbMaintenance','installFailureKeepsRetryAction','installUsesReturnedVerifiedStatusAndRefreshes','compatibleOldReceiverCanConnectWithOptionalUpgrade','oldReceiverStartsWithoutBootstrapOrBackgroundAuthorization'])assert.equal(results[key],true,key);
+  return;
+ }
+ if(process.env.ANPOD_UI_REFRESH_ACCESSIBILITY_ONLY){
+  const matrix=[];
+  const rgb=value=>{const hex=value.replace('#','');return hex.length===3?hex.split('').map(channel=>parseInt(channel+channel,16)):hex.match(/../g).map(channel=>parseInt(channel,16));};
+  const luminance=color=>color.map(channel=>{const value=channel/255;return value<=0.04045?value/12.92:((value+0.055)/1.055)**2.4;}).reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0);
+  const contrast=(foreground,background)=>{const values=[luminance(rgb(foreground)),luminance(rgb(background))].sort((a,b)=>b-a);return (values[0]+0.05)/(values[1]+0.05);};
+  const baseUrl=new URL(process.env.ANPOD_UI_URL||'http://127.0.0.1:1420');
+  for(const language of ['zh','en']){
+   const url=new URL(baseUrl);url.searchParams.set('lang',language);
+   await page.goto(url.toString());await page.locator('.app-shell').waitFor();
+   const settingsName=language==='zh'?'打开设置':'Open settings';
+   let largeTextState=false;
+   for(const size of [[360,500],[420,590],[480,700]])for(const theme of ['light','dark'])for(const large of [false,true]){
+    await page.setViewportSize({width:size[0],height:size[1]});
+    await page.emulateMedia({colorScheme:theme,reducedMotion:'reduce'});
+    await page.waitForFunction(value=>document.documentElement.dataset.theme===value,theme);
+    if(large!==largeTextState){
+     await page.getByRole('button',{name:settingsName,exact:true}).click();
+     const dialog=page.getByRole('dialog');await dialog.waitFor();
+     const largeText=dialog.locator('.settings-appearance input[type="checkbox"]').first();
+     if(large)await largeText.check();else await largeText.uncheck();
+     await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+     largeTextState=large;
+    }
+    const sample=await page.evaluate(()=>{
+     const root=getComputedStyle(document.documentElement),shell=document.querySelector('.app-shell'),main=document.querySelector('.main-scroll'),button=document.querySelector('.main-action'),footer=document.querySelector('.footer');
+     const initial=button.getBoundingClientRect(),mainRect=main.getBoundingClientRect();
+     const initialInViewport=initial.width>0&&initial.height>0&&initial.top<innerHeight&&initial.bottom>0;
+     const start=main.scrollTop;button.scrollIntoView({block:'nearest'});const reachableRect=button.getBoundingClientRect(),footerRect=footer.getBoundingClientRect();
+     const mainActionReachable=reachableRect.width>0&&reachableRect.top>=mainRect.top&&reachableRect.bottom<=footerRect.top;
+     main.scrollTop=start;
+     return {theme:document.documentElement.dataset.theme,background:root.backgroundColor,backgroundToken:root.getPropertyValue('--color-background').trim(),surfaceToken:root.getPropertyValue('--color-surface').trim(),textToken:root.getPropertyValue('--color-text').trim(),mutedToken:root.getPropertyValue('--color-muted').trim(),accentToken:root.getPropertyValue('--color-accent').trim(),onAccentToken:root.getPropertyValue('--color-on-accent').trim(),largeText:shell.classList.contains('large-text'),fontSize:getComputedStyle(shell).fontSize,viewport:[innerWidth,innerHeight],documentWidth:document.documentElement.scrollWidth,appWidth:shell.getBoundingClientRect().width,mainActionInitialInViewport:initialInViewport,mainActionReachable,mainActionTop:initial.top,mainActionBottom:initial.bottom,footerTop:footerRect.top};
+    });
+    const name=`matrix-${language}-${theme}-${large?'large':'normal'}-${size[0]}x${size[1]}.png`;
+    await page.screenshot({path:`${out}/${name}`});
+    matrix.push({language,theme,large,size,expectedTheme:theme,screenshot:name,textContrast:contrast(sample.textToken,sample.backgroundToken),mutedContrast:contrast(sample.mutedToken,sample.backgroundToken),onAccentContrast:contrast(sample.onAccentToken,sample.accentToken),focusRingTokenContrast:contrast(sample.accentToken,sample.backgroundToken),...sample});
+   }
+  }
+  results.visualMatrix=matrix;
+  await page.goto(new URL('?lang=zh',baseUrl).toString());await page.locator('.app-shell').waitFor();
+  await page.setViewportSize({width:420,height:590});await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
+  await page.waitForFunction(()=>document.documentElement.dataset.theme==='dark');
+  await page.getByRole('button',{name:'打开设置',exact:true}).click();
+  const darkSettings=page.getByRole('dialog');await darkSettings.waitFor();
+  results.darkSettingsTheme=await page.evaluate(()=>({theme:document.documentElement.dataset.theme,background:getComputedStyle(document.documentElement).backgroundColor,backgroundToken:getComputedStyle(document.documentElement).getPropertyValue('--color-background').trim(),surfaceToken:getComputedStyle(document.documentElement).getPropertyValue('--color-surface').trim(),dialogBackground:getComputedStyle(document.querySelector('dialog')).backgroundColor}));
+  await page.screenshot({path:`${out}/settings-dark-420x590.png`});
+  await page.keyboard.press('Escape');await darkSettings.waitFor({state:'detached'});
+  await page.goto(new URL('?lang=zh',baseUrl).toString());await page.locator('.app-shell').waitFor();
+  await page.setViewportSize({width:420,height:590});await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
+  await page.waitForFunction(()=>document.documentElement.dataset.theme==='dark');
+  await page.keyboard.press('Tab');
+  results.keyboardFocusRing=await page.evaluate(()=>{const el=document.activeElement,style=getComputedStyle(el),root=getComputedStyle(document.documentElement),parseRgb=value=>{const match=value.match(/^rgba?\(([^)]+)\)$/);if(!match)return null;const parts=match[1].split(/[\s,/]+/).filter(Boolean).map(Number);if(parts.length<3||(parts.length>3&&parts[3]!==1)||parts.slice(0,3).some(channel=>!Number.isFinite(channel)))return null;return parts.slice(0,3);},luminance=channels=>channels.map(channel=>{const value=channel/255;return value<=0.04045?value/12.92:((value+0.055)/1.055)**2.4;}).reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0),outlineRgb=parseRgb(style.outlineColor),backgroundRgb=parseRgb(root.backgroundColor),accent=root.getPropertyValue('--color-accent').trim(),backgroundToken=root.getPropertyValue('--color-background').trim(),contrast=outlineRgb&&backgroundRgb?(()=>{const values=[luminance(outlineRgb),luminance(backgroundRgb)].sort((a,b)=>b-a);return (values[0]+0.05)/(values[1]+0.05);})():null;return {tag:el.tagName,className:el.className,outlineWidth:style.outlineWidth,outlineStyle:style.outlineStyle,outlineColor:style.outlineColor,backgroundColor:root.backgroundColor,accentToken:accent,backgroundToken,focusRingComputedContrast:contrast,reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches};});
+  const trigger=page.getByRole('button',{name:'打开设置',exact:true});
+  await trigger.focus();await page.keyboard.press('Enter');
+  const settings=page.getByRole('dialog');await settings.waitFor();
+  await page.keyboard.press('Tab');results.tabStaysInDialog=await settings.evaluate(el=>el.contains(document.activeElement));
+  await page.keyboard.press('Shift+Tab');results.shiftTabStaysInDialog=await settings.evaluate(el=>el.contains(document.activeElement));
+  await page.keyboard.press('Escape');await settings.waitFor({state:'detached'});
+  await page.waitForTimeout(80);
+  results.escapeReturnsFocus=await trigger.evaluate(el=>document.activeElement===el);
+  const connection=page.getByRole('group',{name:'连接方式'});
+  const usb=connection.getByRole('button',{name:'USB',exact:true});const wireless=connection.getByRole('button',{name:'无线',exact:true});
+  await wireless.focus();await page.keyboard.press('Space');
+  await page.waitForFunction(()=>[...document.querySelectorAll('.connection-section [role="group"] button')].some(button=>button.textContent.includes('无线')&&button.getAttribute('aria-pressed')==='true'));
+  results.spaceUpdatesAriaPressed=await wireless.getAttribute('aria-pressed')==='true'&&await usb.getAttribute('aria-pressed')==='false';
+  await usb.focus();await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>[...document.querySelectorAll('.connection-section [role="group"] button')].some(button=>button.textContent.trim().includes('USB')&&button.getAttribute('aria-pressed')==='true'));
+  results.enterUpdatesAriaPressed=await usb.getAttribute('aria-pressed')==='true'&&await wireless.getAttribute('aria-pressed')==='false';
+  await page.evaluate(()=>window.reviewSet('connecting','usb'));
+  results.busyControlsExposeDisabled=await connection.getByRole('button').all().then(buttons=>Promise.all(buttons.map(button=>button.isDisabled()))).then(values=>values.every(Boolean))
+    &&await connection.getByRole('button',{name:'USB',exact:true}).getAttribute('aria-pressed')==='true';
+  await page.evaluate(()=>window.reviewSet('ready','usb'));
+  await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});
+  await wireless.focus();await page.keyboard.press('Space');await page.waitForTimeout(50);
+  results.reducedMotionSuppressesSegmentAnimation=await page.evaluate(()=>matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.querySelector('.fluid-segmented-control__selection')?.getAnimations().some(animation=>animation.playState==='running'));
+  results.noExtraStartupOrInstallListeners=await page.evaluate(()=>window.reviewProgressListenerCount()===0&&window.reviewCalls.start_aoa_audio===undefined&&window.reviewCalls.start_network_audio===undefined);
+  fs.writeFileSync(`${out}/ui-refresh-accessibility-result.json`,JSON.stringify(results,null,2));
+  await browser.close();
+  assert.deepEqual(errors,[]);
+  assert.equal(matrix.length,24);
+  assert.equal(matrix.filter(sample=>sample.documentWidth>sample.viewport[0]||sample.appWidth!==sample.viewport[0]||sample.theme!==sample.expectedTheme).length,0);
+  assert.equal(matrix.filter(sample=>!sample.mainActionReachable||sample.largeText!==sample.large||sample.backgroundToken===(sample.theme==='dark'?'#f4f5f6':'#1b1f24')).length,0);
+  assert.equal(matrix.filter(sample=>sample.textContrast<4.5||sample.mutedContrast<4.5||sample.onAccentContrast<4.5).length,0);
+  assert.equal(results.darkSettingsTheme.theme,'dark');assert.equal(results.darkSettingsTheme.backgroundToken,'#1b1f24');assert.equal(results.darkSettingsTheme.dialogBackground,'rgb(35, 41, 47)');
+  for(const key of ['tabStaysInDialog','shiftTabStaysInDialog','escapeReturnsFocus','spaceUpdatesAriaPressed','enterUpdatesAriaPressed','busyControlsExposeDisabled','reducedMotionSuppressesSegmentAnimation','noExtraStartupOrInstallListeners'])assert.equal(results[key],true,key);
+  assert.ok(Number.isFinite(results.keyboardFocusRing.focusRingComputedContrast)&&results.keyboardFocusRing.focusRingComputedContrast>=3,'Computed focus ring contrast must be measurable and at least 3:1');
   return;
  }
  await page.setViewportSize({width:420,height:590});await page.evaluate(()=>window.reviewSet('ready','wifi'));

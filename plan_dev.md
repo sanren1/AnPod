@@ -692,3 +692,9 @@ PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈�
 桌面输入快照 `6f3cc1a17216c60087f1b267a1f8d3ad203c94eefd82f2be7da41ca8954e6f58`，Receiver 输入快照 `1130341514450fc472d43026de7a5465895927dafe69603a52ab1b5749799e3e`，均与当前输入复算一致；Receiver `sourceModified=false`，沿用发布证书 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`，aapt/apksigner、精确审计登记通过。Native/Legacy 按角色验证包内已登记哈希，README 与工作树及构建提交一致、11 个本地链接存在，Direct API24 / ADB-LAN API23 门槛与代码一致，无私钥、私有 env、构建缓存或日志混入包。
 
 构建时 `workingTreeDirty=true` 来自保留的三个原有缓存，源码输入未改；本节与 UI 规划的交付文档更新位于两个输入范围之外，不改变制品来源。新 APK 中间构建目录、过期测试尝试和临时浏览器/服务缓存已清理；有效结果、旧版制品和用户缓存保留。使用本轮变更需同步更新 PC 与随包手机应用。未推送或远程发布；真实三链路、防火墙/切网、USB 权限/热插拔、手机安装升级、硬件采集/输出、音质/延迟/长时稳定性仍 **NOT_TESTED**，按用户要求跳过旧实机核查。
+
+## 2026-10-22 · MD3 / Soft Minimal 双端UI重构
+
+执行与验收详见 `AnPod_UI_UX_Plan/plan.md` 第15节及两份新增UI规划。工作分支 `codex/ui-refresh`，基线 `dev@ffea50f`；PC1.11.0 / Receiver0.18.0-v3-flow-candidate/code41。手机入口/状态/内联设置与PC主题/分段控件/设置分组已实现，独立预审问题已修订。Android94项JVM及lint通过，PC六专项通过，最终焦点/布局/默认流程及独立复审以本轮artifacts原始结果为准。
+
+上一轮GitHub Format失败源于discovery.rs的rustfmt折行，已在c75856f单独修复，CI同款格式检查通过；提交前复查该命令。未更改音频/连接协议、授权与签名门禁。实机与生产WebView性能仍未测，不沿用旧结果冒充本轮通过；本轮未推送或远程发布。
