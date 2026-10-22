@@ -46,6 +46,19 @@
     <string name="connected_waiting_for_audio">已连接，等待接收音频</string>
     <string name="connection_failed_retry">连接失败，可重试</string>
     <string name="connection_method">连接方式：%1$s</string>
+    <string name="connection_mode">连接方式</string>
+    <string name="connection_usb_direct">USB Direct</string>
+    <string name="connection_usb_adb">USB ADB</string>
+    <string name="connection_usb_direct_short">Direct</string>
+    <string name="connection_usb_adb_short">ADB</string>
+    <string name="connection_wifi">Wi-Fi</string>
+    <string name="connection_direct_description">通过 USB Accessory（AOA）直接连接，适合低延迟传输。</string>
+    <string name="connection_adb_description">请在电脑端通过 USB ADB 发起连接；手机不会启动接收服务。</string>
+    <string name="connection_wifi_description">通过当前网络传输音频，请确保手机和电脑可以互相访问。</string>
+    <string name="adb_waiting_guidance">请在电脑端使用 USB ADB 连接这台手机并启动 AnPod。等待指引不会启动服务。</string>
+    <string name="close_connection_guide">关闭连接指引</string>
+    <string name="actual_connection">实际连接：%1$s</string>
+    <string name="actual_connection_unknown">传输方式未知</string>
     <string name="dialog_cancel">取消</string>
     <string name="low_latency_limited_by_system">低延迟（系统受限）</string>
     <string name="low_latency_reported_by_computer">低延迟（电脑报告）</string>
@@ -113,8 +126,8 @@
     <string name="operation_error_summary">操作没有完成。请检查网络后重试，或展开查看详情。</string>
     <string name="show_error_details">查看详情</string>
     <string name="wireless_udp">无线 · UDP</string>
-    <string name="aod_title">常显屏幕</string>
-    <string name="aod_toggle">常显屏幕</string>
+    <string name="aod_title">屏幕常显</string>
+    <string name="aod_toggle">屏幕常显</string>
     <string name="aod_toggle_description">收到电脑声音时显示时钟和波形；屏幕会一直亮着。</string>
     <string name="aod_preview">预览常显</string>
     <string name="aod_exit">退出</string>
@@ -127,6 +140,7 @@
     <string name="aod_not_running">请先连接电脑，再打开常显屏幕。</string>
     <string name="state_not_connected">未连接</string>
     <string name="state_waiting_for_computer">等待电脑</string>
+    <string name="state_waiting_for_pc_action">等待电脑操作</string>
     <string name="state_receiving">正在接收</string>
     <string name="state_connecting">连接中</string>
     <string name="state_needs_attention">需要处理</string>
@@ -158,4 +172,7 @@
     <string name="hide_paired_computer_id">收起配对标识</string>
     <string name="other_connection_methods">其他连接方式</string>
     <string name="hide_other_connection_methods">收起其他连接方式</string>
+    <string name="other_settings">其他设置</string>
+    <string name="hide_other_settings">收起其他设置</string>
+    <string name="other_settings_summary">播放引擎、无线接收等待与授权</string>
 </resources>

@@ -46,6 +46,19 @@
     <string name="connected_waiting_for_audio">Connected. Waiting for audio.</string>
     <string name="connection_failed_retry">Connection failed. Try again.</string>
     <string name="connection_method">Connection: %1$s</string>
+    <string name="connection_mode">Connection method</string>
+    <string name="connection_usb_direct">USB Direct</string>
+    <string name="connection_usb_adb">USB ADB</string>
+    <string name="connection_usb_direct_short">Direct</string>
+    <string name="connection_usb_adb_short">ADB</string>
+    <string name="connection_wifi">Wi-Fi</string>
+    <string name="connection_direct_description">Connect directly over USB Accessory (AOA) for low-latency audio.</string>
+    <string name="connection_adb_description">Start the connection from the computer with USB ADB. The phone will not start the receiver.</string>
+    <string name="connection_wifi_description">Send audio over the current network. The phone and computer must be able to reach each other.</string>
+    <string name="adb_waiting_guidance">On the computer, connect this phone with USB ADB and start AnPod. This guide does not start the receiver.</string>
+    <string name="close_connection_guide">Close connection guide</string>
+    <string name="actual_connection">Actual connection: %1$s</string>
+    <string name="actual_connection_unknown">Transport unknown</string>
     <string name="dialog_cancel">Cancel</string>
     <string name="low_latency_limited_by_system">Low latency (limited by Android)</string>
     <string name="low_latency_reported_by_computer">Low latency (reported by computer)</string>
@@ -127,6 +140,7 @@
     <string name="aod_not_running">Connect to the computer before opening the always-on screen.</string>
     <string name="state_not_connected">Not connected</string>
     <string name="state_waiting_for_computer">Waiting for computer</string>
+    <string name="state_waiting_for_pc_action">Waiting for computer action</string>
     <string name="state_receiving">Receiving</string>
     <string name="state_connecting">Connecting</string>
     <string name="state_needs_attention">Needs attention</string>
@@ -158,4 +172,7 @@
     <string name="hide_paired_computer_id">Hide paired computer ID</string>
     <string name="other_connection_methods">Other connection methods</string>
     <string name="hide_other_connection_methods">Hide other connection methods</string>
+    <string name="other_settings">Other settings</string>
+    <string name="hide_other_settings">Hide other settings</string>
+    <string name="other_settings_summary">Playback engine, wireless standby, and permission</string>
 </resources>

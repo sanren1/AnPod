@@ -24,7 +24,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -37,6 +39,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -46,6 +49,10 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -64,8 +71,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -80,6 +89,39 @@ private data class BackgroundTrustTarget(
     val operationGeneration: Long,
     val bindingFingerprint: String
 )
+
+internal enum class ConnectionChoice(val preferenceValue: String) {
+    USB_DIRECT("usb-direct"), USB_ADB("usb-adb"), WIFI("wifi");
+
+    companion object {
+        fun fromPreference(value: String?) = values().firstOrNull { it.preferenceValue == value } ?: USB_DIRECT
+    }
+}
+
+internal enum class PrimaryAction {
+    CONNECT_USB_DIRECT, SHOW_ADB_GUIDE, CONNECT_WIFI, CANCEL_USB_PERMISSION,
+    CLOSE_ADB_GUIDE, CANCEL_PENDING_CONNECTION, STOP_RECEIVER, STOP_BACKGROUND_STANDBY, DISABLED
+}
+
+internal fun primaryActionFor(
+    choice: ConnectionChoice,
+    receiverActive: Boolean = false,
+    operationStopping: Boolean = false,
+    usbPermissionPending: Boolean = false,
+    connectionPending: Boolean = false,
+    adbGuideVisible: Boolean = false,
+    backgroundStandbyEnabled: Boolean = false
+): PrimaryAction = when {
+    operationStopping -> PrimaryAction.DISABLED
+    receiverActive -> PrimaryAction.STOP_RECEIVER
+    backgroundStandbyEnabled -> PrimaryAction.STOP_BACKGROUND_STANDBY
+    usbPermissionPending -> PrimaryAction.CANCEL_USB_PERMISSION
+    connectionPending -> PrimaryAction.CANCEL_PENDING_CONNECTION
+    choice == ConnectionChoice.USB_ADB && adbGuideVisible -> PrimaryAction.CLOSE_ADB_GUIDE
+    choice == ConnectionChoice.USB_DIRECT -> PrimaryAction.CONNECT_USB_DIRECT
+    choice == ConnectionChoice.USB_ADB -> PrimaryAction.SHOW_ADB_GUIDE
+    else -> PrimaryAction.CONNECT_WIFI
+}
 
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -102,6 +144,7 @@ class MainActivity : ComponentActivity() {
     private var aodEnabled by mutableStateOf(false)
     private var aodShownForSession: String? = null
     private var outputEngine by mutableStateOf("oboeExperimental")
+    private var connectionChoice by mutableStateOf(ConnectionChoice.USB_DIRECT)
     private var usbDirectAvailable by mutableStateOf(false)
     private var usbPermissionPending by mutableStateOf(false)
     internal data class PendingUsbPermission(val generation: Long, val accessory: UsbAccessory, val action: String)
@@ -265,6 +308,7 @@ class MainActivity : ComponentActivity() {
             "oboeExperimental" -> "oboeExperimental"
             else -> "audioTrack"
         }
+        connectionChoice = ConnectionChoice.fromPreference(preferences.getString("connection_choice", null))
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             ReceiverTheme {
@@ -276,6 +320,10 @@ class MainActivity : ComponentActivity() {
                     localMessage = localMessage,
                     connectionPending = pendingConnection != null,
                     onSelect = { selectNetwork(it) },
+                    connectionChoice = connectionChoice,
+                    onSelectConnectionChoice = { choice ->
+                        saveConnectionChoicePreference(choice)
+                    },
                     onConnectComputer = { connectComputer() },
                     onConnectUsbDirect = { connectUsbDirect() },
                     usbDirectAvailable = usbDirectAvailable,
@@ -283,6 +331,7 @@ class MainActivity : ComponentActivity() {
                     usbAccessoryFeatureAvailable = packageManager.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY),
                     usbPermissionPending = usbPermissionPending,
                     onCancelUsbPermission = { cancelUsbPermission() },
+                    onCancelPendingConnection = { cancelPendingConnection() },
                     onStartBackgroundStandby = { startBackgroundStandby() },
                     onStopBackgroundStandby = { stopBackgroundStandby() },
                     serviceConnected = receiver != null,
@@ -311,6 +360,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun connectComputer() = beginReceive(backgroundStandby = false)
+
+    internal fun saveConnectionChoicePreference(choice: ConnectionChoice) {
+        connectionChoice = choice
+        getSharedPreferences("anpod_receiver", MODE_PRIVATE).edit()
+            .putString("connection_choice", choice.preferenceValue)
+            .apply()
+    }
 
     private fun connectUsbDirect() {
         val service = receiver
@@ -587,6 +643,8 @@ private fun ReceiverTheme(content: @Composable () -> Unit) {
 @Composable
 private fun ReceiverScreen(
     snapshot: UiSnapshot?,
+    connectionChoice: ConnectionChoice,
+    onSelectConnectionChoice: (ConnectionChoice) -> Unit,
     interfaces: List<UiInterface>,
     selectedAddress: String,
     selectedPrefix: Int,
@@ -595,6 +653,7 @@ private fun ReceiverScreen(
     onSelect: (UiInterface) -> Unit,
     onConnectComputer: () -> Unit,
     onConnectUsbDirect: () -> Unit,
+    onCancelPendingConnection: () -> Unit,
     usbDirectAvailable: Boolean,
     usbDirectSupported: Boolean,
     usbAccessoryFeatureAvailable: Boolean,
@@ -615,7 +674,8 @@ private fun ReceiverScreen(
     onOpenNotificationSettings: () -> Unit
 ) {
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
-    var showMoreMethods by remember { mutableStateOf(false) }
+    var otherSettingsExpanded by remember { mutableStateOf(false) }
+    var adbGuideVisible by remember(connectionChoice) { mutableStateOf(false) }
     val currentTrustTarget = snapshot?.takeIf {
         serviceConnected && (it.backgroundStandbyEnabled || it.canRevokeBackgroundTrust)
             && it.bindingFingerprint.isNotEmpty()
@@ -637,6 +697,29 @@ private fun ReceiverScreen(
     val needsAttention = diagnostic.isNotEmpty() || snapshot?.backgroundListenerState == "pending"
             || snapshot?.serviceState == "failed" || snapshot?.operationState == "error"
             || snapshot?.backgroundGrantKind == "unavailable"
+    val backgroundStandbyEnabled = snapshot?.backgroundStandbyEnabled == true
+    val receiverActive = snapshot?.serviceState in setOf("authenticated", "receiverRunning", "streaming", "paused") ||
+        (!backgroundStandbyEnabled && (snapshot?.operationState in setOf("starting", "running") ||
+            snapshot?.serviceState in setOf("starting", "prepared")))
+    val selectionLocked = running || connectionPending || usbPermissionPending
+    LaunchedEffect(receiverActive) { if (receiverActive) adbGuideVisible = false }
+    val action = primaryActionFor(
+        connectionChoice,
+        receiverActive = receiverActive,
+        operationStopping = snapshot?.operationState == "stopping",
+        usbPermissionPending = usbPermissionPending,
+        connectionPending = connectionPending,
+        adbGuideVisible = adbGuideVisible && !running,
+        backgroundStandbyEnabled = backgroundStandbyEnabled
+    )
+    val canPerformAction = action != PrimaryAction.DISABLED && when (action) {
+        PrimaryAction.CONNECT_USB_DIRECT -> usbDirectSupported && usbAccessoryFeatureAvailable && serviceConnected
+        PrimaryAction.CONNECT_WIFI -> serviceConnected
+        PrimaryAction.SHOW_ADB_GUIDE, PrimaryAction.CLOSE_ADB_GUIDE -> true
+        PrimaryAction.CANCEL_USB_PERMISSION, PrimaryAction.CANCEL_PENDING_CONNECTION -> true
+        PrimaryAction.STOP_RECEIVER, PrimaryAction.STOP_BACKGROUND_STANDBY -> serviceConnected
+        PrimaryAction.DISABLED -> false
+    }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
@@ -652,14 +735,22 @@ private fun ReceiverScreen(
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        stateLabel(snapshot, connectionPending, needsAttention),
+                        stateLabel(snapshot, connectionPending, needsAttention, adbGuideVisible),
                         style = MaterialTheme.typography.headlineSmall,
                         color = if (needsAttention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
                     )
+                    if (snapshot?.serviceState in setOf("authenticated", "receiverRunning", "streaming", "paused")) snapshot?.let {
+                        Text(stringResource(R.string.actual_connection,
+                            stringResource(actualConnectionLabel(it.connectionMethod))),
+                            style = MaterialTheme.typography.bodyMedium)
+                    }
                     Text(
-                        nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
-                            networkChoiceNeeded, notificationPermissionDenied),
+                        if (snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending)
+                            nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
+                                networkChoiceNeeded, notificationPermissionDenied)
+                        else stringResource(if (connectionChoice == ConnectionChoice.USB_ADB)
+                            R.string.adb_waiting_guidance else connectionChoice.descriptionResource()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -689,59 +780,93 @@ private fun ReceiverScreen(
                 }
             }
 
-            val canStartReceiver = snapshot != null && bound && !running && selectedAddress.isNotEmpty() &&
-                    interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix }
-            val canStopReceiver = running && snapshot?.operationState != "stopping"
-            val backgroundStandbyEnabled = snapshot?.backgroundStandbyEnabled == true
-            Button(
-                onClick = when {
-                    backgroundStandbyEnabled -> onStopBackgroundStandby
-                    running -> onStop
-                    else -> onConnectComputer
-                },
-                enabled = if (backgroundStandbyEnabled) snapshot?.operationState != "stopping"
-                    else canStartReceiver || canStopReceiver,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
-            ) {
-                Text(when {
-                    backgroundStandbyEnabled -> stringResource(R.string.background_standby_primary_action)
-                    snapshot?.operationState == "stopping" -> stringResource(R.string.stopping)
-                    canStopReceiver -> stringResource(R.string.stop_receiving)
-                    connectionPending -> stringResource(R.string.processing)
-                    else -> stringResource(R.string.start_receiving)
-                })
-            }
-
-            TextButton(
-                onClick = { showMoreMethods = !showMoreMethods },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-            ) {
-                Text(stringResource(if (showMoreMethods) R.string.hide_other_connection_methods else R.string.other_connection_methods))
-            }
-            if (showMoreMethods) {
-                OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
-
-                OutlinedButton(
-                    onClick = onConnectUsbDirect,
-                enabled = !running && !connectionPending && !usbPermissionPending
-                        && usbDirectSupported && usbAccessoryFeatureAvailable && usbDirectAvailable && bound,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
-            ) {
-                Text(if (usbPermissionPending) stringResource(R.string.usb_direct_permission_pending)
-                    else stringResource(R.string.usb_direct_connect))
-            }
-            if (usbPermissionPending) {
-                TextButton(onClick = onCancelUsbPermission,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                    Text(stringResource(R.string.usb_direct_cancel))
+            val methodCardColor = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+            Card(colors = methodCardColor) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(stringResource(R.string.connection_mode), style = MaterialTheme.typography.titleMedium)
+                    BoxWithConstraints {
+                        val compact = maxWidth < 300.dp || LocalDensity.current.fontScale >= 1.3f
+                        if (compact) {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                ConnectionChoice.values().forEach { choice ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).selectable(
+                                            selected = connectionChoice == choice,
+                                            enabled = !selectionLocked,
+                                            role = Role.RadioButton,
+                                            onClick = { onSelectConnectionChoice(choice) }
+                                        ),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        RadioButton(
+                                            selected = connectionChoice == choice,
+                                            onClick = null,
+                                            enabled = !selectionLocked,
+                                            modifier = Modifier.heightIn(min = 48.dp)
+                                        )
+                                        Text(stringResource(choice.labelResource()),
+                                            modifier = Modifier.weight(1f).heightIn(min = 48.dp))
+                                    }
+                                }
+                            }
+                        } else {
+                            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                                ConnectionChoice.values().forEachIndexed { index, choice ->
+                                    SegmentedButton(
+                                        selected = connectionChoice == choice,
+                                        onClick = { onSelectConnectionChoice(choice) },
+                                        enabled = !selectionLocked,
+                                        shape = SegmentedButtonDefaults.itemShape(index, ConnectionChoice.values().size)
+                                    ) { Text(stringResource(choice.shortLabelResource())) }
+                                }
+                            }
+                        }
+                    }
+                    Text(stringResource(connectionChoice.descriptionResource()),
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Button(
+                        onClick = {
+                            when (action) {
+                                PrimaryAction.CONNECT_USB_DIRECT -> onConnectUsbDirect()
+                                PrimaryAction.SHOW_ADB_GUIDE -> adbGuideVisible = true
+                                PrimaryAction.CONNECT_WIFI -> onConnectComputer()
+                                PrimaryAction.CANCEL_USB_PERMISSION -> onCancelUsbPermission()
+                                PrimaryAction.CLOSE_ADB_GUIDE -> adbGuideVisible = false
+                                PrimaryAction.CANCEL_PENDING_CONNECTION -> onCancelPendingConnection()
+                                PrimaryAction.STOP_RECEIVER -> onStop()
+                                PrimaryAction.STOP_BACKGROUND_STANDBY -> onStopBackgroundStandby()
+                                PrimaryAction.DISABLED -> Unit
+                            }
+                        },
+                        enabled = canPerformAction,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                    ) { Text(stringResource(action.labelResource())) }
+                    if (adbGuideVisible && !running && connectionChoice == ConnectionChoice.USB_ADB) {
+                        Text(stringResource(R.string.adb_waiting_guidance),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (connectionChoice == ConnectionChoice.USB_DIRECT) {
+                        val directNote = when {
+                            !usbDirectSupported -> R.string.usb_direct_requires_api24
+                            !usbAccessoryFeatureAvailable -> R.string.usb_direct_not_supported
+                            !usbDirectAvailable -> R.string.usb_direct_connect_hint
+                            else -> 0
+                        }
+                        if (directNote != 0) Text(stringResource(directNote),
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (connectionChoice == ConnectionChoice.WIFI && !running && (networkChoiceNeeded || interfaces.isEmpty())) {
+                        Text(stringResource(R.string.network_recovery_title), style = MaterialTheme.typography.titleSmall)
+                        if (interfaces.isEmpty()) {
+                            Text(stringResource(R.string.no_private_ipv4_interfaces_found),
+                                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            Text(stringResource(R.string.network_recovery_help),
+                                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
+                        }
+                    }
                 }
-            }
-            if (!usbDirectSupported) Text(stringResource(R.string.usb_direct_requires_api24),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            else if (!usbAccessoryFeatureAvailable) Text(stringResource(R.string.usb_direct_not_supported),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            else if (!usbDirectAvailable) Text(stringResource(R.string.usb_direct_connect_hint),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
@@ -775,67 +900,64 @@ private fun ReceiverScreen(
                 }
             }
 
-            if (showMoreMethods) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+            Card(colors = methodCardColor) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.background_standby_title), style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        backgroundStandbyStatus(snapshot, bound, running, connectionPending),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
-                    if (snapshot?.backgroundAuthorizationError?.isNotEmpty() == true) {
-                        Text(stringResource(R.string.background_authorization_failed), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = { otherSettingsExpanded = !otherSettingsExpanded },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                        Text(stringResource(if (otherSettingsExpanded) R.string.hide_other_settings else R.string.other_settings))
                     }
-                    when {
-                        snapshot?.backgroundStandbyEnabled == true -> {
-                            if (snapshot.backgroundGrantKind != "untilRevoked") {
-                                TextButton(
-                                    onClick = { trustConfirmationTarget = currentTrustTarget },
-                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                ) { Text(stringResource(R.string.trust_binding_until_revoked)) }
+                    if (!otherSettingsExpanded) Text(stringResource(R.string.other_settings_summary),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    AnimatedVisibility(visible = otherSettingsExpanded) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
+                            Text(stringResource(R.string.background_standby_title), style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                backgroundStandbyStatus(snapshot, bound, running, connectionPending),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
+                            if (snapshot?.backgroundAuthorizationError?.isNotEmpty() == true) {
+                                Text(stringResource(R.string.background_authorization_failed), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
                             }
-                            if (snapshot.canRevokeBackgroundTrust
-                                && snapshot.backgroundGrantKind in setOf("once", "eightHours", "untilRevoked")) {
-                                TextButton(
-                                    onClick = {
-                                        currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
-                                    },
-                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                ) { Text(stringResource(R.string.revoke_background_trust_and_stop)) }
+                            when {
+                                snapshot?.backgroundStandbyEnabled == true -> {
+                                    if (snapshot.backgroundGrantKind != "untilRevoked") {
+                                        TextButton(
+                                            onClick = { trustConfirmationTarget = currentTrustTarget },
+                                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                        ) { Text(stringResource(R.string.trust_binding_until_revoked)) }
+                                    }
+                                    if (snapshot.canRevokeBackgroundTrust
+                                        && snapshot.backgroundGrantKind in setOf("once", "eightHours", "untilRevoked")) {
+                                        TextButton(
+                                            onClick = {
+                                                currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
+                                            },
+                                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                        ) { Text(stringResource(R.string.revoke_background_trust_and_stop)) }
+                                    }
+                                }
+                                snapshot != null && bound && !running && !connectionPending -> {
+                                    TextButton(
+                                        onClick = onStartBackgroundStandby,
+                                        enabled = selectedAddress.isNotEmpty() && interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix },
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                    ) { Text(stringResource(R.string.start_background_standby)) }
+                                    if (snapshot.canRevokeBackgroundTrust
+                                        && snapshot.backgroundGrantKind in setOf("eightHours", "untilRevoked")) {
+                                        TextButton(
+                                            onClick = {
+                                                currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
+                                            },
+                                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                        ) { Text(stringResource(if (snapshot.backgroundGrantKind == "untilRevoked") R.string.revoke_background_trust else R.string.revoke_background_trust_temporary)) }
+                                    }
+                                }
+                                else -> Text(stringResource(R.string.background_standby_requires_idle_receiver), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
-                        snapshot != null && bound && !running && !connectionPending -> {
-                            TextButton(
-                                onClick = onStartBackgroundStandby,
-                                enabled = selectedAddress.isNotEmpty() && interfaces.any { it.address == selectedAddress && it.prefixLength == selectedPrefix },
-                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                            ) { Text(stringResource(R.string.start_background_standby)) }
-                            if (snapshot.canRevokeBackgroundTrust
-                                && snapshot.backgroundGrantKind in setOf("eightHours", "untilRevoked")) {
-                                TextButton(
-                                    onClick = {
-                                        currentTrustTarget?.let { onRevokeBackgroundTrust(it, snapshot.backgroundGrantKind) }
-                                    },
-                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                ) { Text(stringResource(if (snapshot.backgroundGrantKind == "untilRevoked") R.string.revoke_background_trust else R.string.revoke_background_trust_temporary)) }
-                            }
-                        }
-                        else -> Text(stringResource(R.string.background_standby_requires_idle_receiver), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-            }
-            }
-
-            if (!running && (networkChoiceNeeded || interfaces.isEmpty())) {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.network_recovery_title), style = MaterialTheme.typography.titleMedium)
-                    if (interfaces.isEmpty()) {
-                        Text(stringResource(R.string.no_private_ipv4_interfaces_found), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        Text(stringResource(R.string.network_recovery_help), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
                     }
                 }
             }
@@ -1018,10 +1140,10 @@ private fun InterfacePicker(
 }
 
 @Composable
-private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean): String =
+private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean, adbGuideVisible: Boolean): String =
     stringResource(chooseMainStateLabel(
         snapshot?.serviceState, snapshot?.operationState, snapshot != null,
-        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention
+        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention, adbGuideVisible
     ))
 
 internal fun chooseMainStateLabel(
@@ -1030,18 +1152,57 @@ internal fun chooseMainStateLabel(
     snapshotAvailable: Boolean,
     backgroundStandbyEnabled: Boolean,
     connectionPending: Boolean,
-    needsAttention: Boolean
+    needsAttention: Boolean,
+    adbGuideVisible: Boolean = false
 ): Int = when {
+    operationState == "stopping" -> R.string.stopping
     needsAttention -> R.string.state_needs_attention
     !snapshotAvailable || connectionPending || serviceState == "starting"
-            || operationState == "starting" || operationState == "stopping" ->
+            || operationState == "starting" ->
         R.string.state_connecting
     serviceState == "streaming" -> R.string.state_receiving
     serviceState == "receiverRunning" -> R.string.aod_connected
     serviceState == "paused" -> R.string.paused
     serviceState == "authenticated" -> R.string.aod_connected
     backgroundStandbyEnabled || serviceState == "prepared" -> R.string.state_waiting_for_computer
+    snapshotAvailable && !connectionPending && adbGuideVisible -> R.string.state_waiting_for_pc_action
     else -> R.string.state_not_connected
+}
+
+internal fun actualConnectionLabel(method: String?): Int = when (method) {
+    "usb-aoa" -> R.string.connection_usb_direct
+    "usb-adb" -> R.string.connection_usb_adb
+    "wireless-udp" -> R.string.connection_wifi
+    else -> R.string.actual_connection_unknown
+}
+
+private fun ConnectionChoice.labelResource(): Int = when (this) {
+    ConnectionChoice.USB_DIRECT -> R.string.connection_usb_direct
+    ConnectionChoice.USB_ADB -> R.string.connection_usb_adb
+    ConnectionChoice.WIFI -> R.string.connection_wifi
+}
+
+private fun ConnectionChoice.shortLabelResource(): Int = when (this) {
+    ConnectionChoice.USB_DIRECT -> R.string.connection_usb_direct_short
+    ConnectionChoice.USB_ADB -> R.string.connection_usb_adb_short
+    ConnectionChoice.WIFI -> R.string.connection_wifi
+}
+
+private fun ConnectionChoice.descriptionResource(): Int = when (this) {
+    ConnectionChoice.USB_DIRECT -> R.string.connection_direct_description
+    ConnectionChoice.USB_ADB -> R.string.connection_adb_description
+    ConnectionChoice.WIFI -> R.string.connection_wifi_description
+}
+
+private fun PrimaryAction.labelResource(): Int = when (this) {
+    PrimaryAction.CONNECT_USB_DIRECT, PrimaryAction.CONNECT_WIFI -> R.string.start_receiving
+    PrimaryAction.SHOW_ADB_GUIDE -> R.string.start_receiving
+    PrimaryAction.CANCEL_USB_PERMISSION -> R.string.usb_direct_cancel
+    PrimaryAction.CLOSE_ADB_GUIDE -> R.string.close_connection_guide
+    PrimaryAction.CANCEL_PENDING_CONNECTION -> R.string.cancel_connection
+    PrimaryAction.STOP_RECEIVER -> R.string.stop_receiving
+    PrimaryAction.STOP_BACKGROUND_STANDBY -> R.string.background_standby_primary_action
+    PrimaryAction.DISABLED -> R.string.stopping
 }
 
 @Composable
