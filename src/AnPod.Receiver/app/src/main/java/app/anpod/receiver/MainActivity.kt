@@ -322,6 +322,7 @@ class MainActivity : ComponentActivity() {
                     onSelect = { selectNetwork(it) },
                     connectionChoice = connectionChoice,
                     onSelectConnectionChoice = { choice ->
+                        if (choice != connectionChoice) localMessage = ""
                         saveConnectionChoicePreference(choice)
                     },
                     onConnectComputer = { connectComputer() },
@@ -683,7 +684,12 @@ private fun ReceiverScreen(
     LaunchedEffect(trustConfirmationTarget, currentTrustTarget) {
         if (trustConfirmationTarget != null && trustConfirmationTarget != currentTrustTarget) trustConfirmationTarget = null
     }
-    val diagnostic = localMessage.takeIf { it.isNotEmpty() }
+    val permissionPendingMessage = stringResource(R.string.usb_direct_permission_pending)
+    val permissionCancelledMessage = stringResource(R.string.usb_direct_cancelled)
+    val localStatusMessage = localMessage.takeIf {
+        isInformationalUsbPermissionMessage(it, permissionPendingMessage, permissionCancelledMessage)
+    }
+    val diagnostic = localMessage.takeIf { it.isNotEmpty() && localStatusMessage == null }
         ?: snapshot?.error?.takeIf { it.isNotEmpty() }
         ?: snapshot?.backgroundAuthorizationError?.takeIf { it.isNotEmpty() }.orEmpty()
     val notificationPermissionDenied = localMessage == stringResource(R.string.notification_permission_required)
@@ -735,7 +741,7 @@ private fun ReceiverScreen(
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        stateLabel(snapshot, connectionPending, needsAttention, adbGuideVisible),
+                        stateLabel(snapshot, connectionPending, needsAttention, adbGuideVisible, usbPermissionPending),
                         style = MaterialTheme.typography.headlineSmall,
                         color = if (needsAttention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
@@ -746,11 +752,15 @@ private fun ReceiverScreen(
                             style = MaterialTheme.typography.bodyMedium)
                     }
                     Text(
-                        if (snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending)
+                        if (shouldShowAdbGuideAsStatusStep(
+                                connectionChoice, adbGuideVisible, snapshot != null, needsAttention,
+                                receiverActive, backgroundStandbyEnabled, connectionPending
+                            ))
+                            stringResource(R.string.adb_waiting_guidance)
+                        else if (snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending)
                             nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
                                 networkChoiceNeeded, notificationPermissionDenied)
-                        else stringResource(if (connectionChoice == ConnectionChoice.USB_ADB)
-                            R.string.adb_waiting_guidance else connectionChoice.descriptionResource()),
+                        else stringResource(connectionChoice.descriptionResource()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -822,8 +832,10 @@ private fun ReceiverScreen(
                             }
                         }
                     }
-                    Text(stringResource(connectionChoice.descriptionResource()),
-                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (!(adbGuideVisible && connectionChoice == ConnectionChoice.USB_ADB)) {
+                        Text(stringResource(connectionChoice.descriptionResource()),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Button(
                         onClick = {
                             when (action) {
@@ -841,10 +853,8 @@ private fun ReceiverScreen(
                         enabled = canPerformAction,
                         modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)
                     ) { Text(stringResource(action.labelResource())) }
-                    if (adbGuideVisible && !running && connectionChoice == ConnectionChoice.USB_ADB) {
-                        Text(stringResource(R.string.adb_waiting_guidance),
-                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+                    if (localStatusMessage != null) Text(localStatusMessage,
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (connectionChoice == ConnectionChoice.USB_DIRECT) {
                         val directNote = when {
                             !usbDirectSupported -> R.string.usb_direct_requires_api24
@@ -920,6 +930,19 @@ private fun ReceiverScreen(
                             Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
                             if (snapshot?.backgroundAuthorizationError?.isNotEmpty() == true) {
                                 Text(stringResource(R.string.background_authorization_failed), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                            }
+                            if (connectionChoice != ConnectionChoice.WIFI && !running && !selectedNetworkAvailable) {
+                                Text(stringResource(R.string.network_recovery_title), style = MaterialTheme.typography.titleSmall)
+                                if (interfaces.isEmpty()) {
+                                    Text(stringResource(R.string.no_private_ipv4_interfaces_found),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                } else {
+                                    Text(stringResource(R.string.network_recovery_help),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    InterfacePicker(interfaces, selectedAddress, selectedPrefix, false, onSelect)
+                                }
                             }
                             when {
                                 snapshot?.backgroundStandbyEnabled == true -> {
@@ -1140,10 +1163,17 @@ private fun InterfacePicker(
 }
 
 @Composable
-private fun stateLabel(snapshot: UiSnapshot?, connectionPending: Boolean, needsAttention: Boolean, adbGuideVisible: Boolean): String =
+private fun stateLabel(
+    snapshot: UiSnapshot?,
+    connectionPending: Boolean,
+    needsAttention: Boolean,
+    adbGuideVisible: Boolean,
+    usbPermissionPending: Boolean
+): String =
     stringResource(chooseMainStateLabel(
         snapshot?.serviceState, snapshot?.operationState, snapshot != null,
-        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention, adbGuideVisible
+        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention, adbGuideVisible,
+        usbPermissionPending
     ))
 
 internal fun chooseMainStateLabel(
@@ -1153,10 +1183,12 @@ internal fun chooseMainStateLabel(
     backgroundStandbyEnabled: Boolean,
     connectionPending: Boolean,
     needsAttention: Boolean,
-    adbGuideVisible: Boolean = false
+    adbGuideVisible: Boolean = false,
+    usbPermissionPending: Boolean = false
 ): Int = when {
     operationState == "stopping" -> R.string.stopping
     needsAttention -> R.string.state_needs_attention
+    usbPermissionPending -> R.string.usb_direct_permission_pending
     !snapshotAvailable || connectionPending || serviceState == "starting"
             || operationState == "starting" ->
         R.string.state_connecting
@@ -1171,10 +1203,24 @@ internal fun chooseMainStateLabel(
 
 internal fun actualConnectionLabel(method: String?): Int = when (method) {
     "usb-aoa" -> R.string.connection_usb_direct
-    "usb-adb" -> R.string.connection_usb_adb
+    "usb-adb", "usb-or-local" -> R.string.connection_usb_adb_short
     "wireless-udp" -> R.string.connection_wifi
     else -> R.string.actual_connection_unknown
 }
+
+internal fun isInformationalUsbPermissionMessage(message: String, pending: String, cancelled: String) =
+    message == pending || message == cancelled
+
+internal fun shouldShowAdbGuideAsStatusStep(
+    choice: ConnectionChoice,
+    adbGuideVisible: Boolean,
+    snapshotAvailable: Boolean,
+    needsAttention: Boolean,
+    receiverActive: Boolean,
+    backgroundStandbyEnabled: Boolean,
+    connectionPending: Boolean
+) = choice == ConnectionChoice.USB_ADB && adbGuideVisible && snapshotAvailable &&
+        !needsAttention && !receiverActive && !backgroundStandbyEnabled && !connectionPending
 
 private fun ConnectionChoice.labelResource(): Int = when (this) {
     ConnectionChoice.USB_DIRECT -> R.string.connection_usb_direct

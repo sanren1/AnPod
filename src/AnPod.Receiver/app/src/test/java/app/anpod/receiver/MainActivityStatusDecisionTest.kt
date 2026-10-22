@@ -36,9 +36,44 @@ class MainActivityStatusDecisionTest {
     fun actualTransportUsesOnlyExplicitSnapshotValues() {
         assertEquals(R.string.connection_usb_direct, actualConnectionLabel("usb-aoa"))
         assertEquals(R.string.connection_wifi, actualConnectionLabel("wireless-udp"))
-        assertEquals(R.string.connection_usb_adb, actualConnectionLabel("usb-adb"))
-        assertEquals(R.string.actual_connection_unknown, actualConnectionLabel("usb-or-local"))
+        assertEquals(R.string.connection_usb_adb_short, actualConnectionLabel("usb-adb"))
+        assertEquals(R.string.connection_usb_adb_short, actualConnectionLabel("usb-or-local"))
         assertEquals(R.string.actual_connection_unknown, actualConnectionLabel(null))
+    }
+
+    @Test
+    fun normalUsbPermissionMessagesAreNotTreatedAsErrors() {
+        assertEquals(true, isInformationalUsbPermissionMessage("pending", "pending", "cancelled"))
+        assertEquals(true, isInformationalUsbPermissionMessage("cancelled", "pending", "cancelled"))
+        assertEquals(false, isInformationalUsbPermissionMessage("denied", "pending", "cancelled"))
+    }
+
+    @Test
+    fun adbGuideStatusStepNeverOverridesRealStatus() {
+        fun showGuide(
+            choice: ConnectionChoice = ConnectionChoice.USB_ADB,
+            snapshotAvailable: Boolean = true,
+            needsAttention: Boolean = false,
+            receiverActive: Boolean = false,
+            backgroundStandbyEnabled: Boolean = false,
+            connectionPending: Boolean = false
+        ) = shouldShowAdbGuideAsStatusStep(
+            choice = choice,
+            adbGuideVisible = true,
+            snapshotAvailable = snapshotAvailable,
+            needsAttention = needsAttention,
+            receiverActive = receiverActive,
+            backgroundStandbyEnabled = backgroundStandbyEnabled,
+            connectionPending = connectionPending
+        )
+
+        assertEquals(true, showGuide())
+        assertEquals(false, showGuide(needsAttention = true))
+        assertEquals(false, showGuide(receiverActive = true))
+        assertEquals(false, showGuide(backgroundStandbyEnabled = true))
+        assertEquals(false, showGuide(connectionPending = true))
+        assertEquals(false, showGuide(snapshotAvailable = false))
+        assertEquals(false, showGuide(choice = ConnectionChoice.WIFI))
     }
 
     @Test
@@ -88,6 +123,8 @@ class MainActivityStatusDecisionTest {
         assertEquals(R.string.state_receiving, label("streaming", adbGuide = true))
         assertEquals(R.string.state_needs_attention, label("stopped", attention = true, adbGuide = true))
         assertEquals(R.string.stopping, label("streaming", adbGuide = true, operation = "stopping"))
+        assertEquals(R.string.usb_direct_permission_pending,
+            chooseMainStateLabel("stopped", "idle", true, false, false, false, usbPermissionPending = true))
     }
 
     private fun connectionChoice(activity: MainActivity): ConnectionChoice =
