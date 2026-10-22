@@ -103,6 +103,6 @@ PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 �
 
 源码构建依赖 Rust stable、Node.js/npm、MSVC x64 C++ 工具；重建 Receiver 另需 JDK 17 与 Android SDK。前端使用 `cd frontend; npm ci; npm run build`。便携包入口见 [`packaging/publish-tauri.ps1`](packaging/publish-tauri.ps1)，构建前请阅读其中参数及脚本要求。旧 WPF 实现保留在 `src/AnPod.Desktop/`。
 
-提交 Rust 改动前运行 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`；发现排版差异先运行同命令去掉 `--check` 修正，再复查。其余检查以 [Windows CI 工作流](.github/workflows/windows-checks.yml) 为准。
+提交 Rust 改动前运行 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`；发现排版差异先运行同命令去掉 `--check` 修正，再复查。其余检查以 [Windows CI 工作流](https://github.com/sanren1/AnPod/blob/dev/.github/workflows/windows-checks.yml) 为准。
 
 第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码以 **GPL-3.0-or-later** 发布，完整文本见 [`LICENSE`](LICENSE)；其中改编自 AudioShare 的部分仍按 LGPL-3.0-or-later 说明处理。
