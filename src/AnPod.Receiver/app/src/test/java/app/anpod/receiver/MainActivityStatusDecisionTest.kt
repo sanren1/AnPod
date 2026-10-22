@@ -12,9 +12,11 @@ class MainActivityStatusDecisionTest {
         )
 
         assertEquals(R.string.aod_connected, label("authenticated"))
+        assertEquals(R.string.aod_connected, label("receiverRunning"))
+        assertEquals(R.string.state_receiving, label("streaming"))
         assertEquals(R.string.paused, label("paused"))
         assertEquals(R.string.state_waiting_for_computer, label("prepared"))
-        assertEquals(R.string.state_needs_attention, label("paused", attention = true))
+        assertEquals(R.string.state_needs_attention, label("streaming", attention = true))
     }
 
     @Test

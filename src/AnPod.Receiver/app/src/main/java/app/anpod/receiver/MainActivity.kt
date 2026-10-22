@@ -1036,7 +1036,8 @@ internal fun chooseMainStateLabel(
     !snapshotAvailable || connectionPending || serviceState == "starting"
             || operationState == "starting" || operationState == "stopping" ->
         R.string.state_connecting
-    serviceState == "receiverRunning" || serviceState == "streaming" -> R.string.state_receiving
+    serviceState == "streaming" -> R.string.state_receiving
+    serviceState == "receiverRunning" -> R.string.aod_connected
     serviceState == "paused" -> R.string.paused
     serviceState == "authenticated" -> R.string.aod_connected
     backgroundStandbyEnabled || serviceState == "prepared" -> R.string.state_waiting_for_computer
