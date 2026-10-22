@@ -18,7 +18,7 @@ fs.mkdirSync(out, {recursive:true});
   let id=0;const callbacks=new Map(),listeners=new Map();window.reviewCopiedText='';Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.reviewCopiedText=value;}}});
   const device={serial:'TESTUSB',transport:'usb',state:'device',manufacturer:'Google',model:'Pixel 8 Pro',androidVersion:'15',apiLevel:'35',displayName:'Google Pixel 8 Pro',statusText:'可连接',connectable:true};
   const secondDevice={...device,serial:'TESTSECOND',transport:'usb',displayName:'Long Google Pixel Wireless Device Name',androidVersion:'14'};
-  let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewDeferListener=false;let reviewResolveListener=null;let reviewDeferNetworkInterfaces=false;let reviewResolveNetworkInterfaces=null;let reviewBackgroundStartError='';let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
+  let reviewInterfaces=[{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}];let reviewReceiverInterfaces=[{interfaceIndex:1,interfaceName:'Wi-Fi',address:'192.168.50.20',prefixLength:24}];let reviewBindings=['phoneA-abcdef','phoneB-abcdef'];let reviewCandidates=[{endpoint:'192.168.50.3:45678'}];let reviewOfferAddress=null;let reviewListenerError='';let reviewDeferListener=false;let reviewResolveListener=null;let reviewDeferNetworkInterfaces=false;let reviewResolveNetworkInterfaces=null;let reviewBackgroundStartError='';let reviewDiscoveryError='';let reviewDeferDiscovery=false;let reviewResolveDiscovery=null;let reviewDeferNetworkStart=false;let reviewResolveNetworkStart=null;let reviewCancelReturnsActive=false;let reviewDeferCancel=false;let reviewResolveCancel=null;let reviewTrustError='';let reviewDeferTrust=false;let reviewTrustStatus={kind:'untilRevoked',persistence:'binding',remainingMs:null};
   let reviewReceiverManagementBusy=false;let reviewManagementSlotConflicts=0;
   let reviewAoaStartResolve=null;
   let reviewDisconnectFails=false;
@@ -62,6 +62,15 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewHoldInstallAndVerification=()=>{reviewDeferInstall=true;reviewDeferInstallVerification=true;reviewManualInstallProgress=true;};
   window.reviewWirelessFlowConfigure=(interfaces,bindings,candidates)=>{reviewInterfaces=structuredClone(interfaces);reviewBindings=[...bindings];reviewCandidates=structuredClone(candidates);reviewOfferAddress=null;reviewListenerError='';snapshot.wirelessConnectionOffers={active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]};emit();};
   window.reviewBackgroundStartFailure=message=>{reviewBackgroundStartError=message||'';};
+  window.reviewDiscoveryFailure=(message,defer=false)=>{reviewDiscoveryError=message||'';reviewDeferDiscovery=defer;};
+  window.reviewRejectDiscovery=()=>{if(reviewResolveDiscovery){const resolve=reviewResolveDiscovery;reviewResolveDiscovery=null;resolve();}};
+  window.reviewDiscoveryWaiting=()=>typeof reviewResolveDiscovery==='function';
+  window.reviewDeferStart=()=>{reviewDeferNetworkStart=true;};
+  window.reviewCancelAtCompletedStart=()=>{reviewCancelReturnsActive=true;};
+  window.reviewDeferCancel=()=>{reviewDeferCancel=true;};
+  window.reviewResolveCancel=()=>{if(reviewResolveCancel){const resolve=reviewResolveCancel;reviewResolveCancel=null;resolve();}};
+  window.reviewResolveStart=payload=>{if(reviewResolveNetworkStart){const resolve=reviewResolveNetworkStart;reviewResolveNetworkStart=null;resolve(payload);}};
+  window.reviewSetOfferWithoutEmit=offer=>{snapshot.wirelessConnectionOffers={...snapshot.wirelessConnectionOffers,offers:[offer]};};
   window.reviewBackgroundTrust=(status,error='')=>{reviewTrustStatus=structuredClone(status);reviewTrustError=error;};
   window.reviewDeferBackgroundTrust=()=>{reviewDeferTrust=true;};
   window.reviewTrustSessionGeneration=generation=>{snapshot.sessionGeneration=generation;emit();};
@@ -148,13 +157,13 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='switch_aoa_mode'){window.reviewAoaSwitchArgs=args;return new Promise(resolve=>window.reviewCompleteAoaSwitch=result=>resolve(result));}
    if(cmd==='start_aoa_audio'){window.reviewAoaStartArgs=args;return new Promise(resolve=>{reviewAoaStartResolve=resolve;});}
    if(cmd==='network_interfaces'){if(reviewDeferNetworkInterfaces)await new Promise(resolve=>reviewResolveNetworkInterfaces=resolve);return structuredClone(reviewInterfaces);}
-    if(cmd==='start_network_audio'){if(reviewBackgroundStartError){const message=reviewBackgroundStartError;reviewBackgroundStartError='';throw new Error(message);}if(args.backgroundAuthorizationRequired&&(!args.bindingReference||args.bootstrapSerial))throw new Error('后台授权目标缺少有效绑定');if(args.bootstrapSerial&&!reviewBindings.includes('new-phone-binding'))reviewBindings.push('new-phone-binding');snapshot={...snapshot,state:'phoneReady',message:'Receiver 已认证',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:args.bindingReference||'new-phone-binding',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:44,versionCode:reviewUsbStatuses[args.bootstrapSerial]?.versionCode??null},canDisconnect:true,canChangeModes:false,canChangePlaybackMode:true,connectionTransport:'wireless',transport:'wifi',output:'phone',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();return structuredClone(snapshot);}
+    if(cmd==='start_network_audio'){if(reviewDeferNetworkStart){reviewDeferNetworkStart=false;const result=await new Promise(resolve=>reviewResolveNetworkStart=resolve);return structuredClone(result);}if(reviewBackgroundStartError){const message=reviewBackgroundStartError;reviewBackgroundStartError='';throw new Error(message);}if(args.backgroundAuthorizationRequired&&(!args.bindingReference||args.bootstrapSerial))throw new Error('后台授权目标缺少有效绑定');if(args.bootstrapSerial&&!reviewBindings.includes('new-phone-binding'))reviewBindings.push('new-phone-binding');snapshot={...snapshot,state:'phoneReady',message:'Receiver 已认证',deviceName:'Google Pixel 8 Pro',sessionSerial:null,sessionReceiverBinding:args.bindingReference||'new-phone-binding',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',sessionCapabilities:{controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:44,versionCode:reviewUsbStatuses[args.bootstrapSerial]?.versionCode??null},canDisconnect:true,canChangeModes:false,canChangePlaybackMode:true,connectionTransport:'wireless',transport:'wifi',output:'phone',settings:{...snapshot.settings,preferredTransport:'Wifi',wirelessProtocol:'udp'}};emit();return structuredClone(snapshot);}
    if(cmd==='query_background_trust'){if(reviewDeferTrust){reviewDeferTrust=false;await new Promise(resolve=>window.reviewResolveBackgroundTrust=resolve);}if(reviewTrustError)throw new Error(reviewTrustError);return {target:args.target.target,bindingReference:args.target.bindingReference,sessionGeneration:args.target.sessionGeneration??null,...structuredClone(reviewTrustStatus)};}
    if(cmd==='revoke_background_trust'){if(reviewTrustError)throw new Error(reviewTrustError);reviewTrustStatus={kind:'none',persistence:'none',remainingMs:0};if(args.target.target==='activeSession'){snapshot={...snapshot,state:'ready',sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,canDisconnect:false,output:'computer'};emit();}return {target:args.target.target,bindingReference:args.target.bindingReference,sessionGeneration:args.target.sessionGeneration??null,...structuredClone(reviewTrustStatus)};}
    if(cmd==='get_snapshot')return structuredClone(snapshot);
    if(cmd==='set_wireless_connection_offers'){window.reviewListenerCalls.push({localAddress:args.localAddress,allowed:args.allowed,bindingReference:args.bindingReference});if(args.allowed&&reviewDeferListener)await new Promise(resolve=>reviewResolveListener=resolve);if(args.allowed&&reviewListenerError){const message=reviewListenerError;reviewListenerError='';throw new Error(message);}if(args.allowed)reviewOfferAddress=args.localAddress;snapshot.wirelessConnectionOffers={active:args.allowed,automaticBinding:args.allowed?(args.bindingReference??(reviewBindings.length===1?reviewBindings[0]:null)):null,interfaceAddress:args.allowed?args.localAddress:null,interfacePrefixLength:args.allowed?24:null,offers:[]};emit();return structuredClone(snapshot.wirelessConnectionOffers);}
    if(cmd==='accept_wireless_connection_offer'){window.reviewAcceptedOffers.push({offerId:args.offerId,bindingReference:args.bindingReference});snapshot.wirelessConnectionOffers={active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]};snapshot.state='phoneReady';snapshot.message='已认证连接';snapshot.sessionSerial=null;snapshot.sessionReceiverBinding=args.bindingReference;snapshot.sessionTransport='lan';snapshot.sessionConnectionTransport='wireless';snapshot.sessionWirelessProtocol='udp';snapshot.sessionCapabilities={controlMajor:3,audioMajor:1,managementCompatible:true,audioCompatible:true,compatible:true,capabilityBits:12,versionCode:7};snapshot.canDisconnect=true;snapshot.canChangeModes=false;snapshot.canChangePlaybackMode=true;snapshot.output='phone';emit();return structuredClone(snapshot);}
-   if(cmd==='discover_network_receivers')return structuredClone(reviewCandidates);
+   if(cmd==='discover_network_receivers'){if(reviewDeferDiscovery){reviewDeferDiscovery=false;await new Promise(resolve=>reviewResolveDiscovery=resolve);}if(reviewDiscoveryError){const message=reviewDiscoveryError;reviewDiscoveryError='';throw new Error(message);}return structuredClone(reviewCandidates);}
    if(cmd==='qr_credentials')return {instanceName:'studio-Test123456',password:'abcdefghijklmnopqrst',payload:'WIFI:T:ADB;S:studio-Test123456;P:abcdefghijklmnopqrst;;'};
    if(cmd==='pair_qr')return new Promise(resolve=>{window.reviewPairQrArgs=args;window.reviewCompleteQrPair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
    if(cmd==='pair_wifi')return new Promise(resolve=>{window.reviewCompletePair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
@@ -163,8 +172,8 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='connect_device_only'){window.reviewSet('connected',snapshot.transport,args.serial);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='switch_device'){if(window.reviewSwitchMode==='failure')return {success:false,message:'模拟切换失败，已恢复原连接',snapshot:structuredClone(snapshot)};window.reviewSet(snapshot.output==='phone'?'streaming':'connected',snapshot.transport,args.serial);snapshot.selectedSerial=args.serial;return {success:true,message:'已切换',snapshot:structuredClone(snapshot)};}
    if(cmd==='select_device'){snapshot.selectedSerial=args.serial;return structuredClone(snapshot);}
-   if(cmd==='cancel_operation'){const current={...snapshot,state:'ready',message:'已取消 USB Direct 连接',sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionReceiverBinding:null,sessionGeneration:null,canDisconnect:false,canChangeModes:true,busy:false,output:'computer'};snapshot=current;emit();if(reviewAoaStartResolve){const resolve=reviewAoaStartResolve;reviewAoaStartResolve=null;resolve(structuredClone(snapshot));}return structuredClone(snapshot);}
-   if(cmd==='disconnect'){if(reviewDisconnectFails){reviewDisconnectFails=false;return {success:false,message:'模拟断开失败',snapshot:structuredClone(snapshot)};}window.reviewSet('ready',snapshot.transport);return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
+   if(cmd==='cancel_operation'){if(reviewDeferCancel){reviewDeferCancel=false;await new Promise(resolve=>reviewResolveCancel=resolve);}if(reviewCancelReturnsActive){reviewCancelReturnsActive=false;return structuredClone(snapshot);}const current={...snapshot,state:'ready',message:'已取消 USB Direct 连接',sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionReceiverBinding:null,sessionGeneration:null,canDisconnect:false,canChangeModes:true,busy:false,output:'computer'};snapshot=current;emit();if(reviewAoaStartResolve){const resolve=reviewAoaStartResolve;reviewAoaStartResolve=null;resolve(structuredClone(snapshot));}return structuredClone(snapshot);}
+   if(cmd==='disconnect'){if(reviewDisconnectFails){reviewDisconnectFails=false;return {success:false,message:'模拟断开失败',snapshot:structuredClone(snapshot)};}snapshot={...snapshot,state:'ready',message:'已断开',sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,canDisconnect:false,canChangeModes:true,canChangePlaybackMode:false,busy:false,output:'computer'};emit();return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
    if(cmd==='set_output'){snapshot.output=args.output;snapshot.state=args.output==='phone'?'streaming':'connected';emit();return structuredClone(snapshot);}
    if(cmd==='reconfigure_session'){snapshot.settings[args.kind==='playback'?'playbackMode':'preferredTransport']=args.kind==='playback'?(args.value==='balanced'?'Balanced':'LowLatency'):(args.value==='usb'?'Usb':'Wifi');snapshot.transport=snapshot.settings.preferredTransport==='Wifi'?'wifi':'usb';window.reviewSet(snapshot.state,snapshot.transport);}
    return structuredClone(snapshot);
@@ -557,18 +566,28 @@ fs.mkdirSync(out, {recursive:true});
   await recovery.getByRole('button',{name:'连接手机',exact:true}).click();
   const confirm=page.getByRole('dialog').filter({hasText:'会中断当前播放'});
   results.activeRecoveryRequiresConfirmation=await confirm.count()===1&&await page.evaluate(()=>window.reviewCalls.start_network_audio===1&&window.reviewCalls.disconnect===undefined);
-  await confirm.getByRole('button',{name:'取消',exact:true}).click();await closeDialog(recovery);
+   await page.evaluate(()=>{window.reviewDeferStart();window.reviewCancelAtCompletedStart();});
+   await confirm.getByRole('button',{name:'继续',exact:true}).click();
+   await page.waitForFunction(()=>window.reviewCalls.start_network_audio===2);
+   const networkCancel=confirm.getByRole('button',{name:'取消连接',exact:true});
+   results.confirmedNetworkStartCanBeCancelled=await networkCancel.isEnabled();
+   await networkCancel.click();
+   await page.waitForFunction(()=>window.reviewCalls.cancel_operation===1&&window.reviewCalls.disconnect===1);
+   await page.evaluate(()=>window.reviewResolveStart({...window.reviewRead(),state:'phoneReady',message:'迟到的 Receiver 成功快照',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',canDisconnect:true,output:'phone'}));
+   await page.waitForFunction(()=>document.querySelectorAll('dialog[open]').length===1);
+   results.confirmCancelClosesConfirmation=await confirm.count()===0&&await page.evaluate(()=>window.reviewRead().sessionTransport===null);
+   await closeDialog(recovery);
 
   await configure(['phoneB-abcdef'],initialCandidates);await page.evaluate(()=>window.reviewBackgroundStartFailure('模拟连接失败'));
   await page.locator('.device-select').click();dialog=page.getByRole('dialog',{name:'连接手机'});await dialog.getByRole('button',{name:'连接手机',exact:true}).click();
   let recoveryDialog=page.getByRole('dialog',{name:'连接手机'});await recoveryDialog.getByRole('alert').waitFor();
   results.failedConnectShowsRecovery=await recoveryDialog.getByRole('button',{name:'返回连接手机',exact:true}).isVisible()&&await recoveryDialog.getByRole('button',{name:'连接手机',exact:true}).isEnabled();
   await recoveryDialog.getByRole('button',{name:'返回连接手机',exact:true}).click();dialog=page.getByRole('dialog',{name:'连接手机'});
-  await dialog.getByRole('button',{name:'连接手机',exact:true}).click();await page.waitForFunction(()=>window.reviewCalls.start_network_audio===3);
+  await dialog.getByRole('button',{name:'连接手机',exact:true}).click();await page.waitForFunction(()=>window.reviewCalls.start_network_audio===4);
   results.simpleRetryReconnects=await page.evaluate(()=>window.reviewRead().sessionConnectionTransport==='wireless');
   await page.waitForFunction(()=>document.querySelector('dialog[open]')===null);
 
-  await page.evaluate(()=>window.reviewSet('connecting','wifi'));
+  await page.evaluate(()=>{window.reviewCalls.cancel_operation=0;window.reviewSet('connecting','wifi');});
   const cancel=page.getByRole('button',{name:'取消连接',exact:true});
   await cancel.evaluate(button=>{button.click();button.click();});
   await page.waitForFunction(()=>window.reviewCalls.cancel_operation===1);
@@ -605,7 +624,7 @@ fs.mkdirSync(out, {recursive:true});
   fs.writeFileSync(`${out}/result.json`,JSON.stringify(results,null,2));
   const {layouts,...summary}=results;console.log(JSON.stringify({...summary,layoutFailures:layouts.filter(x=>x.width!==x.scrollWidth||x.deviceHeight<x.copyHeight)}));
   await browser.close();assert.deepEqual(errors,[]);
-   for(const key of ['targetCardUsesSimpleConnectFlow','mainActionUsesSameConnectFlow','pairedPhoneUsesExistingAuthenticatedPath','activeTargetDoesNotDisconnect','firstUseExplainsUsbSetup','firstUseKeepsExplicitInstall','multipleSavedTargetsUseGenericLabels','explicitSavedTargetIsUsed','discoveryAmbiguityMovesToRecovery','activeRecoveryRequiresConfirmation','failedConnectShowsRecovery','simpleRetryReconnects','busyCancelSendsOneCommand','advancedConnectionStartsCollapsed','audioFormatsStartCollapsed','audioFormatsExpand','advancedConnectionAlwaysVisible','keyboardFocusStaysInConnectDialog','keyboardCanOpenAndCloseConnectFlow'])assert.equal(results[key],true,key);
+    for(const key of ['targetCardUsesSimpleConnectFlow','mainActionUsesSameConnectFlow','pairedPhoneUsesExistingAuthenticatedPath','activeTargetDoesNotDisconnect','firstUseExplainsUsbSetup','firstUseKeepsExplicitInstall','multipleSavedTargetsUseGenericLabels','explicitSavedTargetIsUsed','discoveryAmbiguityMovesToRecovery','activeRecoveryRequiresConfirmation','confirmedNetworkStartCanBeCancelled','confirmCancelClosesConfirmation','failedConnectShowsRecovery','simpleRetryReconnects','busyCancelSendsOneCommand','advancedConnectionStartsCollapsed','audioFormatsStartCollapsed','audioFormatsExpand','advancedConnectionAlwaysVisible','keyboardFocusStaysInConnectDialog','keyboardCanOpenAndCloseConnectFlow'])assert.equal(results[key],true,key);
   assert.equal(layouts.filter(x=>x.width!==x.scrollWidth||x.deviceHeight<x.copyHeight).length,0);
   return;
  }
@@ -897,6 +916,12 @@ fs.mkdirSync(out, {recursive:true});
   results.singleClickStartsOnUniqueSelections=await page.evaluate(()=>window.reviewListenerCalls[2]?.localAddress==='192.168.50.2'&&window.reviewListenerCalls[2]?.bindingReference==='phoneA-abcdef'&&window.reviewListenerCalls[2]?.allowed===true);
   results.listenerStatusAndStopAction=await page.getByRole('button',{name:'停止等待',exact:true}).isEnabled()&&await page.evaluate(()=>window.reviewRead().wirelessConnectionOffers.automaticBinding==='phoneA-abcdef');
   results.listeningStatusAndStopLabel=await page.locator('.status-line').innerText().then(text=>text==='等待手机连接电脑')&&await page.getByRole('button',{name:'停止等待',exact:true}).count()===1;
+  const pollsBeforeUnannouncedOffer=await page.evaluate(()=>window.reviewCalls.get_snapshot||0);
+  await page.evaluate(()=>window.reviewSetOfferWithoutEmit({id:'poll-only-request',endpoint:'192.168.50.8:49772'}));
+  const pollOnlyDialog=page.getByRole('dialog',{name:'连接手机'});
+  await pollOnlyDialog.getByRole('button',{name:/192\.168\.50\.8/}).waitFor();
+  results.mainPollingDetectsOfferWithoutEvent=await page.evaluate(before=>(window.reviewCalls.get_snapshot||0)>before&&window.reviewAcceptedOffers.length===0,pollsBeforeUnannouncedOffer);
+  await pollOnlyDialog.getByRole('button',{name:'关闭',exact:true}).click();
   await page.screenshot({path:`${out}/wireless-listening-auto.png`});
   await page.evaluate(()=>window.reviewWirelessOffers([{id:'request-a',endpoint:'192.168.50.8:49772'}]));
   await dialog.waitFor();
@@ -1010,7 +1035,7 @@ fs.mkdirSync(out, {recursive:true});
   console.log(JSON.stringify(summary));
   await browser.close();
   assert.deepEqual(errors,[]);
-  for(const key of ['mainControlsKeepChineseAccessibleNames','settingsKeepChineseLabels','listenerNotStartedAutomatically','phoneCardWaitsAfterEmptyDiscovery','closeReturnsToActiveWait','closeDoesNotStopListener','singleClickStartsOnUniqueSelections','listenerStatusAndStopAction','listeningStatusAndStopLabel','mainWaitOpensManualRequest','listenerCanStopWhileBackendBusy','listenerStopReachesBackendWhileBusy','stopCancelsListener','pendingListenerStartCanBeStopped','cancelledStartDoesNotResurrect','networkChangeCancelsPendingChoice','listenerFailureHasRetry','listenerRetryUsesCorrectBinding','unexpectedListenerLossRearmsSamePath','onlyExplicitAcceptanceStartsPhonePlayback','udpSessionComputerOutputCanPlay','activeSessionDoesNotStartListener','mainClickExplicitlyStartsDiscoveredPhone','multipleChoicesRequireSelection','validSelectionsSurviveRefresh','invalidSelectionsAreRevoked','networkChangeStopsOldListener','userSelectionsSurviveRefresh','listenerUsesExplicitChoices','automaticModeDoesNotOfferPerRequestApproval','multipleAutomaticTargetsRemainSelectable','multiOfferPreservesStillValidChoice','expiredSelectionClearedWithoutAcceptance','explicitRequestSelectionSurvivesRefresh'])assert.equal(results[key],true,key);
+  for(const key of ['mainControlsKeepChineseAccessibleNames','settingsKeepChineseLabels','listenerNotStartedAutomatically','phoneCardWaitsAfterEmptyDiscovery','closeReturnsToActiveWait','closeDoesNotStopListener','singleClickStartsOnUniqueSelections','listenerStatusAndStopAction','listeningStatusAndStopLabel','mainPollingDetectsOfferWithoutEvent','mainWaitOpensManualRequest','listenerCanStopWhileBackendBusy','listenerStopReachesBackendWhileBusy','stopCancelsListener','pendingListenerStartCanBeStopped','cancelledStartDoesNotResurrect','networkChangeCancelsPendingChoice','listenerFailureHasRetry','listenerRetryUsesCorrectBinding','unexpectedListenerLossRearmsSamePath','onlyExplicitAcceptanceStartsPhonePlayback','udpSessionComputerOutputCanPlay','activeSessionDoesNotStartListener','mainClickExplicitlyStartsDiscoveredPhone','multipleChoicesRequireSelection','validSelectionsSurviveRefresh','invalidSelectionsAreRevoked','networkChangeStopsOldListener','userSelectionsSurviveRefresh','listenerUsesExplicitChoices','automaticModeDoesNotOfferPerRequestApproval','multipleAutomaticTargetsRemainSelectable','multiOfferPreservesStillValidChoice','expiredSelectionClearedWithoutAcceptance','explicitRequestSelectionSurvivesRefresh'])assert.equal(results[key],true,key);
   return;
  }
  if(!process.env.ANPOD_SKIP_LAYOUT_MATRIX)for(const size of [[420,590],[360,500]]){
@@ -1343,6 +1368,48 @@ fs.mkdirSync(out, {recursive:true});
   await page.waitForFunction(()=>window.reviewCalls.start_network_audio===1);
   results.udpPrimaryConnectsOneDiscoveredTargetWithoutStandbyAuth=await page.evaluate(()=>window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired===false&&window.reviewCommandArgs.start_network_audio?.bindingReference==='phoneA-abcdef'&&window.reviewCommandArgs.start_network_audio?.localAddress==='192.168.50.2'&&window.reviewCommandArgs.start_network_audio?.peer==='192.168.50.3:45678'&&!window.reviewCalls.query_background_trust);
 
+  await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'}]);window.reviewBackgroundStartFailure('FORMAT_RATE_MISMATCH: requested=96000, mix=48000');});
+  await page.getByRole('button',{name:'连接手机',exact:true}).click();
+  const mainRateFailure=page.getByRole('dialog',{name:'连接手机'});
+  await mainRateFailure.getByRole('alert').waitFor();
+  await mainRateFailure.getByRole('alert').locator('details').locator('summary').click();
+  results.mainScreenStartFailureIsVisible=await mainRateFailure.getByRole('alert').locator('pre').innerText().then(text=>text.includes('FORMAT_RATE_MISMATCH'));
+  await mainRateFailure.getByRole('button',{name:'关闭',exact:true}).click();
+
+  await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'}]);window.reviewDiscoveryFailure('模拟迟到发现失败',true);});
+  await page.getByRole('button',{name:'连接手机',exact:true}).click();
+  await page.waitForFunction(()=>window.reviewDiscoveryWaiting());
+  await page.getByRole('button',{name:'打开设置',exact:true}).click();
+  const settingsDuringDiscovery=page.getByRole('dialog',{name:'设置'});
+  await settingsDuringDiscovery.waitFor();
+  await page.evaluate(()=>window.reviewRejectDiscovery());
+  await page.waitForTimeout(50);
+  results.staleDiscoveryFailureDoesNotReopenNetwork=await settingsDuringDiscovery.isVisible()&&await page.getByRole('dialog',{name:'连接手机'}).count()===0;
+  await settingsDuringDiscovery.getByRole('button',{name:'关闭',exact:true}).click();
+
+  await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'}]);window.reviewDeferStart();});
+  const cancelsBeforeNetworkStart=await page.evaluate(()=>window.reviewCalls.cancel_operation||0);
+  const startsBeforeCancelledNetworkStart=await page.evaluate(()=>window.reviewCalls.start_network_audio||0);
+  await page.getByRole('button',{name:'连接手机',exact:true}).click();
+  await page.waitForFunction(before=>(window.reviewCalls.start_network_audio||0)>before,startsBeforeCancelledNetworkStart);
+  const cancelNetworkButton=page.getByRole('button',{name:'取消连接',exact:true});
+  results.mainNetworkStartCanBeCancelled=await cancelNetworkButton.isEnabled()&&await page.locator('.status-line').innerText().then(text=>text.includes('正在连接'));
+  const disconnectsBeforeNetworkCancel=await page.evaluate(()=>window.reviewCalls.disconnect||0);
+  await page.evaluate(()=>{window.reviewSetUdpStreaming();window.reviewTrustSessionGeneration(41);window.reviewCancelAtCompletedStart();window.reviewDeferCancel();});
+  await cancelNetworkButton.click();
+  await page.waitForFunction(before=>(window.reviewCalls.cancel_operation||0)>before,cancelsBeforeNetworkStart);
+  const retryDuringCancel=page.locator('.main-action');
+  results.networkActionsStayDisabledUntilCancelAck=await retryDuringCancel.isDisabled();
+  await retryDuringCancel.click({timeout:1000}).catch(()=>{});
+  results.noSecondNetworkStartBeforeCancelAck=await page.evaluate(before=>(window.reviewCalls.start_network_audio||0)===before,startsBeforeCancelledNetworkStart+1);
+  await page.evaluate(()=>window.reviewResolveCancel());
+  await page.waitForFunction(before=>(window.reviewCalls.disconnect||0)>before,disconnectsBeforeNetworkCancel);
+  await page.evaluate(()=>{const late={...window.reviewRead(),state:'phoneReady',message:'迟到的 Receiver 成功快照',sessionSerial:null,sessionReceiverBinding:'phoneA-abcdef',sessionGeneration:41,sessionTransport:'lan',sessionConnectionTransport:'wireless',sessionWirelessProtocol:'udp',canDisconnect:true,output:'phone'};window.reviewResolveStart(late);});
+  await page.waitForTimeout(50);
+  results.cancelledNetworkStartIgnoresLateSuccess=await page.getByRole('button',{name:'连接手机',exact:true}).isEnabled()&&await page.locator('dialog[open]').count()===0&&await page.evaluate(()=>window.reviewRead().state==='ready');
+
+  await page.evaluate(()=>{window.reviewCalls.cancel_operation=0;window.reviewSetUdpStreaming();window.reviewTrustSessionGeneration(41);});
+
   await page.evaluate(()=>window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'},{endpoint:'192.168.50.4:45678'}]));
   await page.getByRole('button',{name:'打开设置',exact:true}).click();
 
@@ -1376,25 +1443,28 @@ fs.mkdirSync(out, {recursive:true});
   await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:1,name:'Wi-Fi',address:'192.168.50.2',prefixLength:24,gateways:[]}],['phoneA-abcdef'],[{endpoint:'192.168.50.3:45678'},{endpoint:'192.168.50.4:45678'}]);});
   const trustQueriesBeforeMulti=await page.evaluate(()=>window.reviewCalls.query_background_trust||0);
   await trustDialog.getByRole('button',{name:'关闭',exact:true}).click();
+   await page.evaluate(()=>window.reviewSetUdpReady());
+   const startsBeforeMulti=await page.evaluate(()=>window.reviewCalls.start_network_audio||0);
   await page.getByRole('button',{name:'连接手机',exact:true}).click();
   const multiTargetDialog=page.getByRole('dialog',{name:'连接手机'});
   await multiTargetDialog.getByLabel('手机地址').waitFor();
-  results.multipleDiscoveredTargetsRequireChoice=await multiTargetDialog.getByLabel('手机地址').inputValue()===''&&await multiTargetDialog.getByRole('button',{name:'连接手机',exact:true}).isDisabled()&&await page.evaluate(()=>window.reviewCalls.start_network_audio===1);
+   results.multipleDiscoveredTargetsRequireChoice=await multiTargetDialog.getByLabel('手机地址').inputValue()===''&&await multiTargetDialog.getByRole('button',{name:'连接手机',exact:true}).isDisabled()&&await page.evaluate(before=>(window.reviewCalls.start_network_audio||0)===before,startsBeforeMulti);
   await multiTargetDialog.getByRole('button',{name:/192\.168\.50\.4:45678/}).click();
   await multiTargetDialog.getByRole('button',{name:'连接手机',exact:true}).click();
-  await page.waitForFunction(()=>window.reviewCalls.start_network_audio===2);
-  results.explicitCandidateConnectsWithoutStandbyAuth=await page.evaluate(before=>window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired!==true&&window.reviewCommandArgs.start_network_audio?.peer==='192.168.50.4:45678'&&(window.reviewCalls.query_background_trust||0)===before,trustQueriesBeforeMulti);
+   await page.waitForFunction(before=>(window.reviewCalls.start_network_audio||0)===before+1,startsBeforeMulti);
+   results.explicitCandidateConnectsWithoutStandbyAuth=await page.evaluate(({starts,trustQueries})=>window.reviewCalls.start_network_audio===starts+1&&window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired!==true&&window.reviewCommandArgs.start_network_audio?.peer==='192.168.50.4:45678'&&(window.reviewCalls.query_background_trust||0)===trustQueries,{starts:startsBeforeMulti,trustQueries:trustQueriesBeforeMulti});
 
   await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:2,name:'Ethernet',address:'10.0.0.2',prefixLength:24,gateways:[]}],['phoneB-abcdef'],[{endpoint:'10.0.0.3:45678'}]);});
+   const startsBeforeReplacement=await page.evaluate(()=>window.reviewCalls.start_network_audio||0);
   await page.getByRole('button',{name:'连接手机',exact:true}).click();
   const replacedTargetDialog=page.getByRole('dialog',{name:'连接手机'});
   await replacedTargetDialog.getByLabel('电脑网络接口').waitFor();
-  results.replacedDirectTargetsRequireExplicitChoice=await replacedTargetDialog.getByLabel('电脑网络接口').inputValue()===''&&await replacedTargetDialog.getByLabel('已配对手机').inputValue()===''&&await page.evaluate(()=>window.reviewCalls.start_network_audio===2);
+   results.replacedDirectTargetsRequireExplicitChoice=await replacedTargetDialog.getByLabel('电脑网络接口').inputValue()===''&&await replacedTargetDialog.getByLabel('已配对手机').inputValue()===''&&await page.evaluate(before=>(window.reviewCalls.start_network_audio||0)===before,startsBeforeReplacement);
   await replacedTargetDialog.getByLabel('电脑网络接口').selectOption('10.0.0.2');
   await replacedTargetDialog.getByLabel('已配对手机').selectOption('phoneB-abcdef');
   await replacedTargetDialog.getByRole('button',{name:/10\.0\.0\.3:45678/}).click();
   await replacedTargetDialog.getByRole('button',{name:/直接连接这台手机/}).click();
-  await page.waitForFunction(()=>window.reviewCalls.start_network_audio===3);
+   await page.waitForFunction(before=>(window.reviewCalls.start_network_audio||0)===before+1,startsBeforeReplacement);
   results.explicitReplacementTargetConnectsWithoutStandbyAuth=await page.evaluate(()=>window.reviewCommandArgs.start_network_audio?.localAddress==='10.0.0.2'&&window.reviewCommandArgs.start_network_audio?.bindingReference==='phoneB-abcdef'&&window.reviewCommandArgs.start_network_audio?.peer==='10.0.0.3:45678'&&window.reviewCommandArgs.start_network_audio?.backgroundAuthorizationRequired!==true);
 
   await page.evaluate(()=>{window.reviewSetUdpReady();window.reviewWirelessFlowConfigure([{index:2,name:'Ethernet',address:'10.0.0.2',prefixLength:24,gateways:[]}],['phoneB-abcdef'],[{endpoint:'10.0.0.3:45678'},{endpoint:'10.0.0.4:45678'}]);window.reviewBackgroundStartFailure('模拟显式连接失败');});
@@ -1454,6 +1524,6 @@ fs.mkdirSync(out, {recursive:true});
  await browser.close();
  assert.deepEqual(errors,[]);
  if(!process.env.ANPOD_SKIP_LAYOUT_MATRIX)assert.equal(layouts.filter(x=>x.horizontalOverflow||x.deviceHeight<x.deviceTextHeight||x.width!==x.size[0]).length,0);
- for(const key of ['focusStable','pairDialogTabsKeepChineseAccessibleNames','modalKeepsScrollingWithoutScrollbar','qrCancellationUsesBackendAndLeavesPairCode','pairCodeSurvivesQrCancel','stalePairStaysClosed','cleanupRetryEnabled','cleanupRetryWorks','deviceDialogChineseLabels','selectDoesNotConnect','usbPrimaryStartsPlayback','stopRestoresComputer','activeComputerOutputStartsWithoutDisconnect','secondaryComputerOutputWorks','adbPrimaryStartsPlayback','activeModeChangeReconfiguresWithoutConfirm','stopRemainsEnabledWhileBusy','stopDuringBusyDisconnects','activeErrorKeepsDisconnectRetry','errorDetailsRemainAvailableOnDemand','activeUdpCompactPhoneCard','udpModeReconfiguresWithoutConfirm','managementSessionDoesNotOfferPlayback','noTargetOffersHelp','udpHelpDescribesPhoneRestartAndUsbCheck','udpSelectionStaysOnMainScreen','udpPrimaryActionIsVerb','udpPrimaryConnectsOneDiscoveredTargetWithoutStandbyAuth','backgroundTrustQueryUsesActiveSessionGeneration','revokeNeedsExplicitTargetConfirmation','revokeUsesAckStateAndPreservesBinding','failedTrustQueryIsUnknown','staleTrustResponseDiscarded','multipleDiscoveredTargetsRequireChoice','explicitCandidateConnectsWithoutStandbyAuth','replacedDirectTargetsRequireExplicitChoice','explicitReplacementTargetConnectsWithoutStandbyAuth','explicitConnectFailureKeepsManualRetry','udpListenerCanStop','noBindingKeepsUsbSetupAvailable','noBindingStartsFirstSetup','connectingCanBeCancelled','busyBlocksModes','cancelConnectionWorks','recoveryCountdownUsesSnapshot','recoveryCountdownHiddenWhenAbsent','advancedOptionsStartCollapsed','advancedOptionsInSettings','standardViewportNoOverflow','largeTextNoOverflow','largeTextFitsOrCanScroll'])assert.equal(results[key],true,key);
+ for(const key of ['focusStable','pairDialogTabsKeepChineseAccessibleNames','modalKeepsScrollingWithoutScrollbar','qrCancellationUsesBackendAndLeavesPairCode','pairCodeSurvivesQrCancel','stalePairStaysClosed','cleanupRetryEnabled','cleanupRetryWorks','deviceDialogChineseLabels','selectDoesNotConnect','usbPrimaryStartsPlayback','stopRestoresComputer','activeComputerOutputStartsWithoutDisconnect','secondaryComputerOutputWorks','adbPrimaryStartsPlayback','activeModeChangeReconfiguresWithoutConfirm','stopRemainsEnabledWhileBusy','stopDuringBusyDisconnects','activeErrorKeepsDisconnectRetry','errorDetailsRemainAvailableOnDemand','activeUdpCompactPhoneCard','udpModeReconfiguresWithoutConfirm','managementSessionDoesNotOfferPlayback','noTargetOffersHelp','udpHelpDescribesPhoneRestartAndUsbCheck','udpSelectionStaysOnMainScreen','udpPrimaryActionIsVerb','udpPrimaryConnectsOneDiscoveredTargetWithoutStandbyAuth','mainScreenStartFailureIsVisible','staleDiscoveryFailureDoesNotReopenNetwork','mainNetworkStartCanBeCancelled','networkActionsStayDisabledUntilCancelAck','noSecondNetworkStartBeforeCancelAck','cancelledNetworkStartIgnoresLateSuccess','backgroundTrustQueryUsesActiveSessionGeneration','revokeNeedsExplicitTargetConfirmation','revokeUsesAckStateAndPreservesBinding','failedTrustQueryIsUnknown','staleTrustResponseDiscarded','multipleDiscoveredTargetsRequireChoice','explicitCandidateConnectsWithoutStandbyAuth','replacedDirectTargetsRequireExplicitChoice','explicitReplacementTargetConnectsWithoutStandbyAuth','explicitConnectFailureKeepsManualRetry','udpListenerCanStop','noBindingKeepsUsbSetupAvailable','noBindingStartsFirstSetup','connectingCanBeCancelled','busyBlocksModes','cancelConnectionWorks','recoveryCountdownUsesSnapshot','recoveryCountdownHiddenWhenAbsent','advancedOptionsStartCollapsed','advancedOptionsInSettings','standardViewportNoOverflow','largeTextNoOverflow','largeTextFitsOrCanScroll'])assert.equal(results[key],true,key);
  assert.equal(results.codeRetained,'123456');
 })().catch(e=>{console.error(e);process.exit(1)});
