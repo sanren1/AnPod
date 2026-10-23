@@ -11,8 +11,8 @@
 .text-button:hover:not(:disabled) { background: var(--accent-soft); }
 .status-description { min-height: 24px; margin: 7px 0 0; color: var(--muted); line-height: 20px; overflow-wrap: anywhere; }
 .status-description.actionable-error { color: var(--danger); }
-.device-section { padding-bottom: 5px; }
-.connection-section { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 0 10px; padding: 4px 0 6px; }
+.device-section { padding-bottom: 0; }
+.connection-section { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 0 10px; margin-top: 8px; padding: 4px 0 12px; }
 .connection-section > .section-title { grid-column: 1; grid-row: 1; }
 .connection-section > .fluid-segmented-control { grid-column: 2; grid-row: 1; }
 .connection-section > .wired-mode-section { grid-column: 1 / -1; }
@@ -280,7 +280,7 @@
 @media (max-width: 390px) { .audio-quality-status div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 @media (max-width: 390px) { .settings-dialog .select-setting { align-items: stretch; flex-direction: column; gap: 5px; } .settings-dialog .select-setting select { width: 100%; max-width: none; } }
 /* Playback mode collapses into a one-line summary; open by default so the choice stays visible. */
-.mode-disclosure { padding-top: 6px; }
+.mode-disclosure { padding-top: 12px; }
 .mode-disclosure > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; font-weight: 650; }
 .mode-disclosure > summary::-webkit-details-marker { display: none; }
 .mode-disclosure > summary strong { margin-left: auto; color: var(--muted); font-weight: 600; }
@@ -349,12 +349,12 @@
 .diagnostics-dialog .diagnostic-group h3 { color: var(--muted); }
 
 @media (max-width: 390px) {
-  .device-section { padding-bottom: 2px; }
   .device-select { min-height: 56px; }
-  .connection-section { padding-block: 2px 3px; }
+  .connection-section { margin-top: 4px; padding-bottom: 8px; }
   .wired-mode-section { margin-top: 2px; }
   .wired-mode-section .mode-row { min-height: 44px; }
   .status-hero { padding-block: 6px; }
   .status-hero .status-line { min-height: 24px; }
+  .mode-disclosure { padding-top: 8px; }
   .settings-dialog .settings-group { margin-inline: 12px; }
 }
