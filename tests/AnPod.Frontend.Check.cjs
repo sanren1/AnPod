@@ -24,7 +24,7 @@ fs.mkdirSync(out, {recursive:true});
   let reviewAoaStartResolve=null;
   let reviewDisconnectFails=false;
   let reviewAoaTargets=[{id:'opaque-target-a',label:'AnPod 配件设备'}];let reviewAoaSwitchTargets=[{id:'switch-phone-a',label:'iQOO 11 (V2243A)'}];
-  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,lastUsbDirectTargetId:null,lastUsbDirectBindingReference:null,wiredMode:'adb',minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.0.3'};
+  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,lastUsbDirectTargetId:null,lastUsbDirectBindingReference:null,wiredMode:'adb',minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.11.1'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
   window.reviewSetAoaTargets=targets=>{reviewAoaTargets=structuredClone(targets);};
@@ -184,6 +184,98 @@ fs.mkdirSync(out, {recursive:true});
  await page.locator('.app-shell').waitFor();
  await page.waitForFunction(()=>window.reviewCalls?.get_snapshot===1&&window.reviewCalls?.refresh_devices===1);
  const results={errors,layouts:[],focusStable:null};
+ if(process.env.ANPOD_SETTINGS_CHILD_FOCUS_ONLY){
+  const settingsLauncher=page.getByRole('button',{name:'打开设置',exact:true});
+  const focusState=async()=>page.evaluate(()=>{const el=document.activeElement;return {tag:el?.tagName??null,label:el?.getAttribute('aria-label')??el?.innerText?.trim()??null,className:typeof el?.className==='string'?el.className:null,isBody:el===document.body};});
+  const openSettings=async()=>{await settingsLauncher.click();const dialog=page.getByRole('dialog',{name:'设置'});await dialog.waitFor();return dialog;};
+  let settings=await openSettings();
+  await settings.getByRole('button',{name:'诊断',exact:true}).click();
+  const diagnostics=page.getByRole('dialog',{name:'诊断'});await diagnostics.waitFor();await page.keyboard.press('Escape');await diagnostics.waitFor({state:'detached'});await page.waitForTimeout(100);
+  results.diagnosticsFocus=await focusState();
+  results.diagnosticsReturnsToSettingsLauncher=await settingsLauncher.evaluate(el=>document.activeElement===el);
+  results.diagnosticsReturnsToFooterTrigger=await page.locator('.footer').getByRole('button',{name:'诊断',exact:true}).evaluate(el=>document.activeElement===el);
+  settings=await openSettings();
+  await settings.getByRole('button',{name:'连接帮助',exact:true}).click();
+  const help=page.getByRole('dialog',{name:'连接帮助'});await help.waitFor();await page.keyboard.press('Escape');await help.waitFor({state:'detached'});await page.waitForTimeout(100);
+  results.helpFocus=await focusState();
+  results.helpReturnsToSettingsLauncher=await settingsLauncher.evaluate(el=>document.activeElement===el);
+  results.helpReturnsToFooterTrigger=await page.locator('.footer').getByRole('button',{name:'连接帮助',exact:true}).evaluate(el=>document.activeElement===el);
+  results.diagnosticsFocusReturned=results.diagnosticsReturnsToSettingsLauncher||results.diagnosticsReturnsToFooterTrigger;
+  results.helpFocusReturned=results.helpReturnsToSettingsLauncher||results.helpReturnsToFooterTrigger;
+  fs.writeFileSync(`${out}/settings-child-focus-result.json`,JSON.stringify(results,null,2));
+  await browser.close();assert.deepEqual(errors,[]);assert.equal(results.diagnosticsFocusReturned,true,'diagnostics closes back to a persistent settings/help trigger');assert.equal(results.helpFocusReturned,true,'help closes back to a persistent settings/help trigger');return;
+ }
+ if(process.env.ANPOD_UI_REFERENCE_CAPTURE){
+  const baseUrl=process.env.ANPOD_UI_URL||'http://127.0.0.1:1420';
+  const geometry=[];
+  const openSettings=async()=>{const chinese=page.getByRole('button',{name:'打开设置',exact:true});if(await chinese.count())await chinese.click();else await page.getByRole('button',{name:'Open settings',exact:true}).click();const dialog=page.getByRole('dialog').last();await dialog.waitFor();return dialog;};
+  const configure=async(language,theme,large,width,height)=>{
+   await page.goto(new URL(`?lang=${language}`,baseUrl).toString());await page.locator('.app-shell').waitFor();
+   await page.setViewportSize({width,height});await page.emulateMedia({colorScheme:theme,reducedMotion:'reduce'});
+   await page.waitForFunction(value=>document.documentElement.dataset.theme===value,theme);
+   if(large){const dialog=await openSettings();const toggle=dialog.locator('.settings-appearance input[type="checkbox"]').first();await toggle.check();await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});await page.locator('.app-shell.large-text').waitFor();}
+   await page.evaluate(()=>window.reviewSet('connected','usb'));
+   await page.waitForFunction(()=>window.reviewRead().state==='connected');
+  };
+  for(const size of [[420,590],[360,500],[480,700]])for(const theme of ['light','dark']){
+   const [width,height]=size;await configure('zh',theme,false,width,height);
+   const mainName=`main-zh-${theme}-${width}x${height}.png`;await page.screenshot({path:`${out}/${mainName}`});
+   const main=await page.evaluate(()=>{
+    const describe=el=>{if(!el)return null;const style=getComputedStyle(el),rect=el.getBoundingClientRect();return {width:rect.width,height:rect.height,borderRadius:style.borderRadius,background:style.backgroundColor,color:style.color};};
+    const groups=[...document.querySelectorAll('.fluid-segmented-control')].map(el=>({label:el.getAttribute('aria-label'),...describe(el),selected:describe(el.querySelector('button[aria-pressed="true"]'))}));
+    const action=document.querySelector('.main-action'),mode=document.querySelector('.mode-section .fluid-segmented-control'),modeRow=document.querySelector('.mode-section'),footer=document.querySelector('.footer');
+    const modeRect=mode?.getBoundingClientRect(),modeRowRect=modeRow?.getBoundingClientRect(),footerRect=footer?.getBoundingClientRect(),scrollRoot=document.querySelector('.main-scroll'),scrollTop=scrollRoot?.scrollTop??0;
+    modeRow?.scrollIntoView({block:'end'});
+    const reachableRowRect=modeRow?.getBoundingClientRect(),scrollViewport=scrollRoot?.getBoundingClientRect(),reachableFooterRect=footer?.getBoundingClientRect();
+    const rowReachableByScroll=!!reachableRowRect&&!!scrollViewport&&!!reachableFooterRect&&reachableRowRect.top>=scrollViewport.top&&reachableRowRect.bottom<=reachableFooterRect.top;
+    if(scrollRoot)scrollRoot.scrollTop=scrollTop;
+    return {theme:document.documentElement.dataset.theme,language:document.documentElement.lang,viewport:[innerWidth,innerHeight],appWidth:document.querySelector('.app-shell').getBoundingClientRect().width,groups,mainAction:describe(action),statusText:document.querySelector('.status-line,[data-testid="connection-status"]')?.innerText??null,playbackMode:{control:describe(mode),row:describe(modeRow),fullyVisibleAboveFooter:!!modeRect&&!!footerRect&&modeRect.bottom<=footerRect.top,rowFullyVisibleAboveFooter:!!modeRowRect&&!!footerRect&&modeRowRect.bottom<=footerRect.top,rowReachableByScroll}};
+   });
+   const labels=main.groups.map(group=>group.label).sort();
+   const radii=main.groups.map(group=>Number.parseFloat(group.borderRadius));
+   const capsuleGeometry=main.groups.length===3&&labels.join('|')===['USB 连接模式','连接方式','播放模式'].sort().join('|')&&main.groups.every(group=>group.borderRadius===main.groups[0].borderRadius&&Number.parseFloat(group.borderRadius)>=group.height/2)&&main.groups.every(group=>group.selected.borderRadius===group.borderRadius);
+   const primaryActionGeometry=main.mainAction?.height>=48;
+   geometry.push({screenshot:mainName,capsuleGeometry,primaryActionGeometry,...main});
+   assert.equal(capsuleGeometry,true,`${mainName}: three real segmented controls share capsule geometry`);
+   assert.equal(primaryActionGeometry,true,`${mainName}: primary action remains a usable hero control`);
+   assert.equal(main.playbackMode?.fullyVisibleAboveFooter,true,`${mainName}: playback mode stays fully visible above the fixed footer`);
+   assert.equal(main.playbackMode?.rowReachableByScroll,true,`${mainName}: playback mode row remains reachable by scrolling above the fixed footer`);
+   if(width>=390)assert.equal(main.playbackMode?.rowFullyVisibleAboveFooter,true,`${mainName}: playback mode row stays fully visible above the fixed footer at standard desktop width`);
+   const settings=await openSettings();
+   const collapsedName=`settings-zh-${theme}-collapsed-${width}x${height}.png`;await page.screenshot({path:`${out}/${collapsedName}`});
+   const collapsed=await settings.locator('.settings-disclosure').count()?await settings.locator('.settings-disclosure').evaluate(el=>!el.open):null;
+   await settings.locator('.settings-disclosure > summary').click();
+   const expandedName=`settings-zh-${theme}-expanded-${width}x${height}.png`;await page.screenshot({path:`${out}/${expandedName}`});
+   await settings.evaluate(el=>el.scrollTop=el.scrollHeight);
+   const bottomName=`settings-zh-${theme}-expanded-bottom-${width}x${height}.png`;await page.screenshot({path:`${out}/${bottomName}`});
+   const settingsEvidence=await settings.evaluate(dialog=>({headings:[...dialog.querySelectorAll('h2,h3,h4')].map(el=>el.innerText.trim()),radioCount:dialog.querySelectorAll('input[type="radio"]').length,radioChecked:[...dialog.querySelectorAll('input[type="radio"]')].filter(el=>el.checked).length,radioDisabled:[...dialog.querySelectorAll('input[type="radio"]')].map(el=>el.disabled),advancedOpen:dialog.querySelector('.settings-disclosure')?.open??null,text:dialog.innerText}));
+   const headings=settingsEvidence.headings;
+   const fourGroups=['界面','音频','连接','关于与诊断'].every(heading=>headings.includes(heading));
+   const radioSemantics=settingsEvidence.radioCount===3&&settingsEvidence.radioChecked===1;
+   geometry.push({screenshot:collapsedName,collapsedAdvanced:collapsed});geometry.push({screenshot:expandedName,fourGroups,radioSemantics,...settingsEvidence});geometry.push({screenshot:bottomName});
+   assert.equal(collapsed,true,`${collapsedName}: advanced settings start collapsed`);
+   assert.equal(fourGroups,true,`${expandedName}: all four settings groups remain present`);
+   assert.equal(radioSemantics,true,`${expandedName}: quality choices retain radio semantics`);
+   await settings.locator('.audio-format-disclosure > summary').click();
+   const unknownFormat=await settings.locator('.audio-quality-status').innerText();
+   const unknownFormatName=`settings-zh-${theme}-unknown-format-${width}x${height}.png`;await page.screenshot({path:`${out}/${unknownFormatName}`});
+   geometry.push({screenshot:unknownFormatName,unknownFormatText:unknownFormat});
+   assert.match(unknownFormat,/未知|未确认/,`${unknownFormatName}: missing telemetry remains explicitly unknown`);
+   await page.keyboard.press('Escape');await settings.waitFor({state:'detached'});
+  }
+  for(const language of ['zh','en'])for(const theme of ['light','dark']){
+   await configure(language,theme,true,360,500);
+   const mainName=`main-${language}-${theme}-large-360x500.png`;await page.screenshot({path:`${out}/${mainName}`});
+   const settings=await openSettings();const collapsed=`settings-${language}-${theme}-large-collapsed-360x500.png`;const advancedCollapsed=await settings.locator('.settings-disclosure').evaluate(el=>!el.open);await page.screenshot({path:`${out}/${collapsed}`});
+   await settings.locator('.settings-disclosure > summary').click();const expanded=`settings-${language}-${theme}-large-expanded-360x500.png`;await page.screenshot({path:`${out}/${expanded}`});
+   geometry.push({screenshot:mainName});geometry.push({screenshot:collapsed,advancedCollapsed});geometry.push({screenshot:expanded,advancedExpanded:await settings.locator('.settings-disclosure').evaluate(el=>el.open)});
+   assert.equal(advancedCollapsed,true,`${collapsed}: advanced settings start collapsed with large text`);
+   await page.keyboard.press('Escape');await settings.waitFor({state:'detached'});
+  }
+  results.referenceCapture={versionFixture:await page.evaluate(()=>window.reviewRead().version),screenshots:geometry};
+  fs.writeFileSync(`${out}/reference-capture-result.json`,JSON.stringify(results.referenceCapture,null,2));
+  await browser.close();assert.deepEqual(errors,[]);return;
+ }
  if(process.env.ANPOD_UI_FOCUS_RETURN_ONLY){
   const trigger=page.getByRole('button',{name:'打开设置',exact:true});
   const describeFocus=()=>page.evaluate(()=>{const el=document.activeElement;return {tag:el?.tagName??null,ariaLabel:el?.getAttribute('aria-label')??null,className:typeof el?.className==='string'?el.className:null,insideOpenDialog:!!document.querySelector('dialog[open]')?.contains(el),isBody:el===document.body};});
@@ -385,6 +477,8 @@ fs.mkdirSync(out, {recursive:true});
   await dialog.waitFor();
    results.audioQualityStartsCollapsed=await dialog.locator('.settings-disclosure').evaluate(el=>!el.open);
    await dialog.locator('.settings-disclosure > summary').click();
+  results.zhAudioCards=await dialog.locator('.audio-quality-card').evaluateAll(cards=>({count:cards.length,items:cards.map(card=>{const rect=card.getBoundingClientRect(),style=getComputedStyle(card);return {text:card.innerText,visible:rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden',scrollWidth:card.scrollWidth,clientWidth:card.clientWidth};})}));
+  results.zhRequestedSpecsVisible=results.zhAudioCards.count===3&&results.zhAudioCards.items.every(item=>item.visible&&item.scrollWidth<=item.clientWidth)&&['48 kHz / 16-bit','48 kHz / 24-bit','96 kHz / 24-bit'].every(spec=>results.zhAudioCards.items.some(item=>item.text.includes(spec)));
    results.audioFormatsStartCollapsed=await dialog.locator('.audio-format-disclosure').evaluate(el=>!el.open);
    await dialog.locator('.audio-format-disclosure > summary').click();
   const hifi=dialog.getByRole('radio',{name:/高保真/});
@@ -427,6 +521,8 @@ fs.mkdirSync(out, {recursive:true});
   await page.getByRole('button',{name:/settings/i}).click();
   dialog=page.getByRole('dialog');await dialog.waitFor();
    await dialog.locator('.settings-disclosure > summary').click();
+  results.enAudioCards=await dialog.locator('.audio-quality-card').evaluateAll(cards=>({count:cards.length,items:cards.map(card=>{const rect=card.getBoundingClientRect(),style=getComputedStyle(card);return {text:card.innerText,visible:rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden',scrollWidth:card.scrollWidth,clientWidth:card.clientWidth};})}));
+  results.enRequestedSpecsVisible=results.enAudioCards.count===3&&results.enAudioCards.items.every(item=>item.visible&&item.scrollWidth<=item.clientWidth)&&['48 kHz / 16-bit','48 kHz / 24-bit','96 kHz / 24-bit'].every(spec=>results.enAudioCards.items.some(item=>item.text.includes(spec)));
    await dialog.locator('.audio-format-disclosure > summary').click();
    results.enLabelsAndDefault=await dialog.getByRole('radio',{name:'Standard · 48 kHz / 16-bit'}).isChecked()&&!await dialog.getByRole('radio',{name:/Hi-Fi/}).isDisabled()&&!await dialog.getByRole('radio',{name:/Hi-Res/}).isDisabled()&&await dialog.getByText(/Hi-Res requires 96 kHz capture and phone app support/).isVisible();
   results.enActualFormats=await dialog.locator('.audio-quality-status').innerText().then(text=>text.includes('48 kHz · PCM16LE · 2 ch · 16 valid bits')&&text.includes('44.1 kHz · Integer PCM · 2 ch · 24 container bits · Unknown')&&text.includes('Float32 stream'))&&await dialog.getByText(/physical output device’s effective precision is unknown/).isVisible();
@@ -444,9 +540,9 @@ fs.mkdirSync(out, {recursive:true});
   await page.setViewportSize({width:640,height:360});
   results.landscapeDialogCanScroll=await dialog.evaluate(el=>{const horizontal=el.scrollWidth<=el.clientWidth&&[...el.querySelectorAll('.audio-quality-status div')].every(row=>row.scrollWidth<=row.clientWidth);if(el.scrollHeight<=el.clientHeight)return horizontal;el.scrollTop=el.scrollHeight;return horizontal&&el.scrollTop>0;});
   fs.writeFileSync(`${out}/audio-quality-result.json`,JSON.stringify(results,null,2));
-  console.log(JSON.stringify({zhLabelsAndDefault:results.zhLabelsAndDefault,zhActualFormats:results.zhActualFormats,hifiCanBeRequested:results.hifiCanBeRequested,hiResCanBeRequested:results.hiResCanBeRequested,selectedTierDoesNotInventActual96:results.selectedTierDoesNotInventActual96,zhHiResActualFormats:results.zhHiResActualFormats,unknownFormatsStayUnknown:results.unknownFormatsStayUnknown,unsupportedHiResFailureIsClear:results.unsupportedHiResFailureIsClear,busyLocksQuality:results.busyLocksQuality,zhDialogNoHorizontalOverflow:results.zhDialogNoHorizontalOverflow,keyboardFocusStaysInSettings:results.keyboardFocusStaysInSettings,enLabelsAndDefault:results.enLabelsAndDefault,enActualFormats:results.enActualFormats,enDialogNoHorizontalOverflow:results.enDialogNoHorizontalOverflow,largeTextApplied:results.largeTextApplied,englishLight375NoOverflow:results.englishLight375NoOverflow,englishLight375Geometry:results.englishLight375Geometry,landscapeDialogCanScroll:results.landscapeDialogCanScroll,errors}));
+  console.log(JSON.stringify({zhRequestedSpecsVisible:results.zhRequestedSpecsVisible,zhAudioCards:results.zhAudioCards,zhLabelsAndDefault:results.zhLabelsAndDefault,zhActualFormats:results.zhActualFormats,hifiCanBeRequested:results.hifiCanBeRequested,hiResCanBeRequested:results.hiResCanBeRequested,selectedTierDoesNotInventActual96:results.selectedTierDoesNotInventActual96,zhHiResActualFormats:results.zhHiResActualFormats,unknownFormatsStayUnknown:results.unknownFormatsStayUnknown,unsupportedHiResFailureIsClear:results.unsupportedHiResFailureIsClear,busyLocksQuality:results.busyLocksQuality,zhDialogNoHorizontalOverflow:results.zhDialogNoHorizontalOverflow,keyboardFocusStaysInSettings:results.keyboardFocusStaysInSettings,enRequestedSpecsVisible:results.enRequestedSpecsVisible,enAudioCards:results.enAudioCards,enLabelsAndDefault:results.enLabelsAndDefault,enActualFormats:results.enActualFormats,enDialogNoHorizontalOverflow:results.enDialogNoHorizontalOverflow,largeTextApplied:results.largeTextApplied,englishLight375NoOverflow:results.englishLight375NoOverflow,englishLight375Geometry:results.englishLight375Geometry,landscapeDialogCanScroll:results.landscapeDialogCanScroll,errors}));
   await browser.close();assert.deepEqual(errors,[]);
-   for(const key of ['audioQualityStartsCollapsed','audioFormatsStartCollapsed','zhLabelsAndDefault','zhActualFormats','hifiCanBeRequested','hiResCanBeRequested','selectedTierDoesNotInventActual96','zhHiResActualFormats','unknownFormatsStayUnknown','unsupportedHiResFailureIsClear','busyLocksQuality','zhDialogNoHorizontalOverflow','keyboardFocusStaysInSettings','enLabelsAndDefault','enActualFormats','enDialogNoHorizontalOverflow','largeTextApplied','englishLight375NoOverflow','landscapeDialogCanScroll'])assert.equal(results[key],true,key);
+   for(const key of ['audioQualityStartsCollapsed','zhRequestedSpecsVisible','audioFormatsStartCollapsed','zhLabelsAndDefault','zhActualFormats','hifiCanBeRequested','hiResCanBeRequested','selectedTierDoesNotInventActual96','zhHiResActualFormats','unknownFormatsStayUnknown','unsupportedHiResFailureIsClear','busyLocksQuality','zhDialogNoHorizontalOverflow','keyboardFocusStaysInSettings','enRequestedSpecsVisible','enLabelsAndDefault','enActualFormats','enDialogNoHorizontalOverflow','largeTextApplied','englishLight375NoOverflow','landscapeDialogCanScroll'])assert.equal(results[key],true,key);
   return;
  }
  if(process.env.ANPOD_DIAGNOSTICS_ONLY){

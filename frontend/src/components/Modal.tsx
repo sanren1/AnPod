@@ -2,7 +2,7 @@ import { useEffect, useRef, type Ref, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { strings } from "../strings";
 
-export function Modal({ title, children, onClose, className = "" }: { title: string; children: ReactNode; onClose: () => void; className?: string }) {
+export function Modal({ title, children, onClose, className = "", returnFocusTarget }: { title: string; children: ReactNode; onClose: () => void; className?: string; returnFocusTarget?: () => HTMLElement | null }) {
   const ref = useRef<HTMLDialogElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => { onCloseRef.current = onClose; });
@@ -17,7 +17,8 @@ export function Modal({ title, children, onClose, className = "" }: { title: str
       dialog.removeEventListener("keydown", key);
       if (dialog.open) dialog.close();
       const replacementModal = [...document.querySelectorAll("dialog.modal")].some(candidate => candidate !== dialog);
-      if (!replacementModal && opener?.isConnected) opener.focus({ preventScroll: true });
+      const focusTarget = returnFocusTarget?.() ?? opener;
+      if (!replacementModal && focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
     };
   }, []);
   return <dialog ref={ref} aria-label={title} className={`modal ${className}`} onCancel={event => { event.preventDefault(); onClose(); }} onClick={event => { const dialog = ref.current; if (!dialog || event.target !== dialog) return; const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose(); }}>

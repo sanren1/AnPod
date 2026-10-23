@@ -6,7 +6,7 @@ import { invokeApp, hasActiveSession, intendedConnectionLabel, actualConnectionL
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 
-export function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; onClose: () => void }) {
+export function DiagnosticsDialog({ snapshot, onClose, returnFocusTarget }: { snapshot: Snapshot; onClose: () => void; returnFocusTarget?: () => HTMLElement | null }) {
   const capabilities = snapshot.sessionCapabilities;
   const diagnostic = snapshot.playbackDiagnostics;
   const [exporting, setExporting] = useState(false);
@@ -92,7 +92,7 @@ export function DiagnosticsDialog({ snapshot, onClose }: { snapshot: Snapshot; o
     <dl>{group.metrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
     {group.note && <p>{group.note}</p>}
   </section>;
-  return <Modal title={strings.diagnostics.dialogTitle} onClose={onClose} className="diagnostics-dialog">
+  return <Modal title={strings.diagnostics.dialogTitle} onClose={onClose} className="diagnostics-dialog" returnFocusTarget={returnFocusTarget}>
     <section className="diagnostic-overview" aria-label={strings.diagnostics.currentState}>
       <dl><div><dt>{strings.diagnostics.state}</dt><dd>{readableStatus(snapshot, snapshot.canDisconnect && snapshot.state === "error")}</dd></div>
         <div><dt>{strings.diagnostics.actualConnection}</dt><dd>{active ? actualConnectionLabel(snapshot) : strings.diagnostics.notConnected}</dd></div>

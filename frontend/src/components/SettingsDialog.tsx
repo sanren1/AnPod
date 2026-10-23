@@ -1,9 +1,10 @@
 import { strings } from "../strings";
 import type { Settings, Snapshot } from "../appTypes";
+import { Activity, CircleHelp, Smartphone } from "lucide-react";
 import { Modal } from "./Modal";
 import { SettingToggle } from "./SettingToggle";
 
-export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
+export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => void; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onSave: (key: string, value: unknown) => void; onClose: () => void }) {
   const settings = snapshot.settings;
   const adbQualityOnly = snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
     ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
@@ -24,7 +25,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     : strings.app.audioFormatUnknown;
   return <Modal title={strings.app.settingsTitle} onClose={onClose} className="settings-dialog">
     <section className="settings-group settings-appearance" aria-labelledby="settings-appearance-title">
-      <h3 id="settings-appearance-title">{strings.app.windowAppearance}</h3>
+      <h3 id="settings-appearance-title">{strings.app.settingsInterface}</h3>
       <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy} value={settings.appearanceTheme} onChange={event => update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
       <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
       <SettingToggle disabled={snapshot.busy} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
@@ -32,13 +33,23 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     <details className="settings-disclosure">
       <summary><span>{strings.app.advancedConnection}<small>{strings.app.advancedSettingsHint}</small></span></summary>
       <section className="settings-group settings-audio" aria-labelledby="settings-audio-title">
-        <h3 id="settings-audio-title">{strings.app.transportQuality}</h3>
+        <h3 id="settings-audio-title">{strings.app.settingsAudio}</h3>
         <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
-          <legend className="visually-hidden">{strings.app.transportQuality}</legend>
-          {(["standard", "hifi", "hires"] as const).map(quality => <label className="setting-toggle" key={quality}>
-            <span>{strings.app.audioQualityLabels[quality]}</span>
-            <input type="radio" name="audioQuality" value={quality} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => update("audioQuality", quality)} />
-          </label>)}
+          <legend>{strings.app.transportQuality}</legend>
+          <div className="audio-quality-options">
+            {(["standard", "hifi", "hires"] as const).map(quality => {
+              const fullLabel = strings.app.audioQualityLabels[quality];
+              const requestedSpec = fullLabel.split(" · ").slice(1).join(" · ").replace(/\s*(?:（实验）|\(experimental\))$/i, "");
+              return <label className="audio-quality-card" key={quality}>
+                <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => update("audioQuality", quality)} />
+                <span>
+                  <strong>{strings.app.audioQualityShortLabels[quality]}</strong>
+                  <small>{strings.app.requestedSpecification}: {requestedSpec}</small>
+                  {quality !== "standard" && <small>{strings.app.audioExperimental}</small>}
+                </span>
+              </label>;
+            })}
+          </div>
           {adbQualityOnly && <p className="dialog-footnote">{strings.app.adbStandardQualityOnly}</p>}
           <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
           <details className="audio-format-disclosure">
@@ -53,15 +64,20 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
         </fieldset>
       </section>
       <section className="settings-group settings-connection" aria-labelledby="settings-connection-title">
-        <h3 id="settings-connection-title">{strings.app.connectionMode}</h3>
+        <h3 id="settings-connection-title">{strings.app.settingsConnection}</h3>
         <label className="select-setting"><span>{strings.app.wirelessProtocol}<small>{strings.app.wirelessProtocolHelp}</small></span><select aria-label={strings.app.wirelessProtocol} disabled={busy} value={settings.wirelessProtocol} onChange={event => onSetOption("wirelessProtocol", event.target.value)}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
         <label className="select-setting"><span>{strings.app.receiverBackend}<small>{strings.app.receiverBackendHelp}</small></span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed} value={settings.audioBackend} onChange={event => onSetOption("audioBackend", event.target.value)}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
         {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
         {aoaSession ? <p className="dialog-footnote">{strings.app.aoaReceiverBackendFixed}</p> : udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
       </section>
     </details>
-    <section className="settings-group settings-about" aria-label={strings.app.phoneApplication}>
-      <button className="text-button backend-manager-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.phoneApplication}</button>
+    <section className="settings-group settings-about" aria-labelledby="settings-about-title">
+      <h3 id="settings-about-title">{strings.app.aboutAndDiagnostics}</h3>
+      <div className="settings-about-actions">
+        <button type="button" disabled={busy} onClick={onOpenReceiverManager}><Smartphone size={15} aria-hidden="true" />{strings.app.phoneApplication}</button>
+        <button type="button" onClick={onOpenDiagnostics}><Activity size={15} aria-hidden="true" />{strings.app.diagnostics}</button>
+        <button type="button" onClick={onOpenHelp}><CircleHelp size={15} aria-hidden="true" />{strings.app.help}</button>
+      </div>
       {snapshot.busy && <p className="dialog-footnote">{strings.app.settingsBusy}</p>}
       <p className="dialog-footnote">{strings.app.settingsPrivacy}</p>
     </section>

@@ -5,20 +5,23 @@
 .state-paused .status-dot { background: var(--warning); }
 .state-error .status-dot { background: var(--danger); }
 .main-action { width: 100%; min-height: 52px; margin: 7px 0 4px; font-size: 15px; }
-.section-title { display: flex; align-items: center; justify-content: space-between; min-height: 32px; }
+.section-title { display: flex; align-items: center; justify-content: space-between; min-height: 26px; }
 .section-title h1, .section-title h2, .mode-row h2 { margin: 0; font-size: 14px; font-weight: 650; line-height: 20px; }
 .text-button { min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 4px 7px; border: 0; border-radius: 6px; background: transparent; color: var(--accent); cursor: pointer; white-space: nowrap; }
 .text-button:hover:not(:disabled) { background: var(--accent-soft); }
 .status-description { min-height: 24px; margin: 7px 0 0; color: var(--muted); line-height: 20px; overflow-wrap: anywhere; }
 .status-description.actionable-error { color: var(--danger); }
-.device-section { padding-bottom: 11px; }
-.connection-section { padding: 8px 0 10px; border-block: 1px solid var(--line); }
+.device-section { padding-bottom: 5px; }
+.connection-section { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 0 10px; padding: 4px 0 6px; border-block: 1px solid var(--line); }
+.connection-section > .section-title { grid-column: 1; grid-row: 1; }
+.connection-section > .fluid-segmented-control { grid-column: 2; grid-row: 1; }
+.connection-section > .wired-mode-section { grid-column: 1 / -1; }
 .device-status-actions { display: grid; gap: 3px; padding-top: 8px; }
 .device-status-actions .main-action { margin: 2px 0 0; }
 .transport-switch, .mode-switch { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; border-radius: 9px; background: var(--wash); }
 .transport-switch { min-height: 48px; }
 .transport-switch button, .mode-switch button { min-width: 0; display: inline-flex; justify-content: center; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
-.transport-switch button { min-height: 42px; padding: 6px 8px; }
+.transport-switch button { min-height: 36px; padding: 5px 8px; }
 .transport-switch button[aria-pressed="true"], .mode-switch button[aria-pressed="true"] { border-color: var(--line); background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #19243a1c; font-weight: 650; }
 .transport-switch button:disabled, .mode-switch button:disabled { opacity: 0.62; }
 .protocol-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 8px; }
@@ -26,15 +29,14 @@
 .protocol-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 650; }
 .protocol-switch button:disabled { opacity: 0.62; cursor: default; }
 .protocol-switch small { font-size: 11px; font-weight: 500; }
-.connection-hint { margin: 6px 1px 0; color: var(--muted); font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
-.wired-mode-section { margin-top: 8px; }
+.connection-hint { margin: 2px 1px 0; color: var(--muted); font-size: 11px; line-height: 15px; overflow-wrap: anywhere; }
+.wired-mode-section { margin-top: 5px; }
 .wired-mode-section .mode-row h3 { font-size: 13px; }
-.wired-mode-section .transport-switch { width: min(220px, 64%); }
 .device-heading { margin: 5px 0 3px; }
 .device-heading h2 { font-size: 13px; }
 .device-card { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0 4px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
 .device-card:focus-within, .device-card:hover { border-color: var(--accent); }
-.device-select { grid-column: 1; grid-row: 1; min-width: 0; width: 100%; min-height: 68px; display: grid; grid-template-columns: 26px minmax(0, 1fr) 20px; align-items: center; gap: 9px; padding: 9px 0 9px 11px; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
+.device-select { grid-column: 1; grid-row: 1; min-width: 0; width: 100%; min-height: 60px; display: grid; grid-template-columns: 26px minmax(0, 1fr) 20px; align-items: center; gap: 9px; padding: 8px 0 8px 11px; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
 .device-select:disabled { cursor: default; }
 .device-icon { display: grid; place-items: center; color: var(--muted); }
 .device-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -274,7 +276,7 @@
 
 @keyframes rotate { to { transform: rotate(360deg); } }
 @keyframes pulse { to { opacity: .42; } }
-@media (max-width: 390px) { .main-scroll { padding-inline: 12px; } .output-card { padding-inline: 10px; } .status-device { display: none; } }
+@media (max-width: 390px) { .output-card { padding-inline: 10px; } .status-device { display: none; } }
 @media (max-width: 390px) { .audio-quality-status div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 @media (max-width: 390px) { .settings-dialog .select-setting { align-items: stretch; flex-direction: column; gap: 5px; } .settings-dialog .select-setting select { width: 100%; max-width: none; } }
 /* Playback mode collapses into a one-line summary; open by default so the choice stays visible. */
@@ -288,14 +290,10 @@
 .mode-disclosure .mode-switch { width: 100%; }
 
 /* Refresh the existing choice controls without changing their snapshot-confirmed behavior. */
-.fluid-segmented-control.transport-switch { min-height: 48px; border-radius: 9px; }
-.fluid-segmented-control.mode-switch { width: min(220px, 64%); min-height: 48px; border-radius: 9px; }
-.fluid-segmented-control.transport-switch > button,
-.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 7px; }
-.fluid-segmented-control.transport-switch > button[aria-pressed="true"],
-.fluid-segmented-control.mode-switch > button[aria-pressed="true"] { border-color: var(--line); background: transparent; box-shadow: none; }
-.fluid-segmented-control.transport-switch .fluid-segmented-control__selection,
-.fluid-segmented-control.mode-switch .fluid-segmented-control__selection { border-color: var(--line); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow-raised); }
+.fluid-segmented-control.transport-switch { min-height: 40px; border-radius: 999px; }
+.fluid-segmented-control.mode-switch { width: 100%; min-height: 48px; border-radius: 999px; }
+.fluid-segmented-control.transport-switch > button { min-height: 36px; padding-block: 4px; }
+.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 999px; }
 .fluid-segmented-control.transport-switch > button:disabled,
 .fluid-segmented-control.mode-switch > button:disabled { opacity: .62; }
 
@@ -308,6 +306,26 @@
 .settings-dialog .settings-audio { margin-inline: 0; }
 .settings-dialog .settings-audio > h3 { margin-inline: 18px; }
 .settings-dialog .settings-about { margin-top: 8px; }
+.status-hero { gap: 5px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.status-hero .status-line { min-height: 26px; gap: 9px; color: var(--text); font-size: 15px; font-weight: 650; }
+.status-hero .status-dot { width: 9px; height: 9px; }
+.status-hero .main-action { min-height: 52px; margin: 1px 0 0; border-radius: 10px; font-size: 15px; }
+.status-hero .status-description { margin: 0; }
+.status-hero .primary-button:not(.main-action) { min-height: 42px; }
+.audio-quality-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 8px 18px 0; }
+.audio-quality-card { min-width: 0; min-height: 66px; display: grid; place-content: center; justify-items: center; gap: 7px; padding: 8px 5px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); background: var(--bg); text-align: center; font-size: 12px; line-height: 16px; cursor: pointer; }
+.audio-quality-card:has(input:checked) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--text); background: var(--accent-soft); font-weight: 650; }
+.audio-quality-card:has(input:disabled) { opacity: .62; cursor: not-allowed; }
+.audio-quality-card:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.audio-quality-card input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.audio-quality-card span { display: grid; gap: 1px; overflow-wrap: anywhere; }
+.audio-quality-card small { color: var(--muted); font-size: 11px; line-height: 14px; font-weight: 400; }
+.settings-about-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0 4px; }
+.settings-about-actions button { min-width: 0; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 5px 4px; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: var(--bg); font-size: 12px; cursor: pointer; }
+.settings-about-actions button:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+.settings-about-actions button:disabled { opacity: .62; }
+.settings-about-actions button svg { flex: 0 0 auto; color: var(--accent); }
+.settings-dialog .settings-about > .dialog-footnote { margin-inline: 4px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 /* Keep dialogs calm and readable while leaving their existing focus and close behavior intact. */
@@ -327,6 +345,12 @@
 .diagnostics-dialog .diagnostic-group h3 { color: var(--muted); }
 
 @media (max-width: 390px) {
-  .fluid-segmented-control.mode-switch { width: min(220px, 100%); }
+  .device-section { padding-bottom: 2px; }
+  .device-select { min-height: 56px; }
+  .connection-section { padding-block: 2px 3px; }
+  .wired-mode-section { margin-top: 2px; }
+  .wired-mode-section .mode-row { min-height: 44px; }
+  .status-hero { padding-block: 6px; }
+  .status-hero .status-line { min-height: 24px; }
   .settings-dialog .settings-group { margin-inline: 12px; }
 }
