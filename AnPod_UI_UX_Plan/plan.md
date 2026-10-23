@@ -284,3 +284,12 @@
 审计依据最新原始XML确认Android13 suites /94 tests、0 failures/errors/skipped及Gradle EXIT_CODE=0，覆盖较早源码审查报告中的定向7项证据限制。lint原始报告为 `src/AnPod.Receiver/app/build/reports/lint-results-debug.xml`，实际59条Warning与4条Information，不能宣称零警告；未比较同条件基线，尚不能判定其中新旧比例。
 
 后续审查统一使用 GPT 6 astra medium，执行代理保持 GPT 6 luna high。交付记录位于源码输入范围之外，后续文档提交不改变上述制品来源。受跟踪源码无未提交修改，全树dirty标记仅来自保留的三个用户缓存；本轮构建中间目录与临时浏览器/服务缓存已清理。实机与生产性能范围仍按上文NOT_TESTED，本轮未推送或远程发布。
+
+## 16. 2026-10-23 · 离线质量与生产前端代理核验
+
+基于 `4c927a2`，两项执行使用 GPT 6 luna high，独立复核使用 GPT 6 astra medium。未修改生产代码、版本或依赖，不重新封包。证据目录 `artifacts/ui-quality-20261023/`，独立结论 `review.md` 为PASS（仅本节范围）。
+
+- PC：同一工具/依赖环境构建 `ffea50f` 与当前生产静态资源，固定baseline→current交替9对，新Chrome进程、同一无设备mock；18次各自版本harness运行成功。主按钮可见、启用且中心点可命中的代理指标p50为199.0609→197.3333ms，p95为248.1759→207.5981ms。本样本未显示退化；n=9的p95等于最大值，不能据此证明性能提升或10%预算达标。计时从Node调用goto前开始，不是Performance API navigationStart，不含Chrome启动，也不证明点击处理或连接完成。OS文件缓存可能已热，未测暖浏览器缓存；两份历史harness不完全同套，共用已安装依赖而非独立clean install，构建未含tsc。报告 `pc/report.json`，原始记录 `pc/runs/`；静态服务已关闭。JS gzip增加44,430 bytes，保留体积警告，无据此新增拆包架构。
+- Android：标准完整基线lint成功，0 Error/56 Warning/4 Information；保存的当前完整报告为0/59/4。按severity/id/message比对，55条当前警告沿用基线，4条新增未使用字符串（processing、usb_direct_connect、other_connection_methods、hide_other_connection_methods），1条旧警告cancel_connection消失。未发现已证实运行时缺陷，不为静态警告更改生产行为。当前报告未重新执行；基线首次离线失败后补取已声明依赖再成功，无依赖声明改动。完整报告、差异与日志保存在 `android/`，隔离源码/build目录已清理，主树与用户缓存未动。
+
+独立代理复核PC七项哈希、18份原始数据/分位数及Android完整XML差分通过。下一阶段仍缺Windows WebView2、真实三链路、音频/AOD及长时资源测量；继续按既定要求保持NOT_TESTED，不把本轮浏览器代理结果迁移为实机通过。原1.11.0/Receiver41候选仍有效，未推送或远程发布。
