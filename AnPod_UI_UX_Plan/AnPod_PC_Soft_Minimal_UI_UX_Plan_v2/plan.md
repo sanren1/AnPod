@@ -918,9 +918,9 @@ node tests/AnPod.Frontend.Check.cjs
 |---|---|---|
 | dev HEAD/版本/工程结构 | 已从远端读取 | 基线 `ffea50f`；执行时重查 |
 | 现有 UI/UX 计划记录 | 已从远端读取 | 历史记录包括前一轮模拟检查与交付审计 |
-| 新视觉代码实施 | NOT_STARTED | v2 详细 UI/UX 实施规范和效果图已就绪；**软件源码尚未修改** |
-| 当前规划下前端构建 | NOT_RUN | 本轮未在本地运行构建 |
-| 当前规划下 Playwright 回归 | NOT_RUN | 本轮仅审查仓库中的测试代码/历史记录 |
+| 新视觉代码实施 | IMPLEMENTED（离线范围） | 基于 `e0e36e7` 的既有成果实施v2差距，源码 `aa36590`；常显音质摘要、连接组管理入口、sticky标题、单列格式、11/9px圆角及44px主按钮；业务协调代码未改 |
+| 当前规划下前端构建 | PASS | 本轮实际 `tsc -b` 与 Vite production build通过；保留已有>500k JS块提示 |
+| 当前规划下 Playwright 回归 | PASS（浏览器mock） | 九项检查、32组尺寸/语言/主题/字号、11状态输出及原业务文件blob等价核对；证据 `artifacts/ui-v2-aod-20261023/pc-qa/`。版本1.12.0只重采图，不称重跑全套 |
 | 当前规划下 Windows 真机 UX | NOT_TESTED | 包括防火墙/缩放/系统窗口交互 |
 | 当前规划下 USB / AOA / 无线音频实机 | NOT_TESTED | 不将历史运行结果迁移为 PASS |
 

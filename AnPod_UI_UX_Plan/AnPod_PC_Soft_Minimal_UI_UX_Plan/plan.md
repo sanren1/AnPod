@@ -460,7 +460,7 @@ node tests/AnPod.Frontend.Check.cjs
 |---|---|---|
 | dev HEAD/版本/工程结构 | 已从远端读取 | 基线 `ffea50f`；执行时重查 |
 | 现有 UI/UX 计划记录 | 已从远端读取 | 历史记录包括前一轮模拟检查与交付审计 |
-| 新视觉代码实施 | IMPLEMENTED | `codex/ui-refresh`，PC 1.11.0；两处分段动效、语义主题与设置分组，业务仍由原容器持有 |
+| 新视觉代码实施 | 前版修订完成，已转v2 | `e0e36e7`补齐前版视觉缺口；后续按用户新增v2文字规格实施（源码 `aa36590`），不沿用本版52px/999px为新验收门槛。历史功能检查不替代视觉或实机验证 |
 | 当前规划下前端构建 | PASS | 实际 `tsc -b` 与 Vite production build；Motion 接入后 JS 单块约558 kB，存在体积警告 |
 | 当前规划下 Playwright 回归 | PASS | 六专项、最终默认全流程、24组新布局/键盘矩阵及焦点回返通过，真实dark设置已核对；证据 `artifacts/ui-refresh-20261022/qa/final-modal-freeze/` |
 | 当前规划下 Windows 真机 UX | NOT_TESTED | 包括防火墙/缩放/系统窗口交互 |
