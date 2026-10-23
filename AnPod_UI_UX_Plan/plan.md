@@ -269,8 +269,18 @@
 - Android：Direct/ADB/Wi-Fi 共用唯一主操作；本地选择持久化、实际状态优先；屏幕常显后连续展开其他设置，保留播放引擎、后台等待和完整授权管理。预审四项（ADB真实标签、后台多接口恢复、模式切换残留错误、权限等待误报）及重复说明已修复。
 - PC：浅色银灰、深色石墨语义主题，两处原生按钮语义分段控件加 Motion 动效，设置视觉分组及弹窗轻量整理。保留所有原有 IPC、轮询、确认/取消、三档音质、实际格式和禁用规则。修复原有弹窗卸载不返回焦点，并提高焦点描边对比。
 - CI：用户指出的 `discovery.rs` rustfmt 排版失败已单独修复；后续提交前执行 CI 同款 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`，不改规则绕过。
-- 实际验证：前端 `tsc -b` / Vite production build、六个独立专项通过；最终默认流程和24组新布局/键盘矩阵见 `artifacts/ui-refresh-20261022/qa/`。Android完整94项JVM测试通过，lint零错误/零警告，Debug构建通过。最终独立审查记录 `artifacts/ui-refresh-20261022/review-final.md`；仅原始结果完成的范围可计PASS。
-- Receiver41：0.18.0-v3-flow-candidate，release原证书，来源 `c75856fe83579c1e0650271b0ff26e5bdebf03db`，sourceModified=false；SHA-256 `cbfdd5dad8ee3e38bc704290b1bcfc95a4b488fd2d80f8d135a4baecad804e56`。PC候选1.11.0，精确APK登记与本地打包完成后记录下文。
+- 实际验证：前端 `tsc -b` / Vite production build、六个独立专项通过；最终默认流程和24组新布局/键盘矩阵见 `artifacts/ui-refresh-20261022/qa/`。Android完整94项JVM测试通过，lint执行成功（0 Error、59 Warning、4 Information），Debug构建通过。最终独立审查记录 `artifacts/ui-refresh-20261022/review-final.md`；仅原始结果完成的范围可计PASS。
+- Receiver41：0.18.0-v3-flow-candidate，release原证书，来源 `c75856fe83579c1e0650271b0ff26e5bdebf03db`，sourceModified=false；SHA-256 `cbfdd5dad8ee3e38bc704290b1bcfc95a4b488fd2d80f8d135a4baecad804e56`。PC候选1.11.0，精确APK登记与本地打包已完成，结果如下。
 - 性能范围：Motion接入增加约43,882 gzip bytes JS，单块约558 kB存在Vite体积警告。Vite开发服务器的Chrome CTA代理p50 425.3→429.5ms；p95 894.2→2659.1ms含冷依赖优化且当前样本与Gradle并发，不能作为生产WebView性能结论。未凭警告进行额外架构拆分。许可证原文已随LICENSES补齐。
 
 按用户要求不重启旧实机核查。本轮未安装或操作手机；Windows原生窗口/DPI/防火墙、三链路物理音频、USB权限与热插拔、AOD、手机横屏/动态色/大字/TalkBack、声学/延迟/长时性能仍NOT_TESTED。浏览器截图不替代这些验证；本轮仅本地候选，不远程发布。
+
+### 本地交付验收（2026-10-23）
+
+最终便携包 `artifacts/AnPod-1.11.0-tauri-win-x64-portable.zip`，18,526,109 bytes，SHA-256 `bb46d2772d1511e7837fd206592d0e04cd921db2220b1f5c05605e69eb53a646`。桌面冻结来源 `01dee74dcfb90361c23b5bbdccfd34bf86af64a9`；包内 EXE SHA-256 `5e8755483625ad6b61802332e7c52c2ae2461034c70caaae10e2a6a81f4a9153`，桌面输入快照 `b7fb848a1c63325238d4713fba1748b2788ff3a6614ea8d0d9099d4e2a8a60d2`。随包 Receiver41 为上述原签名 APK，输入快照 `aaa8a2a0b50a9b8433f669b506998fa52fd583c1031183f43c499b5ec1507386`，证书 SHA-256 `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`。
+
+无历史上下文的 GPT 6 astra medium 独立交付审计23项全部通过，报告 `artifacts/ui-refresh-20261022/delivery-audit.json` / `.md`。根代理另行打开最终ZIP，52项路径、长度、SHA-256与目录逐项一致，记录 `root-zip-verification.json`。审计覆盖源码快照、EXE版本、APK身份与签名、Native/Legacy角色、精确制品登记、README及许可原文。初次封包的README相对CI链接已修正并重新冻结封包；未交付旧尝试已删除，历史有效包保留。指定新APK目录的真实制品读取测试1/1通过；CI同款Rust格式检查通过，记录 `final-format-check.log`。
+
+审计依据最新原始XML确认Android13 suites /94 tests、0 failures/errors/skipped及Gradle EXIT_CODE=0，覆盖较早源码审查报告中的定向7项证据限制。lint原始报告为 `src/AnPod.Receiver/app/build/reports/lint-results-debug.xml`，实际59条Warning与4条Information，不能宣称零警告；未比较同条件基线，尚不能判定其中新旧比例。
+
+后续审查统一使用 GPT 6 astra medium，执行代理保持 GPT 6 luna high。交付记录位于源码输入范围之外，后续文档提交不改变上述制品来源。受跟踪源码无未提交修改，全树dirty标记仅来自保留的三个用户缓存；本轮构建中间目录与临时浏览器/服务缓存已清理。实机与生产性能范围仍按上文NOT_TESTED，本轮未推送或远程发布。

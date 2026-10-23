@@ -267,6 +267,6 @@ enum class ConnectionChoice { USB_DIRECT, USB_ADB, WIFI }
 
 **实施状态（2026-10-22 更新）**：已在 `codex/ui-refresh` 实施，手机源码提交 `26f538a`、修订 `7f3e632`；Receiver `0.18.0-v3-flow-candidate/code41`。三模式持久偏好、单主操作、真实状态优先、屏幕常显及连续内联其他设置已落地。独立预审发现的 ADB 标签、多接口恢复入口、旧本地错误及权限等待误报已修复，ADB 重复文案已收短。
 
-**离线验证**：当前完整 JVM 13 suites / 94 tests、0 failures/errors/skipped；`lintDebug` 0 errors/0 warnings，`assembleDebug` 通过。原始记录在 `artifacts/ui-refresh-20261022/android-ci/`。release APK 已沿用原发布证书构建，`sourceModified=false`，元数据在 `artifacts/ui-refresh-20261022-receiver41/receiver.json`。这不是实机验收记录。
+**离线验证**：当前完整 JVM 13 suites / 94 tests、0 failures/errors/skipped；`lintDebug` 执行成功，原始 XML 为0 Error、59 Warning、4 Information，`assembleDebug` 通过。原始记录在 `artifacts/ui-refresh-20261022/android-ci/`，lint XML 在 `src/AnPod.Receiver/app/build/reports/lint-results-debug.xml`；未比较同条件基线，不判定警告新旧比例。release APK 已沿用原发布证书构建，`sourceModified=false`，元数据在 `artifacts/ui-refresh-20261022-receiver41/receiver.json`。这不是实机验收记录。
 
 **实机边界**：按用户要求不重启旧实机核查；本轮未安装或操作手机。实际三链路、配件权限/热插拔、AOD、动态色/字体/横屏及 TalkBack 仍为 **NOT_TESTED**。因此以上涉及实机的验收勾选不凭编译或 JVM 结果勾为通过。最终独立复审与交付汇总见主规划第15节。
