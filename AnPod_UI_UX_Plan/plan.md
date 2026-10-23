@@ -302,7 +302,7 @@
 
 前版修订源码已提交 `e0e36e7`，PC 1.11.1浏览器视觉/交互复审通过，包已在本地生成；其后独立包审计因Astra额度中断，未完成，不能称独立交付审计通过。后续用户提供v2规划，以下以新规格继续实施，不把前版52px主按钮/999px圆角沿用为v2硬门槛。
 
-## 18. 2026-10-23 · PC v2 / Android横向布局与AOD设置（进行中）
+## 18. 2026-10-23 · PC v2 / Android横向布局与AOD设置
 
 输入为用户新增 `AnPod_PC_Soft_Minimal_UI_UX_Plan_v2/`；基线 `e0e36e7`（PC1.11.1 / Receiver41）。PC按该目录 `plan.md` 4.5–4.14的实施规格核对已有成果，文字规格高于参考图：仅改展示/样式/访问性，不修改连接与音频状态机；音频摘要保持可见，高级设置默认折叠，弹窗固定标题/单一内容滚动。两端执行Luna high，无历史派发，不嵌套。
 
@@ -323,3 +323,11 @@ Android实施契约：
 Android已实现固定顶栏、横向连接选择、同排设置/预览、主题内可滚动常显设置弹窗。时钟80–120%按真实字形宽高与clock/footer锚点限制，波形80/100/120%作用于静音和真实PCM绘制；协议/接收/缓冲/丢包四项本地开关默认全开，状态保留，窄屏可换行。设置页不启动AOD采样/超时逻辑。
 
 Android此前全量14 suites/97 tests零失败；审查修订后定向3项、lintDebug及assembleDebug通过，不把两批计数相加或称最后重跑全量。最终lint为0 Error、59 Warning、4 Information。证据 `android/full-suite-lint.log`、`android/final-checks.log`、原始XML。独立Astra medium发现并关闭两项P2（开关无辅助名称、横屏大字缺高度约束），最终代码/PC浏览器/JVM构建范围PASS，详见 `review.md`。所有实机/模拟器显示、TalkBack、系统权限、真实音频仍NOT_TESTED。
+
+### 本地制品
+
+PC便携包 `artifacts/AnPod-1.12.0-tauri-win-x64-portable.zip`，18,533,994 bytes，SHA-256 `59b8958ec4b8fb28e7cbfbaade9bb43ed262904020a6293e14b5ceea37e8af41`。构建来源 `a703bb268055033637711aa37460e9066fc3a192`，EXE SHA-256 `1c5e58ba01fc08e36b4e01ded67a6ca7d3ffaaa99a3e41c7d8998610760a2de9`，桌面输入快照 `b945e4cd96022a0ca49f0c14a709df59ca48f22e9c1e4c0e7bb5a0e04d280426`。
+
+Receiver42：`artifacts/ui-v2-aod-20261023-receiver42/receiver.apk`，13,708,905 bytes；SHA-256 `96d9eb04f73ef3aed8054842f4d8b5f34e12f4a4e10e75d1ceb10f7045e749fb`。release / target35 / 原证书，source `aa365903929074b4abcf3872066184140023fee9`，sourceModified=false，输入快照 `19d464c84a2c67f64c8cd0ab7b41eb3c37dd6bf4fbcd7b244872c261b0719dd4`。精确审计登记 `4a8272d`，指定本轮APK目录的真实Rust artifact-read 1/1及CI同款fmt检查通过。APK中间构建目录已清理，用户缓存与旧包保留。
+
+根代理另行打开ZIP逐项核对52个文件路径/长度/哈希通过，结果 `artifacts/ui-v2-aod-20261023/root-zip-verification.json`。独立Astra medium制品审计PASS，同目录 `delivery-audit.json` / `.md` 记录EXE版本、APK原签名/来源/精确登记、Native/Legacy、README冻结/10个本地链接及许可证核验。构建时受跟踪源码干净，全树dirty仅因三个既有用户缓存；本节文档在源码输入范围外，不改变制品来源。本轮未推送或远程发布，使用新增手机功能需同步更新随包Receiver42。
