@@ -4,7 +4,9 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本轮开发版本为 PC 1.11.1 + Receiver 0.18.0-v3-flow-candidate/code 41，尚非公开发布，三链路音频与长期效果仍未验收；公开下载以 Releases 为准。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本轮开发版本为 PC 1.12.0 + Receiver 0.19.0-v3-flow-candidate/code 42，尚非公开发布，三链路音频与长期效果仍未验收；公开下载以 Releases 为准。
+
+PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置按界面、音频、连接、关于与诊断分组，并区分请求音质档位和实际格式。
 
 ## 使用要求
 
@@ -24,7 +26,7 @@
 
 USB Direct 需要 Android 7.0（API 24）或更高；ADB/LAN 仍支持 Android 6.0。
 
-本轮开发版本为 PC 1.11.1 + Receiver 0.18.0-v3-flow-candidate/code 41；尚非公开发布，三链路音频仍未验收。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
+本轮开发版本为 PC 1.12.0 + Receiver 0.19.0-v3-flow-candidate/code 42；尚非公开发布，三链路音频仍未验收。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
 
 1. 首次使用先通过 USB/ADB 安装 Receiver 并完成配对，再在 USB 下选择持久化的 ADB 或 USB Direct 模式。打开 Direct 主按钮或手机卡片可进入配置页。
 2. AnPod 自动刷新只读发现的设备；发现唯一设备时会预选。需要物理切换 USB 模式时，展开切换选项并按提示操作；切换仅支持已验证的 iQOO 11，且须明确允许停止电脑上的全局 ADB server。然后在手机 Receiver 中允许配件权限。
@@ -45,6 +47,7 @@ ADB 仅支持 Standard（48 kHz、16 bit），切换到有效 ADB 连接会自�
 手机端提供“伪 AOD”常显：纯黑横屏，显示大号时钟、由真实 PCM 驱动的双线波形，以及状态、协议、接收码率、接收端缓冲延迟、UDP 缺帧率五项指标。USB Direct 只在真实 PCM 入流时显示接收统计；Oboe 与 AudioTrack 共用这一路统计。无法进一步识别的有线或无线 ADB 设备统一显示“ADB”。
 
 - 仅手机端控制：在 Receiver 主界面打开“屏幕常显”，可点“预览常显”立即进入；PC 没有 AOD 开关，也不新增控制协议。
+- Receiver 主界面的“常显设置”可调整时钟字号、波形粗细，并选择显示协议、接收速率、缓冲和丢包信息；设置保存在手机本地。
 - 双线波形分别对应立体声的两个声道，共用同一条基线、没有文字标记；右声道反相，所以即使左右声道音频完全一致，也会一条向上、一条向下。
 - 指标口径：Recv 为音频 payload 码率，Latency 为接收端可观测缓冲，Loss 为 UDP 缺帧率（USB/ADB 显示 `—`）。
 - 只显示当前有效会话；数字静音仍保持显示，波形回到中心直线。连续约 15 秒没有 PCM 才会退出，因此在 PC 上切换“均衡/低延迟”不会让常显退出重进。

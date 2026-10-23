@@ -30,6 +30,16 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
       <SettingToggle disabled={snapshot.busy} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => update("minimizeToTray", value)} />
     </section>
+    <section className="settings-audio-summary" aria-label={strings.app.settingsAudio}>
+      <span>{strings.app.transportQuality}</span>
+      <strong>{strings.app.audioQualityShortLabels[settings.audioQuality]}</strong>
+    </section>
+    <section className="settings-group settings-connection-shortcut" aria-labelledby="settings-connection-shortcut-title">
+      <h3 id="settings-connection-shortcut-title">{strings.app.settingsConnection}</h3>
+      <div className="settings-about-actions">
+        <button type="button" disabled={busy} onClick={onOpenReceiverManager}><Smartphone size={15} aria-hidden="true" />{strings.app.phoneApplication}</button>
+      </div>
+    </section>
     <details className="settings-disclosure">
       <summary><span>{strings.app.advancedConnection}<small>{strings.app.advancedSettingsHint}</small></span></summary>
       <section className="settings-group settings-audio" aria-labelledby="settings-audio-title">
@@ -74,7 +84,6 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     <section className="settings-group settings-about" aria-labelledby="settings-about-title">
       <h3 id="settings-about-title">{strings.app.aboutAndDiagnostics}</h3>
       <div className="settings-about-actions">
-        <button type="button" disabled={busy} onClick={onOpenReceiverManager}><Smartphone size={15} aria-hidden="true" />{strings.app.phoneApplication}</button>
         <button type="button" onClick={onOpenDiagnostics}><Activity size={15} aria-hidden="true" />{strings.app.diagnostics}</button>
         <button type="button" onClick={onOpenHelp}><CircleHelp size={15} aria-hidden="true" />{strings.app.help}</button>
       </div>

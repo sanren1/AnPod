@@ -183,6 +183,19 @@ fs.mkdirSync(out, {recursive:true});
  await page.goto(process.env.ANPOD_UI_URL || 'http://127.0.0.1:1420');
  await page.locator('.app-shell').waitFor();
  await page.waitForFunction(()=>window.reviewCalls?.get_snapshot===1&&window.reviewCalls?.refresh_devices===1);
+ if(process.env.ANPOD_CAPTURE_GOLDEN==='1'){
+  const rows=[];
+  for(const state of ['noDevice','unauthorized','ready','connecting','connected','phoneReady','streaming','paused','reconnecting','managementOnly','error']){
+   await page.evaluate(value=>{
+    if(value==='managementOnly'){window.reviewSetManagementOnly();return;}
+    if(value==='error'){window.reviewSetActiveError();return;}
+    window.reviewSet(value);
+   },state);
+   await page.waitForTimeout(30);
+   rows.push(await page.evaluate(value=>({fixture:value,status:document.querySelector('.status-line')?.innerText.trim()??null,mainAction:document.querySelector('.main-action')?.innerText.trim()??null,disabled:document.querySelector('.main-action')?.disabled??null}),state));
+  }
+  fs.writeFileSync(`${out}/e0e36e7-main-status-golden.json`,JSON.stringify({baseline:'e0e36e706f1cace85264d676a3c4fa6aa41f2322',source:'unchanged App.tsx/appRuntime.ts functions, captured through existing frontend mock fixtures',rows},null,2));
+ }
  const results={errors,layouts:[],focusStable:null};
  if(process.env.ANPOD_SETTINGS_CHILD_FOCUS_ONLY){
   const settingsLauncher=page.getByRole('button',{name:'打开设置',exact:true});
@@ -217,7 +230,7 @@ fs.mkdirSync(out, {recursive:true});
    await page.evaluate(()=>window.reviewSet('connected','usb'));
    await page.waitForFunction(()=>window.reviewRead().state==='connected');
   };
-  for(const size of [[420,590],[360,500],[480,700]])for(const theme of ['light','dark']){
+  for(const size of [[420,590],[360,500],[390,600],[480,700]])for(const theme of ['light','dark']){
    const [width,height]=size;await configure('zh',theme,false,width,height);
    const mainName=`main-zh-${theme}-${width}x${height}.png`;await page.screenshot({path:`${out}/${mainName}`});
    const main=await page.evaluate(()=>{
@@ -233,8 +246,8 @@ fs.mkdirSync(out, {recursive:true});
    });
    const labels=main.groups.map(group=>group.label).sort();
    const radii=main.groups.map(group=>Number.parseFloat(group.borderRadius));
-   const capsuleGeometry=main.groups.length===3&&labels.join('|')===['USB 连接模式','连接方式','播放模式'].sort().join('|')&&main.groups.every(group=>group.borderRadius===main.groups[0].borderRadius&&Number.parseFloat(group.borderRadius)>=group.height/2)&&main.groups.every(group=>group.selected.borderRadius===group.borderRadius);
-   const primaryActionGeometry=main.mainAction?.height>=48;
+   const capsuleGeometry=main.groups.length===3&&labels.join('|')===['USB 连接模式','连接方式','播放模式'].sort().join('|')&&main.groups.every(group=>Number.parseFloat(group.borderRadius)>=10&&Number.parseFloat(group.borderRadius)<=12)&&main.groups.every(group=>Number.parseFloat(group.selected.borderRadius)>=8&&Number.parseFloat(group.selected.borderRadius)<=10);
+   const primaryActionGeometry=main.mainAction?.height>=40&&main.mainAction?.height<=44;
    geometry.push({screenshot:mainName,capsuleGeometry,primaryActionGeometry,...main});
    assert.equal(capsuleGeometry,true,`${mainName}: three real segmented controls share capsule geometry`);
    assert.equal(primaryActionGeometry,true,`${mainName}: primary action remains a usable hero control`);
@@ -244,6 +257,15 @@ fs.mkdirSync(out, {recursive:true});
    const settings=await openSettings();
    const collapsedName=`settings-zh-${theme}-collapsed-${width}x${height}.png`;await page.screenshot({path:`${out}/${collapsedName}`});
    const collapsed=await settings.locator('.settings-disclosure').count()?await settings.locator('.settings-disclosure').evaluate(el=>!el.open):null;
+   const settingsStructure=await settings.evaluate(dialog=>{
+    const formats=dialog.querySelector('.audio-quality-status div'),head=dialog.querySelector('.modal-head');
+    const nestedScrollers=[...dialog.querySelectorAll('*')].filter(el=>{const style=getComputedStyle(el);return /(auto|scroll)/.test(style.overflowY)&&el.scrollHeight>el.clientHeight+1;});
+    return {audioSummaryVisible:!!dialog.querySelector('.settings-audio-summary')&&getComputedStyle(dialog.querySelector('.settings-audio-summary')).display!=='none',headerPosition:head?getComputedStyle(head).position:null,modalScroll:getComputedStyle(dialog).overflowY,nestedScrollers:nestedScrollers.length,formatColumns:formats?getComputedStyle(formats).gridTemplateColumns:null};
+   });
+   assert.equal(settingsStructure.audioSummaryVisible,true,`${collapsedName}: requested audio quality summary stays visible while advanced settings are closed`);
+   assert.equal(settingsStructure.headerPosition,'sticky',`${collapsedName}: settings title remains sticky`);
+   assert.equal(settingsStructure.modalScroll,'auto',`${collapsedName}: settings use the dialog as the single scroll container`);
+   assert.equal(settingsStructure.nestedScrollers,0,`${collapsedName}: settings do not create nested scroll areas`);
    await settings.locator('.settings-disclosure > summary').click();
    const expandedName=`settings-zh-${theme}-expanded-${width}x${height}.png`;await page.screenshot({path:`${out}/${expandedName}`});
    await settings.evaluate(el=>el.scrollTop=el.scrollHeight);
@@ -257,6 +279,8 @@ fs.mkdirSync(out, {recursive:true});
    assert.equal(fourGroups,true,`${expandedName}: all four settings groups remain present`);
    assert.equal(radioSemantics,true,`${expandedName}: quality choices retain radio semantics`);
    await settings.locator('.audio-format-disclosure > summary').click();
+   const formatColumns=await settings.locator('.audio-quality-status div').first().evaluate(el=>getComputedStyle(el).gridTemplateColumns.trim().split(/\s+/).length);
+   assert.equal(formatColumns,1,`${collapsedName}: actual format fields stay in a single column`);
    const unknownFormat=await settings.locator('.audio-quality-status').innerText();
    const unknownFormatName=`settings-zh-${theme}-unknown-format-${width}x${height}.png`;await page.screenshot({path:`${out}/${unknownFormatName}`});
    geometry.push({screenshot:unknownFormatName,unknownFormatText:unknownFormat});
@@ -286,6 +310,13 @@ fs.mkdirSync(out, {recursive:true});
   results.triggerStillConnected=await trigger.evaluate(el=>el.isConnected);
   fs.writeFileSync(`${out}/focus-return-result.json`,JSON.stringify(results,null,2));await browser.close();assert.deepEqual(errors,[]);return;
  }
+ const outsideClickTrigger=page.getByRole('button',{name:'打开设置',exact:true});
+ await outsideClickTrigger.click();const outsideClickDialog=page.getByRole('dialog',{name:'设置'});await outsideClickDialog.waitFor();
+ const outsideClickBounds=await outsideClickDialog.boundingBox();
+ await page.mouse.click(Math.max(1,(outsideClickBounds?.x??20)-4),Math.max(1,(outsideClickBounds?.y??20)+24));
+ await outsideClickDialog.waitFor({state:'detached'});results.realOutsideClickCloses=true;
+ results.outsideClickReturnsFocus=await outsideClickTrigger.evaluate(el=>document.activeElement===el);
+ assert.equal(results.outsideClickReturnsFocus,true,'A real click outside the dialog closes it and restores focus');
  if(process.env.ANPOD_AOA_ONLY){
   await page.setViewportSize({width:360,height:640});
   await page.getByRole('button',{name:'打开设置'}).click();
@@ -1374,7 +1405,7 @@ fs.mkdirSync(out, {recursive:true});
    await page.goto(url.toString());await page.locator('.app-shell').waitFor();
    const settingsName=language==='zh'?'打开设置':'Open settings';
    let largeTextState=false;
-   for(const size of [[360,500],[420,590],[480,700]])for(const theme of ['light','dark'])for(const large of [false,true]){
+    for(const size of [[360,500],[390,600],[420,590],[480,700]])for(const theme of ['light','dark'])for(const large of [false,true]){
     await page.setViewportSize({width:size[0],height:size[1]});
     await page.emulateMedia({colorScheme:theme,reducedMotion:'reduce'});
     await page.waitForFunction(value=>document.documentElement.dataset.theme===value,theme);
@@ -1441,7 +1472,7 @@ fs.mkdirSync(out, {recursive:true});
   fs.writeFileSync(`${out}/ui-refresh-accessibility-result.json`,JSON.stringify(results,null,2));
   await browser.close();
   assert.deepEqual(errors,[]);
-  assert.equal(matrix.length,24);
+  assert.equal(matrix.length,32);
   assert.equal(matrix.filter(sample=>sample.documentWidth>sample.viewport[0]||sample.appWidth!==sample.viewport[0]||sample.theme!==sample.expectedTheme).length,0);
   assert.equal(matrix.filter(sample=>!sample.mainActionReachable||sample.largeText!==sample.large||sample.backgroundToken===(sample.theme==='dark'?'#f4f5f6':'#1b1f24')).length,0);
   assert.equal(matrix.filter(sample=>sample.textContrast<4.5||sample.mutedContrast<4.5||sample.onAccentContrast<4.5).length,0);

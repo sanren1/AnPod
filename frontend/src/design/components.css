@@ -6,7 +6,7 @@
   gap: 3px;
   min-width: 0;
   padding: 3px;
-  border-radius: 999px;
+  border-radius: 11px;
   background: var(--wash);
   isolation: isolate;
 }
@@ -22,7 +22,7 @@
   gap: 7px;
   padding: 6px 8px;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: 9px;
   color: var(--muted);
   background: transparent;
   cursor: pointer;
@@ -33,7 +33,7 @@
 .fluid-segmented-control > button > span:last-child { position: relative; z-index: 1; }
 .fluid-segmented-control > button:disabled { opacity: .55; cursor: default; }
 .fluid-segmented-control > button:focus-visible { z-index: 2; }
-.fluid-segmented-control__selection { position: absolute; z-index: 0; inset: 0; border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--line)); border-radius: inherit; background: var(--accent-soft); box-shadow: var(--shadow-raised); }
+.fluid-segmented-control__selection { position: absolute; z-index: 0; inset: 0; border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--line)); border-radius: 9px; background: var(--accent-soft); box-shadow: var(--shadow-raised); }
 
 @media (prefers-reduced-motion: reduce) {
   .fluid-segmented-control__selection { transition: none; }

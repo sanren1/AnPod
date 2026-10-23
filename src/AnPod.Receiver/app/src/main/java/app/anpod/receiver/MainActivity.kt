@@ -26,7 +26,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -39,7 +38,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -49,7 +47,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -71,10 +68,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -142,6 +137,7 @@ class MainActivity : ComponentActivity() {
     )
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
     private var aodEnabled by mutableStateOf(false)
+    private var aodDisplaySettings by mutableStateOf(AodDisplaySettings())
     private var aodShownForSession: String? = null
     private var outputEngine by mutableStateOf("oboeExperimental")
     private var connectionChoice by mutableStateOf(ConnectionChoice.USB_DIRECT)
@@ -304,6 +300,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
         aodEnabled = preferences.getBoolean("aod_enabled", false)
+        aodDisplaySettings = AodDisplaySettings.read(preferences)
         outputEngine = when (preferences.getString("output_engine", "oboeExperimental")) {
             "oboeExperimental" -> "oboeExperimental"
             else -> "audioTrack"
@@ -344,6 +341,11 @@ class MainActivity : ComponentActivity() {
                         if (current != null) receiver?.stop(current.operationId)
                     },
                     aodEnabled = aodEnabled,
+                    aodDisplaySettings = aodDisplaySettings,
+                    onAodDisplaySettingsChange = { value ->
+                        aodDisplaySettings = value
+                        value.save(getSharedPreferences("anpod_receiver", MODE_PRIVATE))
+                    },
                     onToggleAod = { updateAodEnabled(it) },
                     outputEngine = outputEngine,
                     onOutputEngineChange = { value ->
@@ -667,6 +669,8 @@ private fun ReceiverScreen(
     onRevokeBackgroundTrust: (BackgroundTrustTarget, String) -> Unit,
     onStop: () -> Unit,
     aodEnabled: Boolean,
+    aodDisplaySettings: AodDisplaySettings,
+    onAodDisplaySettingsChange: (AodDisplaySettings) -> Unit,
     onToggleAod: (Boolean) -> Unit,
     outputEngine: String,
     onOutputEngineChange: (String) -> Unit,
@@ -676,6 +680,7 @@ private fun ReceiverScreen(
 ) {
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
     var otherSettingsExpanded by remember { mutableStateOf(false) }
+    var aodSettingsOpen by remember { mutableStateOf(false) }
     var adbGuideVisible by remember(connectionChoice) { mutableStateOf(false) }
     val currentTrustTarget = snapshot?.takeIf {
         serviceConnected && (it.backgroundStandbyEnabled || it.canRevokeBackgroundTrust)
@@ -729,14 +734,16 @@ private fun ReceiverScreen(
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(start = 20.dp, top = 28.dp, end = 20.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(horizontal = 20.dp),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall)
-            }
+            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.padding(top = 28.dp, bottom = 14.dp))
+            Column(
+                modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
 
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -794,42 +801,18 @@ private fun ReceiverScreen(
             Card(colors = methodCardColor) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(stringResource(R.string.connection_mode), style = MaterialTheme.typography.titleMedium)
-                    BoxWithConstraints {
-                        val compact = maxWidth < 300.dp || LocalDensity.current.fontScale >= 1.3f
-                        if (compact) {
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                ConnectionChoice.values().forEach { choice ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).selectable(
-                                            selected = connectionChoice == choice,
-                                            enabled = !selectionLocked,
-                                            role = Role.RadioButton,
-                                            onClick = { onSelectConnectionChoice(choice) }
-                                        ),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        RadioButton(
-                                            selected = connectionChoice == choice,
-                                            onClick = null,
-                                            enabled = !selectionLocked,
-                                            modifier = Modifier.heightIn(min = 48.dp)
-                                        )
-                                        Text(stringResource(choice.labelResource()),
-                                            modifier = Modifier.weight(1f).heightIn(min = 48.dp))
-                                    }
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                        ConnectionChoice.values().forEachIndexed { index, choice ->
+                            val accessibleLabel = stringResource(choice.labelResource())
+                            SegmentedButton(
+                                selected = connectionChoice == choice,
+                                onClick = { onSelectConnectionChoice(choice) },
+                                enabled = !selectionLocked,
+                                shape = SegmentedButtonDefaults.itemShape(index, ConnectionChoice.values().size),
+                                modifier = Modifier.heightIn(min = 48.dp).semantics {
+                                    contentDescription = accessibleLabel
                                 }
-                            }
-                        } else {
-                            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                                ConnectionChoice.values().forEachIndexed { index, choice ->
-                                    SegmentedButton(
-                                        selected = connectionChoice == choice,
-                                        onClick = { onSelectConnectionChoice(choice) },
-                                        enabled = !selectionLocked,
-                                        shape = SegmentedButtonDefaults.itemShape(index, ConnectionChoice.values().size)
-                                    ) { Text(stringResource(choice.shortLabelResource())) }
-                                }
-                            }
+                            ) { Text(stringResource(choice.shortLabelResource()), softWrap = true) }
                         }
                     }
                     if (!(adbGuideVisible && connectionChoice == ConnectionChoice.USB_ADB)) {
@@ -902,11 +885,16 @@ private fun ReceiverScreen(
                             }
                         )
                     }
-                    TextButton(
-                        onClick = onOpenAod,
-                        enabled = serviceConnected,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    ) { Text(stringResource(R.string.aod_preview)) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { aodSettingsOpen = true },
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                            Text(stringResource(R.string.aod_settings))
+                        }
+                        TextButton(onClick = onOpenAod, enabled = serviceConnected,
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                            Text(stringResource(R.string.aod_preview))
+                        }
+                    }
                 }
             }
 
@@ -988,7 +976,13 @@ private fun ReceiverScreen(
             Spacer(Modifier.height(8.dp))
         }
     }
+    }
     val confirmedTarget = trustConfirmationTarget
+    if (aodSettingsOpen) AodSettingsDialog(
+        settings = aodDisplaySettings,
+        onChange = onAodDisplaySettingsChange,
+        onClose = { aodSettingsOpen = false }
+    )
     if (confirmedTarget != null && confirmedTarget == currentTrustTarget) {
         var showFullBindingId by remember(confirmedTarget) { mutableStateOf(false) }
         AlertDialog(
@@ -1090,8 +1084,8 @@ private fun OutputEnginePicker(snapshot: UiSnapshot?, outputEngine: String, onSe
                 )
             }
         }
+        }
     }
-}
 
 @Composable
 private fun outputEngineLabel(engine: String): String = stringResource(

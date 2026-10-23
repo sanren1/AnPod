@@ -62,7 +62,7 @@
 .modal * { scrollbar-width: none; }
 .modal::-webkit-scrollbar, .modal *::-webkit-scrollbar { display: none; }
 .modal::backdrop { background: #111c2b72; backdrop-filter: blur(2px); }
-.modal-head { min-height: 58px; display: flex; justify-content: space-between; align-items: center; padding: 0 16px 0 20px; border-bottom: 1px solid var(--line); }
+.modal-head { position: sticky; top: 0; z-index: 2; min-height: 58px; display: flex; justify-content: space-between; align-items: center; padding: 0 16px 0 20px; border-bottom: 1px solid var(--line); }
 .modal-head h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .device-dialog, .settings-dialog, .pair-dialog, .network-dialog, .help-dialog, .diagnostics-dialog, .confirm-dialog { padding-bottom: 16px; }
 .aoa-dialog { padding-bottom: 16px; }
@@ -115,7 +115,7 @@
 .audio-format-disclosure { margin: 12px 18px 0; padding-top: 8px; border-top: 1px solid var(--line); }
 .audio-format-disclosure > summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--muted); }
 .audio-quality-status { display: grid; gap: 8px; margin: 12px 18px; font-size: 13px; line-height: 19px; }
-.audio-quality-status div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; overflow-wrap: anywhere; }
+.audio-quality-status div { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; overflow-wrap: anywhere; }
 .audio-quality-status dt { color: var(--muted); }
 .audio-quality-status dd { margin: 0; }
 .background-trust-disclosure > summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-weight: 600; }
@@ -290,10 +290,10 @@
 .mode-disclosure .mode-switch { width: 100%; }
 
 /* Refresh the existing choice controls without changing their snapshot-confirmed behavior. */
-.fluid-segmented-control.transport-switch { min-height: 40px; border-radius: 999px; }
-.fluid-segmented-control.mode-switch { width: 100%; min-height: 48px; border-radius: 999px; }
+.fluid-segmented-control.transport-switch { min-height: 40px; border-radius: 11px; }
+.fluid-segmented-control.mode-switch { width: 100%; min-height: 48px; border-radius: 11px; }
 .fluid-segmented-control.transport-switch > button { min-height: 36px; padding-block: 4px; }
-.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 999px; }
+.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 9px; }
 .fluid-segmented-control.transport-switch > button:disabled,
 .fluid-segmented-control.mode-switch > button:disabled { opacity: .62; }
 
@@ -306,10 +306,14 @@
 .settings-dialog .settings-audio { margin-inline: 0; }
 .settings-dialog .settings-audio > h3 { margin-inline: 18px; }
 .settings-dialog .settings-about { margin-top: 8px; }
+.settings-dialog { overscroll-behavior: contain; }
+.settings-audio-summary { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 14px 0; padding: 0 4px; border-top: 1px solid var(--line); color: var(--muted); }
+.settings-audio-summary strong { color: var(--text); font-weight: 600; }
+.settings-connection-shortcut .settings-about-actions { grid-template-columns: minmax(0, 1fr); }
 .status-hero { gap: 5px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .status-hero .status-line { min-height: 26px; gap: 9px; color: var(--text); font-size: 15px; font-weight: 650; }
 .status-hero .status-dot { width: 9px; height: 9px; }
-.status-hero .main-action { min-height: 52px; margin: 1px 0 0; border-radius: 10px; font-size: 15px; }
+.status-hero .main-action { min-height: 44px; margin: 1px 0 0; border-radius: 10px; font-size: 15px; }
 .status-hero .status-description { margin: 0; }
 .status-hero .primary-button:not(.main-action) { min-height: 42px; }
 .audio-quality-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 8px 18px 0; }
