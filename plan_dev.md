@@ -709,4 +709,4 @@ PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈�
 
 已基于用户新增 `AnPod_PC_Soft_Minimal_UI_UX_Plan_v2/` 完成PC展示增量；手机连接方式固定横排、AnPod顶栏固定，仅正文滚动；常显设置与预览同排，支持80–120%时钟字号、三档波形粗细及四项真实指标开关并持久保存。业务源码 `aa36590`，精确Receiver42登记 `4a8272d`，桌面封包来源 `a703bb2`。PC1.12.0 / Receiver0.19.0-v3-flow-candidate/code42。
 
-PC九项浏览器检查、32矩阵样本通过；Android此前全量97项通过，独立审查两项修订后定向3项、lint和Debug构建通过（不称最后又全量重跑），lint0 Error/59 Warning/4 Information。独立Astra medium代码审查及制品审计均PASS；实机/模拟器UI、TalkBack、Windows DPI/权限、三链路和音频仍NOT_TESTED。证据 `artifacts/ui-v2-aod-20261023/`，制品及完整哈希见UI总规划第18节；ZIP52文件独立核对一致，原签名/来源/登记/README/许可证全部通过。便携包 `artifacts/AnPod-1.12.0-tauri-win-x64-portable.zip` 含原签名Receiver42，保留全部旧包和三个用户缓存，未推送或远程发布。
+PC九项浏览器检查、32矩阵样本通过；Android此前全量97项通过，独立审查两项修订后定向3项、lint和Debug构建通过（不称最后又全量重跑），lint0 Error/59 Warning/5 Information（独立审查复核XML后更正）。独立Astra medium代码审查及制品审计均PASS；实机/模拟器UI、TalkBack、Windows DPI/权限、三链路和音频仍NOT_TESTED。证据 `artifacts/ui-v2-aod-20261023/`，制品及完整哈希见UI总规划第18节；ZIP52文件独立核对一致，原签名/来源/登记/README/许可证全部通过。便携包 `artifacts/AnPod-1.12.0-tauri-win-x64-portable.zip` 含原签名Receiver42，保留全部旧包和三个用户缓存，未推送或远程发布。

@@ -166,6 +166,8 @@ export const en: typeof zhCN = {
     light: "Light",
     dark: "Dark",
     settingsBusy: "Settings cannot be changed while connecting.",
+    settingsSavePending: "Applying setting…",
+    settingsSaveFailed: "Could not apply this setting. Try again.",
     settingsPrivacy: "Configuration stays on this computer and contains no pairing codes or handshake tokens.",
     operationNotCompleted: "The operation did not finish. Retry; if it still fails, expand details or open diagnostics.",
     hiresRateMismatch: (rateHz: number | null) => rateHz ? `Hi-Res requires 96 kHz; the current mix is ${rateHz / 1000} kHz. Choose Hi-Fi or change Windows output.` : "Hi-Res requires a 96 kHz Windows output. Choose Hi-Fi or change Windows output.",

@@ -24,7 +24,8 @@ final class ReceiverUiState {
             aodSessionId = -1;
             aodSampler.reset(now);
             return new AodTelemetrySnapshot(-1, AodTelemetrySnapshot.DisplayStatus.DISCONNECTED,
-                    AodTelemetrySnapshot.Transport.UNKNOWN, null, null, null, false, now);
+                    AodTelemetrySnapshot.Transport.UNKNOWN, null, null, null,
+                    -1, -1, -1, "unknown", false, now);
         }
         if (session.id != aodSessionId) {
             aodSessionId = session.id;
@@ -57,7 +58,8 @@ final class ReceiverUiState {
                 : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP
                 : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
-                lossPercent, receivedRecently, now);
+                lossPercent, metrics.sampleRate, metrics.channels, metrics.underrunCount,
+                session.actualOutputEngine, receivedRecently, now);
     }
 
     UiSnapshot snapshot() {

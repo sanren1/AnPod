@@ -299,6 +299,8 @@
 
 /* Settings remain in the existing dialog and retain the advanced disclosure default. */
 .settings-dialog .settings-group { margin: 8px 14px 0; padding: 10px 0 2px; border-top: 1px solid var(--line); }
+.settings-dialog > .settings-save-feedback { position: sticky; top: 58px; z-index: 1; margin: 0; padding: 6px 18px; background: var(--surface); }
+.settings-save-feedback > p { margin: 0; }
 .settings-dialog .settings-appearance { margin-top: 0; border-top: 0; }
 .settings-dialog .settings-group > h3 { margin: 0 4px 7px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
 .settings-dialog .settings-group .select-setting,

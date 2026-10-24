@@ -163,6 +163,8 @@ export const zhCN = {
     light: "浅色",
     dark: "深色",
     settingsBusy: "正在连接，暂时无法更改设置。",
+    settingsSavePending: "正在应用设置…",
+    settingsSaveFailed: "设置未能应用，请重试。",
     settingsPrivacy: "配置保存在本机，不包含配对码或握手令牌。",
     operationNotCompleted: "操作没有完成。请重试；仍失败时展开详情或查看诊断。",
     hiresRateMismatch: (rateHz: number | null) => rateHz ? `Hi-Res 需要 96 kHz；当前为 ${rateHz / 1000} kHz。请选高保真或调整 Windows 输出。` : "Hi-Res 需要 Windows 输出为 96 kHz。请选高保真或调整 Windows 输出。",

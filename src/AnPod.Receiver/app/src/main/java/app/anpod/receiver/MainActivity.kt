@@ -890,7 +890,7 @@ private fun ReceiverScreen(
                             modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                             Text(stringResource(R.string.aod_settings))
                         }
-                        TextButton(onClick = onOpenAod, enabled = serviceConnected,
+                        OutlinedButton(onClick = onOpenAod, enabled = serviceConnected,
                             modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                             Text(stringResource(R.string.aod_preview))
                         }

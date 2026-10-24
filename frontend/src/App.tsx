@@ -19,6 +19,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "receiver" | "setup" | "aoa" | "help" | "diagnostics" | null>(null);
   const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "wiredMode" | "device" | "network" | "receiverUsb" | "aoa"; value: string } | null>(null);
+  const pendingSettingsConfirmation = useRef<{ kind: "wirelessProtocol" | "audioBackend"; value: string; resolve: () => void; reject: (error: unknown) => void } | null>(null);
   const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
   const [pendingReceiverOperation, setPendingReceiverOperation] = useState<ReceiverUsbOperation | null>(null);
   const [receiverOperationBusy, setReceiverOperationBusy] = useState(false);
@@ -78,6 +79,14 @@ function App() {
     snapshotRefreshGeneration.current++;
     setSnapshot(value);
     setLocalSelected(value.selectedSerial);
+  };
+
+  const settlePendingSettingsConfirmation = (kind: string, value: string, result: { error?: unknown }) => {
+    const pending = pendingSettingsConfirmation.current;
+    if (!pending || pending.kind !== kind || pending.value !== value) return;
+    pendingSettingsConfirmation.current = null;
+    if ("error" in result) pending.reject(result.error);
+    else pending.resolve();
   };
   useEffect(() => {
     let disposed = false;
@@ -305,7 +314,7 @@ function App() {
     finally { setWorking(false); }
   };
 
-  const setOption = async (kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback", value: string) => {
+  const setOption = async (kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback", value: string, reportFailureToSettings = false) => {
     if (!snapshot) return;
     if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
     if (kind === "transport" || kind === "wirelessProtocol") {
@@ -336,7 +345,12 @@ function App() {
       finally { setWorking(false); }
       return;
     }
-    if (active) { setConfirm({ kind, value }); return; }
+    if (active) {
+      setConfirm({ kind, value });
+      if (reportFailureToSettings && (kind === "wirelessProtocol" || kind === "audioBackend"))
+        return new Promise<void>((resolve, reject) => { pendingSettingsConfirmation.current = { kind, value, resolve, reject }; });
+      return;
+    }
     setWorking(true);
     try {
       const key = kind === "playback" ? "playbackMode" : kind;
@@ -349,7 +363,7 @@ function App() {
         catch (error) { refreshFailure = String(error); }
       }
       if (refreshFailure) announce(strings.app.settingsSavedRefreshFailed, refreshFailure); else setNotice("");
-    } catch (error) { notify(String(error)); }
+    } catch (error) { notify(String(error)); if (reportFailureToSettings) throw error; }
     finally { setWorking(false); }
   };
 
@@ -498,6 +512,7 @@ function App() {
           openNetworkDialog();
         }
       }
+      settlePendingSettingsConfirmation(confirm.kind, confirm.value, {});
       setConfirm(null);
       setPendingNetworkStart(null);
     } catch (error) {
@@ -513,6 +528,7 @@ function App() {
         }
         notify(message);
       }
+      settlePendingSettingsConfirmation(confirm.kind, confirm.value, { error });
       setConfirm(null);
       setPendingNetworkStart(null);
       if (confirm.kind === "receiverUsb") setPendingReceiverOperation(null);
@@ -993,9 +1009,9 @@ function App() {
     {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{strings.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
     {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionTransport === "aoa" ? null : snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={null} onClose={() => setPanel(null)} />}
-    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} onSetOption={(kind, value) => void setOption(kind, value)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onSave={async (key, value) => {
+    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} onSetOption={(kind, value) => setOption(kind, value, true)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onSave={async (key, value) => {
       try { const next = await invokeApp<Snapshot>("update_setting", { key, value }); apply(next); if (key === "preferredTransport") apply(await invokeApp<Snapshot>("refresh_devices")); }
-      catch (error) { notify(String(error)); }
+      catch (error) { notify(String(error)); throw error; }
     }} onClose={() => setPanel(null)} />}
     {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}:${networkRecoveryMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} networkRecoveryMode={networkRecoveryMode} onNetworkRecoveryChange={setNetworkRecoveryMode} onConnect={startBackgroundConnection} preferredBindingReference={lastOfferListenerChoice.current?.bindingReference ?? snapshot.wirelessConnectionOffers.automaticBinding ?? ""} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || cancelPending || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} receiverOperationProgress={receiverOperationProgress} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { if (networkStartPendingRef.current) void cancelNetworkStart(); if (panel === "network") retainOfferListenerOnClose.current = true; setBackgroundStartMode(false); if (!receiverOperationBusy) { setReceiverOperationResult(null); setReceiverOperationProgress(null); } setPanel(null); }} />}
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
@@ -1010,7 +1026,7 @@ function App() {
         title={installing ? strings.app.confirmInstallTitle : strings.app.confirmInterruptTitle}
         body={installing ? strings.app.confirmInstallBody : strings.app.confirmInterruptBody}
         confirmLabel={confirm.kind === "network" && networkStartPending ? strings.app.connectCancel : strings.app.confirmInterruptAction}
-        busy={working && !networkStartPending} onCancel={() => { if (networkStartPending) void cancelNetworkStart(); if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => networkStartPending ? void cancelNetworkStart() : void applyConfirmed()} />;
+        busy={working && !networkStartPending} onCancel={() => { if (networkStartPending) void cancelNetworkStart(); if (confirm.kind === "receiverUsb") { setPanel(pendingReceiverOperation?.returnPanel ?? "receiver"); receiverOperationLock.current = false; receiverConfirmationStarted.current = false; } settlePendingSettingsConfirmation(confirm.kind, confirm.value, {}); setConfirm(null); setPendingNetworkStart(null); setPendingReceiverOperation(null); }} onConfirm={() => networkStartPending ? void cancelNetworkStart() : void applyConfirmed()} />;
     })()}
   </div>;
 }

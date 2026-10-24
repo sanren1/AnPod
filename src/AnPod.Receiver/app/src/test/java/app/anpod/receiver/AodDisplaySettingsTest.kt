@@ -30,7 +30,31 @@ class AodDisplaySettingsTest {
         assertTrue(settings.showReceiveRate)
         assertTrue(settings.showBuffer)
         assertTrue(settings.showLoss)
+        assertEquals(false, settings.showAudioFormat)
+        assertEquals(false, settings.showUnderruns)
+        assertEquals(false, settings.showOutputEngine)
         assertEquals(100, settings.clockScale)
+    }
+
+    @Test
+    fun existingPreferencesKeepOldMetricsAndDefaultNewMetricsOff() {
+        val preferences = ApplicationProvider.getApplicationContext<Context>()
+            .getSharedPreferences("aod_legacy_test", Context.MODE_PRIVATE)
+        preferences.edit().clear()
+            .putBoolean("aod_show_protocol", false)
+            .putBoolean("aod_show_receive_rate", true)
+            .putBoolean("aod_show_buffer", false)
+            .putBoolean("aod_show_loss", true)
+            .commit()
+
+        val settings = AodDisplaySettings.read(preferences)
+        assertEquals(false, settings.showProtocol)
+        assertEquals(true, settings.showReceiveRate)
+        assertEquals(false, settings.showBuffer)
+        assertEquals(true, settings.showLoss)
+        assertEquals(false, settings.showAudioFormat)
+        assertEquals(false, settings.showUnderruns)
+        assertEquals(false, settings.showOutputEngine)
     }
 
     @Test

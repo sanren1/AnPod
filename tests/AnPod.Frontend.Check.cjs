@@ -24,7 +24,7 @@ fs.mkdirSync(out, {recursive:true});
   let reviewAoaStartResolve=null;
   let reviewDisconnectFails=false;
   let reviewAoaTargets=[{id:'opaque-target-a',label:'AnPod 配件设备'}];let reviewAoaSwitchTargets=[{id:'switch-phone-a',label:'iQOO 11 (V2243A)'}];
-  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,lastUsbDirectTargetId:null,lastUsbDirectBindingReference:null,wiredMode:'adb',minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.12.0'};
+  let snapshot={state:'noDevice',message:'尚未连接手机',deviceName:null,devices:[],selectedSerial:null,sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,sessionAndroidVersion:null,playbackDiagnostics:null,negotiatedAudioFormat:null,windowsMixFormat:null,androidOutputFormat:null,networkRecoverySecondsRemaining:null,wirelessConnectionOffers:{active:false,automaticBinding:null,interfaceAddress:null,interfacePrefixLength:null,offers:[]},transport:'usb',connectionTransport:'usb',output:'computer',audioBitrateBps:null,settings:{schemaVersion:1,autoConnectLastDevice:true,lastDeviceId:null,lastUsbDirectTargetId:null,lastUsbDirectBindingReference:null,wiredMode:'adb',minimizeToTray:true,launchAtLogin:false,autoReconnectWifi:true,preferredTransport:'Usb',wirelessProtocol:'udp',audioBackend:'receiver',lastWirelessEndpoint:null,audioQuality:'standard',playbackMode:'Balanced',appearanceTheme:'System'},busy:false,canDisconnect:false,canChangeModes:true,statusDetail:'声音继续从电脑播放。',presence:[],version:'1.12.1'};
   window.reviewCalls={};window.reviewCommandArgs={};
   window.reviewSavedBindings=()=>[...reviewBindings];
   window.reviewSetAoaTargets=targets=>{reviewAoaTargets=structuredClone(targets);};
@@ -38,6 +38,10 @@ fs.mkdirSync(out, {recursive:true});
   window.reviewEmitReceiverProgress=payload=>emitEvent('anpod://receiver-install-progress',payload);
   window.reviewProgressListenerCount=()=>listeners.has('anpod://receiver-install-progress')?1:0;
   window.reviewRead=()=>structuredClone(snapshot);
+  window.reviewDelayNextSettingUpdate=()=>{window.reviewSettingUpdateStarted=false;window.reviewFinishSettingUpdate=null;window.reviewDelaySettingUpdate=true;};
+  window.reviewRejectSettingUpdate=()=>{const reject=window.reviewFinishSettingUpdate;window.reviewFinishSettingUpdate=null;reject?.(new Error('模拟设置保存失败'));};
+  window.reviewDelayNextReconfigure=()=>{window.reviewReconfigureStarted=false;window.reviewFinishReconfigure=null;window.reviewDelayReconfigure=true;};
+  window.reviewRejectReconfigure=(message='模拟重配置失败')=>{const reject=window.reviewFinishReconfigure;window.reviewFinishReconfigure=null;reject?.(new Error(message));};
   window.reviewSetDirectMemory=(targetId,binding)=>{snapshot.settings.lastUsbDirectTargetId=targetId;snapshot.settings.lastUsbDirectBindingReference=binding;emit();};
   window.reviewSetWiredMode=value=>{snapshot.settings.wiredMode=value;emit();};
   window.reviewFailNextDisconnect=()=>{reviewDisconnectFails=true;};
@@ -168,7 +172,7 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='qr_credentials')return {instanceName:'studio-Test123456',password:'abcdefghijklmnopqrst',payload:'WIFI:T:ADB;S:studio-Test123456;P:abcdefghijklmnopqrst;;'};
    if(cmd==='pair_qr')return new Promise(resolve=>{window.reviewPairQrArgs=args;window.reviewCompleteQrPair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
    if(cmd==='pair_wifi')return new Promise(resolve=>{window.reviewCompletePair=()=>resolve({success:true,message:'已配对',snapshot:structuredClone(snapshot)});});
-   if(cmd==='update_setting'){snapshot.settings[args.key]=args.value;if(args.key==='wiredMode'&&args.value==='adb')snapshot.settings.audioQuality='standard';if(args.key==='transport'){snapshot.connectionTransport=args.value;snapshot.transport=args.value==='wireless'?'wifi':'usb';snapshot.settings.preferredTransport=args.value==='wireless'?'Wifi':'Usb';}return structuredClone(snapshot);}
+   if(cmd==='update_setting'){if(window.reviewDelaySettingUpdate){window.reviewDelaySettingUpdate=false;window.reviewSettingUpdateStarted=true;await new Promise((resolve,reject)=>{window.reviewFinishSettingUpdate=reject;});}snapshot.settings[args.key]=args.value;if(args.key==='wiredMode'&&args.value==='adb')snapshot.settings.audioQuality='standard';if(args.key==='transport'){snapshot.connectionTransport=args.value;snapshot.transport=args.value==='wireless'?'wifi':'usb';snapshot.settings.preferredTransport=args.value==='wireless'?'Wifi':'Usb';}return structuredClone(snapshot);}
    if(cmd==='connect_device'){window.reviewSet('streaming',snapshot.transport);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='connect_device_only'){window.reviewSet('connected',snapshot.transport,args.serial);return {success:true,message:'已连接',snapshot:structuredClone(snapshot)};}
    if(cmd==='switch_device'){if(window.reviewSwitchMode==='failure')return {success:false,message:'模拟切换失败，已恢复原连接',snapshot:structuredClone(snapshot)};window.reviewSet(snapshot.output==='phone'?'streaming':'connected',snapshot.transport,args.serial);snapshot.selectedSerial=args.serial;return {success:true,message:'已切换',snapshot:structuredClone(snapshot)};}
@@ -176,7 +180,7 @@ fs.mkdirSync(out, {recursive:true});
    if(cmd==='cancel_operation'){if(reviewDeferCancel){reviewDeferCancel=false;await new Promise(resolve=>reviewResolveCancel=resolve);}if(reviewCancelReturnsActive){reviewCancelReturnsActive=false;return structuredClone(snapshot);}const current={...snapshot,state:'ready',message:'已取消 USB Direct 连接',sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionReceiverBinding:null,sessionGeneration:null,canDisconnect:false,canChangeModes:true,busy:false,output:'computer'};snapshot=current;emit();if(reviewAoaStartResolve){const resolve=reviewAoaStartResolve;reviewAoaStartResolve=null;resolve(structuredClone(snapshot));}return structuredClone(snapshot);}
    if(cmd==='disconnect'){if(reviewDisconnectFails){reviewDisconnectFails=false;return {success:false,message:'模拟断开失败',snapshot:structuredClone(snapshot)};}snapshot={...snapshot,state:'ready',message:'已断开',sessionSerial:null,sessionReceiverBinding:null,sessionGeneration:null,sessionTransport:null,sessionConnectionTransport:null,sessionWirelessProtocol:null,sessionCapabilities:null,canDisconnect:false,canChangeModes:true,canChangePlaybackMode:false,busy:false,output:'computer'};emit();return {success:true,message:'已断开',snapshot:structuredClone(snapshot)};}
    if(cmd==='set_output'){snapshot.output=args.output;snapshot.state=args.output==='phone'?'streaming':'connected';emit();return structuredClone(snapshot);}
-   if(cmd==='reconfigure_session'){snapshot.settings[args.kind==='playback'?'playbackMode':'preferredTransport']=args.kind==='playback'?(args.value==='balanced'?'Balanced':'LowLatency'):(args.value==='usb'?'Usb':'Wifi');snapshot.transport=snapshot.settings.preferredTransport==='Wifi'?'wifi':'usb';window.reviewSet(snapshot.state,snapshot.transport);}
+   if(cmd==='reconfigure_session'){if(window.reviewDelayReconfigure){window.reviewDelayReconfigure=false;window.reviewReconfigureStarted=true;await new Promise((resolve,reject)=>{window.reviewFinishReconfigure=reject;});}if(args.kind==='wirelessProtocol'||args.kind==='audioBackend')snapshot.settings[args.kind]=args.value;else snapshot.settings[args.kind==='playback'?'playbackMode':'preferredTransport']=args.kind==='playback'?(args.value==='balanced'?'Balanced':'LowLatency'):(args.value==='usb'?'Usb':'Wifi');snapshot.transport=snapshot.settings.preferredTransport==='Wifi'?'wifi':'usb';window.reviewSet(snapshot.state,snapshot.transport);}
    return structuredClone(snapshot);
   }};
  });
@@ -197,6 +201,113 @@ fs.mkdirSync(out, {recursive:true});
   fs.writeFileSync(`${out}/e0e36e7-main-status-golden.json`,JSON.stringify({baseline:'e0e36e706f1cace85264d676a3c4fa6aa41f2322',source:'unchanged App.tsx/appRuntime.ts functions, captured through existing frontend mock fixtures',rows},null,2));
  }
  const results={errors,layouts:[],focusStable:null};
+ if(process.env.ANPOD_SETTINGS_SAVE_FEEDBACK_ONLY){
+  const settingsLauncher=page.getByRole('button',{name:'打开设置',exact:true});
+  await settingsLauncher.click();
+  const dialog=page.getByRole('dialog',{name:'设置'});await dialog.waitFor();
+  await page.evaluate(()=>window.reviewSetWiredMode('aoa'));
+  await dialog.locator('.settings-disclosure > summary').click();
+  const audioQuality=dialog.locator('input[name="audioQuality"][value="hifi"]');
+  await audioQuality.scrollIntoViewIfNeeded();
+  await page.evaluate(()=>window.reviewDelayNextSettingUpdate());
+  await audioQuality.click();
+  await page.waitForFunction(()=>window.reviewSettingUpdateStarted);
+  const pending=dialog.getByRole('status');
+  await pending.waitFor({state:'visible'});
+  results.pendingVisible=await pending.isVisible()&&await pending.innerText()==='正在应用设置…';
+  results.pendingIsLive=await pending.getAttribute('aria-live')==='polite';
+  results.audioQualityDisabledWhileSaving=await audioQuality.isDisabled();
+  results.largeTextRemainsEnabled=await dialog.locator('.settings-appearance .setting-toggle input').first().isEnabled();
+  results.feedbackVisibleAtAudioSetting=await page.evaluate(()=>{const feedback=document.querySelector('.settings-save-feedback').getBoundingClientRect(),dialog=document.querySelector('.settings-dialog').getBoundingClientRect();return feedback.top>=dialog.top+50&&feedback.bottom<=dialog.bottom;});
+  results.valueUnchangedWhileSaving=!(await audioQuality.isChecked())&&await page.evaluate(()=>window.reviewRead().settings.audioQuality==='standard');
+  await page.evaluate(()=>window.reviewRejectSettingUpdate());
+  const saveError=dialog.getByRole('alert');await saveError.waitFor({state:'visible'});
+  results.inlineErrorVisible=await saveError.isVisible();
+  results.errorVisibleAtAudioSetting=await page.evaluate(()=>{const feedback=document.querySelector('.settings-save-feedback').getBoundingClientRect(),dialog=document.querySelector('.settings-dialog').getBoundingClientRect();return feedback.top>=dialog.top+50&&feedback.bottom<=dialog.bottom;});
+  results.valueUnchangedAfterFailure=!(await audioQuality.isChecked())&&await page.evaluate(()=>window.reviewRead().settings.audioQuality==='standard');
+  results.audioQualityReenabledAfterFailure=await audioQuality.isEnabled();
+  await audioQuality.click();
+  await page.waitForFunction(()=>window.reviewRead().settings.audioQuality==='hifi');
+  await page.waitForFunction(()=>!document.querySelector('.settings-dialog [role="alert"]'));
+  results.retryClearsError=await audioQuality.isChecked()&&await dialog.getByRole('alert').count()===0;
+  results.retryAppliedSnapshot=await page.evaluate(()=>window.reviewRead().settings.audioQuality==='hifi');
+  const wirelessProtocol=dialog.getByLabel('无线方式');
+  await page.evaluate(()=>window.reviewDelayNextSettingUpdate());
+  await wirelessProtocol.selectOption('adb');
+  await page.waitForFunction(()=>window.reviewSettingUpdateStarted);
+  await pending.waitFor({state:'visible'});
+  results.optionPendingVisible=await pending.isVisible()&&await wirelessProtocol.isDisabled();
+  results.optionValueUnchangedWhileSaving=await wirelessProtocol.inputValue()==='udp'&&await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='udp');
+  await page.evaluate(()=>window.reviewRejectSettingUpdate());
+  await saveError.waitFor({state:'visible'});
+  results.optionInlineErrorVisible=await saveError.isVisible();
+  results.optionValueUnchangedAfterFailure=await wirelessProtocol.inputValue()==='udp'&&await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='udp');
+  results.optionReenabledAfterFailure=await wirelessProtocol.isEnabled();
+  await wirelessProtocol.selectOption('adb');
+  await page.waitForFunction(()=>window.reviewRead().settings.wirelessProtocol==='adb');
+  await page.waitForFunction(()=>!document.querySelector('.settings-dialog [role="alert"]'));
+  results.optionRetryClearsError=await wirelessProtocol.inputValue()==='adb'&&await dialog.getByRole('alert').count()===0;
+  results.optionRetryAppliedSnapshot=await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='adb');
+  results.settingUpdateCalls=await page.evaluate(()=>window.reviewCalls.update_setting);
+  fs.writeFileSync(`${out}/settings-save-feedback-result.json`,JSON.stringify(results,null,2));
+  await browser.close();assert.deepEqual(errors,[]);
+  for(const key of ['pendingVisible','pendingIsLive','audioQualityDisabledWhileSaving','largeTextRemainsEnabled','feedbackVisibleAtAudioSetting','valueUnchangedWhileSaving','inlineErrorVisible','errorVisibleAtAudioSetting','valueUnchangedAfterFailure','audioQualityReenabledAfterFailure','retryClearsError','retryAppliedSnapshot','optionPendingVisible','optionValueUnchangedWhileSaving','optionInlineErrorVisible','optionValueUnchangedAfterFailure','optionReenabledAfterFailure','optionRetryClearsError','optionRetryAppliedSnapshot'])assert.equal(results[key],true,key);
+  assert.equal(results.settingUpdateCalls,4);
+  return;
+ }
+ if(process.env.ANPOD_SETTINGS_SAVE_CONFIRM_ONLY){
+  await page.evaluate(()=>window.reviewSet('connected','usb'));
+  await page.getByRole('button',{name:'打开设置',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'设置'});await dialog.waitFor();
+  await dialog.locator('.settings-disclosure > summary').click();
+  const wirelessProtocol=dialog.getByLabel('无线方式');
+  const confirmDialog=page.locator('dialog.confirm-dialog');
+  await wirelessProtocol.selectOption('adb');
+  await confirmDialog.waitFor();
+  const pending=dialog.getByRole('status');
+  results.pendingUntilConfirm=await pending.isVisible()&&await wirelessProtocol.inputValue()==='udp';
+  await confirmDialog.getByRole('button',{name:'取消',exact:true}).click();
+  await confirmDialog.waitFor({state:'detached'});
+  await pending.waitFor({state:'detached'});
+  results.cancelKeepsOldValue=await wirelessProtocol.inputValue()==='udp'&&await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='udp');
+  results.cancelHasNoError=await dialog.getByRole('alert').count()===0;
+  await wirelessProtocol.selectOption('adb');
+  await confirmDialog.waitFor();
+  await page.evaluate(()=>window.reviewDelayNextReconfigure());
+  await confirmDialog.getByRole('button',{name:'继续',exact:true}).click();
+  await page.waitForFunction(()=>window.reviewReconfigureStarted);
+  results.pendingDuringReconfigure=await pending.isVisible()&&await wirelessProtocol.inputValue()==='udp';
+  await page.evaluate(()=>window.reviewRejectReconfigure());
+  const saveError=dialog.getByRole('alert');await saveError.waitFor({state:'visible'});
+  await confirmDialog.waitFor({state:'detached'});
+  results.failureKeepsSettingsOpen=await dialog.isVisible();
+  results.failureKeepsOldValue=await wirelessProtocol.inputValue()==='udp'&&await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='udp');
+  results.failureHasInlineError=await saveError.isVisible();
+  results.originalErrorRemainsAvailable=await page.locator('.toast details pre').textContent().then(value=>value?.includes('模拟重配置失败')??false);
+  results.pendingClearsAfterFailure=await pending.count()===0;
+  await wirelessProtocol.selectOption('adb');
+  await confirmDialog.waitFor();
+  await confirmDialog.getByRole('button',{name:'继续',exact:true}).click();
+  await page.waitForFunction(()=>window.reviewRead().settings.wirelessProtocol==='adb');
+  await confirmDialog.waitFor({state:'detached'});
+  await page.waitForFunction(()=>!document.querySelector('.settings-dialog [role="alert"]'));
+  results.retryUsesReturnedSnapshot=await wirelessProtocol.inputValue()==='adb'&&await page.evaluate(()=>window.reviewRead().settings.wirelessProtocol==='adb');
+  results.errorClearedAfterSuccess=await dialog.getByRole('alert').count()===0;
+  results.reconfigureCalls=await page.evaluate(()=>window.reviewCalls.reconfigure_session);
+  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+  const snapshotRefreshes=await page.evaluate(()=>window.reviewCalls.get_snapshot||0);
+  await page.evaluate(()=>window.reviewDelayNextReconfigure());
+  await page.getByRole('group',{name:'播放模式'}).getByRole('button',{name:'低延迟'}).click();
+  await page.waitForFunction(()=>window.reviewReconfigureStarted);
+  await page.evaluate(()=>window.reviewRejectReconfigure('模拟主屏重配置失败'));
+  await page.waitForFunction(previous=>(window.reviewCalls.get_snapshot||0)>previous,snapshotRefreshes);
+  results.mainScreenFailureHandled=await page.locator('.toast details pre').textContent().then(value=>value?.includes('模拟主屏重配置失败')??false);
+  fs.writeFileSync(`${out}/settings-save-confirm-result.json`,JSON.stringify(results,null,2));
+  await browser.close();assert.deepEqual(errors,[]);
+  for(const key of ['pendingUntilConfirm','cancelKeepsOldValue','cancelHasNoError','pendingDuringReconfigure','failureKeepsSettingsOpen','failureKeepsOldValue','failureHasInlineError','originalErrorRemainsAvailable','pendingClearsAfterFailure','retryUsesReturnedSnapshot','errorClearedAfterSuccess','mainScreenFailureHandled'])assert.equal(results[key],true,key);
+  assert.equal(results.reconfigureCalls,2);
+  return;
+ }
  if(process.env.ANPOD_SETTINGS_CHILD_FOCUS_ONLY){
   const settingsLauncher=page.getByRole('button',{name:'打开设置',exact:true});
   const focusState=async()=>page.evaluate(()=>{const el=document.activeElement;return {tag:el?.tagName??null,label:el?.getAttribute('aria-label')??el?.innerText?.trim()??null,className:typeof el?.className==='string'?el.className:null,isBody:el===document.body};});

@@ -322,7 +322,7 @@ Android实施契约：
 
 Android已实现固定顶栏、横向连接选择、同排设置/预览、主题内可滚动常显设置弹窗。时钟80–120%按真实字形宽高与clock/footer锚点限制，波形80/100/120%作用于静音和真实PCM绘制；协议/接收/缓冲/丢包四项本地开关默认全开，状态保留，窄屏可换行。设置页不启动AOD采样/超时逻辑。
 
-Android此前全量14 suites/97 tests零失败；审查修订后定向3项、lintDebug及assembleDebug通过，不把两批计数相加或称最后重跑全量。最终lint为0 Error、59 Warning、4 Information。证据 `android/full-suite-lint.log`、`android/final-checks.log`、原始XML。独立Astra medium发现并关闭两项P2（开关无辅助名称、横屏大字缺高度约束），最终代码/PC浏览器/JVM构建范围PASS，详见 `review.md`。所有实机/模拟器显示、TalkBack、系统权限、真实音频仍NOT_TESTED。
+Android此前全量14 suites/97 tests零失败；审查修订后定向3项、lintDebug及assembleDebug通过，不把两批计数相加或称最后重跑全量。最终lint为0 Error、59 Warning、5 Information（后续独立审查复核原始XML，更正此前记录的4条）。证据 `android/full-suite-lint.log`、`android/final-checks.log`、原始XML。独立Astra medium发现并关闭两项P2（开关无辅助名称、横屏大字缺高度约束），最终代码/PC浏览器/JVM构建范围PASS，详见 `review.md`。所有实机/模拟器显示、TalkBack、系统权限、真实音频仍NOT_TESTED。
 
 ### 本地制品
 
@@ -331,3 +331,18 @@ PC便携包 `artifacts/AnPod-1.12.0-tauri-win-x64-portable.zip`，18,533,994 byt
 Receiver42：`artifacts/ui-v2-aod-20261023-receiver42/receiver.apk`，13,708,905 bytes；SHA-256 `96d9eb04f73ef3aed8054842f4d8b5f34e12f4a4e10e75d1ceb10f7045e749fb`。release / target35 / 原证书，source `aa365903929074b4abcf3872066184140023fee9`，sourceModified=false，输入快照 `19d464c84a2c67f64c8cd0ab7b41eb3c37dd6bf4fbcd7b244872c261b0719dd4`。精确审计登记 `4a8272d`，指定本轮APK目录的真实Rust artifact-read 1/1及CI同款fmt检查通过。APK中间构建目录已清理，用户缓存与旧包保留。
 
 根代理另行打开ZIP逐项核对52个文件路径/长度/哈希通过，结果 `artifacts/ui-v2-aod-20261023/root-zip-verification.json`。独立Astra medium制品审计PASS，同目录 `delivery-audit.json` / `.md` 记录EXE版本、APK原签名/来源/精确登记、Native/Legacy、README冻结/10个本地链接及许可证核验。构建时受跟踪源码干净，全树dirty仅因三个既有用户缓存；本节文档在源码输入范围外，不改变制品来源。本轮未推送或远程发布，使用新增手机功能需同步更新随包Receiver42。
+
+## 19. 2026-10-23 · 间距收尾、AOD细化及整体审查（进行中）
+
+最新用户指令覆盖第18节的AOD显示细节：实际常显文本全部英文，参数居中、使用 `|` 分隔；多项显示可换行，不为塞进一行缩小可读字号。常显设置保留本地化菜单，增加小型设置预览，两个同排入口采用同样式，将“预览常显”改为“进入常显”。
+
+| 任务 | 类型与依赖 | 当前验收状态 |
+| --- | --- | --- |
+| 首页分隔线与模块间距 | [SUBAGENT]，独立完成 | `f295d4f` / `61add73`；420/480宽三处12px、360/390宽8px，浏览器截图及滚动几何通过；未包含于旧1.12.0包 |
+| 设置保存反馈 | [SUBAGENT]，独立执行 | 普通保存、无会话高级设置、活动会话确认三条路径均已补齐；最新生产静态前端默认59项布尔全真、确认专项12项全真、保存专项19项全真及调用次数断言通过，等待冻结复审 |
+| AOD参数与设置预览 | [SUBAGENT]，独立执行 | 新增实际音频格式、输出引擎、欠载次数可选项，默认关闭；现有四项偏好保留。复用当前Metrics/session数据，无新增采样周期；14套98项JVM通过，清理本轮弃用资源后lint及Debug构建通过，等待冻结复审 |
+| 有限恢复及PCM24模式一致性 | [SERIAL]，单执行代理完成耦合模块 | 已复现SetMode后恢复窗口为空导致无限重试；认证前同步profile mode，保留质量/速率/位深；完整回归与旧模式切换测试失败仍在核查 |
+| 整体审查与修订 | [SUBAGENT]，全部实现冻结后验收 | 按2026-10-24最新指令改为独立GPT 6.1 sol high，不再使用Astra；覆盖UI/UX、简短文案、连接链路/并发/释放及制品信任边界；发现须修订再复审 |
+| 版本、签名与本地交付 | [SERIAL]，依赖上述验收 | 沿用原密钥与精确制品登记门禁，不覆盖历史有效包，不推送或远程发布 |
+
+执行代理保持GPT 6 luna high、无历史派发、无嵌套、最多三个并行。规划完成度独立报告 `artifacts/project-review-20261023/ui-plan-completion.md` 区分源码已实现、离线已验证和实机未验证；P5及此前明确跳过的实机内容不凭浏览器/JVM勾为完成。

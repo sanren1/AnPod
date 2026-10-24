@@ -22,7 +22,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -40,6 +39,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
@@ -79,6 +79,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -310,7 +311,7 @@ private fun AodScreen(
             modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
                 .graphicsLayer { alpha = exitAlpha }
         ) {
-            Text(stringResource(R.string.aod_exit), color = Color(0x55FFFFFF), fontSize = 13.sp)
+            Text("Close", color = Color(0x55FFFFFF), fontSize = 13.sp)
         }
     }
 }
@@ -327,6 +328,8 @@ internal fun AodSettingsDialog(
         text = {
             Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(stringResource(R.string.aod_preview_label), style = MaterialTheme.typography.titleMedium)
+                AodSettingsPreview(settings)
                 Text(stringResource(R.string.aod_clock_size), style = MaterialTheme.typography.titleMedium)
                 val clockSizeLabel = stringResource(R.string.aod_clock_size)
                 Slider(value = settings.clockScale.toFloat(), onValueChange = {
@@ -364,6 +367,15 @@ internal fun AodSettingsDialog(
                 AodSettingSwitch(R.string.aod_metric_loss, settings.showLoss) {
                     onChange(settings.copy(showLoss = it))
                 }
+                AodSettingSwitch(R.string.aod_metric_audio_format, settings.showAudioFormat) {
+                    onChange(settings.copy(showAudioFormat = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_underruns, settings.showUnderruns) {
+                    onChange(settings.copy(showUnderruns = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_output_engine, settings.showOutputEngine) {
+                    onChange(settings.copy(showOutputEngine = it))
+                }
             }
         },
         confirmButton = {
@@ -372,6 +384,22 @@ internal fun AodSettingsDialog(
             }
         }
     )
+}
+
+@Composable
+private fun AodSettingsPreview(settings: AodDisplaySettings) {
+    Column(
+        Modifier.fillMaxWidth().heightIn(min = 132.dp).background(Color.Black, RoundedCornerShape(12.dp)).padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text("21:38", fontFamily = RubikClock, fontWeight = FontWeight.Black,
+            fontSize = (30f * settings.clockScale / 100f).sp, letterSpacing = (-1).sp,
+            color = Color(0xFFF7F7F7), maxLines = 1)
+        WaveformCanvas(null, 1f, settings.waveformWeight / 100f,
+            Modifier.fillMaxWidth(0.84f).height(22.dp))
+        MetricsRow(null, settings, Modifier.fillMaxWidth())
+    }
 }
 
 @Composable
@@ -401,7 +429,7 @@ private fun VolumeGestureArea(modifier: Modifier) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false)
             if (audioManager.isVolumeFixed) {
-                Toast.makeText(context, R.string.aod_volume_fixed, Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "This device's media volume is fixed by the system.", Toast.LENGTH_SHORT).show()
                 return@awaitEachGesture
             }
             val minimum = if (Build.VERSION.SDK_INT >= 28)
@@ -422,7 +450,7 @@ private fun VolumeGestureArea(modifier: Modifier) {
                     audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
                 } catch (error: SecurityException) {
                     android.util.Log.w("AnPodAod", "Media volume adjustment denied", error)
-                    Toast.makeText(context, R.string.aod_volume_unavailable, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Android does not allow volume changes here. Use the volume buttons.", Toast.LENGTH_SHORT).show()
                     break
                 }
             }
@@ -508,16 +536,22 @@ private fun DrawScope.smoothWaveformPath(offsets: FloatArray, centerY: Float): P
 
 @Composable
 private fun MetricsRow(telemetry: AodTelemetrySnapshot?, settings: AodDisplaySettings, modifier: Modifier) {
-    FlowRow(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    val items = buildList {
+        if (settings.showProtocol) add("Protocol ${protocolLabel(telemetry)}")
+        if (settings.showReceiveRate) add("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}")
+        if (settings.showBuffer) add("Buffer ${latencyLabel(telemetry?.receiverBufferMs)}")
+        if (settings.showLoss) add("Loss ${lossLabel(telemetry?.udpLossPercent)}")
+        if (settings.showAudioFormat) add("Format ${audioFormatLabel(telemetry)}")
+        if (settings.showUnderruns) add("Underruns ${countLabel(telemetry?.underrunCount)}")
+        if (settings.showOutputEngine) add("Output ${outputEngineLabel(telemetry)}")
+    }
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
             StatusDot(telemetry)
             Text(statusLabel(telemetry), color = Color(0xFFE6E6E6), fontSize = 14.sp)
         }
-        if (settings.showProtocol) Text(stringResource(R.string.aod_metric_protocol_value, protocolLabel(telemetry)), color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        if (settings.showReceiveRate) Text(stringResource(R.string.aod_metric_receive_rate_value, rateLabel(telemetry?.recvAudioPayloadBps)), color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        if (settings.showBuffer) Text(stringResource(R.string.aod_metric_buffer_value, latencyLabel(telemetry?.receiverBufferMs)), color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        if (settings.showLoss) Text(stringResource(R.string.aod_metric_loss_value, lossLabel(telemetry?.udpLossPercent)), color = Color(0xFFB3B3B3), fontSize = 14.sp)
+        if (items.isNotEmpty()) Text(items.joinToString("\u00A0|\u00A0"), modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFFB3B3B3), fontSize = 14.sp, textAlign = TextAlign.Center)
     }
 }
 
@@ -532,13 +566,12 @@ private fun StatusDot(telemetry: AodTelemetrySnapshot?) {
     Box(Modifier.size(8.dp).background(color, CircleShape))
 }
 
-@Composable
-private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = stringResource(when (telemetry?.status) {
-    AodTelemetrySnapshot.DisplayStatus.RECEIVING -> R.string.state_receiving
-    AodTelemetrySnapshot.DisplayStatus.CONNECTED -> R.string.aod_connected
-    AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> R.string.aod_reconnecting
-    else -> R.string.state_not_connected
-})
+private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.status) {
+    AodTelemetrySnapshot.DisplayStatus.RECEIVING -> "Receiving"
+    AodTelemetrySnapshot.DisplayStatus.CONNECTED -> "Connected"
+    AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> "Reconnecting"
+    else -> "Not connected"
+}
 
 private fun protocolLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.transport) {
     AodTelemetrySnapshot.Transport.USB_DIRECT -> "USB Direct"
@@ -558,6 +591,27 @@ private fun latencyLabel(millis: Float?): String =
 
 private fun lossLabel(percent: Float?): String =
     percent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—"
+
+private fun audioFormatLabel(telemetry: AodTelemetrySnapshot?): String {
+    if (telemetry == null || telemetry.outputSampleRate <= 0 || telemetry.outputChannels <= 0) return "—"
+    val channels = when (telemetry.outputChannels) {
+        1 -> "Mono"
+        2 -> "Stereo"
+        else -> "${telemetry.outputChannels} ch"
+    }
+    val rate = if (telemetry.outputSampleRate % 1000 == 0)
+        "${telemetry.outputSampleRate / 1000}"
+    else String.format(Locale.US, "%.1f", telemetry.outputSampleRate / 1000.0)
+    return "$rate kHz $channels"
+}
+
+private fun countLabel(count: Int?): String = count?.takeIf { it >= 0 }?.toString() ?: "—"
+
+private fun outputEngineLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.actualOutputEngine) {
+    "audioTrack" -> "AudioTrack"
+    "oboeExperimental" -> "Oboe"
+    else -> "—"
+}
 
 private val RubikClock = FontFamily(Font(R.font.rubik_black, FontWeight.Black))
 
