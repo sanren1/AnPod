@@ -65,4 +65,11 @@ class AodDisplaySettingsTest {
         assertEquals(100f, AodDisplaySettings.clockSizeSp(100f, 240f, 120f, 240f, 300f, 120), 0.01f)
         assertEquals(100f, AodDisplaySettings.clockSizeSp(100f, 240f, 200f, 400f, 200f, 120), 0.01f)
     }
+
+    @Test
+    fun savedWaveformWeightsMapToThinDefaultAndBoldStrokeScales() {
+        assertEquals(0.5f, AodDisplaySettings(waveformWeight = 80).waveformStrokeScale)
+        assertEquals(1f, AodDisplaySettings().waveformStrokeScale)
+        assertEquals(2f, AodDisplaySettings(waveformWeight = 120).waveformStrokeScale)
+    }
 }

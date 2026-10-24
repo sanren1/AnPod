@@ -13,6 +13,13 @@ internal data class AodDisplaySettings(
     val showUnderruns: Boolean = false,
     val showOutputEngine: Boolean = false
 ) {
+    val waveformStrokeScale: Float
+        get() = when (waveformWeight) {
+            80 -> 0.5f
+            120 -> 2f
+            else -> 1f
+        }
+
     companion object {
         const val DEFAULT_CLOCK_SCALE = 100
         const val DEFAULT_WAVEFORM_WEIGHT = 100

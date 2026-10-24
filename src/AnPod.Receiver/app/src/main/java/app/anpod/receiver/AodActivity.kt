@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
+import android.util.DisplayMetrics
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -34,6 +35,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
@@ -69,7 +71,8 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -85,6 +88,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -211,19 +215,38 @@ private fun AodScreen(
         animationSpec = tween(durationMillis = 700),
         label = "aodExitAlpha"
     )
+    val clockText = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+    AodVisualLayout(telemetry, waveform, settings, clockText, drift.first, drift.second,
+        exitAlpha, exitVisible, onExit) { lastInteraction = SystemClock.elapsedRealtime() }
+}
+
+@Composable
+private fun AodVisualLayout(
+    telemetry: AodTelemetrySnapshot?,
+    waveform: PcmWaveformTap.Waveform?,
+    settings: AodDisplaySettings,
+    clockText: String,
+    driftX: Float,
+    driftY: Float,
+    exitAlpha: Float,
+    exitVisible: Boolean,
+    onExit: (() -> Unit)?,
+    onInteraction: (() -> Unit)? = null
+) {
     BoxWithConstraints(
-        Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) {
-            awaitPointerEventScope {
-                while (true) {
-                    awaitPointerEvent(PointerEventPass.Initial)
-                    lastInteraction = SystemClock.elapsedRealtime()
+        Modifier.fillMaxSize().background(Color.Black).then(
+            if (onInteraction != null) Modifier.pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        awaitPointerEvent(PointerEventPass.Initial)
+                        onInteraction()
+                    }
                 }
-            }
-        }
+            } else Modifier
+        )
     ) {
         val baseClockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
         val density = LocalDensity.current
-        val clockText = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
         val clockMeasurement = rememberTextMeasurer().measure(
             AnnotatedString(clockText),
             style = TextStyle(fontFamily = RubikClock, fontWeight = FontWeight.Black,
@@ -246,8 +269,7 @@ private fun AodScreen(
             (footerTop - clockTop - clearancePx).coerceAtLeast(0f),
             settings.clockScale
         )
-        val driftXPx = with(density) { drift.first.dp.toPx() }
-        val driftYPx = with(density) { drift.second.dp.toPx() }
+        val driftYPx = with(density) { driftY.dp.toPx() }
         val waveformLayout = AodWaveformGeometry.layout(
             if (clockBottomPx.isFinite()) clockBottomPx else screenHeightPx * 0.54f,
             footerTop,
@@ -267,51 +289,46 @@ private fun AodScreen(
             color = Color(0xFFF7F7F7),
             modifier = Modifier.align(Alignment.TopCenter)
                 .padding(top = (maxHeight.value * 0.10f).dp)
-                .offset(x = drift.first.dp, y = drift.second.dp)
+                .offset(x = driftX.dp, y = driftY.dp)
                 .onGloballyPositioned { coordinates ->
-                    // The anchors describe the undrifted layout so the waveform region keeps its size
-                    // while every element drifts together.
-                    val top = coordinates.positionInRoot().y - driftYPx
-                    val bottom = coordinates.positionInRoot().y + coordinates.size.height - driftYPx
-                    if (clockTopPx.isNaN() || kotlin.math.abs(clockTopPx - top) > 0.5f)
-                        clockTopPx = top
-                    if (clockBottomPx.isNaN() || kotlin.math.abs(clockBottomPx - bottom) > 0.5f)
-                        clockBottomPx = bottom
+                    val top = coordinates.positionInParent().y - driftYPx
+                    val bottom = coordinates.positionInParent().y + coordinates.size.height - driftYPx
+                    if (clockTopPx.isNaN() || kotlin.math.abs(clockTopPx - top) > 0.5f) clockTopPx = top
+                    if (clockBottomPx.isNaN() || kotlin.math.abs(clockBottomPx - bottom) > 0.5f) clockBottomPx = bottom
                 }
         )
         WaveformCanvas(
             waveform,
             waveformLayout.maximumAmplitude,
-            settings.waveformWeight / 100f,
+            settings.waveformStrokeScale,
             Modifier.align(Alignment.TopCenter)
                 .offset(y = waveformTop)
                 .fillMaxWidth(0.90f)
                 .height(waveformHeight)
-                .offset(x = drift.first.dp, y = drift.second.dp)
+                .offset(x = driftX.dp, y = driftY.dp)
         )
         MetricsRow(
             telemetry, settings,
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                 .padding(start = 28.dp, end = 28.dp, bottom = 22.dp)
-                .offset(x = drift.first.dp, y = drift.second.dp)
+                .offset(x = driftX.dp, y = driftY.dp)
                 .onGloballyPositioned { coordinates ->
-                    val top = coordinates.positionInRoot().y - driftYPx
-                    if (footerTopPx.isNaN() || kotlin.math.abs(footerTopPx - top) > 0.5f)
-                        footerTopPx = top
+                    val top = coordinates.positionInParent().y - driftYPx
+                    if (footerTopPx.isNaN() || kotlin.math.abs(footerTopPx - top) > 0.5f) footerTopPx = top
                 }
         )
-        VolumeGestureArea(
-            Modifier.align(Alignment.CenterEnd).fillMaxWidth(1f / 3f).fillMaxHeight()
-                .windowInsetsPadding(WindowInsets.systemGestures)
-                .padding(top = 64.dp, end = 16.dp, bottom = 48.dp)
-        )
-        TextButton(
-            onClick = onExit,
-            enabled = exitVisible,
-            modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
-                .graphicsLayer { alpha = exitAlpha }
-        ) {
-            Text("Close", color = Color(0x55FFFFFF), fontSize = 13.sp)
+        if (onExit != null) {
+            VolumeGestureArea(
+                Modifier.align(Alignment.CenterEnd).fillMaxWidth(1f / 3f).fillMaxHeight()
+                    .windowInsetsPadding(WindowInsets.systemGestures)
+                    .padding(top = 64.dp, end = 16.dp, bottom = 48.dp)
+            )
+            TextButton(
+                onClick = onExit,
+                enabled = exitVisible,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
+                    .graphicsLayer { alpha = exitAlpha }
+            ) { Text("Close", color = Color(0x55FFFFFF), fontSize = 13.sp) }
         }
     }
 }
@@ -388,17 +405,46 @@ internal fun AodSettingsDialog(
 
 @Composable
 private fun AodSettingsPreview(settings: AodDisplaySettings) {
-    Column(
-        Modifier.fillMaxWidth().heightIn(min = 132.dp).background(Color.Black, RoundedCornerShape(12.dp)).padding(10.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text("21:38", fontFamily = RubikClock, fontWeight = FontWeight.Black,
-            fontSize = (30f * settings.clockScale / 100f).sp, letterSpacing = (-1).sp,
-            color = Color(0xFFF7F7F7), maxLines = 1)
-        WaveformCanvas(null, 1f, settings.waveformWeight / 100f,
-            Modifier.fillMaxWidth(0.84f).height(22.dp))
-        MetricsRow(null, settings, Modifier.fillMaxWidth())
+    val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
+    val (screenWidth, screenHeight) = remember(configuration, density) {
+        val windowManager = context.getSystemService(WindowManager::class.java)
+        val (widthPx, heightPx) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
+        with(density) {
+            maxOf(widthPx.toDp().value, heightPx.toDp().value) to
+                minOf(widthPx.toDp().value, heightPx.toDp().value)
+        }
+    }
+    val waveform = remember {
+        val channel = FloatArray(PcmWaveformTap.POINTS) { index ->
+            val envelope = sin(index * 0.23f)
+            0.22f + 0.65f * envelope * envelope
+        }
+        PcmWaveformTap.Waveform(channel, channel.copyOf(), 0L, false)
+    }
+    BoxWithConstraints(Modifier.fillMaxWidth().height(140.dp), contentAlignment = Alignment.Center) {
+        val scale = minOf(maxWidth.value / screenWidth, maxHeight.value / screenHeight)
+        Box(
+            Modifier.requiredSize(screenWidth.dp * scale, screenHeight.dp * scale)
+                .background(Color.Black, RoundedCornerShape(8.dp))
+        ) {
+            Box(
+                Modifier.requiredSize(screenWidth.dp, screenHeight.dp)
+                    .align(Alignment.Center)
+                    .graphicsLayer(scaleX = scale, scaleY = scale)
+            ) {
+                AodVisualLayout(null, waveform, settings, "21:38", 0f, 0f, 0f, false, null)
+            }
+        }
     }
 }
 
@@ -550,8 +596,51 @@ private fun MetricsRow(telemetry: AodTelemetrySnapshot?, settings: AodDisplaySet
             StatusDot(telemetry)
             Text(statusLabel(telemetry), color = Color(0xFFE6E6E6), fontSize = 14.sp)
         }
-        if (items.isNotEmpty()) Text(items.joinToString("\u00A0|\u00A0"), modifier = Modifier.fillMaxWidth(),
-            color = Color(0xFFB3B3B3), fontSize = 14.sp, textAlign = TextAlign.Center)
+        if (items.isNotEmpty()) Layout(
+            content = {
+                items.forEachIndexed { index, item ->
+                    Text(item, color = Color(0xFFB3B3B3), fontSize = 14.sp, textAlign = TextAlign.Center)
+                    if (index < items.lastIndex) Text("|", color = Color(0xFFB3B3B3), fontSize = 14.sp)
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { measurables, constraints ->
+            val textConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+            val itemsMeasured = items.indices.map { measurables[it * 2].measure(textConstraints) }
+            val separatorsMeasured = (0 until items.lastIndex).map { measurables[it * 2 + 1].measure(textConstraints) }
+            val separatorPadding = 8.dp.roundToPx()
+            val separatorWidth = separatorsMeasured.firstOrNull()?.width?.plus(separatorPadding * 2) ?: 0
+            val rows = AodMetricsGeometry.wrap(itemsMeasured.map { it.width }.toIntArray(), separatorWidth, constraints.maxWidth)
+            val rowHeights = rows.map { (start, end) ->
+                (start until end).maxOf { itemsMeasured[it].height }
+            }
+            val rowSpacing = 2.dp.roundToPx()
+            val height = rowHeights.sum() + rowSpacing * (rows.size - 1).coerceAtLeast(0)
+            layout(constraints.maxWidth, height.coerceIn(constraints.minHeight, constraints.maxHeight)) {
+                var y = 0
+                rows.forEachIndexed { rowIndex, (start, end) ->
+                    val count = end - start
+                    val naturalWidth = (start until end).sumOf { itemsMeasured[it].width } +
+                        separatorWidth * (count - 1)
+                    val gap = if (count > 1) (constraints.maxWidth - naturalWidth).coerceAtLeast(0) / (count - 1) else 0
+                    var x = if (count == 1) (constraints.maxWidth - naturalWidth).coerceAtLeast(0) / 2 else 0
+                    for (index in start until end) {
+                        val item = itemsMeasured[index]
+                        item.placeRelative(x, y + (rowHeights[rowIndex] - item.height) / 2)
+                        x += item.width
+                        if (index < end - 1) {
+                            val separator = separatorsMeasured[index]
+                            separator.placeRelative(
+                                x + separatorPadding + AodMetricsGeometry.gapBeforeSeparator(gap),
+                                y + (rowHeights[rowIndex] - separator.height) / 2
+                            )
+                            x += separatorWidth + gap
+                        }
+                    }
+                    y += rowHeights[rowIndex] + rowSpacing
+                }
+            }
+        }
     }
 }
 
