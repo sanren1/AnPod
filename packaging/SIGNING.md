@@ -29,7 +29,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
-| 0.19.2-v3-flow-candidate / code 44 | `5afcd792dea8685f332fe6e2da76cff9b80ac4460b4facb34e815be22be2820b` | 独立手机端本地候选，AOD 自适应间距、等比预览及波形粗细；source 416e28c（sourceModified=false）；未进行设备安装或原地升级验证 |
+| 0.19.2-v3-flow-candidate / code 44 | `5afcd792dea8685f332fe6e2da76cff9b80ac4460b4facb34e815be22be2820b` | PC 1.12.4 配套的独立手机端本地候选，AOD 自适应间距、等比预览及波形粗细；source 416e28c（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.19.1-v3-flow-candidate / code 43 | `f912db8dc39935b7d0c3c23dbcf8d54d8053f484e5cb8524b9bba989022f3161` | 本地 release 候选；source 82e82ec（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.19.0-v3-flow-candidate / code 42 | `96d9eb04f73ef3aed8054842f4d8b5f34e12f4a4e10e75d1ceb10f7045e749fb` | PC 1.12.0 本地候选，AOD 显示设置与布局修订；source aa36590（sourceModified=false）；未进行设备安装或原地升级验证 |
 | 0.18.0-v3-flow-candidate / code 41 | `cbfdd5dad8ee3e38bc704290b1bcfc95a4b488fd2d80f8d135a4baecad804e56` | PC 1.11.0 本地候选；source c75856f（sourceModified=false）；未进行设备安装或原地升级验证 |
