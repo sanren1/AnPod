@@ -210,10 +210,10 @@ pub struct AndroidOutputFormat {
 fn negotiated_v2_audio_format(format: AudioFormatV2) -> NegotiatedAudioFormat {
     NegotiatedAudioFormat {
         codec_version: 2,
-        sample_format: if format.sample_format == 2 {
-            "pcm24le"
-        } else {
-            "pcm16le"
+        sample_format: match format.sample_format {
+            2 => "pcm24le",
+            3 => "float32le",
+            _ => "pcm16le",
         }
         .into(),
         sample_rate_hz: format.sample_rate,
@@ -348,11 +348,101 @@ pub struct DiagnosticsExport {
     pub session_capabilities: Option<ReceiverCapabilities>,
     pub playback: Option<PlaybackDiagnostics>,
     pub network_recovery_seconds_remaining: Option<u64>,
+    pub timeline: DiagnosticsTimeline,
 }
 
-fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsTimelineSample {
+    pub sampled_at_utc: String,
+    pub elapsed_ms: u64,
+    pub session_generation: Option<u64>,
+    pub state: String,
+    pub transport: String,
+    pub session_transport: Option<String>,
+    pub session_wireless_protocol: Option<String>,
+    pub output: String,
+    pub playback_mode: String,
+    pub audio_quality: String,
+    pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    pub windows_mix_format: Option<WindowsMixFormat>,
+    pub android_output_format: Option<AndroidOutputFormat>,
+    pub pc_queued_frames: Option<u64>,
+    pub pc_dropped_frames: Option<u64>,
+    pub playback: Option<PlaybackDiagnostics>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsTimeline {
+    pub interval_ms: u32,
+    pub retention_ms: u64,
+    pub truncated: bool,
+    pub samples_omitted: u64,
+    pub samples: Vec<DiagnosticsTimelineSample>,
+}
+
+struct DiagnosticsTimelineBuffer {
+    started_at: Instant,
+    last_sample_at: Option<Instant>,
+    truncated: bool,
+    samples_omitted: u64,
+    samples: VecDeque<DiagnosticsTimelineSample>,
+}
+
+const DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(2);
+const DIAGNOSTICS_RETENTION: Duration = Duration::from_secs(60 * 60);
+const DIAGNOSTICS_MAX_SAMPLES: usize = 1800;
+
+impl DiagnosticsTimelineBuffer {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_sample_at: None,
+            truncated: false,
+            samples_omitted: 0,
+            samples: VecDeque::with_capacity(DIAGNOSTICS_MAX_SAMPLES),
+        }
+    }
+
+    fn push(&mut self, sample: DiagnosticsTimelineSample, now: Instant) {
+        if self
+            .last_sample_at
+            .is_some_and(|last| now.saturating_duration_since(last) < DIAGNOSTICS_INTERVAL)
+        {
+            return;
+        }
+        self.last_sample_at = Some(now);
+        let elapsed_ms = now.saturating_duration_since(self.started_at).as_millis() as u64;
+        while self.samples.front().is_some_and(|oldest| {
+            elapsed_ms.saturating_sub(oldest.elapsed_ms) > DIAGNOSTICS_RETENTION.as_millis() as u64
+        }) {
+            self.samples.pop_front();
+            self.truncated = true;
+            self.samples_omitted = self.samples_omitted.saturating_add(1);
+        }
+        if self.samples.len() == DIAGNOSTICS_MAX_SAMPLES {
+            self.samples.pop_front();
+            self.truncated = true;
+            self.samples_omitted = self.samples_omitted.saturating_add(1);
+        }
+        self.samples.push_back(sample);
+    }
+
+    fn export(&self) -> DiagnosticsTimeline {
+        DiagnosticsTimeline {
+            interval_ms: DIAGNOSTICS_INTERVAL.as_millis() as u32,
+            retention_ms: DIAGNOSTICS_RETENTION.as_millis() as u64,
+            truncated: self.truncated,
+            samples_omitted: self.samples_omitted,
+            samples: self.samples.iter().cloned().collect(),
+        }
+    }
+}
+
+fn diagnostics_export(snapshot: &AppSnapshot, timeline: DiagnosticsTimeline) -> DiagnosticsExport {
     DiagnosticsExport {
-        schema_version: 1,
+        schema_version: 2,
         exported_at: iso8601_utc(unix_seconds()),
         app_version: snapshot.version.clone(),
         state: snapshot.state.clone(),
@@ -371,6 +461,25 @@ fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
         session_capabilities: snapshot.session_capabilities.clone(),
         playback: snapshot.playback_diagnostics.clone(),
         network_recovery_seconds_remaining: snapshot.network_recovery_seconds_remaining,
+        timeline,
+    }
+}
+
+fn diagnostics_generation_is_consistent(
+    active_generation: Option<u64>,
+    snapshot_generation: Option<u64>,
+) -> bool {
+    active_generation == snapshot_generation
+}
+
+fn session_audio_queue_metrics(queue: &SessionAudioQueue) -> (Option<u64>, Option<u64>) {
+    match queue {
+        SessionAudioQueue::Pcm16(queue) => {
+            (Some(queue.queued_frames()), Some(queue.dropped_frames()))
+        }
+        SessionAudioQueue::Float32(queue, _) => {
+            (Some(queue.queued_frames()), Some(queue.dropped_frames()))
+        }
     }
 }
 
@@ -519,6 +628,7 @@ pub struct AppState {
     session: AsyncMutex<Option<Session>>,
     pcm_rate_sample: Mutex<Option<(u64, u64, Instant)>>,
     receiver_health_sample: Mutex<Option<(u64, u32)>>,
+    diagnostics_timeline: Mutex<DiagnosticsTimelineBuffer>,
     audio: AudioActor,
     data_dir: PathBuf,
     adb_path: PathBuf,
@@ -639,6 +749,7 @@ impl AppState {
             session: AsyncMutex::new(None),
             pcm_rate_sample: Mutex::new(None),
             receiver_health_sample: Mutex::new(None),
+            diagnostics_timeline: Mutex::new(DiagnosticsTimelineBuffer::new()),
             audio: AudioActor::new(audio_path, data_dir.join("muted-endpoints.txt")),
             data_dir,
             adb_path,
@@ -740,16 +851,16 @@ impl AppState {
             self.audio.initialize()?;
             let playback_mode = if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 };
             let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality != "standard" {
-                let profile_id = if audio_quality == "hifi" { 2 } else { 3 };
+                let profile_id = if audio_quality == "hifi" { 4 } else { 5 };
                 let format = AudioFormatV2::for_profile(profile_id, playback_mode)
-                    .map_err(|_| "Unable to construct the authenticated PCM24 format.".to_string())?;
+                    .map_err(|_| "Unable to construct the authenticated Float32 format.".to_string())?;
                 let native = self.audio.probe_float_format()?;
                 crate::audio::validate_float_format_for_session(&native, format)?;
                 let mix_format = windows_mix_format(native);
                 let queue = Arc::new(FloatPcmQueue::new(playback_mode == 1));
                 (
                     PcmFormat { sample_rate: native.capture_sample_rate, channels: native.capture_channels as u16 },
-                    HostAudioProfile::Pcm24(format),
+                    HostAudioProfile::AudioV2(format),
                     Some(queue),
                     Some(mix_format),
                 )
@@ -881,7 +992,7 @@ impl AppState {
             let unsupported_v2_format = owner_snapshot
                 .last_error
                 .as_deref()
-                .is_some_and(|error| error.contains("PCM24 format"));
+                .is_some_and(|error| error.contains("audio format"));
             let capabilities = owner_snapshot.capabilities;
             *self.session.lock().await = Some(Session {
                 generation: session_generation,
@@ -908,7 +1019,7 @@ impl AppState {
                 view.network_recovery_seconds_remaining = None;
                 view.output = session_output.into();
                 view.state = if management_only { "managementOnly" } else { "phoneReady" }.into();
-                view.message = if unsupported_v2_format { "Receiver 不支持所选 PCM24 格式" } else if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
+                view.message = if unsupported_v2_format { "Receiver 不支持所选 V2 音频格式" } else if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
                 view.status_detail = if unsupported_v2_format { "V2 握手已认证，但 Receiver 拒绝所选音频描述符；未启动 BIND、START 或 PCM。请选择 Standard 或更新 Receiver。" }
                     else if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
                     else { "P5-A 已认证；本机 PCM 已接入所选 LAN 接收会话。" }.into();
@@ -1230,6 +1341,82 @@ impl AppState {
         if changed {
             self.emit(app);
         }
+    }
+
+    pub async fn sample_diagnostics_timeline(&self) {
+        let session = self.session.lock().await;
+        let snapshot = self.snapshot();
+        let (session_generation, session_transport, session_wireless_protocol, playback, queue) =
+            if let Some(active) = session.as_ref() {
+                if !diagnostics_generation_is_consistent(
+                    Some(active.generation),
+                    snapshot.session_generation,
+                ) {
+                    return;
+                }
+                let (playback, queue) = if let Some(owner) = active.aoa_owner.as_ref() {
+                    let owner = owner.snapshot();
+                    (
+                        owner.playback_progress,
+                        active.aoa_owner.as_ref().map(AoaOwner::audio_queue),
+                    )
+                } else if let Some(owner) = active.network_owner.as_ref() {
+                    let owner_snapshot = owner.snapshot();
+                    (owner_snapshot.playback_diagnostics, owner.audio_queue())
+                } else {
+                    (
+                        snapshot.playback_diagnostics.clone(),
+                        active.network_sink_queue.clone(),
+                    )
+                };
+                (
+                    Some(active.generation),
+                    snapshot.session_transport.clone(),
+                    snapshot.session_wireless_protocol.clone(),
+                    playback,
+                    queue,
+                )
+            } else {
+                if !diagnostics_generation_is_consistent(None, snapshot.session_generation) {
+                    return;
+                }
+                (None, None, None, None, None)
+            };
+        drop(session);
+        let (queued_frames, dropped_frames) = queue
+            .as_ref()
+            .map(session_audio_queue_metrics)
+            .unwrap_or((None, None));
+        let now = Instant::now();
+        let sample = DiagnosticsTimelineSample {
+            sampled_at_utc: iso8601_utc(unix_seconds()),
+            elapsed_ms: 0,
+            session_generation,
+            state: snapshot.state,
+            transport: snapshot.transport,
+            session_transport,
+            session_wireless_protocol,
+            output: snapshot.output,
+            playback_mode: snapshot.settings.playback_mode,
+            audio_quality: snapshot.settings.audio_quality,
+            negotiated_audio_format: snapshot.negotiated_audio_format,
+            windows_mix_format: snapshot.windows_mix_format,
+            android_output_format: snapshot.android_output_format,
+            pc_queued_frames: queued_frames
+                .or_else(|| playback.as_ref().and_then(|p| p.pc_queued_frames)),
+            pc_dropped_frames: dropped_frames
+                .or_else(|| playback.as_ref().and_then(|p| p.pc_dropped_frames)),
+            playback,
+        };
+        let mut timeline = self
+            .diagnostics_timeline
+            .lock()
+            .expect("diagnostics timeline lock");
+        let mut sample = sample;
+        sample.elapsed_ms = now
+            .saturating_duration_since(timeline.started_at)
+            .as_millis() as u64;
+        timeline.push(sample, now);
     }
 
     async fn clear_audio_bitrate_if_session(
@@ -3938,7 +4125,12 @@ impl AppState {
 
     /// Writes a sanitised diagnostics snapshot and returns its absolute path.
     pub fn export_diagnostics(&self) -> Result<String, String> {
-        let export = diagnostics_export(&self.snapshot());
+        let timeline = self
+            .diagnostics_timeline
+            .lock()
+            .expect("diagnostics timeline lock")
+            .export();
+        let export = diagnostics_export(&self.snapshot(), timeline);
         let directory = self.data_dir.join("exports");
         fs::create_dir_all(&directory).map_err(|e| format!("无法创建诊断导出目录：{e}"))?;
         let path = directory.join(format!("diagnostics-{}.json", unix_seconds()));

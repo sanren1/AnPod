@@ -723,21 +723,18 @@ impl FloatUdpSender {
         pcm_payload_bytes_sent: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         format.encode().map_err(|error| error.to_string())?;
-        if !matches!(
-            (format.profile, format.sample_rate),
-            (2, 48_000) | (3, 96_000)
-        ) || format.sample_format != 2
+        if !matches!(format.profile, 2..=5)
+            || AudioFormatV2::for_profile(format.profile, format.mode).ok() != Some(format)
             || format.channels != 2
-            || format.valid_bits != 24
-            || format.bytes_per_sample != 3
-            || format.frame_bytes != 6
             || !remote.is_ipv4()
             || !socket
                 .local_addr()
                 .map_err(|error| error.to_string())?
                 .is_ipv4()
         {
-            return Err("Unsupported PCM24 format or UDP source for the native sink.".into());
+            return Err(
+                "Unsupported authenticated audio format or UDP source for the native sink.".into(),
+            );
         }
         let stopping = Arc::new(AtomicBool::new(false));
         let expected_queue_stop = Arc::new(AtomicBool::new(false));
@@ -849,6 +846,13 @@ pub(crate) fn float_to_pcm24(sample: f32) -> Result<i32, &'static str> {
     Ok((scaled as i32).clamp(-8_388_608, 8_388_607))
 }
 
+pub(crate) fn float32_to_le_bytes(sample: f32) -> Result<[u8; 4], &'static str> {
+    sample
+        .is_finite()
+        .then(|| sample.to_le_bytes())
+        .ok_or("Float32 PCM contains a non-finite sample.")
+}
+
 fn send_float_loop(
     socket: UdpSocket,
     remote: SocketAddr,
@@ -885,7 +889,7 @@ fn send_float_loop(
         }
         if info.sample_rate != format.sample_rate || info.channels != format.channels as u16 {
             return Err(
-                "Float32 queue block does not match the authenticated PCM24 format.".into(),
+                "Float32 queue block does not match the authenticated audio format.".into(),
             );
         }
         let frames = info.frame_count as usize;
@@ -906,8 +910,13 @@ fn send_float_loop(
             let sample_end = sample_offset + packet_frames * info.channels as usize;
             payload.clear();
             for sample in &samples[sample_offset..sample_end] {
-                let quantized = float_to_pcm24(*sample).map_err(str::to_string)? as u32;
-                payload.extend_from_slice(&quantized.to_le_bytes()[..3]);
+                if format.sample_format == 3 {
+                    payload
+                        .extend_from_slice(&float32_to_le_bytes(*sample).map_err(str::to_string)?);
+                } else {
+                    let quantized = float_to_pcm24(*sample).map_err(str::to_string)? as u32;
+                    payload.extend_from_slice(&quantized.to_le_bytes()[..3]);
+                }
             }
             let frame_index = info
                 .frame_index

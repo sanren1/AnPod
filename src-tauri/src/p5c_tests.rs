@@ -488,6 +488,43 @@ fn playback_progress_wire_metrics_keep_unknown_values_null() {
     payload[45] = 2;
     assert!(decode_playback_progress(&payload).is_err());
 }
+
+#[test]
+fn playback_progress_extension_schema_two_decodes_metrics_and_unknowns() {
+    let mut payload = vec![0xff; 78 + 126];
+    payload[45] = 1;
+    payload[70] = 1;
+    payload[71] = 3;
+    payload[72] = 2;
+    payload[73] = 0;
+    payload[74..78].copy_from_slice(&48_000u32.to_be_bytes());
+    let extension = &mut payload[78..];
+    extension[0] = 2;
+    extension[1..9].copy_from_slice(&1_234u64.to_be_bytes());
+    extension[9..17].copy_from_slice(&9u64.to_be_bytes());
+    extension[17..21].copy_from_slice(&3u32.to_be_bytes());
+    extension[21] = 2;
+    extension[22..30].copy_from_slice(&480_000u64.to_be_bytes());
+    extension[30..38].copy_from_slice(&7u64.to_be_bytes());
+    extension[118..122].copy_from_slice(&12u32.to_be_bytes());
+    let progress = decode_playback_progress_with_format(&payload, true, true).unwrap();
+    assert_eq!(progress.progress_schema, Some(2));
+    assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
+    assert_eq!(progress.receiver_generation, Some(9));
+    assert_eq!(progress.output_epoch, Some(3));
+    assert_eq!(progress.output_engine, Some(2));
+    assert_eq!(progress.ingress_audio_frames, Some(480_000));
+    assert_eq!(progress.queue_dropped_frames, Some(7));
+    assert_eq!(progress.queue_expired_frames, None);
+    assert_eq!(progress.ring_pending_frames, Some(12));
+    assert_eq!(progress.stream_pending_frames, None);
+
+    payload[78] = 1;
+    assert!(decode_playback_progress_with_format(&payload, true, true).is_err());
+    payload[78] = 2;
+    payload[78 + 21] = 3;
+    assert!(decode_playback_progress_with_format(&payload, true, true).is_err());
+}
 use crate::security::{
     test_binding_material, test_binding_material_with_wrong_identity,
     test_binding_material_with_wrong_secret,
@@ -598,6 +635,9 @@ fn compile_java_endpoint() -> PathBuf {
     command.arg(
         repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm24PackedCodec.java"),
     );
+    command.arg(
+        repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Float32LeCodec.java"),
+    );
     command.arg(repo.join("tests/P5cLoopbackEndpoint.java"));
     command.arg(repo.join("tests/BuildConfig.java"));
     let result = command
@@ -613,7 +653,7 @@ fn compile_java_endpoint() -> PathBuf {
 }
 
 fn spawn_endpoint(classes: &Path) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, false, false, false, false, false, false)
+    spawn_endpoint_mode(classes, false, false, false, false, false, false, false)
 }
 
 fn spawn_endpoint_without_queue_self_checks(
@@ -708,6 +748,7 @@ fn spawn_endpoint_mode(
     drop_stop_ack: bool,
     verify_mode_switch: bool,
     verify_audio_window: bool,
+    progress_extension: bool,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
     let (_, java) = java_paths();
     let mut command = Command::new(java);
@@ -736,6 +777,9 @@ fn spawn_endpoint_mode(
     if verify_audio_window {
         command.arg("--verify-audio-window");
     }
+    if progress_extension {
+        command.arg("--progress-extension");
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -762,25 +806,34 @@ fn spawn_endpoint_until_disconnect(
     classes: &Path,
     fail_resume: bool,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, true, fail_resume, false, false, false, false)
+    spawn_endpoint_mode(
+        classes,
+        true,
+        fail_resume,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 fn spawn_discoverable_endpoint(
     classes: &Path,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, false, false, true, false, false, true)
+    spawn_endpoint_mode(classes, false, false, true, false, false, true, true)
 }
 
 fn spawn_mode_switch_endpoint(
     classes: &Path,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, false, false, true, false, true, false)
+    spawn_endpoint_mode(classes, false, false, true, false, true, false, false)
 }
 
 fn spawn_persistent_endpoint(
     classes: &Path,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, true, false, true, false, false, false)
+    spawn_endpoint_mode(classes, true, false, true, false, false, false, false)
 }
 
 fn spawn_fail_start_endpoint(
@@ -860,7 +913,7 @@ fn spawn_recovery_window_endpoint(
 fn spawn_stop_ack_drop_endpoint(
     classes: &Path,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
-    spawn_endpoint_mode(classes, false, false, false, true, false, false)
+    spawn_endpoint_mode(classes, false, false, false, true, false, false, false)
 }
 
 fn spawn_capability_endpoint(
@@ -907,6 +960,7 @@ fn spawn_audio_v2_upgrade_fixture(
         profile,
         sessions,
         None,
+        false,
     )
 }
 
@@ -916,6 +970,7 @@ fn spawn_audio_v2_upgrade_fixture_with_profiles(
     profile: Option<u8>,
     sessions: Option<u8>,
     supported_profiles: Option<&str>,
+    progress_extension: bool,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
     let (_, java) = java_paths();
     let mut command = Command::new(java);
@@ -935,6 +990,9 @@ fn spawn_audio_v2_upgrade_fixture_with_profiles(
     }
     if let Some(profiles) = supported_profiles {
         command.arg(format!("--audio-v2-supported-profiles={profiles}"));
+    }
+    if progress_extension {
+        command.arg("--progress-extension");
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -1256,7 +1314,7 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
     assert_eq!(capabilities.audio_major, 1);
     assert_eq!(
         capabilities.capability_bits,
-        3 | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE
+        3 | CAP_PLAYBACK_PROGRESS | CAP_PROGRESS_EXT | CAP_TERMINAL_CAUSE
     );
     assert_eq!(
         capabilities.version_code, 0,
@@ -1274,6 +1332,11 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
         "fixture reports unknown instead of inventing metrics"
     );
     assert_eq!(progress.playback_advancing, None);
+    assert_eq!(progress.progress_schema, Some(2));
+    assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
+    assert_eq!(progress.receiver_generation, Some(77));
+    assert_eq!(progress.ingress_audio_frames, Some(480_000));
+    assert_eq!(progress.queue_dropped_frames, Some(7));
     host.resend_last_for_test().unwrap();
     host.send_old_audio_for_test().unwrap();
     thread::sleep(Duration::from_millis(100));
@@ -1427,6 +1490,8 @@ fn authenticated_control_stays_alive_without_pcm() {
     )
     .unwrap();
     host.start().unwrap();
+    let legacy_progress = host.playback_progress().unwrap().unwrap();
+    assert_eq!(legacy_progress.progress_schema, None);
     for _ in 0..7 {
         thread::sleep(Duration::from_secs(1));
         assert_eq!(
@@ -1839,7 +1904,7 @@ fn mode_change_with_unavailable_endpoint_stops_after_recovery_window() {
 #[test]
 fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
     let format = AudioFormatV2::for_profile(3, 0).unwrap();
-    let mut profile = HostAudioProfile::Pcm24(format);
+    let mut profile = HostAudioProfile::AudioV2(format);
     let mut parameters = AudioParameters {
         sample_rate: 96_000,
         channels: 2,
@@ -1864,7 +1929,7 @@ fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
         RetryWait::ReconnectNow
     ));
     profile = profile_for_mode(profile, parameters.mode).unwrap();
-    let HostAudioProfile::Pcm24(reconnect_format) = profile else {
+    let HostAudioProfile::AudioV2(reconnect_format) = profile else {
         panic!("PCM24 profile must be preserved during recovery mode changes");
     };
     assert_eq!(reconnect_format, AudioFormatV2::for_profile(3, 1).unwrap());
@@ -1883,7 +1948,7 @@ fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
         PendingCommands::ModeChanged
     ));
     profile = profile_for_mode(profile, parameters.mode).unwrap();
-    let HostAudioProfile::Pcm24(pending_format) = profile else {
+    let HostAudioProfile::AudioV2(pending_format) = profile else {
         panic!("PCM24 profile must be preserved during pending mode changes");
     };
     assert_eq!(pending_format, AudioFormatV2::for_profile(3, 0).unwrap());
@@ -3301,7 +3366,7 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
             channels: 2,
             mode: 0,
         },
-        HostAudioProfile::Pcm24(format),
+        HostAudioProfile::AudioV2(format),
         &mut initial_queue,
         CancellationToken::new(),
     )
@@ -3319,6 +3384,8 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
     session.bind_audio().unwrap();
     session.select_mode().unwrap();
     session.start().unwrap();
+    let legacy_progress = session.playback_progress().unwrap().unwrap();
+    assert_eq!(legacy_progress.progress_schema, None);
 
     let samples = [
         1.0 / 8_388_608.0,
@@ -3392,8 +3459,14 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
 #[test]
 fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
     let classes = compile_java_endpoint();
-    let (mut child, stdout, peer) =
-        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), None, Some("2,3"));
+    let (mut child, stdout, peer) = spawn_audio_v2_upgrade_fixture_with_profiles(
+        &classes,
+        None,
+        Some(3),
+        None,
+        Some("2,3"),
+        false,
+    );
     let mut endpoint = SessionEndpoint::loopback(peer);
     endpoint.connection_intent = Some(([0x5a; 16], true));
     let format = AudioFormatV2::for_profile(3, 0).unwrap();
@@ -3408,7 +3481,7 @@ fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
             channels: 2,
             mode: 0,
         },
-        HostAudioProfile::Pcm24(format),
+        HostAudioProfile::AudioV2(format),
         &mut initial_queue,
         CancellationToken::new(),
     )
@@ -3453,10 +3526,165 @@ fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
 }
 
 #[test]
+fn float32_profiles_authenticate_udp_and_preserve_sample_bits() {
+    let classes = compile_java_endpoint();
+    for (profile, rate) in [(4, 48_000), (5, 96_000)] {
+        let (mut child, stdout, peer) = spawn_audio_v2_upgrade_fixture_with_profiles(
+            &classes,
+            None,
+            Some(profile),
+            None,
+            Some("4,5"),
+            true,
+        );
+        let format = AudioFormatV2::for_profile(profile, 0).unwrap();
+        let queue = Arc::new(FloatPcmQueue::new(false));
+        queue.set_expected_format(rate, 4096).unwrap();
+        let mut initial_queue = Some(queue.clone());
+        let mut endpoint = SessionEndpoint::loopback(peer);
+        endpoint.connection_intent = Some(([0x5a; 16], true));
+        let mut session = HostSession::authenticate_for_profile(
+            endpoint,
+            &test_binding_material(),
+            AudioParameters {
+                sample_rate: rate,
+                channels: 2,
+                mode: 0,
+            },
+            HostAudioProfile::AudioV2(format),
+            &mut initial_queue,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        session.negotiate_capabilities().unwrap();
+        let capabilities = session.capabilities().unwrap();
+        assert!(capabilities.compatible);
+        assert_ne!(capabilities.capability_bits & CAP_AUDIO_V2, 0);
+        assert_ne!(capabilities.capability_bits & CAP_AUDIO_FLOAT32, 0);
+        assert_ne!(capabilities.capability_bits & CAP_PROGRESS_EXT, 0);
+        session.bind_audio().unwrap();
+        session.select_mode().unwrap();
+        session.start().unwrap();
+        let progress = session.playback_progress().unwrap().unwrap();
+        assert_eq!(progress.progress_schema, Some(2));
+        assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
+        assert_eq!(progress.receiver_generation, Some(77));
+        assert_eq!(progress.output_epoch, Some(4));
+        assert_eq!(progress.output_engine, Some(2));
+        assert_eq!(progress.ingress_audio_frames, Some(480_000));
+        assert_eq!(progress.queue_dropped_frames, Some(7));
+
+        let samples = [
+            1.0 / 8_388_608.0,
+            -1.0 / 8_388_608.0,
+            32_769.0 / 8_388_608.0,
+            -32_769.0 / 8_388_608.0,
+        ];
+        assert!(queue.push_raw(samples.as_ptr(), 2, rate, 2, 0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.pcm_payload_bytes_sent() < 16 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(session.pcm_payload_bytes_sent() >= 16);
+        session.pause().unwrap();
+        session.stop().unwrap();
+        drop(session);
+        child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+        drop(child.stdin.take());
+        let result = finish_endpoint(child, stdout);
+        let fields: Vec<_> = result.split(',').collect();
+        assert_eq!(
+            fields.len(),
+            7,
+            "unexpected Float32 profile {profile} result: {result}"
+        );
+        assert_eq!(fields[0], "", "Float32 profile {profile} failed: {result}");
+        assert_eq!(
+            fields[1], "1",
+            "Float32 profile {profile} did not start: {result}"
+        );
+        assert_eq!(
+            fields[5], "true",
+            "Float32 UDP receiver did not close: {result}"
+        );
+        assert_eq!(
+            fields[6], "true",
+            "Float32 payload bits did not reach Java queue: {result}"
+        );
+    }
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn float32_profile_without_receiver_capability_fails_without_fallback() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) = spawn_audio_v2_upgrade_fixture_with_profiles(
+        &classes,
+        None,
+        Some(4),
+        None,
+        Some("2,3"),
+        false,
+    );
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let mut initial_queue = Some(queue);
+    let mut session = HostSession::authenticate_for_profile(
+        SessionEndpoint::loopback(peer),
+        &test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::AudioV2(AudioFormatV2::for_profile(4, 0).unwrap()),
+        &mut initial_queue,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    session.negotiate_capabilities().unwrap();
+    let capabilities = session.capabilities().unwrap();
+    assert_eq!(capabilities.capability_bits & CAP_AUDIO_FLOAT32, 0);
+    let legacy_progress = session.playback_progress().unwrap().unwrap();
+    assert_eq!(legacy_progress.progress_schema, None);
+    let error = session
+        .bind_audio()
+        .expect_err("receiver without the Float32 capability must not BIND");
+    assert!(
+        error.contains("RECEIVER_UPDATE_REQUIRED"),
+        "unexpected capability error: {error}"
+    );
+    assert!(
+        error.contains("Float32"),
+        "missing Float32 capability detail: {error}"
+    );
+    assert!(
+        initial_queue.is_none(),
+        "the Float32 session must keep its own capture queue until rejected"
+    );
+    drop(session);
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(
+        fields[1], "0",
+        "unsupported Float32 profile started: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
 fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
     let classes = compile_java_endpoint();
-    let (mut child, stdout, peer) =
-        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), Some(2), Some("2,3"));
+    let (mut child, stdout, peer) = spawn_audio_v2_upgrade_fixture_with_profiles(
+        &classes,
+        None,
+        Some(3),
+        Some(2),
+        Some("2,3"),
+        false,
+    );
     let mut endpoint = SessionEndpoint::loopback(peer);
     endpoint.connection_intent = Some(([0x5a; 16], true));
     let format = AudioFormatV2::for_profile(3, 0).unwrap();
@@ -3475,7 +3703,7 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
             channels: 2,
             mode: 0,
         },
-        HostAudioProfile::Pcm24(format),
+        HostAudioProfile::AudioV2(format),
         Some(initial_queue.clone()),
         CancellationToken::new(),
         timing,
@@ -3486,7 +3714,7 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
         status.state == SessionLifecycleState::ReceiverRunning && status.negotiated_format.is_some()
     });
     assert_eq!(first.negotiated_format.unwrap().profile, 3);
-    assert!(owner.matches_audio_quality("hires"));
+    assert!(!owner.matches_audio_quality("hires"));
     assert!(!owner.matches_audio_quality("hifi"));
     let first_queue = match owner.audio_queue().unwrap() {
         SessionAudioQueue::Float32(queue, _) => queue,
@@ -3607,7 +3835,7 @@ fn pcm24_upgrade_rejects_receiver_unsupported_v2_descriptor_before_bind() {
                 channels: 2,
                 mode: 0,
             },
-            HostAudioProfile::Pcm24(format),
+            HostAudioProfile::AudioV2(format),
             &mut initial_queue,
             CancellationToken::new(),
         )

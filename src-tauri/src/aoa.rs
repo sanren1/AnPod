@@ -126,7 +126,7 @@ fn validate_body(kind: RecordType, body: &[u8]) -> io::Result<()> {
             if body.len() < 50
                 || &body[..4] != b"ANPD"
                 || body[4] != 2
-                || !matches!(body[5], 1 | 2)
+                || !matches!(body[5], 1..=3)
                 || body[6..8] != [0, 0]
             {
                 return Err(invalid_input("invalid ANPD v2 audio body"));

@@ -2,6 +2,16 @@ use super::*;
 use crate::protocol::{PacketType, PcmFormat};
 
 #[test]
+fn float32_wire_encoding_preserves_bits_and_rejects_non_finite_values() {
+    for sample in [0.0f32, -0.0, 0.25, -0.5, f32::MIN_POSITIVE] {
+        assert_eq!(float32_to_le_bytes(sample).unwrap(), sample.to_le_bytes());
+    }
+    assert!(float32_to_le_bytes(f32::NAN).is_err());
+    assert!(float32_to_le_bytes(f32::INFINITY).is_err());
+    assert!(float32_to_le_bytes(f32::NEG_INFINITY).is_err());
+}
+
+#[test]
 fn session_queue_discards_audio_that_does_not_match_negotiated_format() {
     let queue = PcmQueue::for_session(
         PcmFormat {
@@ -190,7 +200,7 @@ fn float_udp_sender_splits_96khz_profile3_and_preserves_low_q23_samples_and_indi
     receiver
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut sender = FloatUdpSender::spawn_authenticated(
+    let sender = FloatUdpSender::spawn_authenticated(
         receiver.local_addr().unwrap(),
         queue.clone(),
         UdpSocket::bind(("127.0.0.1", 0)).unwrap(),
@@ -237,6 +247,65 @@ fn float_udp_sender_splits_96khz_profile3_and_preserves_low_q23_samples_and_indi
         &audio[0].payload[..12],
         &[1, 0, 0, 255, 255, 255, 1, 128, 0, 255, 127, 255]
     );
+}
+
+#[test]
+fn float_udp_sender_preserves_float32_le_for_profiles_4_and_5() {
+    for (profile, rate) in [(4, 48_000), (5, 96_000)] {
+        let format = crate::protocol::AudioFormatV2::for_profile(profile, 0).unwrap();
+        let queue = Arc::new(FloatPcmQueue::new(false));
+        queue.set_expected_format(rate, 4096).unwrap();
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sender = FloatUdpSender::spawn_authenticated(
+            receiver.local_addr().unwrap(),
+            queue.clone(),
+            UdpSocket::bind(("127.0.0.1", 0)).unwrap(),
+            UdpSessionMaterial {
+                session_id: 0x2122_2324_2526_2728,
+                key: [0x73; 32],
+            },
+            format,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+
+        let mut decoder =
+            PacketDecoder::new_v2(&[0x73; 32], 0x2122_2324_2526_2728, HOST_TO_RECEIVER, format)
+                .unwrap();
+        let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let format_packet = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(format_packet.header.sequence);
+        assert_eq!(format_packet.payload, format.encode().unwrap());
+
+        let mut samples = vec![0.0f32; 150 * 2];
+        samples[..6].copy_from_slice(&[0.25, -0.5, -0.0, f32::MIN_POSITIVE, 1.0, -1.0]);
+        assert!(queue.push_raw(samples.as_ptr(), 150, rate, 2, 900));
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let first = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(first.header.sequence);
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let second = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(second.header.sequence);
+        assert_eq!(first.header.sample_frame_index, 900);
+        assert_eq!(second.header.sample_frame_index, 900 + 1150 / 8);
+        assert_eq!(first.payload.len(), (1150 / 8) * 8);
+        assert_eq!(second.payload.len(), (150 - 1150 / 8) * 8);
+        let expected = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            [first.payload.as_slice(), second.payload.as_slice()].concat(),
+            expected
+        );
+        sender.expect_queue_stop();
+        queue.stop_and_clear();
+        assert_eq!(sender.stop().unwrap().packets_sent, 3);
+    }
 }
 
 #[test]

@@ -168,24 +168,19 @@ pub(crate) fn validate_float_format_for_session(
     expected: AudioFormatV2,
 ) -> Result<(), String> {
     if AudioFormatV2::for_profile(expected.profile, expected.mode).ok() != Some(expected)
-        || !matches!(
-            (expected.profile, expected.sample_rate),
-            (2, 48_000) | (3, 96_000)
-        )
-        || expected.sample_format != 2
+        || !(2..=5).contains(&expected.profile)
         || expected.channels != 2
-        || expected.valid_bits != 24
-        || expected.bytes_per_sample != 3
-        || expected.frame_bytes != 6
     {
-        return Err("Authenticated session does not describe a supported PCM24 format.".into());
+        return Err(
+            "Authenticated session does not describe a supported high quality audio format.".into(),
+        );
     }
     if format.mix_sample_rate != expected.sample_rate
         || format.capture_sample_rate != expected.sample_rate
         || format.capture_channels != u32::from(expected.channels)
         || format.capture_sample_format != FLOAT_CAPTURE_FORMAT_FLOAT
     {
-        let rate_mismatch = if expected.profile == 3
+        let rate_mismatch = if matches!(expected.profile, 3 | 5)
             && expected.sample_rate == 96_000
             && format.mix_sample_rate != 96_000
         {
@@ -196,7 +191,7 @@ pub(crate) fn validate_float_format_for_session(
         } else {
             String::new()
         };
-        return Err(format!("{rate_mismatch}Windows mix/capture format does not match the authenticated PCM24 session (expected {} Hz stereo Float32; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
+        return Err(format!("{rate_mismatch}Windows mix/capture format does not match the authenticated session (expected {} Hz stereo Float32 capture; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
     }
     Ok(())
 }

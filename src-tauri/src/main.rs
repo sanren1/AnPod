@@ -542,6 +542,7 @@ fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     if let Some(state) = rate_app.try_state::<AppState>() {
                         state.sample_audio_bitrate(&rate_app).await;
+                        state.sample_diagnostics_timeline().await;
                     } else {
                         break;
                     }

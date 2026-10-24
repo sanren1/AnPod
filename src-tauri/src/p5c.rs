@@ -63,6 +63,8 @@ const CAP_BACKGROUND_TRUST_MANAGEMENT: u32 = 0x0000_0040;
 pub(crate) const CAP_AUDIO_V2: u32 = 0x0000_0080;
 pub(crate) const CAP_TERMINAL_CAUSE: u32 = 0x0000_0100;
 pub(crate) const CAP_AOA_SESSION_RESTART: u32 = 0x0000_0200;
+pub(crate) const CAP_AUDIO_FLOAT32: u32 = 0x0000_0400;
+pub(crate) const CAP_PROGRESS_EXT: u32 = 0x0000_0800;
 const IMPLEMENTED_CAPABILITIES: u32 =
     CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
@@ -216,7 +218,7 @@ pub(crate) enum SessionAudioQueue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostAudioProfile {
     Standard,
-    Pcm24(AudioFormatV2),
+    AudioV2(AudioFormatV2),
 }
 
 pub(crate) struct HostSession {
@@ -407,18 +409,13 @@ impl HostSession {
     ) -> Result<Self, String> {
         format
             .encode()
-            .map_err(|_| "Unsupported P5-C PCM24 format.".to_string())?;
-        if !matches!(
-            (format.profile, format.sample_rate),
-            (2, 48_000) | (3, 96_000)
-        ) || format.channels != 2
-            || format.sample_format != 2
-            || format.valid_bits != 24
-            || format.bytes_per_sample != 3
-            || format.frame_bytes != 6
+            .map_err(|_| "Unsupported P5-C audio format.".to_string())?;
+        if !(2..=5).contains(&format.profile)
+            || AudioFormatV2::for_profile(format.profile, format.mode).ok() != Some(format)
+            || format.channels != 2
         {
             return Err(
-                "Only 48 kHz HiFi or 96 kHz Hi-Res stereo packed PCM24 is supported.".into(),
+                "Only authenticated stereo HiFi or Hi-Res audio formats are supported.".into(),
             );
         }
         endpoint.validate()?;
@@ -516,7 +513,7 @@ impl HostSession {
         initial_float_queue: &mut Option<Arc<FloatPcmQueue>>,
         cancellation: CancellationToken,
     ) -> Result<Self, String> {
-        let HostAudioProfile::Pcm24(format) = profile else {
+        let HostAudioProfile::AudioV2(format) = profile else {
             return Self::authenticate_on_network(
                 endpoint,
                 binding.duplicate_for_session(),
@@ -526,15 +523,15 @@ impl HostSession {
         };
 
         if AudioFormatV2::for_profile(format.profile, format.mode).ok() != Some(format)
-            || !matches!(
-                (format.profile, format.sample_rate),
-                (2, 48_000) | (3, 96_000)
-            )
+            || !(2..=5).contains(&format.profile)
             || parameters.sample_rate != format.sample_rate
             || parameters.channels != format.channels
             || parameters.mode != format.mode
         {
-            return Err("Requested PCM24 audio profile does not match the authenticated session parameters.".into());
+            return Err(
+                "Requested authenticated audio profile does not match the session parameters."
+                    .into(),
+            );
         }
 
         let mut probe = Self::authenticate_on_network(
@@ -557,7 +554,11 @@ impl HostSession {
             return Err(error);
         }
         if !supports_v2 {
-            return Err("Receiver does not support authenticated PCM24 audio; update the Receiver or select Standard.".into());
+            return Err(if format.profile >= 4 {
+                "RECEIVER_UPDATE_REQUIRED: Receiver does not advertise authenticated Float32 audio; update the Receiver or select Standard."
+            } else {
+                "Receiver does not support authenticated PCM24 audio; update the Receiver or select Standard."
+            }.into());
         }
 
         let queue = initial_float_queue
@@ -993,16 +994,27 @@ impl HostSession {
         if self.state != ReceiverState::Authenticated {
             return Err("P5-C BIND is out of order.".into());
         }
-        if self
-            .capabilities
-            .as_ref()
-            .is_some_and(|info| !info.compatible)
-        {
-            return Err(if self.format_v2.is_some() {
-                "Receiver rejected the authenticated PCM24 audio format; only supported V2 descriptors can start audio.".into()
-            } else {
-                "Receiver audio capabilities are incompatible; update it or select Standard.".into()
-            });
+        let required_audio = self.format_v2.map_or(0, |format| {
+            CAP_AUDIO_V2
+                | if format.profile >= 4 {
+                    CAP_AUDIO_FLOAT32
+                } else {
+                    0
+                }
+        });
+        if self.capabilities.as_ref().is_some_and(|info| {
+            !info.compatible || info.capability_bits & required_audio != required_audio
+        }) {
+            return Err(
+                if self.format_v2.is_some_and(|format| format.profile >= 4) {
+                    "RECEIVER_UPDATE_REQUIRED: Receiver does not advertise the requested authenticated Float32 audio format; update the Receiver or select Standard.".into()
+                } else if self.format_v2.is_some() {
+                    "RECEIVER_UPDATE_REQUIRED: Receiver does not support the requested authenticated audio format; update the Receiver or select Standard.".into()
+                } else {
+                    "Receiver audio capabilities are incompatible; update it or select Standard."
+                        .into()
+                },
+            );
         }
         if self
             .capabilities
@@ -1229,7 +1241,15 @@ impl HostSession {
         {
             return Ok(None);
         }
-        let ack = self.command(PLAYBACK_PROGRESS_QUERY, &[])?;
+        let extended = self
+            .capabilities
+            .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_PROGRESS_EXT != 0);
+        let request = [2u8];
+        let ack = self.command(
+            PLAYBACK_PROGRESS_QUERY,
+            if extended { &request } else { &[] },
+        )?;
         if ack.result != RESULT_OK {
             return Err("P5-C playback progress query was rejected.".into());
         }
@@ -1339,12 +1359,13 @@ impl HostSession {
             self.session_id,
             &self.cancellation,
         )?;
-        let ack = decode_ack_with_format(
+        let ack = decode_ack_with_format_ext(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
+            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -1402,12 +1423,13 @@ impl HostSession {
         if Instant::now() >= deadline {
             return Err("P5-C approval deadline expired.".into());
         }
-        let ack = decode_ack_with_format(
+        let ack = decode_ack_with_format_ext(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
+            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -1485,12 +1507,13 @@ impl HostSession {
             request_cancellation,
             deadline,
         )?;
-        let ack = decode_ack_with_format(
+        let ack = decode_ack_with_format_ext(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
+            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -2132,7 +2155,7 @@ impl SessionOwner {
             .map(|format| format.profile);
         matches!(
             (quality, profile),
-            ("standard", None) | ("hifi", Some(2)) | ("hires", Some(3))
+            ("standard", None) | ("hifi", Some(4)) | ("hires", Some(5))
         )
     }
 
@@ -2490,7 +2513,7 @@ fn run_session_owner(
             })
         {
             last_error = Some(
-                "Receiver rejected the requested authenticated PCM24 format; this V2 descriptor is unsupported.".into(),
+                "Receiver rejected the requested authenticated audio format; this V2 descriptor is unsupported.".into(),
             );
         }
         publish_session(
@@ -3348,8 +3371,8 @@ fn recovery_window_expired(active_since: Option<Instant>, window: Duration, now:
 fn profile_for_mode(profile: HostAudioProfile, mode: u8) -> Result<HostAudioProfile, String> {
     match profile {
         HostAudioProfile::Standard => Ok(HostAudioProfile::Standard),
-        HostAudioProfile::Pcm24(format) => AudioFormatV2::for_profile(format.profile, mode)
-            .map(HostAudioProfile::Pcm24)
+        HostAudioProfile::AudioV2(format) => AudioFormatV2::for_profile(format.profile, mode)
+            .map(HostAudioProfile::AudioV2)
             .map_err(|error| error.to_string()),
     }
 }
@@ -3656,7 +3679,14 @@ fn decode_ack(
     command: u8,
     command_sequence: u64,
 ) -> Result<Ack, String> {
-    decode_ack_with_format(frame, expected_sequence, command, command_sequence, false)
+    decode_ack_with_format_ext(
+        frame,
+        expected_sequence,
+        command,
+        command_sequence,
+        false,
+        false,
+    )
 }
 
 pub(crate) fn decode_ack_with_format(
@@ -3666,13 +3696,34 @@ pub(crate) fn decode_ack_with_format(
     command_sequence: u64,
     v2_audio: bool,
 ) -> Result<Ack, String> {
+    decode_ack_with_format_ext(
+        frame,
+        expected_sequence,
+        command,
+        command_sequence,
+        v2_audio,
+        false,
+    )
+}
+
+pub(crate) fn decode_ack_with_format_ext(
+    frame: &[u8],
+    expected_sequence: u64,
+    command: u8,
+    command_sequence: u64,
+    v2_audio: bool,
+    progress_extension: bool,
+) -> Result<Ack, String> {
     let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
     let terminal_ack = payload_len == 13 && frame[CONTROL_HEADER_BYTES + 9] == RESULT_USER_STOPPED;
     if frame[5] != ACK
         || u64::from_be_bytes(frame[20..28].try_into().unwrap()) != expected_sequence
         || (!terminal_ack
             && match command {
-                PLAYBACK_PROGRESS_QUERY => payload_len != if v2_audio { 91 } else { 83 },
+                PLAYBACK_PROGRESS_QUERY => {
+                    payload_len
+                        != if v2_audio { 91 } else { 83 } + if progress_extension { 126 } else { 0 }
+                }
                 BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
                     payload_len != 30
                 }
@@ -3703,6 +3754,7 @@ pub(crate) fn decode_ack_with_format(
         Some(decode_playback_progress_with_format(
             &payload[13..],
             v2_audio,
+            progress_extension,
         )?)
     } else {
         None
@@ -3773,14 +3825,16 @@ fn background_trust_management_state(state: ReceiverState) -> bool {
 }
 
 fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> {
-    decode_playback_progress_with_format(data, false)
+    decode_playback_progress_with_format(data, false, false)
 }
 
 fn decode_playback_progress_with_format(
     data: &[u8],
     v2_audio: bool,
+    progress_extension: bool,
 ) -> Result<PlaybackDiagnostics, String> {
-    if data.len() != if v2_audio { 78 } else { 70 } {
+    let base_len = if v2_audio { 78 } else { 70 };
+    if data.len() != base_len + if progress_extension { 126 } else { 0 } {
         return Err("Receiver playback progress payload length was invalid.".into());
     }
     let advancing = match data[45] {
@@ -3828,6 +3882,43 @@ fn decode_playback_progress_with_format(
         diagnostics.output_format = (data[71] != 0).then_some(data[71]);
         diagnostics.opened_track_channels = (data[72] != 0).then_some(data[72]);
         diagnostics.output_sample_rate = (output_sample_rate != 0).then_some(output_sample_rate);
+    }
+    if progress_extension {
+        let extension = &data[base_len..];
+        if extension[0] != 2 || extension[21] > 2 {
+            return Err("Receiver extended playback progress schema or engine was invalid.".into());
+        }
+        let u32_at_ext =
+            |offset| u32::from_be_bytes(extension[offset..offset + 4].try_into().unwrap());
+        let u64_at_ext =
+            |offset| u64::from_be_bytes(extension[offset..offset + 8].try_into().unwrap());
+        let metric_u32 = |offset| {
+            let value = u32_at_ext(offset);
+            (value != u32::MAX).then_some(value)
+        };
+        let metric_u64 = |offset| {
+            let value = u64_at_ext(offset);
+            (value != u64::MAX).then_some(value)
+        };
+        diagnostics.progress_schema = Some(2);
+        diagnostics.progress_monotonic_nanos = metric_u64(1);
+        diagnostics.receiver_generation = metric_u64(9);
+        diagnostics.output_epoch = metric_u32(17);
+        diagnostics.output_engine = Some(extension[21]);
+        diagnostics.ingress_audio_frames = metric_u64(22);
+        diagnostics.queue_dropped_frames = metric_u64(30);
+        diagnostics.queue_expired_frames = metric_u64(38);
+        diagnostics.queue_concealed_frames = metric_u64(46);
+        diagnostics.drift_inserted_frames = metric_u64(54);
+        diagnostics.drift_deleted_frames = metric_u64(62);
+        diagnostics.drift_reset_count = metric_u64(70);
+        diagnostics.output_accepted_frames = metric_u64(78);
+        diagnostics.output_consumed_frames = metric_u64(86);
+        diagnostics.oboe_ring_consumed_frames = metric_u64(94);
+        diagnostics.oboe_callback_requested_frames = metric_u64(102);
+        diagnostics.oboe_zero_filled_frames = metric_u64(110);
+        diagnostics.ring_pending_frames = metric_u32(118);
+        diagnostics.stream_pending_frames = metric_u32(122);
     }
     Ok(diagnostics)
 }

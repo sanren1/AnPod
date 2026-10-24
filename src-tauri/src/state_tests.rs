@@ -1,5 +1,43 @@
 use super::*;
 
+#[test]
+fn diagnostics_sample_requires_matching_session_generation() {
+    assert!(diagnostics_generation_is_consistent(Some(4), Some(4)));
+    assert!(!diagnostics_generation_is_consistent(Some(4), Some(5)));
+    assert!(!diagnostics_generation_is_consistent(None, Some(4)));
+}
+
+#[test]
+fn diagnostics_timeline_prunes_samples_older_than_one_hour() {
+    let mut timeline = DiagnosticsTimelineBuffer::new();
+    let start = timeline.started_at;
+    let sample = |elapsed_ms| DiagnosticsTimelineSample {
+        sampled_at_utc: "2026-10-25T00:00:00Z".into(),
+        elapsed_ms,
+        session_generation: None,
+        state: "ready".into(),
+        transport: "usb".into(),
+        session_transport: None,
+        session_wireless_protocol: None,
+        output: "computer".into(),
+        playback_mode: "Balanced".into(),
+        audio_quality: "standard".into(),
+        negotiated_audio_format: None,
+        windows_mix_format: None,
+        android_output_format: None,
+        pc_queued_frames: None,
+        pc_dropped_frames: None,
+        playback: None,
+    };
+    timeline.push(sample(0), start);
+    timeline.push(sample(3_601_000), start + Duration::from_secs(3_601));
+    let exported = timeline.export();
+    assert!(exported.truncated);
+    assert_eq!(exported.samples_omitted, 1);
+    assert_eq!(exported.samples.len(), 1);
+    assert_eq!(exported.samples[0].elapsed_ms, 3_601_000);
+}
+
 #[tokio::test]
 async fn usb_direct_configuration_suppression_is_owned_by_its_configuration_id() {
     let state = AppState::new();
@@ -166,7 +204,11 @@ fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
     let mut snapshot = sample_snapshot();
     snapshot.settings.last_usb_direct_target_id = Some("usb-target-private".into());
     snapshot.settings.last_usb_direct_binding_reference = Some("binding-private".into());
-    let json = serde_json::to_string(&diagnostics_export(&snapshot)).unwrap();
+    let json = serde_json::to_string(&diagnostics_export(
+        &snapshot,
+        DiagnosticsTimelineBuffer::new().export(),
+    ))
+    .unwrap();
     for leaked in [
         "TESTSERIAL",
         "Test Phone",
@@ -177,7 +219,7 @@ fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
     ] {
         assert!(!json.contains(leaked), "{leaked} leaked into {json}");
     }
-    assert!(json.contains("\"schemaVersion\":1"));
+    assert!(json.contains("\"schemaVersion\":2"));
     assert!(json.contains("\"state\":\"connected\""));
     assert!(json.contains("\"playbackMode\":\"Balanced\""));
     assert!(json.contains("\"audioBitrateBps\":1536000"));
@@ -693,7 +735,11 @@ fn adb_mode_quality_updates_are_atomic_and_usb_direct_memory_is_persisted() {
 
     let mut diagnostic_snapshot = sample_snapshot();
     diagnostic_snapshot.settings = snapshot.settings;
-    let diagnostic = serde_json::to_string(&diagnostics_export(&diagnostic_snapshot)).unwrap();
+    let diagnostic = serde_json::to_string(&diagnostics_export(
+        &diagnostic_snapshot,
+        DiagnosticsTimelineBuffer::new().export(),
+    ))
+    .unwrap();
     assert!(!diagnostic.contains("usb-target-private"));
     assert!(!diagnostic.contains("binding-private"));
     fs::remove_dir_all(root).unwrap();

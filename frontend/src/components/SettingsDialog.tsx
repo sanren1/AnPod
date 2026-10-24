@@ -24,7 +24,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
   const mix = snapshot.windowsMixFormat;
   const android = snapshot.androidOutputFormat;
   const actualFormat = negotiated
-    ? `${negotiated.sampleRateHz / 1000} kHz · ${strings.app.audioSampleFormats[negotiated.sampleFormat]} · ${negotiated.channels} ch · ${negotiated.validBitsPerSample} ${strings.app.validBits}`
+    ? `${negotiated.sampleRateHz / 1000} kHz · ${strings.app.audioSampleFormats[negotiated.sampleFormat]} · ${negotiated.channels} ch · ${negotiated.sampleFormat === "float32le" ? strings.app.float32Representation : `${negotiated.validBitsPerSample} ${strings.app.validBits}`}`
     : strings.app.audioFormatNotConfirmed;
   const mixFormat = mix
     ? `${mix.sampleRate === null ? strings.app.audioFormatUnknown : `${mix.sampleRate / 1000} kHz`} · ${mix.sampleFormat === null ? strings.app.audioFormatUnknown : strings.app.mixSampleFormats[mix.sampleFormat]} · ${mix.channels === null ? strings.app.audioFormatUnknown : `${mix.channels} ch`} · ${mix.containerBits === null ? strings.app.audioFormatUnknown : `${mix.containerBits} ${strings.app.containerBits}`} · ${mix.validBits === null ? strings.app.audioFormatUnknown : `${mix.validBits} ${strings.app.validBits}`}`

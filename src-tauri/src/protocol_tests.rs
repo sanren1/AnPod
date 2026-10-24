@@ -222,7 +222,7 @@ fn aoa_v2_packets_match_all_profiles_reject_lan_keys_and_replay() {
 
 #[test]
 fn v2_descriptors_roundtrip_and_reject_unknown_or_reserved_fields() {
-    for profile in 1..=3 {
+    for profile in 1..=5 {
         for mode in 0..=1 {
             let format = AudioFormatV2::for_profile(profile, mode).unwrap();
             assert_eq!(
@@ -240,7 +240,14 @@ fn v2_descriptors_roundtrip_and_reject_unknown_or_reserved_fields() {
             ProtocolError::InvalidFormat
         );
     }
-    assert!(AudioFormatV2::for_profile(4, 0).is_err());
+    for (profile, expected) in [
+        (4, [2, 4, 3, 2, 32, 4, 0, 0, 0, 0, 0xbb, 0x80, 0, 8, 0, 0]),
+        (5, [2, 5, 3, 2, 32, 4, 0, 0, 0, 1, 0x77, 0, 0, 8, 0, 0]),
+    ] {
+        let format = AudioFormatV2::for_profile(profile, 0).unwrap();
+        assert_eq!(format.encode().unwrap(), expected);
+    }
+    assert!(AudioFormatV2::for_profile(6, 0).is_err());
 }
 
 #[test]

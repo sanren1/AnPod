@@ -1037,6 +1037,33 @@ fn reads_the_artifact_written_by_windows_powershell_when_requested() {
 }
 
 #[test]
+fn audited_receiver45_is_registered_and_preserves_receiver44() {
+    let current = ArtifactMetadata {
+        application_id: PACKAGE.into(),
+        version_code: 45,
+        version_name: "0.20.0-v3-flow-candidate".into(),
+        sha256: "9487984f6cf1f7cb107f10f37cf3663cc6dbde32b2ce191cc83d65f4886f9050".into(),
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573".into(),
+        source_commit: Some("d3a6aeed095a993ee26d8ff8f980102e11b77579".into()),
+    };
+    assert!(AUDITED_RECEIVER_ARTIFACTS.iter().any(|artifact| {
+        artifact.version_code == current.version_code
+            && artifact.version_name == current.version_name
+            && artifact.sha256 == current.sha256
+            && artifact.signer_sha256 == current.signer_sha256
+            && Some(artifact.source_commit) == current.source_commit.as_deref()
+    }));
+
+    let receiver44 = verified_installed_artifact(
+        "5afcd792dea8685f332fe6e2da76cff9b80ac4460b4facb34e815be22be2820b",
+        &current,
+    )
+    .unwrap();
+    assert_eq!(receiver44.version_code, 44);
+    assert_eq!(receiver44.version_name, "0.19.2-v3-flow-candidate");
+}
+
+#[test]
 fn recognizes_audited_code12_and_code13_for_code14_upgrade_but_rejects_unknown_apks() {
     let current = ArtifactMetadata {
         application_id: PACKAGE.into(),

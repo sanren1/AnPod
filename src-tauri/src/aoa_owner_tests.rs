@@ -2,9 +2,9 @@ use super::*;
 use crate::{
     network::PcmQueue,
     p5c::{
-        self, ReceiverState, TerminalCause, ACK, CAPABILITIES_INFO, CAP_AUDIO_V2,
-        CAP_AUTHENTICATED_STATUS, CAP_PLAYBACK_PROGRESS, CAP_TERMINAL_CAUSE,
-        PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED,
+        self, ReceiverState, TerminalCause, ACK, CAPABILITIES_INFO, CAP_AUDIO_FLOAT32,
+        CAP_AUDIO_V2, CAP_AUTHENTICATED_STATUS, CAP_PLAYBACK_PROGRESS, CAP_PROGRESS_EXT,
+        CAP_TERMINAL_CAUSE, PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED,
     },
     protocol::PacketDecoder,
     security::{test_binding_material, ReceiverHandshakeV2},
@@ -228,6 +228,60 @@ fn send_ack(
     send_record(tx, RecordType::Control, ack);
 }
 
+fn send_progress_extension_ack(
+    tx: &Sender<Record>,
+    keys: &SessionKeys,
+    session_id: u64,
+    ack_sequence: u64,
+    request: &Record,
+    format: AudioFormatV2,
+) {
+    p5c::verify_control_frame(
+        &request.body,
+        &keys.host_to_receiver_control,
+        HOST_TO_RECEIVER_CONTROL,
+        session_id,
+    )
+    .unwrap();
+    assert_eq!(request.body[5], PLAYBACK_PROGRESS_QUERY);
+    assert_eq!(u16::from_be_bytes([request.body[28], request.body[29]]), 1);
+    assert_eq!(
+        request.body[30], 2,
+        "host did not explicitly request progress schema 2"
+    );
+    let command_sequence = u64::from_be_bytes(request.body[20..28].try_into().unwrap());
+    let mut payload = vec![0xff; 13 + 78 + 126];
+    payload[0] = PLAYBACK_PROGRESS_QUERY;
+    payload[1..9].copy_from_slice(&command_sequence.to_be_bytes());
+    payload[9] = 0;
+    payload[10] = 2;
+    let progress = &mut payload[13..13 + 78 + 126];
+    progress[45] = 1;
+    progress[70] = 1;
+    progress[71] = format.sample_format;
+    progress[72] = 2;
+    progress[73] = 0;
+    progress[74..78].copy_from_slice(&format.sample_rate.to_be_bytes());
+    let extension = &mut progress[78..];
+    extension[0] = 2;
+    extension[1..9].copy_from_slice(&1234u64.to_be_bytes());
+    extension[9..17].copy_from_slice(&77u64.to_be_bytes());
+    extension[17..21].copy_from_slice(&4u32.to_be_bytes());
+    extension[21] = 2;
+    extension[22..30].copy_from_slice(&480u64.to_be_bytes());
+    extension[30..38].copy_from_slice(&3u64.to_be_bytes());
+    let ack = p5c::encode_control(
+        &keys.receiver_to_host_control,
+        RECEIVER_TO_HOST_CONTROL,
+        session_id,
+        ack_sequence,
+        ACK,
+        &payload,
+    )
+    .unwrap();
+    send_record(tx, RecordType::Control, ack);
+}
+
 fn run_fake_receiver(
     rx: ChannelReceiver<Record>,
     tx: Sender<Record>,
@@ -245,7 +299,16 @@ fn run_fake_receiver(
     let keys = authenticated.into_keys();
 
     let caps = read_record(&rx, RecordType::Control);
-    send_capabilities(&tx, &keys, session_id, &caps);
+    let audio_caps = CAP_AUTHENTICATED_STATUS
+        | CAP_AUDIO_V2
+        | CAP_PLAYBACK_PROGRESS
+        | CAP_PROGRESS_EXT
+        | if format.profile >= 4 {
+            CAP_AUDIO_FLOAT32
+        } else {
+            0
+        };
+    send_capabilities_with_bits(&tx, &keys, session_id, &caps, audio_caps);
     let bind = read_record(&rx, RecordType::Control);
     assert_eq!(bind.body[5], BIND);
     assert_eq!(&bind.body[30..32], &[0, 0]);
@@ -294,49 +357,83 @@ fn run_fake_receiver(
     assert_eq!(format_packet.header.sequence, 0);
     decoder.commit(format_packet.header.sequence);
 
-    let pause = read_record(&rx, RecordType::Control);
-    assert_eq!(
-        pause.body[5], PAUSE,
-        "no media should be emitted while the owner is paused"
-    );
-    send_ack(&tx, &keys, session_id, 4, &pause, ReceiverState::Paused, 0);
-    let resume = read_record(&rx, RecordType::Control);
-    assert_eq!(resume.body[5], RESUME);
-    send_ack(
-        &tx,
-        &keys,
-        session_id,
-        5,
-        &resume,
-        ReceiverState::ReceiverRunning,
-        0,
-    );
+    let mut ack_sequence = 4;
+    let (mut saw_progress, mut saw_pause, mut saw_resume) = (false, false, false);
+    while !saw_progress || !saw_pause || !saw_resume {
+        let request = read_record(&rx, RecordType::Control);
+        match request.body[5] {
+            PLAYBACK_PROGRESS_QUERY => {
+                send_progress_extension_ack(&tx, &keys, session_id, ack_sequence, &request, format);
+                saw_progress = true;
+            }
+            PAUSE => {
+                send_ack(
+                    &tx,
+                    &keys,
+                    session_id,
+                    ack_sequence,
+                    &request,
+                    ReceiverState::Paused,
+                    0,
+                );
+                saw_pause = true;
+            }
+            RESUME => {
+                send_ack(
+                    &tx,
+                    &keys,
+                    session_id,
+                    ack_sequence,
+                    &request,
+                    ReceiverState::ReceiverRunning,
+                    0,
+                );
+                saw_resume = true;
+            }
+            command => panic!("unexpected control command {command}"),
+        }
+        ack_sequence += 1;
+    }
 
-    let (expected_frames, frame_bytes): (&[usize], usize) = if format.profile == 3 {
-        (&[191, 191, 98], 6)
-    } else if format.profile == 1 {
-        (&[1], 4)
+    let frame_bytes = format.frame_bytes as usize;
+    let frame_count = if matches!(format.profile, 3 | 5) {
+        480
     } else {
-        (&[1], 6)
+        1
     };
+    let mut remaining_frames = frame_count;
+    let mut expected_frames = Vec::new();
+    while remaining_frames > 0 {
+        let frames = remaining_frames.min(1150 / frame_bytes);
+        expected_frames.push(frames);
+        remaining_frames -= frames;
+    }
     let mut payload = Vec::new();
     let mut next_frame = 9;
-    for (packet_index, frame_count) in expected_frames.iter().copied().enumerate() {
+    for (packet_index, packet_frames) in expected_frames.iter().copied().enumerate() {
         let audio = read_record(&rx, RecordType::Audio);
         let packet = decoder.open(&audio.body).unwrap();
         assert_eq!(packet.header.packet_type, PacketType::Audio);
         assert_eq!(packet.header.sequence, packet_index as u64 + 1);
         assert_eq!(packet.header.sample_frame_index, next_frame);
-        assert_eq!(packet.payload.len(), frame_count * frame_bytes);
+        assert_eq!(packet.payload.len(), packet_frames * frame_bytes);
         assert!(packet.payload.len() <= 1150);
-        next_frame += frame_count as u64;
+        next_frame += packet_frames as u64;
         payload.extend_from_slice(&packet.payload);
         decoder.commit(packet.header.sequence);
     }
 
     let stop = read_record(&rx, RecordType::Control);
     assert_eq!(stop.body[5], STOP);
-    send_ack(&tx, &keys, session_id, 6, &stop, ReceiverState::Stopped, 0);
+    send_ack(
+        &tx,
+        &keys,
+        session_id,
+        ack_sequence,
+        &stop,
+        ReceiverState::Stopped,
+        0,
+    );
     (format.profile, payload, 9)
 }
 
@@ -493,7 +590,7 @@ fn run_stale_block_receiver(
 
 #[test]
 fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
-    for profile in 1..=3 {
+    for profile in 1..=5 {
         let format = AudioFormatV2::for_profile(profile, 0).unwrap();
         let material = test_binding_material();
         let server_material = material.duplicate_for_session();
@@ -554,7 +651,7 @@ fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
                 retry_until_accepted(|| q.push_raw(samples.as_ptr(), 1, 48_000, 2, frame_index));
             }
             SessionAudioQueue::Float32(q, _) => {
-                let frame_count = if profile == 3 { 480 } else { 1 };
+                let frame_count = if matches!(profile, 3 | 5) { 480 } else { 1 };
                 let samples = [1.0 / 8_388_608.0, -1.0 / 8_388_608.0].repeat(frame_count);
                 retry_until_accepted(|| {
                     q.push_raw(
@@ -567,13 +664,8 @@ fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
                 });
             }
         }
-        let expected_payload_bytes = if profile == 1 {
-            4
-        } else if profile == 3 {
-            2_880
-        } else {
-            6
-        };
+        let expected_payload_bytes =
+            (if matches!(profile, 3 | 5) { 480 } else { 1 }) * format.frame_bytes as u64;
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while owner.snapshot().pcm_payload_bytes_sent < expected_payload_bytes
             && std::time::Instant::now() < deadline
@@ -585,6 +677,12 @@ fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
             "owner did not emit media"
         );
         let owner_snapshot = owner.snapshot();
+        let progress = owner_snapshot.playback_progress.unwrap();
+        assert_eq!(progress.progress_schema, Some(2));
+        assert_eq!(progress.progress_monotonic_nanos, Some(1234));
+        assert_eq!(progress.receiver_generation, Some(77));
+        assert_eq!(progress.ingress_audio_frames, Some(480));
+        assert_eq!(progress.queue_dropped_frames, Some(3));
         assert_eq!(owner_snapshot.format, format);
         owner.stop().unwrap();
         let (got_profile, payload, got_frame) = result_rx
@@ -595,9 +693,17 @@ fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
         assert_eq!(got_frame, frame_index);
         if profile == 1 {
             assert_eq!(payload, [0, 0x40, 0, 0xc0]);
-        } else {
+        } else if profile <= 3 {
             let one_frame = [1, 0, 0, 0xff, 0xff, 0xff];
-            let expected: Vec<u8> = one_frame.repeat(if profile == 3 { 480 } else { 1 });
+            let expected: Vec<u8> = one_frame.repeat(if matches!(profile, 3) { 480 } else { 1 });
+            assert_eq!(payload, expected);
+        } else {
+            let one_frame = [
+                (1.0f32 / 8_388_608.0).to_le_bytes(),
+                (-1.0f32 / 8_388_608.0).to_le_bytes(),
+            ]
+            .concat();
+            let expected: Vec<u8> = one_frame.repeat(if profile == 5 { 480 } else { 1 });
             assert_eq!(payload, expected);
         }
         peer.join().unwrap();

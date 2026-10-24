@@ -128,6 +128,25 @@ pub struct PlaybackDiagnostics {
     pub output_format: Option<u8>,
     pub opened_track_channels: Option<u8>,
     pub output_sample_rate: Option<u32>,
+    pub progress_schema: Option<u8>,
+    pub progress_monotonic_nanos: Option<u64>,
+    pub receiver_generation: Option<u64>,
+    pub output_epoch: Option<u32>,
+    pub output_engine: Option<u8>,
+    pub ingress_audio_frames: Option<u64>,
+    pub queue_dropped_frames: Option<u64>,
+    pub queue_expired_frames: Option<u64>,
+    pub queue_concealed_frames: Option<u64>,
+    pub drift_inserted_frames: Option<u64>,
+    pub drift_deleted_frames: Option<u64>,
+    pub drift_reset_count: Option<u64>,
+    pub output_accepted_frames: Option<u64>,
+    pub output_consumed_frames: Option<u64>,
+    pub oboe_ring_consumed_frames: Option<u64>,
+    pub oboe_callback_requested_frames: Option<u64>,
+    pub oboe_zero_filled_frames: Option<u64>,
+    pub ring_pending_frames: Option<u32>,
+    pub stream_pending_frames: Option<u32>,
 }
 
 impl ReceiverStatus {
@@ -173,6 +192,13 @@ struct AuditedReceiverArtifact {
 // Every shipped APK must be added here after release, or the next version cannot
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "9487984f6cf1f7cb107f10f37cf3663cc6dbde32b2ce191cc83d65f4886f9050",
+        version_code: 45,
+        version_name: "0.20.0-v3-flow-candidate",
+        source_commit: "d3a6aeed095a993ee26d8ff8f980102e11b77579",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
     AuditedReceiverArtifact {
         sha256: "5afcd792dea8685f332fe6e2da76cff9b80ac4460b4facb34e815be22be2820b",
         version_code: 44,

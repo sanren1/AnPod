@@ -15,7 +15,7 @@ export type Settings = {
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
 };
 export type NegotiatedAudioFormat = {
-  codecVersion: 1 | 2; sampleFormat: "pcm16le" | "pcm24le"; sampleRateHz: number;
+  codecVersion: 1 | 2; sampleFormat: "pcm16le" | "pcm24le" | "float32le"; sampleRateHz: number;
   channels: number; validBitsPerSample: number; bytesPerSample: number; frameBytes: number;
 };
 export type WindowsMixFormat = {

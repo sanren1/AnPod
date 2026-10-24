@@ -108,19 +108,44 @@ pub struct AudioFormatV2 {
 
 impl AudioFormatV2 {
     pub fn for_profile(profile: u8, mode: u8) -> Result<Self, ProtocolError> {
-        if !(1..=3).contains(&profile) || mode > 1 {
+        if !(1..=5).contains(&profile) || mode > 1 {
             return Err(ProtocolError::InvalidFormat);
         }
+        let float = profile >= 4;
         let high = profile != 1;
+        let sample_rate = if matches!(profile, 3 | 5) {
+            96_000
+        } else {
+            48_000
+        };
+        let bytes_per_sample = if float {
+            4
+        } else if high {
+            3
+        } else {
+            2
+        };
         Ok(Self {
             profile,
-            sample_format: if high { 2 } else { 1 },
+            sample_format: if float {
+                3
+            } else if high {
+                2
+            } else {
+                1
+            },
             channels: 2,
-            valid_bits: if high { 24 } else { 16 },
-            bytes_per_sample: if high { 3 } else { 2 },
+            valid_bits: if float {
+                32
+            } else if high {
+                24
+            } else {
+                16
+            },
+            bytes_per_sample,
             mode,
-            sample_rate: if profile == 3 { 96_000 } else { 48_000 },
-            frame_bytes: if high { 6 } else { 4 },
+            sample_rate,
+            frame_bytes: 2 * bytes_per_sample as u16,
         })
     }
 

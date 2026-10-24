@@ -1,13 +1,13 @@
 use crate::{
     aoa::{Record, RecordType},
     aoa_winusb::{AoaCancel, AoaReader, AoaStream, AoaWriter},
-    network::float_to_pcm24,
+    network::{float32_to_le_bytes, float_to_pcm24},
     p5c::{
         self, Ack, ReceiverCapabilities, ReceiverState, SessionAudioQueue, TerminalCause,
-        AUDIO_PROTOCOL_MAJOR, BIND, CAPABILITIES_QUERY, CAP_AUDIO_V2, CAP_PLAYBACK_PROGRESS,
-        HEARTBEAT, HOST_TO_RECEIVER_CONTROL, MANAGEMENT_CONTROL_MAJOR, PAUSE,
-        PLAYBACK_PROGRESS_QUERY, RECEIVER_TO_HOST_CONTROL, RESULT_OK, RESULT_USER_STOPPED, RESUME,
-        SELECT_MODE, START, STOP,
+        AUDIO_PROTOCOL_MAJOR, BIND, CAPABILITIES_QUERY, CAP_AUDIO_FLOAT32, CAP_AUDIO_V2,
+        CAP_PLAYBACK_PROGRESS, CAP_PROGRESS_EXT, HEARTBEAT, HOST_TO_RECEIVER_CONTROL,
+        MANAGEMENT_CONTROL_MAJOR, PAUSE, PLAYBACK_PROGRESS_QUERY, RECEIVER_TO_HOST_CONTROL,
+        RESULT_OK, RESULT_USER_STOPPED, RESUME, SELECT_MODE, START, STOP,
     },
     protocol::{
         AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
@@ -34,8 +34,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_POLL: Duration = Duration::from_millis(20);
 const READER_MAILBOX_CAPACITY: usize = 4;
 const OWNER_COMMAND_CAPACITY: usize = 4;
-const PCM16_FRAME_BYTES: usize = 4;
-const PCM24_FRAME_BYTES: usize = 6;
 
 trait RecordReader: Send {
     fn read_record(&mut self) -> io::Result<Record>;
@@ -160,8 +158,21 @@ impl AoaOwner {
                 &keys,
                 session_id,
             )?;
-            if !capabilities.compatible || capabilities.capability_bits & CAP_AUDIO_V2 == 0 {
-                return Err("AOA Receiver does not support authenticated ANPD v2 audio.".into());
+            let required_audio_capabilities = CAP_AUDIO_V2
+                | if format.profile >= 4 {
+                    CAP_AUDIO_FLOAT32
+                } else {
+                    0
+                };
+            if !capabilities.compatible
+                || capabilities.capability_bits & required_audio_capabilities
+                    != required_audio_capabilities
+            {
+                return Err(if format.profile >= 4 {
+                    "RECEIVER_UPDATE_REQUIRED: AOA Receiver does not advertise authenticated Float32 audio."
+                } else {
+                    "AOA Receiver does not support authenticated ANPD v2 audio."
+                }.into());
             }
             let mut command_sequence = 1;
             let mut ack_sequence = 1;
@@ -415,7 +426,7 @@ fn validate_queue(queue: &SessionAudioQueue, format: AudioFormatV2) -> Result<()
         {
             Ok(())
         }
-        (2 | 3, SessionAudioQueue::Float32(q, locked))
+        (2..=5, SessionAudioQueue::Float32(q, locked))
             if *locked == format
                 && q.expected_format() == Some((format.sample_rate, 2))
                 && !q.is_stopped() =>
@@ -549,7 +560,14 @@ fn exchange_command<W: RecordWriter>(
         RECEIVER_TO_HOST_CONTROL,
         session_id,
     )?;
-    let ack = p5c::decode_ack_with_format(&record.body, *ack_sequence, kind, command, true)?;
+    let ack = p5c::decode_ack_with_format_ext(
+        &record.body,
+        *ack_sequence,
+        kind,
+        command,
+        true,
+        kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
+    )?;
     *command_sequence = command
         .checked_add(1)
         .ok_or_else(|| "P5-C command sequence exhausted.".to_string())?;
@@ -720,6 +738,13 @@ fn run_owner_loop<W: RecordWriter>(
             & CAP_PLAYBACK_PROGRESS
             != 0;
         if supports_progress && Instant::now() >= next_progress {
+            let supports_extended_progress = snapshot
+                .lock()
+                .map_err(|_| "AOA snapshot poisoned.")?
+                .capabilities
+                .capability_bits
+                & CAP_PROGRESS_EXT
+                != 0;
             let ack = exchange_command(
                 writer,
                 records,
@@ -729,7 +754,11 @@ fn run_owner_loop<W: RecordWriter>(
                 &mut command_sequence,
                 &mut ack_sequence,
                 PLAYBACK_PROGRESS_QUERY,
-                &[],
+                if supports_extended_progress {
+                    &[2]
+                } else {
+                    &[]
+                },
             )?;
             if ack.result == RESULT_USER_STOPPED {
                 if ack.state != ReceiverState::Stopped
@@ -844,11 +873,7 @@ fn run_owner_loop<W: RecordWriter>(
         if block.sample_rate != format.sample_rate || block.channels != format.channels as u16 {
             return Err("AOA queue block does not match the authenticated format.".into());
         }
-        let frame_bytes = if format.profile == 1 {
-            PCM16_FRAME_BYTES
-        } else {
-            PCM24_FRAME_BYTES
-        };
+        let frame_bytes = format.frame_bytes as usize;
         let max_frames = MAX_PAYLOAD_LEN / frame_bytes;
         let frames = (block.frame_count as usize - block.offset).min(max_frames);
         if frames == 0 {
@@ -872,6 +897,12 @@ fn run_owner_loop<W: RecordWriter>(
                 for sample in &float32[sample_start..sample_end] {
                     let q23 = float_to_pcm24(*sample).map_err(str::to_string)? as u32;
                     payload.extend_from_slice(&q23.to_le_bytes()[..3]);
+                }
+            }
+            (SessionAudioQueue::Float32(_, _), 4 | 5) => {
+                for sample in &float32[sample_start..sample_end] {
+                    payload
+                        .extend_from_slice(&float32_to_le_bytes(*sample).map_err(str::to_string)?);
                 }
             }
             _ => return Err("AOA queue type does not match the authenticated profile.".into()),
