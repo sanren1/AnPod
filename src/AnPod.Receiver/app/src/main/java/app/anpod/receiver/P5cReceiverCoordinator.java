@@ -72,6 +72,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         default int openedTrackChannelsV2() { return 0; }
         default int openedTrackSampleRateV2() { return 0; }
         default boolean supportsPlaybackProgress() { return false; }
+        default boolean supportsPlaybackProgressExtension() { return false; }
         default byte[] playbackProgressPayload() {
             return P5cControlProtocol.playbackProgressPayload(-1, -1, -1,
                     -1, -1, -1, -1, -1, null, -1, -1, -1, -1, -1, -1);
@@ -80,6 +81,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
             return P5cControlProtocol.playbackProgressPayloadV2(playbackProgressPayload(),
                     openedTrackFormatV2(), openedTrackChannelsV2(), openedTrackSampleRateV2());
         }
+        default byte[] playbackProgressPayloadExtended(boolean audioV2) { return null; }
         /** True only for an explicitly started standby endpoint; production defaults to the existing manual flow. */
         default boolean requiresBackgroundStartAuthorization() { return false; }
         default int requestBackgroundStartAuthorization(byte[] requestId, long sessionId, InetAddress peer,
@@ -622,6 +624,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     UdpSessionContext context = null;
                     boolean playbackStarted = false;
                     int state = STATE_AUTHENTICATED;
+                    int negotiatedCapabilities = 0;
                     long expectedCommandSequence = 0;
                     long ackSequence = 0;
                     byte[] lastCommand = null;
@@ -708,7 +711,13 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     | (backgroundAuthorizationRequired ? P5cControlProtocol.CAP_BACKGROUND_START_AUTH : 0)
                                     | (playback.supportsBackgroundTrustManagement()
                                             ? P5cControlProtocol.CAP_BACKGROUND_TRUST_MANAGEMENT : 0)
-                                    | (playback.supportsAudioV2() ? P5cControlProtocol.CAP_AUDIO_V2 : 0);
+                                    | (playback.supportsAudioV2() ? P5cControlProtocol.CAP_AUDIO_V2 : 0)
+                                    | (playback.supportsAudioV2() && formatV2 != null
+                                            && formatV2.sampleFormat == 3
+                                            && playback.supportsAudioFormatV2(formatV2)
+                                            ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
+                                    | (playback.supportsPlaybackProgressExtension()
+                                            ? P5cControlProtocol.CAP_PROGRESS_EXT : 0);
                             if ("incompatible".equals(capabilityTestMode)) audioMajor++;
                             if ("missing-capability".equals(capabilityTestMode))
                                 implemented &= ~P5cControlProtocol.CAP_AUTHENTICATED_STATUS;
@@ -725,6 +734,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                                     P5cControlProtocol.CAPABILITIES_INFO, info);
                             P5cControlProtocol.write(output, response);
+                            if (compatible) negotiatedCapabilities = implemented;
                             terminalCauseNegotiated = (implemented
                                     & P5cControlProtocol.CAP_TERMINAL_CAUSE) != 0;
                             lastCommand = command.raw; lastAck = response; expectedCommandSequence++;
@@ -952,9 +962,13 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             }
                             break;
                         case P5cControlProtocol.PLAYBACK_PROGRESS_QUERY:
-                            if (command.payload.length != 0) result = RESULT_REJECTED;
-                            else responseExtra = formatV2 == null
+                            if (command.payload.length == 0) responseExtra = formatV2 == null
                                     ? playback.playbackProgressPayload() : playback.playbackProgressPayloadV2();
+                            else if (command.payload.length == 1 && command.payload[0] == 2
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0) {
+                                responseExtra = playback.playbackProgressPayloadExtended(formatV2 != null);
+                                if (responseExtra == null) result = RESULT_FAILED;
+                            } else result = RESULT_REJECTED;
                             break;
                         default:
                             result = RESULT_REJECTED;

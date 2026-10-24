@@ -22,6 +22,7 @@ public final class FloatPcmDriftController {
     private long credit;
     private double filteredErrorFrames;
     private boolean baselineReady;
+    private long resetCount;
 
     public FloatPcmDriftController(int sampleRate, int targetFrames) {
         if (sampleRate <= 0 || targetFrames <= 0)
@@ -31,6 +32,7 @@ public final class FloatPcmDriftController {
     }
 
     public synchronized void reset(long nowNanos) {
+        resetCount++;
         baselineCount = 0;
         baselineStartNanos = nowNanos;
         nextBaselineSampleNanos = nowNanos;
@@ -39,6 +41,8 @@ public final class FloatPcmDriftController {
         baselineReady = false;
         clearDebt();
     }
+
+    public synchronized long resetCount() { return resetCount; }
 
     /** Observe queue + AudioTrack pending frames. +1 deletes, -1 inserts, and edits stay <=1000ppm. */
     public synchronized int observe(long nowNanos, long bufferedFrames, boolean playing,

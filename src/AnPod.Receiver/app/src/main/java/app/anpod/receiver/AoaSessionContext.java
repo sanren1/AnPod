@@ -24,7 +24,8 @@ final class AoaSessionContext implements AutoCloseable {
             floatQueue = null;
         } else {
             pcmQueue = null;
-            floatQueue = new FloatPcmFrameQueue(formatV2.sampleRate, lowLatency);
+            floatQueue = new FloatPcmFrameQueue(formatV2.sampleRate, lowLatency,
+                    UdpPacketDecoder.MAX_PLAINTEXT_BYTES / formatV2.frameBytes);
         }
         ingress = AnpdAudioIngress.aoa(sessionId, audioKey, formatV2, pcmQueue, floatQueue);
     }

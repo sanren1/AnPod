@@ -47,6 +47,8 @@ final class P5cControlProtocol {
     static final int CAP_AUDIO_V2 = 0x00000080;
     static final int CAP_TERMINAL_CAUSE = 0x00000100;
     static final int CAP_AOA_SESSION_RESTART = 0x00000200;
+    static final int CAP_AUDIO_FLOAT32 = 0x00000400;
+    static final int CAP_PROGRESS_EXT = 0x00000800;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS
             | CAP_TERMINAL_CAUSE;
     static final int AUTH_PENDING = 0;
@@ -240,6 +242,25 @@ final class P5cControlProtocol {
         payload[72] = (byte) openedTrackChannels;
         payload[73] = 0; // reserved
         putInt(payload, 74, openedTrackSampleRate);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadExtended(byte[] basePayload, long monotonicNanos,
+            long receiverGeneration, int outputEpoch, int outputEngine, long[] counters,
+            int ringPendingFrames, int streamPendingFrames) {
+        if (basePayload == null || (basePayload.length != 70 && basePayload.length != 78)
+                || counters == null || counters.length != 12 || outputEngine < 0 || outputEngine > 2)
+            throw new IllegalArgumentException("invalid extended playback progress fields");
+        byte[] payload = Arrays.copyOf(basePayload, basePayload.length + 126);
+        int offset = basePayload.length;
+        payload[offset] = 2;
+        putLong(payload, offset + 1, monotonicNanos);
+        putLong(payload, offset + 9, receiverGeneration);
+        putInt(payload, offset + 17, outputEpoch);
+        payload[offset + 21] = (byte) outputEngine;
+        for (int i = 0; i < counters.length; i++) putLong(payload, offset + 22 + i * 8, counters[i]);
+        putInt(payload, offset + 118, ringPendingFrames);
+        putInt(payload, offset + 122, streamPendingFrames);
         return payload;
     }
 

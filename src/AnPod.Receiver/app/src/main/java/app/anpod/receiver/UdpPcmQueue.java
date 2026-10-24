@@ -849,6 +849,15 @@ final class UdpPlaybackActivity {
 
     synchronized void resetPlaybackHead(int position) {
         playbackHead.reset(position, clock.nowNanos());
+        resetActivityEvidence();
+    }
+
+    synchronized void resetPlaybackHeadUnavailable() {
+        playbackHead.reset();
+        resetActivityEvidence();
+    }
+
+    private void resetActivityEvidence() {
         lastPlayedFrames = 0;
         hasHeadAdvance = false;
         lastHeadAdvanceAtNanos = 0;

@@ -19,6 +19,8 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         void stop();
         boolean streaming() throws IOException;
         byte[] playbackProgressPayloadV2();
+        default boolean supportsPlaybackProgressExtension() { return false; }
+        default byte[] playbackProgressPayloadExtendedV2() { return null; }
     }
 
     private static final Object OWNER_LOCK = new Object();
@@ -314,6 +316,10 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 int required = readInt(command.payload, 4);
                 int supported = P5cControlProtocol.CAP_AUTHENTICATED_STATUS
                         | (playback.supportsAudio(format) ? P5cControlProtocol.CAP_AUDIO_V2 : 0)
+                        | (playback.supportsAudio(format) && format.sampleFormat == 3
+                                ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
+                        | (playback.supportsPlaybackProgressExtension()
+                                ? P5cControlProtocol.CAP_PROGRESS_EXT : 0)
                         | P5cControlProtocol.CAP_PLAYBACK_PROGRESS
                         | P5cControlProtocol.CAP_TERMINAL_CAUSE
                         | P5cControlProtocol.CAP_AOA_SESSION_RESTART;
@@ -396,8 +402,12 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                         state = P5cReceiverCoordinator.STATE_RECEIVER_RUNNING;
                     break;
                 case P5cControlProtocol.PLAYBACK_PROGRESS_QUERY:
-                    if (command.payload.length != 0) throw new IOException("invalid AOA progress query");
-                    extra = playback.playbackProgressPayloadV2();
+                    if (command.payload.length == 0) extra = playback.playbackProgressPayloadV2();
+                    else if (command.payload.length == 1 && command.payload[0] == 2
+                            && (supportedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0) {
+                        extra = playback.playbackProgressPayloadExtendedV2();
+                        if (extra == null) throw new IOException("AOA progress extension unavailable");
+                    } else throw new IOException("invalid AOA progress query");
                     break;
                 case P5cControlProtocol.STOP:
                     if (command.payload.length == 1 && command.payload[0] == 1) {

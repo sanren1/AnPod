@@ -103,6 +103,13 @@ public final class Pcm16FrameStream {
             lastProgressNanos = nowNanos;
         }
 
+        public synchronized void reset() {
+            initialized = false;
+            lastPosition = 0;
+            framesPlayed = 0;
+            lastProgressNanos = 0;
+        }
+
         public long update(int position) {
             return update(position, System.nanoTime());
         }

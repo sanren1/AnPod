@@ -154,6 +154,7 @@ final class OboePlaybackOutput implements PlaybackOutput {
         ensureOpen();
         int result = OboeNativeBridge.pauseAndFlush(handle);
         if (result != 0) throw failure("Oboe pause/flush", result);
+        outputEpoch++;
         resetMetricsEpoch();
     }
 
@@ -203,6 +204,12 @@ final class OboePlaybackOutput implements PlaybackOutput {
     }
 
     synchronized int outputEpoch() { return outputEpoch; }
+
+    synchronized long[] diagnosticMetrics() throws IOException {
+        readMetrics();
+        return new long[] {metrics[4], metrics[5], extendedCounters[0], extendedCounters[1],
+                extendedCounters[2], extendedCounters[3], outputEpoch};
+    }
 
     @Override public synchronized void close() throws IOException {
         if (closed) return;

@@ -1340,7 +1340,7 @@ public final class ReceiverService extends Service {
             }
 
             @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) {
-                return format != null && format.profile >= 1 && format.profile <= 3;
+                return format != null && format.profile >= 1 && format.profile <= 5;
             }
 
             @Override public void start(AoaSessionContext context) throws IOException {
@@ -1373,6 +1373,12 @@ public final class ReceiverService extends Service {
                 AudioSession session = ownedSession;
                 if (session == null || currentAudio != session) throw new IOException("AoaAudioSessionNotOwned");
                 return session.isStreamingAt(System.nanoTime());
+            }
+
+            @Override public boolean supportsPlaybackProgressExtension() { return true; }
+
+            @Override public byte[] playbackProgressPayloadExtendedV2() {
+                return ReceiverService.playbackProgressPayloadExtendedV2();
             }
 
             @Override public byte[] playbackProgressPayloadV2() {
@@ -1412,9 +1418,10 @@ public final class ReceiverService extends Service {
                 private boolean current() { return isCurrentOperation(ownerId, generation); }
 
                 @Override public boolean supportsPlaybackProgress() { return true; }
+                @Override public boolean supportsPlaybackProgressExtension() { return true; }
                 @Override public boolean supportsAudioV2() { return true; }
                 @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
-                    return supportsPcm24AudioFormatV2(format);
+                    return ReceiverService.supportsAudioFormatV2(format);
                 }
                 @Override public int openedTrackFormatV2() {
                     AudioSession session = ownedSession;
@@ -1522,6 +1529,10 @@ public final class ReceiverService extends Service {
 
                 @Override public byte[] playbackProgressPayload() {
                     return ReceiverService.playbackProgressPayload();
+                }
+
+                @Override public byte[] playbackProgressPayloadExtended(boolean audioV2) {
+                    return ReceiverService.playbackProgressPayloadExtended(audioV2);
                 }
 
                 @Override public boolean start(UdpSessionContext context,
@@ -2006,8 +2017,8 @@ public final class ReceiverService extends Service {
         String failure = "";
         try {
             UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.formatV2();
-            if (!supportsPcm24AudioFormatV2(sourceFormat))
-                throw new IOException("Unsupported audio format for high-resolution playback");
+            if (!supportsAudioFormatV2(sourceFormat))
+                throw new IOException("Unsupported audio format for playback");
             ensureRunning(session);
             boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.playbackMode);
             if (session.request.aoaContext != null) {
@@ -2024,7 +2035,8 @@ public final class ReceiverService extends Service {
                         ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
                 wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
                 wifiLock.acquire();
-                queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency);
+                queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency,
+                        UdpPacketDecoder.MAX_PLAINTEXT_BYTES / sourceFormat.frameBytes);
                 receiver = new UdpReceiver(session.request.udpContext, queue);
                 UdpReceiver receiverForThread = receiver;
                 networkThread = new Thread(() -> {
@@ -2045,7 +2057,8 @@ public final class ReceiverService extends Service {
                     lowLatency, Math.max(1, sourceFormat.sampleRate / 200));
             OpenedV2Track openedTrack = null;
             if (output == null) {
-                openedTrack = openV2AudioTrack(sourceFormat.sampleRate, AudioFormat.CHANNEL_OUT_STEREO);
+                openedTrack = openV2AudioTrack(sourceFormat.sampleRate, AudioFormat.CHANNEL_OUT_STEREO,
+                        sourceFormat.sampleFormat == 3);
                 output = new AudioTrackPlaybackOutput(openedTrack.track, openedTrack.formatCode, openedTrack.frameBytes);
                 recordOutputOpened(session, output);
             }
@@ -2165,6 +2178,7 @@ public final class ReceiverService extends Service {
                     session.trackReady = true;
                     if (session.focusState.canPlay()) {
                         output.play();
+                        markOutputEpoch(session);
                         if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
@@ -2179,6 +2193,7 @@ public final class ReceiverService extends Service {
 
             FloatPcmDriftController drift = new FloatPcmDriftController(sourceFormat.sampleRate,
                     queue.initialTargetFrames());
+            session.floatDriftController = drift;
             long driftNow = System.nanoTime();
             drift.reset(driftNow);
             long initialPlaybackHead = output.playbackHeadPosition();
@@ -2307,6 +2322,17 @@ public final class ReceiverService extends Service {
                 && format.bytesPerSample == Pcm24PackedCodec.BYTES_PER_SAMPLE && format.frameBytes == 6;
     }
 
+    static boolean supportsFloat32AudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+        return format != null && (format.profile == 4 && format.sampleRate == 48_000
+                || format.profile == 5 && format.sampleRate == 96_000)
+                && format.channels == 2 && format.sampleFormat == 3 && format.validBits == 32
+                && format.bytesPerSample == Float.BYTES && format.frameBytes == 8;
+    }
+
+    static boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+        return supportsPcm24AudioFormatV2(format) || supportsFloat32AudioFormatV2(format);
+    }
+
     String requestedOutputEnginePreference() {
         String value = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
                 .getString("output_engine", "oboeExperimental");
@@ -2337,6 +2363,7 @@ public final class ReceiverService extends Service {
             PlaybackOutput output = OboePlaybackOutput.open(sampleRate, channels, totalBudgetFrames, maxWriteFrames);
             session.playbackOutput = output;
             session.actualOutputEngine = output.engine();
+            session.outputEpoch = 1;
             session.outputFallbackReason = "";
             return output;
         } catch (IOException | RuntimeException | UnsatisfiedLinkError error) {
@@ -2394,10 +2421,16 @@ public final class ReceiverService extends Service {
         session.playbackOutput = output;
         session.audioTrack = output.audioTrack();
         session.actualOutputEngine = output.engine();
+        session.outputEpoch = 1;
     }
 
     static OpenedV2Track openV2AudioTrack(int sampleRate, int channelMask) throws IOException {
-        return chooseV2AudioTrack(Build.VERSION.SDK_INT, sampleRate, channelMask,
+        return openV2AudioTrack(sampleRate, channelMask, false);
+    }
+
+    static OpenedV2Track openV2AudioTrack(int sampleRate, int channelMask, boolean preferFloat)
+            throws IOException {
+        return chooseV2AudioTrack(Build.VERSION.SDK_INT, sampleRate, channelMask, preferFloat,
                 ReceiverService::buildV2AudioTrack);
     }
 
@@ -2407,6 +2440,18 @@ public final class ReceiverService extends Service {
 
     static OpenedV2Track chooseV2AudioTrack(int sdk, int sampleRate, int channelMask,
             V2TrackOpener opener) throws IOException {
+        return chooseV2AudioTrack(sdk, sampleRate, channelMask, false, opener);
+    }
+
+    static OpenedV2Track chooseV2AudioTrack(int sdk, int sampleRate, int channelMask,
+            boolean preferFloat, V2TrackOpener opener) throws IOException {
+        if (preferFloat) {
+            try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_FLOAT, 3); }
+            catch (IOException | RuntimeException error) {
+                throw error instanceof IOException ? (IOException) error
+                        : new IOException("Float32 AudioTrack could not be opened", error);
+            }
+        }
         IOException packed24Failure = null;
         if (sdk >= 31) {
             try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_24BIT_PACKED, 2); }
@@ -2863,6 +2908,7 @@ public final class ReceiverService extends Service {
                         long playbackHead = output.playbackHeadPosition();
                         if (playbackHead >= 0) session.driftPlaybackHead.reset((int) playbackHead, driftStartNanos);
                         output.play();
+                        markOutputEpoch(session);
                         if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
@@ -3218,9 +3264,9 @@ public final class ReceiverService extends Service {
         FloatPcmFrameQueue floatQueue = session.floatQueue;
         if (floatQueue != null) floatQueue.setPaused(false);
         try {
-            long head = output.playbackHeadPosition();
-            if (head >= 0) session.driftPlaybackHead.reset((int) head, System.nanoTime());
             output.play();
+            markOutputEpoch(session);
+            resetPlaybackHeadEpoch(session, output.playbackHeadPosition());
             session.trackPlaying = true;
             session.focusState.markTrackPlaying();
             session.driftResetGeneration++;
@@ -3239,13 +3285,10 @@ public final class ReceiverService extends Service {
         output.pauseAndFlush();
         synchronized (session) {
             if (session.playbackOutput != output) return;
+            markOutputEpoch(session);
             session.trackWrittenFrames = 0;
             long playbackPosition = output.playbackHeadPosition();
-            if (playbackPosition >= 0) {
-                long resetAtNanos = System.nanoTime();
-                session.playbackActivity.resetPlaybackHead((int) playbackPosition);
-                session.driftPlaybackHead.reset((int) playbackPosition, resetAtNanos);
-            }
+            resetPlaybackHeadEpoch(session, playbackPosition);
             session.driftResetGeneration++;
             PCM_BYTES_WRITTEN.set(0);
             session.trackPlaying = false;
@@ -3510,11 +3553,104 @@ public final class ReceiverService extends Service {
 
     static byte[] playbackProgressPayload() {
         PlaybackMetrics metrics = playbackMetricsSnapshot();
+        return playbackProgressPayload(metrics);
+    }
+
+    private static byte[] playbackProgressPayload(PlaybackMetrics metrics) {
         return P5cControlProtocol.playbackProgressPayload(metrics.sampleRate, metrics.channels,
                 metrics.jitterTargetFrames, metrics.expiredFrames, metrics.queuedFrames, metrics.pendingFrames,
                 metrics.underrunCount, metrics.tcpDroppedFrames, metrics.advancing, metrics.requestedFrames,
                 metrics.acceptedFrames, metrics.effectiveFrames, metrics.capacityFrames,
                 metrics.startThresholdFrames, metrics.preRollFrames);
+    }
+
+    static byte[] playbackProgressPayloadExtended(boolean audioV2) {
+        AudioSession session = currentAudio;
+        PlaybackMetrics metrics = playbackMetricsSnapshot();
+        if (session != currentAudio) session = null;
+        byte[] base = playbackProgressPayload(metrics);
+        if (audioV2) base = P5cControlProtocol.playbackProgressPayloadV2(base,
+                session == null ? 0 : session.openedTrackFormatV2,
+                session == null ? 0 : session.openedTrackChannelsV2,
+                session == null ? 0 : session.openedTrackSampleRateV2);
+        long[] counters = new long[12];
+        java.util.Arrays.fill(counters, -1L);
+        int outputEpoch = -1;
+        int engine = 0;
+        int ringPending = -1;
+        int streamPending = -1;
+        long receiverGeneration = -1;
+        if (session != null) {
+            receiverGeneration = session.id;
+            FloatPcmFrameQueue floatQueue = session.floatQueue;
+            UdpPcmQueue pcmQueue = session.udpQueue;
+            if (session.request.aoaContext != null) {
+                AnpdAudioIngress ingress = session.request.aoaContext.ingress;
+                counters[0] = pcmQueue != null ? pcmQueue.acceptedAudioFrames() : ingress.authenticatedAudioFrames();
+            } else if (session.request.udpContext != null) {
+                UdpReceiver receiver = session.udpReceiver;
+                counters[0] = pcmQueue != null ? pcmQueue.acceptedAudioFrames()
+                        : receiver == null ? -1 : receiver.authenticatedAudioFrames();
+            }
+            if (floatQueue != null) {
+                counters[1] = floatQueue.droppedFrames();
+                counters[2] = floatQueue.expiredFrames();
+                counters[3] = floatQueue.concealedFrames();
+                counters[4] = floatQueue.insertedDriftFrames();
+                counters[5] = floatQueue.deletedDriftFrames();
+            } else if (pcmQueue != null) {
+                counters[1] = pcmQueue.droppedFrames();
+                counters[2] = pcmQueue.expiredFrames();
+                counters[3] = pcmQueue.concealedFrames();
+            }
+            FloatPcmDriftController drift = session.floatDriftController;
+            if (drift != null) counters[6] = drift.resetCount();
+            PlaybackOutput output = session.playbackOutput;
+            if (output != null) {
+                outputEpoch = session.outputEpoch;
+                engine = "oboeExperimental".equals(session.actualOutputEngine) ? 2
+                        : "audioTrack".equals(session.actualOutputEngine) ? 1 : 0;
+                counters[7] = session.trackWrittenFrames;
+                try {
+                    long position = output.playbackHeadPosition();
+                    if (position >= 0) counters[8] = session.playbackActivity.playedFrames((int) position);
+                    long pending = position < 0 ? -1
+                            : output.pendingFrames(session.trackWrittenFrames, counters[8]);
+                    if (output instanceof OboePlaybackOutput) {
+                        long[] nativeMetrics = ((OboePlaybackOutput) output).diagnosticMetrics();
+                        ringPending = (int) nativeMetrics[0];
+                        streamPending = (int) nativeMetrics[1];
+                        counters[9] = nativeMetrics[3];
+                        counters[10] = nativeMetrics[4];
+                        counters[11] = nativeMetrics[5];
+                        outputEpoch = (int) nativeMetrics[6];
+                    } else if (pending >= 0) streamPending = (int) pending;
+                } catch (IOException | RuntimeException unavailable) {
+                    ringPending = -1;
+                    streamPending = -1;
+                }
+            }
+        }
+        return P5cControlProtocol.playbackProgressPayloadExtended(base,
+                android.os.SystemClock.elapsedRealtimeNanos(), receiverGeneration, outputEpoch, engine,
+                counters, ringPending, streamPending);
+    }
+
+    static byte[] playbackProgressPayloadExtendedV2() {
+        return playbackProgressPayloadExtended(true);
+    }
+
+    private static void markOutputEpoch(AudioSession session) { session.outputEpoch++; }
+
+    private static void resetPlaybackHeadEpoch(AudioSession session, long playbackPosition) {
+        if (playbackPosition >= 0) {
+            int head = (int) playbackPosition;
+            session.playbackActivity.resetPlaybackHead(head);
+            session.driftPlaybackHead.reset(head, System.nanoTime());
+        } else {
+            session.playbackActivity.resetPlaybackHeadUnavailable();
+            session.driftPlaybackHead.reset();
+        }
     }
 
     static boolean udpQueueActive() {
@@ -3651,6 +3787,8 @@ public final class ReceiverService extends Service {
         final Pcm16FrameStream.PlaybackHeadTracker driftPlaybackHead =
                 new Pcm16FrameStream.PlaybackHeadTracker();
         volatile long driftResetGeneration;
+        volatile FloatPcmDriftController floatDriftController;
+        volatile int outputEpoch;
         volatile int driftLastOutputDiscontinuities = -1;
         volatile int oboeXrunCount = -1;
         volatile AudioTrack audioTrack;

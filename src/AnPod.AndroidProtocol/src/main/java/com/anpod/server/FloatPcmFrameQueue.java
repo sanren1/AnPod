@@ -15,10 +15,11 @@ public final class FloatPcmFrameQueue {
     private static final int GAP_WAIT_MS = 5;
     private static final long NANOS_PER_MILLI = 1_000_000L;
     private static final int CHANNELS = 2;
-    private static final int MAX_PACKET_FRAMES = 1150 / (CHANNELS * Pcm24PackedCodec.BYTES_PER_SAMPLE);
+    private static final int DEFAULT_MAX_PACKET_FRAMES = 1150 / (CHANNELS * Pcm24PackedCodec.BYTES_PER_SAMPLE);
 
     private final ArrayList<Packet> packets;
     private final int sampleRate;
+    private final int maxPacketFrames;
     private final int initialTargetFrames;
     private final int maxQueuedFrames;
     private final long maxPacketAgeNanos;
@@ -45,15 +46,21 @@ public final class FloatPcmFrameQueue {
     private long deletedDriftFrames;
 
     public FloatPcmFrameQueue(int sampleRate, boolean lowLatency) {
+        this(sampleRate, lowLatency, DEFAULT_MAX_PACKET_FRAMES);
+    }
+
+    public FloatPcmFrameQueue(int sampleRate, boolean lowLatency, int maxPacketFrames) {
         if (sampleRate <= 0) throw new IllegalArgumentException("sample rate must be positive");
+        if (maxPacketFrames <= 0) throw new IllegalArgumentException("max packet frames must be positive");
         this.sampleRate = sampleRate;
+        this.maxPacketFrames = maxPacketFrames;
         int initialMs = lowLatency ? LOW_LATENCY_INITIAL_MS : BALANCED_INITIAL_MS;
         int maxMs = lowLatency ? LOW_LATENCY_MAX_MS : BALANCED_MAX_MS;
         initialTargetFrames = framesForMillis(sampleRate, initialMs);
         maxQueuedFrames = framesForMillis(sampleRate, maxMs);
         maxPacketAgeNanos = maxMs * NANOS_PER_MILLI;
         int framesPerWindow = framesForMillis(sampleRate, MIN_PACKET_WINDOW_MS);
-        int packetsPerWindow = (framesPerWindow + MAX_PACKET_FRAMES - 1) / MAX_PACKET_FRAMES;
+        int packetsPerWindow = (framesPerWindow + maxPacketFrames - 1) / maxPacketFrames;
         int expectedPacketCapacity = ((maxMs + MIN_PACKET_WINDOW_MS - 1) / MIN_PACKET_WINDOW_MS) * packetsPerWindow;
         packets = new ArrayList<>(expectedPacketCapacity);
         fadeFrames = Math.max(1, framesForMillis(sampleRate, FADE_MS));
@@ -67,7 +74,7 @@ public final class FloatPcmFrameQueue {
     /** Explicit arrival time keeps expiry and pressure behavior deterministic in CPU checks. */
     public synchronized boolean offer(long frameIndex, float[] samples, int frameCount, long nowNanos) {
         if (samples == null) throw new NullPointerException("samples");
-        if (frameCount <= 0 || frameCount > 1150 / (CHANNELS * Pcm24PackedCodec.BYTES_PER_SAMPLE)
+        if (frameCount <= 0 || frameCount > maxPacketFrames
                 || (long) frameCount * CHANNELS != samples.length) {
             throw new IllegalArgumentException("Float32 packet must contain whole, bounded stereo frames");
         }

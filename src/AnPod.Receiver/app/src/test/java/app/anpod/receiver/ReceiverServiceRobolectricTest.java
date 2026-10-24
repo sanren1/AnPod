@@ -69,6 +69,8 @@ public final class ReceiverServiceRobolectricTest {
         int openCalls, startCalls, closeCalls, closeFailures;
         int sampleRate, channels, budgetFrames, ringFrames, acceptedFrames;
         int openStatus, startStatus, zeroWrites, pauseAndFlushStatus;
+        int headOnStart = Integer.MIN_VALUE;
+        boolean headAvailable = true;
         Runnable onZeroWrite;
         Runnable onPauseRequest;
         Runnable onPauseAndFlush;
@@ -112,12 +114,14 @@ public final class ReceiverServiceRobolectricTest {
         @Override public int pauseAndFlush(long handle) {
             pauseAndFlushCalls++;
             if (onPauseAndFlush != null) onPauseAndFlush.run();
-            if (pauseAndFlushStatus == 0) acceptedFrames = 0;
+            if (pauseAndFlushStatus == 0) { acceptedFrames = 0; headAvailable = false; }
             return pauseAndFlushStatus;
         }
         @Override public int start(long handle, int[] info) {
             startCalls++;
             acceptedAtStart = acceptedFrames;
+            if (headOnStart != Integer.MIN_VALUE) reportedHead = headOnStart;
+            headAvailable = true;
             return startStatus;
         }
         @Override public int setVolume(long handle, float volume) {
@@ -128,7 +132,8 @@ public final class ReceiverServiceRobolectricTest {
             if (onGetMetrics != null) onGetMetrics.run();
             metrics[0] = acceptedFrames;
             metrics[1] = acceptedFrames;
-            metrics[4] = 0; metrics[5] = 0; metrics[6] = reportedHead; metrics[7] = reportedHead;
+            metrics[4] = 0; metrics[5] = headAvailable ? 0 : -1;
+            metrics[6] = reportedHead; metrics[7] = reportedHead;
             metrics[8] = 13; metrics[10] = 0;
             timestamp[0] = -1; timestamp[1] = -1;
             return metricsStatus;
@@ -833,6 +838,67 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void oboePauseResumeResetsPlaybackHeadTrackersAtNewStreamEpoch() throws Exception {
+        FakeOboeCalls nativeCalls = new FakeOboeCalls();
+        nativeCalls.reportedHead = 9_000;
+        nativeCalls.headOnStart = 9_000;
+        OboeNativeBridge.setTestCalls(nativeCalls);
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        UdpSessionContext context = new UdpSessionContext(
+                new InetSocketAddress(loopback, 0), new InetSocketAddress(loopback, 12345),
+                96, new byte[32], "lowlatency");
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(97,
+                ReceiverService.AudioRequest.udp(context), "test-owner", 1);
+        session.requestedOutputEngine = "oboeExperimental";
+        session.actualOutputEngine = "unknown";
+        session.trackReady = true;
+        session.trackPlaying = true;
+        ReceiverService.currentAudio = session;
+        PlaybackOutput output = null;
+        try {
+            output = service.openOboeOutputIfRequested(session, 48_000, 2, true, 240);
+            assertNotNull(output);
+            session.playbackOutput = output;
+            output.play();
+            session.playbackActivity.resetPlaybackHead(0);
+            assertEquals(9_000, session.playbackActivity.playedFrames(9_000));
+            session.driftPlaybackHead.reset(0, System.nanoTime());
+            assertEquals(9_000, session.driftPlaybackHead.update(9_000));
+            session.trackWrittenFrames = 10_000;
+
+            Method pause = ReceiverService.class.getDeclaredMethod("setUdpAudioPaused",
+                    ReceiverService.AudioSession.class, boolean.class);
+            pause.setAccessible(true);
+            pause.invoke(service, session, true);
+            assertEquals(-1, output.playbackHeadPosition());
+
+            nativeCalls.headOnStart = 0;
+            pause.invoke(service, session, false);
+            assertEquals(0, output.playbackHeadPosition());
+            assertEquals(0, session.playbackActivity.playedFrames(0));
+            assertEquals(0, session.driftPlaybackHead.update(0));
+
+            byte[] progress = ReceiverService.playbackProgressPayloadExtended(false);
+            assertEquals(0, P5cControlProtocol.getLong(progress, 70 + 22 + 8 * 8));
+            long now = System.nanoTime();
+            session.playbackActivity.noteSuccessfulWrite(now);
+            nativeCalls.reportedHead = 240;
+            assertTrue(session.playbackActivity.isActive(now + 1, 240, true, now, false));
+            assertEquals(240, session.driftPlaybackHead.update(240, now + 1));
+            assertTrue(session.driftPlaybackHead.isAdvancing(now + 1));
+            progress = ReceiverService.playbackProgressPayloadExtended(false);
+            assertEquals(240, P5cControlProtocol.getLong(progress, 70 + 22 + 8 * 8));
+        } finally {
+            service.onDestroy();
+            if (output != null) output.close();
+            context.destroy();
+            OboeNativeBridge.setTestCalls(null);
+            resetWaveformForTest();
+        }
+    }
+
+    @Test
     public void userPauseSerializesMuteAndIgnoresFlushFailureAfterStop() throws Exception {
         FakeOboeCalls nativeCalls = new FakeOboeCalls();
         OboeNativeBridge.setTestCalls(nativeCalls);
@@ -1047,6 +1113,33 @@ public final class ReceiverServiceRobolectricTest {
                 UdpPacketDecoder.AudioFormatV2.forProfile(3, 1)));
         assertFalse(ReceiverService.supportsPcm24AudioFormatV2(
                 UdpPacketDecoder.AudioFormatV2.forProfile(1, 0)));
+    }
+
+    @Test
+    public void v2PolicyAcceptsOnlyTheExact48And96KhzFloatProfiles() {
+        assertTrue(ReceiverService.supportsFloat32AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(4, 0)));
+        assertTrue(ReceiverService.supportsFloat32AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(5, 1)));
+        assertFalse(ReceiverService.supportsFloat32AudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0)));
+        assertTrue(ReceiverService.supportsAudioFormatV2(
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0)));
+    }
+
+    @Test
+    public void float32InputUsesOnlyFloatAudioTrackWithoutPcm24QuantizationFallback() throws Exception {
+        int[] attempts = {0};
+        ReceiverService.OpenedV2Track opened = ReceiverService.chooseV2AudioTrack(34, 96_000,
+                AudioFormat.CHANNEL_OUT_STEREO, true, (sampleRate, channelMask, encoding, formatCode) -> {
+                    attempts[0]++;
+                    assertEquals(96_000, sampleRate);
+                    assertEquals(AudioFormat.ENCODING_PCM_FLOAT, encoding);
+                    assertEquals(3, formatCode);
+                    return new ReceiverService.OpenedV2Track(null, formatCode, 1, 8);
+                });
+        assertEquals(1, attempts[0]);
+        assertEquals(3, opened.formatCode);
     }
 
     @Test

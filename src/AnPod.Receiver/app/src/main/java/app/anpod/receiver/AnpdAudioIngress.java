@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import com.anpod.server.FloatPcmFrameQueue;
+import com.anpod.server.Float32LeCodec;
 import com.anpod.server.Pcm24PackedCodec;
 
 import java.io.IOException;
@@ -21,6 +22,7 @@ final class AnpdAudioIngress implements AutoCloseable {
     private volatile long lastAuthenticatedAudioAtNanos;
     private volatile long droppedFloatFrames;
     private final AtomicLong authenticatedAudioPayloadBytes = new AtomicLong();
+    private final AtomicLong authenticatedAudioFrames = new AtomicLong();
 
     private AnpdAudioIngress(long sessionId, byte[] key, UdpPacketDecoder.AudioFormatV2 formatV2,
             UdpPcmQueue pcmQueue, FloatPcmFrameQueue floatQueue, boolean requireFormatBeforeAudio) {
@@ -78,6 +80,7 @@ final class AnpdAudioIngress implements AutoCloseable {
     }
     long droppedFrames() { return pcmQueue == null ? droppedFloatFrames : pcmQueue.droppedFrames(); }
     long authenticatedAudioPayloadBytes() { return authenticatedAudioPayloadBytes.get(); }
+    long authenticatedAudioFrames() { return authenticatedAudioFrames.get(); }
 
     void fail(IOException error) {
         if (pcmQueue != null) pcmQueue.fail(error); else floatQueue.fail(error);
@@ -104,8 +107,16 @@ final class AnpdAudioIngress implements AutoCloseable {
         hasAuthenticatedAudio = true;
         lastAuthenticatedAudioAtNanos = System.nanoTime();
         float[] samples = new float[frameCount * formatV2.channels];
-        Pcm24PackedCodec.decodeToFloat(packet.payload, 0, samples.length, samples, 0);
+        try {
+            if (formatV2.sampleFormat == 3)
+                Float32LeCodec.decode(packet.payload, 0, samples.length, samples, 0);
+            else
+                Pcm24PackedCodec.decodeToFloat(packet.payload, 0, samples.length, samples, 0);
+        } catch (IllegalArgumentException invalidSample) {
+            throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT, invalidSample);
+        }
         decoder.commit(packet.sequence);
+        authenticatedAudioFrames.addAndGet(frameCount);
         if (!floatQueue.offer(packet.sampleFrameIndex, samples, frameCount)) droppedFloatFrames += frameCount;
     }
 

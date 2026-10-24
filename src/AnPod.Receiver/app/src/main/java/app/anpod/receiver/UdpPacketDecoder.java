@@ -141,11 +141,14 @@ final class UdpPacketDecoder {
             this.sampleRate = sampleRate; this.frameBytes = frameBytes;
         }
         static AudioFormatV2 forProfile(int profile, int mode) {
-            if (profile < 1 || profile > 3 || mode < 0 || mode > 1)
+            if (profile < 1 || profile > 5 || mode < 0 || mode > 1)
                 throw new IllegalArgumentException("unsupported v2 audio profile");
-            boolean high = profile != 1;
-            return new AudioFormatV2(profile, high ? 2 : 1, 2, high ? 24 : 16, high ? 3 : 2,
-                    mode, profile == 3 ? 96000 : 48000, high ? 6 : 4);
+            if (profile == 1) return new AudioFormatV2(profile, 1, 2, 16, 2, mode, 48000, 4);
+            if (profile == 2 || profile == 3)
+                return new AudioFormatV2(profile, 2, 2, 24, 3, mode,
+                        profile == 3 ? 96000 : 48000, 6);
+            return new AudioFormatV2(profile, 3, 2, 32, 4, mode,
+                    profile == 5 ? 96000 : 48000, 8);
         }
         byte[] encode() {
             ByteBuffer b = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN);

@@ -36,7 +36,7 @@ public class AoaReceiverCoordinatorTest {
     }
 
     @Test public void authenticatedProfilesRegisterBeforeStartAckAndStopAfterAck() throws Exception {
-        for (int profile = 1; profile <= 3; profile++) runProfile(profile);
+        for (int profile = 1; profile <= 5; profile++) runProfile(profile);
     }
 
     @Test public void phoneStopIsReportedOnNextNonHeartbeatAck() throws Exception {
@@ -103,13 +103,20 @@ public class AoaReceiverCoordinatorTest {
             }
             try (hostSession) {
                 keys = hostSession.takeKeys();
+                int requiredCapabilities = P5cControlProtocol.CAP_AUDIO_V2
+                        | (format.sampleFormat == 3 ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
+                        | P5cControlProtocol.CAP_PROGRESS_EXT;
                 sendControl(io, keys, hostSession.sessionId, 0, P5cControlProtocol.CAPABILITIES_QUERY,
-                        P5cControlProtocol.capabilitiesQueryPayload(3, 1, P5cControlProtocol.CAP_AUDIO_V2));
+                        P5cControlProtocol.capabilitiesQueryPayload(3, 1, requiredCapabilities));
                 P5cControlProtocol.Frame caps = receiveControl(io, keys, hostSession.sessionId,
                         P5cControlProtocol.CAPABILITIES_INFO);
                 assertEquals(0, caps.payload[11]);
                 assertEquals(P5cControlProtocol.CAP_AUDIO_V2,
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AUDIO_V2);
+                assertEquals(format.sampleFormat == 3 ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AUDIO_FLOAT32);
+                assertEquals(P5cControlProtocol.CAP_PROGRESS_EXT,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_PROGRESS_EXT);
 
                 sendControl(io, keys, hostSession.sessionId, 1, P5cControlProtocol.BIND, new byte[] {0, 0});
                 assertAck(io, keys, hostSession.sessionId, 1, P5cControlProtocol.BIND,
@@ -153,8 +160,16 @@ public class AoaReceiverCoordinatorTest {
                     assertEquals(3, stopped.payload[9] & 0xff);
                     assertEquals(P5cReceiverCoordinator.STATE_STOPPED, stopped.payload[10] & 0xff);
                 } else {
-                    sendControl(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP, new byte[0]);
-                    assertAck(io, keys, hostSession.sessionId, 6, P5cControlProtocol.STOP,
+                    sendControl(io, keys, hostSession.sessionId, 6,
+                            P5cControlProtocol.PLAYBACK_PROGRESS_QUERY, new byte[0]);
+                    assertEquals(13 + 78, receiveControl(io, keys, hostSession.sessionId,
+                            P5cControlProtocol.ACK).payload.length);
+                    sendControl(io, keys, hostSession.sessionId, 7, P5cControlProtocol.PLAYBACK_PROGRESS_QUERY,
+                            new byte[] {2});
+                    assertEquals(13 + 204, receiveControl(io, keys, hostSession.sessionId,
+                            P5cControlProtocol.ACK).payload.length);
+                    sendControl(io, keys, hostSession.sessionId, 8, P5cControlProtocol.STOP, new byte[0]);
+                    assertAck(io, keys, hostSession.sessionId, 8, P5cControlProtocol.STOP,
                             P5cReceiverCoordinator.STATE_STOPPED);
                 }
                 assertTrue(coordinator.awaitTermination(3, TimeUnit.SECONDS));
@@ -221,13 +236,15 @@ public class AoaReceiverCoordinatorTest {
         volatile AoaSessionContext context;
         volatile boolean stopped;
         @Override public boolean isCurrent(String ownerId, long generation) { return true; }
-        @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return format.profile >= 1 && format.profile <= 3; }
+        @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return format.profile >= 1 && format.profile <= 5; }
         @Override public void start(AoaSessionContext context) { this.context = context; }
         @Override public void pause() { }
         @Override public void resume() { }
         @Override public void stop() { stopped = true; }
         @Override public boolean streaming() { return false; }
+        @Override public boolean supportsPlaybackProgressExtension() { return true; }
         @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+        @Override public byte[] playbackProgressPayloadExtendedV2() { return new byte[204]; }
     }
 
     private static final class Duplex {
