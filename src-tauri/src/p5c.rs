@@ -2360,6 +2360,22 @@ fn run_session_owner(
             paused,
             last_error.clone(),
         );
+        profile = match profile_for_mode(profile, parameters.mode) {
+            Ok(profile) => profile,
+            Err(error) => {
+                last_error = Some(error);
+                publish_session(
+                    &status,
+                    SessionLifecycleState::Stopped,
+                    generation,
+                    attempts,
+                    None,
+                    paused,
+                    last_error.clone(),
+                );
+                break 'owner;
+            }
+        };
         let result = HostSession::authenticate_for_profile(
             endpoint,
             &binding,
@@ -2560,16 +2576,6 @@ fn run_session_owner(
                     }
                     Ok(OwnerCommand::SetMode(mode)) => {
                         parameters.mode = mode;
-                        if let HostAudioProfile::Pcm24(current) = profile {
-                            profile = match AudioFormatV2::for_profile(current.profile, mode) {
-                                Ok(format) => HostAudioProfile::Pcm24(format),
-                                Err(error) => {
-                                    management_error = Some(error.to_string());
-                                    restart = true;
-                                    break;
-                                }
-                            };
-                        }
                         // The phone applies a playback mode only in a fresh handshake, so this
                         // restarts the session. Start the recovery window here: without it a failed
                         // switch could report "reconnecting" forever.
@@ -2985,15 +2991,6 @@ fn run_session_owner(
                         continue;
                     }
                     parameters.mode = mode;
-                    if let HostAudioProfile::Pcm24(current) = profile {
-                        match AudioFormatV2::for_profile(current.profile, mode) {
-                            Ok(format) => profile = HostAudioProfile::Pcm24(format),
-                            Err(error) => {
-                                last_error = Some(error.to_string());
-                                break;
-                            }
-                        }
-                    }
                     if let Err(error) = session.stop() {
                         last_error = Some(error);
                     }
@@ -3069,13 +3066,7 @@ fn run_session_owner(
         if stop_owner || !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
             break 'owner;
         }
-        if endpoint_changed {
-            recovery_started_at = None;
-            status
-                .lock()
-                .expect("P5-D session status lock poisoned")
-                .recovery_started_at = None;
-        } else if last_active_at.is_some() && recovery_started_at.is_none() {
+        if last_active_at.is_some() && recovery_started_at.is_none() {
             recovery_started_at = Some(Instant::now());
             status
                 .lock()
@@ -3142,10 +3133,8 @@ fn run_session_owner(
         .expect("P5-D Float32 queue lock poisoned") = None;
     {
         let mut current = status.lock().expect("P5-D session status lock poisoned");
-        if current.terminal_cause.is_none() {
-            if last_error.is_some() {
-                current.terminal_cause = Some(TerminalCause::TransportFailure);
-            }
+        if current.terminal_cause.is_none() && last_error.is_some() {
+            current.terminal_cause = Some(TerminalCause::TransportFailure);
         }
     }
     publish_session(
@@ -3332,6 +3321,15 @@ fn lifecycle_retry_delay(delays: &[Duration; 4], attempt: usize) -> Duration {
 
 fn recovery_window_expired(active_since: Option<Instant>, window: Duration, now: Instant) -> bool {
     active_since.is_some_and(|active_since| now.saturating_duration_since(active_since) >= window)
+}
+
+fn profile_for_mode(profile: HostAudioProfile, mode: u8) -> Result<HostAudioProfile, String> {
+    match profile {
+        HostAudioProfile::Standard => Ok(HostAudioProfile::Standard),
+        HostAudioProfile::Pcm24(format) => AudioFormatV2::for_profile(format.profile, mode)
+            .map(HostAudioProfile::Pcm24)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn random_request_id() -> Result<[u8; 16], String> {

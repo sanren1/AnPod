@@ -270,3 +270,7 @@ enum class ConnectionChoice { USB_DIRECT, USB_ADB, WIFI }
 **离线验证**：当前完整 JVM 13 suites / 94 tests、0 failures/errors/skipped；`lintDebug` 执行成功，原始 XML 为0 Error、59 Warning、4 Information，`assembleDebug` 通过。原始记录在 `artifacts/ui-refresh-20261022/android-ci/`，lint XML 在 `src/AnPod.Receiver/app/build/reports/lint-results-debug.xml`；未比较同条件基线，不判定警告新旧比例。release APK 已沿用原发布证书构建，`sourceModified=false`，元数据在 `artifacts/ui-refresh-20261022-receiver41/receiver.json`。这不是实机验收记录。
 
 **实机边界**：按用户要求不重启旧实机核查；本轮未安装或操作手机。实际三链路、配件权限/热插拔、AOD、动态色/字体/横屏及 TalkBack 仍为 **NOT_TESTED**。因此以上涉及实机的验收勾选不凭编译或 JVM 结果勾为通过。最终独立复审与交付汇总见主规划第15节。
+
+**后续指令与当前源码（2026-10-24）**：以 `82e82ec`、Receiver0.19.1/code43为准，AnPod顶栏固定、仅正文滚动，Direct/ADB/Wi-Fi始终横排，覆盖旧窄屏纵排草案。常显设置与进入常显为同式等宽横排按钮。AOD实际显示为英文居中参数、`|`分隔；可选协议/接收/缓冲/丢包，加实际音频格式/输出引擎/欠载次数三项，后三项默认关闭。设置内提供静态小预览，无新增采样或计时器；字号、笔宽和显示项持久化。
+
+本轮14套98项JVM测试零失败，原始XML位于 `artifacts/project-review-20261023/aod-refine/unit-test-xml/`；完整测试stdout未保存。之后仅删除本轮未调用资源，lint和Debug构建再次成功，最终lint0 Error/59 Warning/5 Information。证据在同目录，不把旧app/build报告当作本轮隔离输出；实机边界保持上述NOT_TESTED。

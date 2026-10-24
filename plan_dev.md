@@ -710,3 +710,11 @@ PC 已新增 Receiver38 的精确审计行，旧版本接受范围和签名/哈�
 已基于用户新增 `AnPod_PC_Soft_Minimal_UI_UX_Plan_v2/` 完成PC展示增量；手机连接方式固定横排、AnPod顶栏固定，仅正文滚动；常显设置与预览同排，支持80–120%时钟字号、三档波形粗细及四项真实指标开关并持久保存。业务源码 `aa36590`，精确Receiver42登记 `4a8272d`，桌面封包来源 `a703bb2`。PC1.12.0 / Receiver0.19.0-v3-flow-candidate/code42。
 
 PC九项浏览器检查、32矩阵样本通过；Android此前全量97项通过，独立审查两项修订后定向3项、lint和Debug构建通过（不称最后又全量重跑），lint0 Error/59 Warning/5 Information（独立审查复核XML后更正）。独立Astra medium代码审查及制品审计均PASS；实机/模拟器UI、TalkBack、Windows DPI/权限、三链路和音频仍NOT_TESTED。证据 `artifacts/ui-v2-aod-20261023/`，制品及完整哈希见UI总规划第18节；ZIP52文件独立核对一致，原签名/来源/登记/README/许可证全部通过。便携包 `artifacts/AnPod-1.12.0-tauri-win-x64-portable.zip` 含原签名Receiver42，保留全部旧包和三个用户缓存，未推送或远程发布。
+
+## 2026-10-24 · AOD细化与整体复审
+
+PC1.12.1 / Receiver0.19.1-v3-flow-candidate/code43。`82e82ec`完成AOD英文居中竖线参数、三项默认关闭的真实监控指标、设置内静态小预览、同式等宽“常显设置／进入常显”入口，以及PC设置保存三路径的pending/失败/旧值重试。首页分隔线与间距修订为 `f295d4f` / `61add73`，本轮新包才包含它们。
+
+连接owner已修复有限恢复窗口与PCM24 mode同步；旧模式切换fixture节拍缺陷已定位并修正，未放宽3会话/11520字节/3STOP等断言。最终P5-C27项、Rust串行151项通过（0失败，1忽略，2实机测试过滤）；fmt/Clippy通过，精确Receiver43实际制品读取1/1通过。Android14套98项XML零失败，后续只删弃用资源后lint/Debug再次成功，lint0/59/5；PC默认59项布尔、确认12项、保存19项及调用数检查全真，零页面错误。完整证据与失败尝试边界见UI总规划第19节和 `artifacts/project-review-20261023/`，不混用历史计数。
+
+从本轮起独立审查按用户最新指令使用GPT 6.1 sol high，停止Astra；执行代理保持GPT 6 luna high。Receiver43沿用原发布密钥，来源 `82e82ec`、sourceModified=false，SHA-256 `f912db8dc39935b7d0c3c23dbcf8d54d8053f484e5cb8524b9bba989022f3161`。本地便携包及最终审计待交付记录，未推送、未操作手机。实机与生产性能仍NOT_TESTED；C#未改且无.NET SDK，未称整套GitHub CI均已本地执行。

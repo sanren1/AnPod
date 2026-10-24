@@ -1004,21 +1004,18 @@ impl AppState {
         &self,
         disconnect_current: bool,
     ) -> Result<UsbDirectConfiguration, String> {
-        let configuration_id = loop {
-            let id = self
-                .usb_direct_configuration_sequence
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1)
-                .max(1);
-            if self
-                .usb_direct_configuration_id
-                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break id;
-            }
+        let configuration_id = self
+            .usb_direct_configuration_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1);
+        if self
+            .usb_direct_configuration_id
+            .compare_exchange(0, configuration_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err("USB Direct 配置窗口已处于打开状态。".into());
-        };
+        }
         let result = async {
             self.prepare_usb_direct_configuration_operation()?;
             let _gate = self.gate.lock().await;
@@ -2325,7 +2322,6 @@ impl AppState {
                     self.emit(app);
                 }
             }
-            return;
         }
 
         // Discovery updates the UI; it never establishes a connection.
@@ -2723,6 +2719,8 @@ impl AppState {
     }
 
     #[cfg(windows)]
+    // Recovery inputs must stay frozen to the generation observed by the caller.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_aoa_session_locked(
         &self,
         app: &AppHandle,
@@ -2894,6 +2892,8 @@ impl AppState {
         self.recovering.store(false, Ordering::Release);
     }
 
+    // Recovery inputs must stay frozen to the generation observed by the caller.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_session_locked(
         &self,
         app: &AppHandle,

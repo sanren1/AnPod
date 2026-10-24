@@ -1784,6 +1784,112 @@ fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
 }
 
 #[test]
+fn mode_change_with_unavailable_endpoint_stops_after_recovery_window() {
+    let classes = compile_java_endpoint();
+    let (child, _stdout, peer) = spawn_mode_switch_endpoint(&classes);
+    let mut child = ChildGuard::new(child);
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(15); 4],
+        recovery_window: Duration::from_millis(100),
+    };
+    let mut owner = SessionOwner::start_with_endpoint(
+        SessionEndpoint::on_interface(&interface, peer),
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 1,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning
+    });
+    child
+        .child_mut()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"close")
+        .unwrap();
+    owner.set_mode(0).unwrap();
+
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    let attempts = stopped.attempts;
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        owner.snapshot().attempts,
+        attempts,
+        "stopped recovery must not keep authenticating"
+    );
+    assert!(
+        owner.pcm_queue().is_none(),
+        "failed recovery must clear the old PCM queue"
+    );
+    owner.stop();
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
+    let mut profile = HostAudioProfile::Pcm24(format);
+    let mut parameters = AudioParameters {
+        sample_rate: 96_000,
+        channels: 2,
+        mode: 0,
+    };
+    let (commands, receiver) = mpsc::channel();
+    commands.send(OwnerCommand::SetMode(1)).unwrap();
+    let mut endpoint = SessionEndpoint::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+    let cancellation = CancellationToken::new();
+    let enabled = AtomicBool::new(true);
+    let mut paused = false;
+    assert!(matches!(
+        wait_for_reconnect(
+            Duration::from_secs(1),
+            &receiver,
+            &cancellation,
+            &enabled,
+            &mut endpoint,
+            &mut parameters,
+            &mut paused,
+        ),
+        RetryWait::ReconnectNow
+    ));
+    profile = profile_for_mode(profile, parameters.mode).unwrap();
+    let HostAudioProfile::Pcm24(reconnect_format) = profile else {
+        panic!("PCM24 profile must be preserved during recovery mode changes");
+    };
+    assert_eq!(reconnect_format, AudioFormatV2::for_profile(3, 1).unwrap());
+
+    parameters.mode = 1;
+    let (commands, receiver) = mpsc::channel();
+    commands.send(OwnerCommand::SetMode(0)).unwrap();
+    assert!(matches!(
+        apply_pending_commands(
+            &receiver,
+            &mut endpoint,
+            &mut parameters,
+            &mut paused,
+            &enabled,
+        ),
+        PendingCommands::ModeChanged
+    ));
+    profile = profile_for_mode(profile, parameters.mode).unwrap();
+    let HostAudioProfile::Pcm24(pending_format) = profile else {
+        panic!("PCM24 profile must be preserved during pending mode changes");
+    };
+    assert_eq!(pending_format, AudioFormatV2::for_profile(3, 0).unwrap());
+}
+
+#[test]
 fn legacy_receiver_disconnect_stops_without_guessing_recovery() {
     let classes = compile_java_endpoint();
     let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes, true);
@@ -3608,19 +3714,26 @@ fn mode_change_uses_a_fresh_session_and_preserves_pause() {
         status.state == SessionLifecycleState::ReceiverRunning
     });
 
-    // One 10 ms synthetic WASAPI capture block is split into two 5 ms UDP
-    // packets and sent as a burst, as the production sender does.
+    // Two 10 ms synthetic capture blocks follow each other at the production
+    // callback cadence; each block is split into two 5 ms UDP packets.
     let old_queue = owner.pcm_queue().unwrap();
     let first_block = vec![0x2345i16; 480 * 2];
     assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 0));
-    wait_for_owner(&owner, |status| {
-        status.state == SessionLifecycleState::Streaming
-    });
     thread::sleep(Duration::from_millis(10));
     assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 480));
     wait_for_owner(&owner, |status| {
         status.state == SessionLifecycleState::Streaming
     });
+    let initial_audio_deadline = Instant::now() + Duration::from_secs(2);
+    while owner.pcm_payload_bytes_sent() < 960 * 2 * 2 {
+        assert!(
+            Instant::now() < initial_audio_deadline,
+            "both initial mode-switch capture blocks were not sent"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Consume the 20 ms of pre-pause audio before SetPaused clears the receiver queue.
+    thread::sleep(Duration::from_millis(30));
 
     owner.set_mode(1).unwrap();
     thread::sleep(Duration::from_millis(30));
