@@ -192,7 +192,7 @@ $metadata = [ordered]@{
     signerSha256 = $signerSha256
     sourceCommit = $sourceCommit
     sourceInputsSha256 = $sourceInputsSha256
-    sourceModified = @(& git -C $root status --porcelain=v1 -- @inputPaths).Count -gt 0
+    sourceModified = (Test-AnPodSourceModified -Root $root -Paths $inputPaths)
 }
 if ((Get-AnPodSourceSnapshot $root $inputPaths) -ne $sourceInputsSha256) { throw 'Receiver source inputs changed during the build.' }
 $metadataJson = $metadata | ConvertTo-Json

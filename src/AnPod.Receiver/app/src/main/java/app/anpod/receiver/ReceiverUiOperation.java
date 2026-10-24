@@ -83,6 +83,13 @@ final class ReceiverUiOperation {
         return true;
     }
 
+    boolean clearFailure(String owner, String expectedError) {
+        if (!owns(owner) || !FAILED.equals(phase) || !error.equals(expectedError)) return false;
+        phase = STOPPED;
+        error = "";
+        return true;
+    }
+
     static String displayState(String networkState, boolean hasAudioSession, boolean audioActive) {
         if (hasAudioSession) {
             if ("paused".equals(networkState)) return "paused";

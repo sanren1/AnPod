@@ -92,6 +92,11 @@ pub struct ReceiverStatus {
     pub foreground: bool,
     pub healthy: bool,
     pub audio_active: bool,
+    pub operation_owner_id: Option<String>,
+    pub operation_generation: Option<u64>,
+    pub terminal_cause: Option<String>,
+    pub terminal_owner_id: Option<String>,
+    pub terminal_generation: Option<u64>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
     pub error: Option<String>,
     pub message: String,
@@ -120,9 +125,20 @@ pub struct PlaybackDiagnostics {
     pub capacity_frames: Option<u32>,
     pub start_threshold_frames: Option<u32>,
     pub pre_roll_frames: Option<u32>,
+    pub output_format: Option<u8>,
+    pub opened_track_channels: Option<u8>,
+    pub output_sample_rate: Option<u32>,
 }
 
 impl ReceiverStatus {
+    pub fn was_stopped_by_user_for(&self, owner_id: Option<&str>, generation: Option<u64>) -> bool {
+        self.terminal_cause.as_deref() == Some("USER_STOP")
+            && owner_id.is_some()
+            && owner_id == self.terminal_owner_id.as_deref()
+            && generation.is_some()
+            && generation == self.terminal_generation
+    }
+
     pub fn monitoring_error(&self) -> Option<String> {
         if self.healthy && self.service_active && self.error.is_none() {
             None
@@ -157,6 +173,83 @@ struct AuditedReceiverArtifact {
 // Every shipped APK must be added here after release, or the next version cannot
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "f912db8dc39935b7d0c3c23dbcf8d54d8053f484e5cb8524b9bba989022f3161",
+        version_code: 43,
+        version_name: "0.19.1-v3-flow-candidate",
+        source_commit: "82e82ec1c2f46060ea3aef4a04a2b8b4e538ddf1",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "96d9eb04f73ef3aed8054842f4d8b5f34e12f4a4e10e75d1ceb10f7045e749fb",
+        version_code: 42,
+        version_name: "0.19.0-v3-flow-candidate",
+        source_commit: "aa365903929074b4abcf3872066184140023fee9",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "cbfdd5dad8ee3e38bc704290b1bcfc95a4b488fd2d80f8d135a4baecad804e56",
+        version_code: 41,
+        version_name: "0.18.0-v3-flow-candidate",
+        source_commit: "c75856fe83579c1e0650271b0ff26e5bdebf03db",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "56578ab87996fb12b16d919f8c6996a86f13a4230703dd07f6f58c202bf2d01f",
+        version_code: 40,
+        version_name: "0.17.6-v3-flow-candidate",
+        source_commit: "3dfb08cd0487fb2ea3b1b9d20a7c508727a73486",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "a77bf771a07272bba5d7437e1d7dd69906387e256537350de990eb789fc2b0d0",
+        version_code: 39,
+        version_name: "0.17.5-v3-flow-candidate",
+        source_commit: "01f16af88b8fbc7578126daa15d0c757973cd2b1",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "01beca356daf6e5630fbce9ff5c24a3b61f5ca75b08f22ce40c1ab08a29037c7",
+        version_code: 38,
+        version_name: "0.17.4-v3-flow-candidate",
+        source_commit: "f1040de83a41e04aa659af916a99fd52055ac5d1",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "379d66041630c65f2ecfab2dedbf649441687759bfdd5d41746079be0fb4dbac",
+        version_code: 37,
+        version_name: "0.17.3-v3-flow-candidate",
+        source_commit: "17394730ee6edad41339ebb66869a41bc92b4ece",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "0f34c03b5618182fcd90f5a33883bd7a6de5f5a4696d9c1a64603f3f4983194e",
+        version_code: 36,
+        version_name: "0.17.2-v3-flow-candidate",
+        source_commit: "ce81f03b54285691b3ce602461180516b60a1d4b",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "8f8e76e4b9e2dc1e3bb8d4575f5e21e77838056b2b55536c5736eedcccf4f15f",
+        version_code: 35,
+        version_name: "0.17.1-v3-flow-candidate",
+        source_commit: "2bd998d65fe650bb225c09d7353c5c2ba39febfc",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "711c20c4348b1865d0475244271271f1fc32d70888f1f77054481bba138fed83",
+        version_code: 34,
+        version_name: "0.17.0-v3-flow-candidate",
+        source_commit: "8ca9638db128f99e36769f42de18ed9244f457c2",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
+    AuditedReceiverArtifact {
+        sha256: "c05f3407aefd7e324017ccfecd5fd431d8eb1e1e9beac4b66e4e59b4cbc0647d",
+        version_code: 33,
+        version_name: "0.16.0-v3-flow-candidate",
+        source_commit: "c299c805f8917df0f961b5174dff47fb074517e6",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
     AuditedReceiverArtifact {
         sha256: "a103232b24e1fcddb456d3d8b986ca69ec902f147c8d1665aecca1cda189ec5c",
         version_code: 32,
@@ -397,6 +490,11 @@ struct Health {
     foreground: bool,
     healthy: bool,
     audio_active: bool,
+    operation_owner_id: Option<String>,
+    operation_generation: Option<u64>,
+    terminal_cause: Option<String>,
+    terminal_owner_id: Option<String>,
+    terminal_generation: Option<u64>,
     playback_diagnostics: PlaybackDiagnostics,
     error: String,
 }
@@ -1599,6 +1697,11 @@ async fn status_with(
             foreground: false,
             healthy: false,
             audio_active: false,
+            operation_owner_id: None,
+            operation_generation: None,
+            terminal_cause: None,
+            terminal_owner_id: None,
+            terminal_generation: None,
             playback_diagnostics: None,
             error: None,
             message: "Receiver 尚未安装。".into(),
@@ -2348,6 +2451,11 @@ fn status_from_health(health: Health) -> ReceiverStatus {
         foreground: health.foreground,
         healthy: health.healthy,
         audio_active: health.audio_active,
+        operation_owner_id: health.operation_owner_id,
+        operation_generation: health.operation_generation,
+        terminal_cause: health.terminal_cause,
+        terminal_owner_id: health.terminal_owner_id,
+        terminal_generation: health.terminal_generation,
         playback_diagnostics: Some(health.playback_diagnostics),
         error: (!health.error.is_empty()).then_some(health.error),
         message,
@@ -2375,6 +2483,20 @@ fn parse_health(output: &str) -> Option<Health> {
             .get("audioActive")
             .and_then(|value| parse_bool(value))
             .unwrap_or(false),
+        operation_owner_id: fields
+            .get("operationOwnerId")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        operation_generation: parse_optional_metric(fields.get("operationGeneration")),
+        terminal_cause: fields
+            .get("terminalCause")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        terminal_owner_id: fields
+            .get("terminalOwnerId")
+            .filter(|value| !value.is_empty() && **value != "unknown")
+            .map(|value| value.to_string()),
+        terminal_generation: parse_optional_metric(fields.get("terminalGeneration")),
         playback_diagnostics: PlaybackDiagnostics {
             receiver_sample_rate: parse_optional_metric(fields.get("actualSampleRate")),
             receiver_channels: parse_optional_metric(fields.get("actualChannels")),

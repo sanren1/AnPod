@@ -1,5 +1,64 @@
 use super::*;
 
+fn aoa_vectors() -> std::collections::HashMap<String, Vec<u8>> {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/aoa-v1-vectors.txt"
+    ))
+    .unwrap()
+    .lines()
+    .filter_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if value.is_empty()
+            || !value.len().is_multiple_of(2)
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some((
+            name.to_owned(),
+            (0..value.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+                .collect(),
+        ))
+    })
+    .collect()
+}
+
+#[test]
+fn aoa_p5c_control_vectors_match_existing_encoder_for_all_profiles() {
+    let vectors = aoa_vectors();
+    for profile in 1..=3 {
+        let prefix = format!("profile.{profile}");
+        let session = 0x0102_0304_0506_0708 + (profile as u64 - 1);
+        let key: [u8; 32] = vectors[&format!("{prefix}.key_h2r_control")]
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let query = encode_control(
+            &key,
+            HOST_TO_RECEIVER_CONTROL,
+            session,
+            0,
+            CAPABILITIES_QUERY,
+            &vectors[&format!("{prefix}.capabilities_query_payload")],
+        )
+        .unwrap();
+        assert_eq!(query, vectors[&format!("{prefix}.anpc_capabilities_query")]);
+        let bind = encode_control(
+            &key,
+            HOST_TO_RECEIVER_CONTROL,
+            session,
+            1,
+            BIND,
+            &vectors[&format!("{prefix}.aoa_bind_payload")],
+        )
+        .unwrap();
+        assert_eq!(bind, vectors[&format!("{prefix}.anpc_aoa_bind")]);
+    }
+}
+
 #[test]
 fn background_authorization_ack_enforces_exact_length_and_status_range() {
     let request_id = [0x35; 16];
@@ -25,6 +84,311 @@ fn background_authorization_ack_enforces_exact_length_and_status_range() {
     );
     assert!(decode_ack(&make_ack(29, AUTH_ONCE), 0, BACKGROUND_START_REQUEST, 0).is_err());
     assert!(decode_ack(&make_ack(30, 7), 0, BACKGROUND_START_REQUEST, 0).is_err());
+}
+
+#[test]
+fn extension_commands_accept_only_canonical_user_stopped_ack() {
+    let make_ack = |command: u8, result: u8, state: u8, port: u16, sequence: u64| {
+        let mut frame = vec![0; CONTROL_HEADER_BYTES + 13 + CONTROL_TAG_BYTES];
+        frame[5] = ACK;
+        frame[20..28].copy_from_slice(&0u64.to_be_bytes());
+        frame[28..30].copy_from_slice(&13u16.to_be_bytes());
+        frame[30] = command;
+        frame[31..39].copy_from_slice(&sequence.to_be_bytes());
+        frame[39] = result;
+        frame[40] = state;
+        frame[41..43].copy_from_slice(&port.to_be_bytes());
+        frame
+    };
+
+    for command in [
+        PLAYBACK_PROGRESS_QUERY,
+        BACKGROUND_START_REQUEST,
+        BACKGROUND_TRUST_QUERY,
+    ] {
+        let ack = decode_ack_with_format(
+            &make_ack(command, RESULT_USER_STOPPED, 5, 0, 7),
+            0,
+            command,
+            7,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ack.result, RESULT_USER_STOPPED);
+        assert_eq!(ack.state, ReceiverState::Stopped);
+        assert_eq!(ack.udp_port, 0);
+        assert!(ack.playback_progress.is_none());
+        assert!(ack.background_authorization.is_none());
+        assert!(ack.background_trust.is_none());
+    }
+
+    let progress = make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 5, 0, 7);
+    assert!(decode_ack_with_format(&progress, 1, PLAYBACK_PROGRESS_QUERY, 7, true).is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 5, 0, 8),
+        0,
+        PLAYBACK_PROGRESS_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(PLAYBACK_PROGRESS_QUERY, RESULT_USER_STOPPED, 2, 0, 7),
+        0,
+        PLAYBACK_PROGRESS_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(BACKGROUND_START_REQUEST, RESULT_USER_STOPPED, 5, 1, 7),
+        0,
+        BACKGROUND_START_REQUEST,
+        7,
+        true,
+    )
+    .is_err());
+    assert!(decode_ack_with_format(
+        &make_ack(BACKGROUND_TRUST_QUERY, RESULT_OK, 5, 0, 7),
+        0,
+        BACKGROUND_TRUST_QUERY,
+        7,
+        true,
+    )
+    .is_err());
+}
+
+#[test]
+fn session_rejects_user_stopped_ack_without_terminal_cause_capability() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    let session_id = 0x0102_0304_0506_0708;
+    let control_tx = [0x31; 32];
+    let control_rx = [0x42; 32];
+    let (stream, server) = {
+        let server_keys = (control_tx, control_rx);
+        let session_id = session_id;
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let request = read_frame(
+                &mut tcp,
+                &server_keys.0,
+                HOST_TO_RECEIVER_CONTROL,
+                session_id,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(request[5], PLAYBACK_PROGRESS_QUERY);
+            let mut payload = [0u8; 13];
+            payload[0] = PLAYBACK_PROGRESS_QUERY;
+            payload[9] = RESULT_USER_STOPPED;
+            payload[10] = 5;
+            let ack = encode_control(
+                &server_keys.1,
+                RECEIVER_TO_HOST_CONTROL,
+                session_id,
+                0,
+                ACK,
+                &payload,
+            )
+            .unwrap();
+            write_frame(&mut tcp, &ack, &CancellationToken::new()).unwrap();
+        });
+        let stream = TcpStream::connect(peer).unwrap();
+        (stream, server)
+    };
+    let mut host = HostSession {
+        tcp: Some(stream),
+        udp_socket: None,
+        sender: None,
+        float_sender: None,
+        pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+        queue: Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            false,
+        )),
+        float_queue: None,
+        keys: SessionKeys {
+            audio: [0; 32],
+            control_tx,
+            control_rx,
+        },
+        parameters: AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        format_v2: None,
+        session_id,
+        binding_commitment: [0; 32],
+        remote_udp: None,
+        command_sequence: 0,
+        ack_sequence: 0,
+        last_command: None,
+        last_ack: None,
+        last_heartbeat: Instant::now(),
+        state: ReceiverState::ReceiverRunning,
+        capabilities: Some(ReceiverCapabilities {
+            control_major: 3,
+            audio_major: 1,
+            management_compatible: true,
+            audio_compatible: true,
+            compatible: true,
+            capability_bits: CAP_AUTHENTICATED_STATUS,
+            version_code: 1,
+        }),
+        terminal_cause: None,
+        connection_intent: None,
+        background_request_id: None,
+        background_authorization_required: false,
+        background_authorized: false,
+        cancellation: CancellationToken::new(),
+    };
+    let error = host.command(PLAYBACK_PROGRESS_QUERY, &[]).err().unwrap();
+    assert!(error.contains("terminal cause"));
+    assert_eq!(host.terminal_cause(), None);
+    server.join().unwrap();
+}
+
+fn host_with_user_stopped_ack(
+    capability_bits: u32,
+    expected_command: u8,
+) -> (HostSession, thread::JoinHandle<()>) {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    let session_id = 0x0102_0304_0506_0708;
+    let control_tx = [0x31; 32];
+    let control_rx = [0x42; 32];
+    let server = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let request = read_frame(
+            &mut tcp,
+            &control_tx,
+            HOST_TO_RECEIVER_CONTROL,
+            session_id,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(request[5], expected_command);
+        let mut payload = [0u8; 13];
+        payload[0] = expected_command;
+        payload[1..9].copy_from_slice(&request[20..28]);
+        payload[9] = RESULT_USER_STOPPED;
+        payload[10] = 5;
+        let ack = encode_control(
+            &control_rx,
+            RECEIVER_TO_HOST_CONTROL,
+            session_id,
+            0,
+            ACK,
+            &payload,
+        )
+        .unwrap();
+        write_frame(&mut tcp, &ack, &CancellationToken::new()).unwrap();
+    });
+    let stream = TcpStream::connect(peer).unwrap();
+    let host = HostSession {
+        tcp: Some(stream),
+        udp_socket: None,
+        sender: None,
+        float_sender: None,
+        pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+        queue: Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            false,
+        )),
+        float_queue: None,
+        keys: SessionKeys {
+            audio: [0; 32],
+            control_tx,
+            control_rx,
+        },
+        parameters: AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        format_v2: None,
+        session_id,
+        binding_commitment: [0; 32],
+        remote_udp: None,
+        command_sequence: 0,
+        ack_sequence: 0,
+        last_command: None,
+        last_ack: None,
+        last_heartbeat: Instant::now(),
+        state: ReceiverState::ReceiverRunning,
+        capabilities: Some(ReceiverCapabilities {
+            control_major: 3,
+            audio_major: 1,
+            management_compatible: true,
+            audio_compatible: true,
+            compatible: true,
+            capability_bits,
+            version_code: 1,
+        }),
+        terminal_cause: None,
+        connection_intent: None,
+        background_request_id: None,
+        background_authorization_required: false,
+        background_authorized: false,
+        cancellation: CancellationToken::new(),
+    };
+    (host, server)
+}
+
+#[test]
+fn user_stopped_ack_is_recorded_in_all_command_deadline_paths() {
+    let (mut host, server) =
+        host_with_user_stopped_ack(CAP_TERMINAL_CAUSE, PLAYBACK_PROGRESS_QUERY);
+    let ack = host
+        .command_until(
+            PLAYBACK_PROGRESS_QUERY,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(ack.result, RESULT_USER_STOPPED);
+    assert_eq!(host.state(), ReceiverState::Stopped);
+    assert_eq!(host.terminal_cause(), Some(TerminalCause::ReceiverUserStop));
+    server.join().unwrap();
+
+    let trust_caps = CAP_BACKGROUND_TRUST_MANAGEMENT | CAP_TERMINAL_CAUSE;
+    let (mut host, server) = host_with_user_stopped_ack(trust_caps, BACKGROUND_TRUST_QUERY);
+    assert!(host
+        .query_background_trust_until(
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .is_err());
+    assert_eq!(host.state(), ReceiverState::Stopped);
+    assert_eq!(host.terminal_cause(), Some(TerminalCause::ReceiverUserStop));
+    server.join().unwrap();
+
+    let (mut host, server) =
+        host_with_user_stopped_ack(CAP_BACKGROUND_TRUST_MANAGEMENT, BACKGROUND_TRUST_QUERY);
+    let error = host
+        .query_background_trust_until(
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("terminal cause"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(host.terminal_cause(), None);
+    server.join().unwrap();
 }
 
 #[test]
@@ -143,6 +507,7 @@ const JAVA_SOURCES: &[&str] = &[
     "UdpSessionContext.java",
     "UdpPacketDecoder.java",
     "UdpPcmQueue.java",
+    "AnpdAudioIngress.java",
     "UdpReceiver.java",
     "P5cDiscovery.java",
     "P5cReceiverCoordinator.java",
@@ -201,7 +566,12 @@ fn compile_java_endpoint() -> PathBuf {
     let (javac, _) = java_paths();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let package = repo.join("src/AnPod.Receiver/app/src/main/java/app/anpod/receiver");
-    let output = std::env::temp_dir().join(format!("anpod-p5c-java-{}", std::process::id()));
+    let test_name = std::thread::current()
+        .name()
+        .unwrap_or("p5c-test")
+        .replace(':', "-");
+    let output =
+        std::env::temp_dir().join(format!("anpod-p5c-java-{}-{test_name}", std::process::id()));
     let _ = fs::remove_dir_all(&output);
     fs::create_dir_all(&output).unwrap();
     let mut command = Command::new(javac);
@@ -219,6 +589,14 @@ fn compile_java_endpoint() -> PathBuf {
     }
     command.arg(
         repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java"),
+    );
+    command.arg(
+        repo.join(
+            "src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/FloatPcmFrameQueue.java",
+        ),
+    );
+    command.arg(
+        repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm24PackedCodec.java"),
     );
     command.arg(repo.join("tests/P5cLoopbackEndpoint.java"));
     command.arg(repo.join("tests/BuildConfig.java"));
@@ -444,14 +822,20 @@ fn spawn_fail_start_endpoint(
 
 fn spawn_recovery_window_endpoint(
     classes: &Path,
+    legacy_terminal_cause: bool,
 ) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
     let (_, java) = java_paths();
-    let mut child = Command::new(java)
+    let mut command = Command::new(java);
+    command
         .arg("-cp")
         .arg(classes)
         .arg("app.anpod.receiver.P5cLoopbackEndpoint")
         .arg("--drop-after-ms=450")
-        .arg("--close-on-stdin")
+        .arg("--close-on-stdin");
+    if legacy_terminal_cause {
+        command.arg("--capabilities-legacy-terminal-cause");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -503,6 +887,69 @@ fn spawn_capability_endpoint(
         .strip_prefix("PORT=")
         .expect("Java capability endpoint port")
         .parse()
+        .unwrap();
+    (
+        child,
+        stdout,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+    )
+}
+
+fn spawn_audio_v2_upgrade_fixture(
+    classes: &Path,
+    background_auth_mode: Option<&str>,
+    profile: Option<u8>,
+    sessions: Option<u8>,
+) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+    spawn_audio_v2_upgrade_fixture_with_profiles(
+        classes,
+        background_auth_mode,
+        profile,
+        sessions,
+        None,
+    )
+}
+
+fn spawn_audio_v2_upgrade_fixture_with_profiles(
+    classes: &Path,
+    background_auth_mode: Option<&str>,
+    profile: Option<u8>,
+    sessions: Option<u8>,
+    supported_profiles: Option<&str>,
+) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+    let (_, java) = java_paths();
+    let mut command = Command::new(java);
+    command
+        .arg("-cp")
+        .arg(classes)
+        .arg("app.anpod.receiver.P5cLoopbackEndpoint")
+        .arg("--audio-v2-upgrade");
+    if let Some(mode) = background_auth_mode {
+        command.arg(format!("--background-auth-mode={mode}"));
+    }
+    if let Some(profile) = profile {
+        command.arg(format!("--audio-v2-profile={profile}"));
+    }
+    if let Some(sessions) = sessions {
+        command.arg(format!("--audio-v2-upgrade-sessions={sessions}"));
+    }
+    if let Some(profiles) = supported_profiles {
+        command.arg(format!("--audio-v2-supported-profiles={profiles}"));
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let port = line
+        .trim()
+        .strip_prefix("PORT=")
+        .expect("Java audio-v2 fixture port")
+        .parse::<u16>()
         .unwrap();
     (
         child,
@@ -623,7 +1070,7 @@ fn rejected_handshake(classes: &Path, wrong_secret: bool) {
         }
     )
     .is_err());
-    let result = finish_endpoint(child, stdout);
+    let result = ChildGuard::new(child).finish(stdout);
     assert!(
         result.starts_with("session_failed,0,0,0,0,"),
         "unauthenticated handshake must not stop playback: {result}"
@@ -807,7 +1254,10 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
         .expect("authenticated capability preflight before BIND");
     assert_eq!(capabilities.control_major, 3);
     assert_eq!(capabilities.audio_major, 1);
-    assert_eq!(capabilities.capability_bits, 3 | CAP_PLAYBACK_PROGRESS);
+    assert_eq!(
+        capabilities.capability_bits,
+        3 | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE
+    );
     assert_eq!(
         capabilities.version_code, 0,
         "localhost fixture versionCode is informational only"
@@ -1267,7 +1717,7 @@ fn thrown_start_and_stop_still_destroy_context_before_retry() {
 #[test]
 fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
     let classes = compile_java_endpoint();
-    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes);
+    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes, false);
     let mut child = ChildGuard::new(child);
     let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
     let timing = SessionTiming {
@@ -1331,6 +1781,197 @@ fn owner_recovery_window_starts_when_a_long_lived_session_disconnects() {
     owner.stop();
     let _ = child.finish(stdout);
     let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn mode_change_with_unavailable_endpoint_stops_after_recovery_window() {
+    let classes = compile_java_endpoint();
+    let (child, _stdout, peer) = spawn_mode_switch_endpoint(&classes);
+    let mut child = ChildGuard::new(child);
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(15); 4],
+        recovery_window: Duration::from_millis(100),
+    };
+    let mut owner = SessionOwner::start_with_endpoint(
+        SessionEndpoint::on_interface(&interface, peer),
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 1,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning
+    });
+    child
+        .child_mut()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"close")
+        .unwrap();
+    owner.set_mode(0).unwrap();
+
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    let attempts = stopped.attempts;
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        owner.snapshot().attempts,
+        attempts,
+        "stopped recovery must not keep authenticating"
+    );
+    assert!(
+        owner.pcm_queue().is_none(),
+        "failed recovery must clear the old PCM queue"
+    );
+    owner.stop();
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
+    let mut profile = HostAudioProfile::Pcm24(format);
+    let mut parameters = AudioParameters {
+        sample_rate: 96_000,
+        channels: 2,
+        mode: 0,
+    };
+    let (commands, receiver) = mpsc::channel();
+    commands.send(OwnerCommand::SetMode(1)).unwrap();
+    let mut endpoint = SessionEndpoint::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+    let cancellation = CancellationToken::new();
+    let enabled = AtomicBool::new(true);
+    let mut paused = false;
+    assert!(matches!(
+        wait_for_reconnect(
+            Duration::from_secs(1),
+            &receiver,
+            &cancellation,
+            &enabled,
+            &mut endpoint,
+            &mut parameters,
+            &mut paused,
+        ),
+        RetryWait::ReconnectNow
+    ));
+    profile = profile_for_mode(profile, parameters.mode).unwrap();
+    let HostAudioProfile::Pcm24(reconnect_format) = profile else {
+        panic!("PCM24 profile must be preserved during recovery mode changes");
+    };
+    assert_eq!(reconnect_format, AudioFormatV2::for_profile(3, 1).unwrap());
+
+    parameters.mode = 1;
+    let (commands, receiver) = mpsc::channel();
+    commands.send(OwnerCommand::SetMode(0)).unwrap();
+    assert!(matches!(
+        apply_pending_commands(
+            &receiver,
+            &mut endpoint,
+            &mut parameters,
+            &mut paused,
+            &enabled,
+        ),
+        PendingCommands::ModeChanged
+    ));
+    profile = profile_for_mode(profile, parameters.mode).unwrap();
+    let HostAudioProfile::Pcm24(pending_format) = profile else {
+        panic!("PCM24 profile must be preserved during pending mode changes");
+    };
+    assert_eq!(pending_format, AudioFormatV2::for_profile(3, 0).unwrap());
+}
+
+#[test]
+fn legacy_receiver_disconnect_stops_without_guessing_recovery() {
+    let classes = compile_java_endpoint();
+    let (child, stdout, peer) = spawn_recovery_window_endpoint(&classes, true);
+    let mut child = ChildGuard::new(child);
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(25); 4],
+        recovery_window: Duration::from_secs(2),
+    };
+    let mut owner = SessionOwner::start_with_endpoint(
+        SessionEndpoint::on_interface(&interface, peer),
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning
+    });
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    assert_eq!(stopped.attempts, 1, "legacy endpoint must not be retried");
+    assert_eq!(
+        stopped.terminal_cause,
+        Some(TerminalCause::TransportFailure)
+    );
+    assert!(stopped
+        .last_error
+        .as_deref()
+        .is_some_and(|message| message.contains("terminal-cause capability")));
+    owner.stop();
+    child
+        .child_mut()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"close")
+        .unwrap();
+    let result = child.finish(stdout);
+    assert!(
+        result.contains(",1,"),
+        "unexpected legacy fixture result: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn initial_connection_failure_does_not_retry_in_background() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = listener.local_addr().unwrap();
+    drop(listener);
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(10); 4],
+        recovery_window: Duration::from_secs(2),
+    };
+    let mut owner = SessionOwner::start_with_timing(
+        peer,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    let stopped = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Stopped
+    });
+    thread::sleep(Duration::from_millis(80));
+    assert_eq!(stopped.attempts, 1);
+    assert_eq!(owner.snapshot().attempts, 1);
+    owner.stop();
 }
 
 #[test]
@@ -1476,11 +2117,19 @@ fn verify_connection_intent(classes: &Path) {
                     thread::sleep(Duration::from_millis(200));
                 }
             }
-            if mode == "missing" || mode == "expired" {
+            if mode == "missing" {
+                let error = host.bind_audio().unwrap_err();
                 assert!(
-                    host.bind_audio().is_err(),
-                    "missing or expired intent must block BIND"
+                    error.contains("requires a phone-initiated connection offer"),
+                    "missing intent must be rejected before BIND: {error}"
                 );
+                assert!(
+                    host.bind_audio_without_connection_intent_for_test()
+                        .unwrap(),
+                    "receiver must independently reject a raw BIND without its phone intent"
+                );
+            } else if mode == "expired" {
+                assert!(host.bind_audio().is_err(), "expired intent must block BIND");
             } else {
                 host.bind_audio().unwrap();
                 host.select_mode().unwrap();
@@ -2356,6 +3005,103 @@ fn verify_background_trust_session_owner(classes: &Path) {
     );
 }
 
+fn verify_management_owner_stops_on_receiver_user_stop(classes: &Path) {
+    let (_, java) = java_paths();
+    let mut child = Command::new(java)
+        .arg("-cp")
+        .arg(classes)
+        .arg("app.anpod.receiver.P5cLoopbackEndpoint")
+        .arg("--background-trust-management")
+        .arg("--capabilities-incompatible")
+        .arg("--request-user-stop-on-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let peer = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        line.trim()
+            .strip_prefix("PORT=")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+    ));
+    let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
+    let mut owner = SessionOwner::start_on_interface(
+        &interface,
+        peer,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let active = wait_for_owner(&owner, |snapshot| {
+        snapshot.state == SessionLifecycleState::Authenticated
+            && snapshot.session_id.is_some()
+            && snapshot
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| !caps.compatible)
+    });
+    child.stdin.as_mut().unwrap().write_all(b"stop").unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "USER_STOP_REQUESTED=true");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(owner.query_background_trust(
+            active.generation,
+            Instant::now() + Duration::from_secs(3),
+            CancellationToken::new(),
+        ))
+        .unwrap_err();
+    assert!(
+        error.contains("Receiver rejected"),
+        "unexpected query result: {error}"
+    );
+
+    let stopped = wait_for_owner(&owner, |snapshot| {
+        snapshot.state == SessionLifecycleState::Stopped
+            && snapshot.terminal_cause == Some(TerminalCause::ReceiverUserStop)
+    });
+    assert_eq!(stopped.attempts, active.attempts);
+    assert_eq!(stopped.last_error, None);
+    thread::sleep(Duration::from_millis(100));
+    let final_status = owner.snapshot();
+    assert_eq!(
+        final_status.attempts, active.attempts,
+        "user stop must not reconnect"
+    );
+    assert_eq!(final_status.state, SessionLifecycleState::Stopped);
+    assert_eq!(
+        final_status.terminal_cause,
+        Some(TerminalCause::ReceiverUserStop)
+    );
+    assert_eq!(
+        final_status.last_error, None,
+        "user stop must not publish a query error"
+    );
+    owner.stop();
+
+    let output = finish_background_trust_endpoint(child, stdout);
+    assert!(
+        output.contains("TRUST_QUERIES=1"),
+        "the user-stop ACK must follow the management query: {output}"
+    );
+}
+
 fn verify_cancelled_after_delayed_management_capability(classes: &Path) {
     let (_, java) = java_paths();
     let mut child = Command::new(java)
@@ -2436,6 +3182,7 @@ fn background_trust_management_java_rust_loopback_contract() {
     let classes = compile_java_endpoint();
     verify_background_trust_management(&classes);
     verify_background_trust_session_owner(&classes);
+    verify_management_owner_stops_on_receiver_user_stop(&classes);
     verify_cancelled_after_delayed_management_capability(&classes);
     let _ = fs::remove_dir_all(classes);
 }
@@ -2533,6 +3280,362 @@ fn verify_capability_negotiation(classes: &Path) {
     );
 }
 
+#[test]
+fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) =
+        spawn_audio_v2_upgrade_fixture(&classes, Some("once"), Some(2), None);
+    let mut endpoint = SessionEndpoint::loopback(peer);
+    endpoint.connection_intent = Some(([0x5a; 16], true));
+    endpoint.background_request_id = Some([0x37; 16]);
+    endpoint.background_authorization_required = true;
+    let format = AudioFormatV2::for_profile(2, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let mut initial_queue = Some(queue.clone());
+    let mut session = HostSession::authenticate_for_profile(
+        endpoint,
+        &test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::Pcm24(format),
+        &mut initial_queue,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(
+        initial_queue.is_none(),
+        "the authenticated V2 session must own its Float queue"
+    );
+    assert!(session.is_v2_audio());
+    session.negotiate_capabilities().unwrap();
+    let capabilities = session.capabilities().unwrap();
+    assert!(capabilities.compatible);
+    assert_ne!(capabilities.capability_bits & CAP_AUDIO_V2, 0);
+    session.authorize_background_start().unwrap();
+    session.bind_audio().unwrap();
+    session.select_mode().unwrap();
+    session.start().unwrap();
+
+    let samples = [
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ];
+    assert!(queue.push_raw(samples.as_ptr(), 2, 48_000, 2, 0));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.pcm_payload_bytes_sent() < 12 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(
+        session.pcm_payload_bytes_sent() >= 12,
+        "Float32 samples did not reach the PCM24 UDP sender"
+    );
+    let progress = session.playback_progress().unwrap().unwrap();
+    assert_eq!(progress.output_format, None);
+    assert_eq!(progress.opened_track_channels, None);
+    assert_eq!(progress.output_sample_rate, None);
+    session.pause().unwrap();
+    queue.stop_and_clear();
+    let sender_deadline = Instant::now() + Duration::from_secs(2);
+    while !session
+        .float_sender
+        .as_ref()
+        .is_some_and(FloatUdpSender::worker_finished)
+        && Instant::now() < sender_deadline
+    {
+        thread::yield_now();
+    }
+    assert!(session
+        .float_sender
+        .as_ref()
+        .is_some_and(FloatUdpSender::worker_finished));
+    assert!(
+        session.check_sender().is_ok(),
+        "a queue stop after authenticated PAUSE is expected"
+    );
+    assert!(session
+        .float_sender
+        .as_ref()
+        .is_some_and(FloatUdpSender::worker_joined));
+    assert_eq!(session.state(), ReceiverState::Paused);
+    assert!(session
+        .resume()
+        .unwrap_err()
+        .contains("reconnect with a fresh queue"));
+    assert!(queue.is_stopped());
+    session.stop().unwrap();
+    drop(session);
+
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(fields.len(), 7, "unexpected PCM24 upgrade result: {result}");
+    assert_eq!(
+        fields[0], "",
+        "probe/fresh V2 session unexpectedly failed: {result}"
+    );
+    assert_eq!(fields[1..5], ["1", "1", "1", "1"]);
+    assert_eq!(fields[5], "true", "UDP receiver was not closed: {result}");
+    assert_eq!(
+        fields[6], "true",
+        "Java PCM24 decoder did not preserve low-bit samples: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) =
+        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), None, Some("2,3"));
+    let mut endpoint = SessionEndpoint::loopback(peer);
+    endpoint.connection_intent = Some(([0x5a; 16], true));
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(96_000, 4096).unwrap();
+    let mut initial_queue = Some(queue.clone());
+    let mut session = HostSession::authenticate_for_profile(
+        endpoint,
+        &test_binding_material(),
+        AudioParameters {
+            sample_rate: 96_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::Pcm24(format),
+        &mut initial_queue,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(session.is_v2_audio());
+    session.negotiate_capabilities().unwrap();
+    assert!(session.capabilities().unwrap().compatible);
+    session.bind_audio().unwrap();
+    session.select_mode().unwrap();
+    session.start().unwrap();
+
+    let samples = [
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ];
+    assert!(queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session.pcm_payload_bytes_sent() < 12 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(session.pcm_payload_bytes_sent() >= 12);
+    session.pause().unwrap();
+    queue.stop_and_clear();
+    session.stop().unwrap();
+    drop(session);
+
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(fields.len(), 7, "unexpected PCM24/96 result: {result}");
+    assert_eq!(fields[0], "", "96 kHz v2 session failed: {result}");
+    assert_eq!(fields[1..5], ["1", "1", "0", "1"]);
+    assert_eq!(fields[5], "true");
+    assert_eq!(
+        fields[6], "true",
+        "96 kHz PCM24 Q23 decode failed: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) =
+        spawn_audio_v2_upgrade_fixture_with_profiles(&classes, None, Some(3), Some(2), Some("2,3"));
+    let mut endpoint = SessionEndpoint::loopback(peer);
+    endpoint.connection_intent = Some(([0x5a; 16], true));
+    let format = AudioFormatV2::for_profile(3, 0).unwrap();
+    let initial_queue = Arc::new(FloatPcmQueue::new(false));
+    initial_queue.set_expected_format(96_000, 4096).unwrap();
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(20); 4],
+        recovery_window: Duration::from_secs(5),
+    };
+    let mut owner = SessionOwner::start_with_endpoint_and_profile(
+        endpoint,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 96_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::Pcm24(format),
+        Some(initial_queue.clone()),
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+
+    let first = wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning && status.negotiated_format.is_some()
+    });
+    assert_eq!(first.negotiated_format.unwrap().profile, 3);
+    assert!(owner.matches_audio_quality("hires"));
+    assert!(!owner.matches_audio_quality("hifi"));
+    let first_queue = match owner.audio_queue().unwrap() {
+        SessionAudioQueue::Float32(queue, _) => queue,
+        SessionAudioQueue::Pcm16(_) => panic!("PCM24 owner must publish a Float32 queue"),
+    };
+    assert!(Arc::ptr_eq(&first_queue, &initial_queue));
+    let samples = [
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ];
+    assert!(first_queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
+    let first_send_deadline = Instant::now() + Duration::from_secs(2);
+    while owner.pcm_payload_bytes_sent() < 12 && Instant::now() < first_send_deadline {
+        thread::yield_now();
+    }
+    assert!(
+        owner.pcm_payload_bytes_sent() >= 12,
+        "first Float session did not send the low-bit PCM24 test vector"
+    );
+
+    owner.set_paused(true).unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Paused
+    });
+    first_queue.stop_and_clear();
+    let barrier_deadline = Instant::now() + Duration::from_secs(4);
+    let mut sender_joined = false;
+    while !sender_joined && Instant::now() < barrier_deadline {
+        sender_joined = owner
+            .sender_barrier_for_test(Duration::from_millis(250))
+            .expect("owner must process the sender barrier while paused");
+        thread::yield_now();
+    }
+    assert!(
+        sender_joined,
+        "stopped Float sender was not joined by the owner"
+    );
+    let paused = owner.snapshot();
+    assert_eq!(paused.state, SessionLifecycleState::Paused);
+    assert_eq!(paused.generation, first.generation);
+    assert!(paused.last_error.is_none());
+    assert!(first_queue.is_stopped());
+
+    owner.set_mode(1).unwrap();
+    let second = wait_for_owner(&owner, |status| {
+        status.generation > first.generation
+            && status.session_id.is_some()
+            && status.state == SessionLifecycleState::Paused
+            && status
+                .negotiated_format
+                .is_some_and(|format| format.mode == 1)
+    });
+    assert_eq!(second.negotiated_format.unwrap().profile, 3);
+    assert_ne!(second.session_id, first.session_id);
+    let second_queue = match owner.audio_queue().unwrap() {
+        SessionAudioQueue::Float32(queue, _) => queue,
+        SessionAudioQueue::Pcm16(_) => panic!("reconnected PCM24 owner must keep Float32"),
+    };
+    second_queue.set_expected_format(96_000, 4096).unwrap();
+    assert!(!Arc::ptr_eq(&first_queue, &second_queue));
+    assert!(!second_queue.is_stopped());
+
+    owner.set_paused(false).unwrap();
+    let resumed = wait_for_owner(&owner, |status| {
+        status.generation == second.generation
+            && status.session_id == second.session_id
+            && status.state == SessionLifecycleState::ReceiverRunning
+    });
+    let resumed_format = resumed.negotiated_format.unwrap();
+    assert_eq!(resumed_format.mode, 1);
+    assert_eq!(resumed_format.profile, 3);
+    assert!(second_queue.push_raw(samples.as_ptr(), 2, 96_000, 2, 0));
+    let second_send_deadline = Instant::now() + Duration::from_secs(2);
+    while owner.pcm_payload_bytes_sent() < 24 && Instant::now() < second_send_deadline {
+        thread::yield_now();
+    }
+    assert!(
+        owner.pcm_payload_bytes_sent() >= 24,
+        "restarted Float session did not send the low-bit PCM24 test vector"
+    );
+    owner.set_paused(true).unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Paused
+    });
+    owner.stop();
+
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(fields.len(), 7, "unexpected PCM24 owner result: {result}");
+    assert_eq!(fields[0], "", "V2 owner restart failed: {result}");
+    assert_eq!(fields[1..5], ["2", "3", "1", "2"]);
+    assert_eq!(fields[5], "true", "UDP receiver was not closed: {result}");
+    assert_eq!(
+        fields[6], "true",
+        "Java PCM24 decoder lost Q23 samples: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn pcm24_upgrade_rejects_receiver_unsupported_v2_descriptor_before_bind() {
+    let classes = compile_java_endpoint();
+    for profile in [1, 3] {
+        let (mut child, stdout, peer) =
+            spawn_audio_v2_upgrade_fixture(&classes, None, Some(profile), None);
+        let endpoint = SessionEndpoint::loopback(peer);
+        let format = AudioFormatV2::for_profile(2, 0).unwrap();
+        let mut initial_queue = Some(Arc::new(FloatPcmQueue::new(false)));
+        let mut session = HostSession::authenticate_for_profile(
+            endpoint,
+            &test_binding_material(),
+            AudioParameters {
+                sample_rate: 48_000,
+                channels: 2,
+                mode: 0,
+            },
+            HostAudioProfile::Pcm24(format),
+            &mut initial_queue,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        session.negotiate_capabilities().unwrap();
+        let capabilities = session.capabilities().unwrap();
+        assert!(capabilities.management_compatible);
+        assert!(
+            !capabilities.compatible,
+            "profile {profile} must be rejected"
+        );
+        assert_eq!(session.state(), ReceiverState::Authenticated);
+        assert!(
+            session.bind_audio().is_err(),
+            "unsupported format must not BIND"
+        );
+        drop(session);
+        child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+        drop(child.stdin.take());
+        let result = finish_endpoint(child, stdout);
+        assert!(
+            result.contains(",0,0,0,0,"),
+            "unsupported format started playback: {result}"
+        );
+    }
+    let _ = fs::remove_dir_all(classes);
+}
+
 fn same_coordinator_accepts_a_fresh_authenticated_session(classes: &Path) {
     let (mut child, stdout, peer) = spawn_persistent_endpoint(classes);
     let interface = crate::network_interface::interface_for_test(Ipv4Addr::LOCALHOST, 32);
@@ -2619,19 +3722,26 @@ fn mode_change_uses_a_fresh_session_and_preserves_pause() {
         status.state == SessionLifecycleState::ReceiverRunning
     });
 
-    // One 10 ms synthetic WASAPI capture block is split into two 5 ms UDP
-    // packets and sent as a burst, as the production sender does.
+    // Two 10 ms synthetic capture blocks follow each other at the production
+    // callback cadence; each block is split into two 5 ms UDP packets.
     let old_queue = owner.pcm_queue().unwrap();
     let first_block = vec![0x2345i16; 480 * 2];
     assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 0));
-    wait_for_owner(&owner, |status| {
-        status.state == SessionLifecycleState::Streaming
-    });
     thread::sleep(Duration::from_millis(10));
     assert!(old_queue.push_raw(first_block.as_ptr(), 480, 48_000, 2, 480));
     wait_for_owner(&owner, |status| {
         status.state == SessionLifecycleState::Streaming
     });
+    let initial_audio_deadline = Instant::now() + Duration::from_secs(2);
+    while owner.pcm_payload_bytes_sent() < 960 * 2 * 2 {
+        assert!(
+            Instant::now() < initial_audio_deadline,
+            "both initial mode-switch capture blocks were not sent"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Consume the 20 ms of pre-pause audio before SetPaused clears the receiver queue.
+    thread::sleep(Duration::from_millis(30));
 
     owner.set_mode(1).unwrap();
     thread::sleep(Duration::from_millis(30));

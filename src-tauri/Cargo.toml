@@ -1,6 +1,6 @@
 [package]
 name = "anpod-tauri"
-version = "1.8.7"
+version = "1.12.3"
 description = "Windows system audio to Android over ADB"
 authors = ["AnPod"]
 license = "GPL-3.0-or-later"
@@ -24,16 +24,21 @@ tokio = { version = "1", features = ["process", "sync", "time", "rt-multi-thread
 tokio-util = { version = "0.7", features = ["rt"] }
 windows = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Usb",
   "Win32_Media_Audio",
   "Win32_Media_Audio_Endpoints",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_IO",
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
   "Win32_Security_Cryptography",
   "Win32_System_Threading",
   "Win32_System_Variant",
+  "Win32_System_Registry",
+  "Win32_Storage_FileSystem",
 ] }
 
 [features]

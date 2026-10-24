@@ -39,6 +39,21 @@ final class PcmWaveformTap {
         if (nowNanos - bucketStartNanos >= BUCKET_NANOS) push(nowNanos);
     }
 
+    synchronized void accept(float[] pcm, int frameOffset, int frameCount, int channels, long nowNanos) {
+        if (pcm == null || channels < 1 || frameOffset < 0 || frameCount <= 0
+                || (long) (frameOffset + (long) frameCount) * channels > pcm.length) return;
+        int stride = Math.max(1, frameCount / 128);
+        for (int frame = 0; frame < frameCount; frame += stride) {
+            int base = (frameOffset + frame) * channels;
+            leftPeak = Math.max(leftPeak, Math.abs(pcm[base]));
+            rightPeak = Math.max(rightPeak, Math.abs(pcm[base + (channels > 1 ? 1 : 0)]));
+            samples++;
+        }
+        lastAcceptNanos = nowNanos;
+        if (bucketStartNanos < 0) bucketStartNanos = nowNanos;
+        if (nowNanos - bucketStartNanos >= BUCKET_NANOS) push(nowNanos);
+    }
+
     synchronized void reset() {
         java.util.Arrays.fill(left, 0f);
         java.util.Arrays.fill(right, 0f);

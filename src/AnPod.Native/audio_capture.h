@@ -65,6 +65,42 @@ extern "C" {
 typedef void (ANPOD_CALL *ConnectCallback)(const char* connectCode);
 typedef void (ANPOD_CALL *PcmCallback)(const int16_t* interleavedPcm, uint32_t frameCount,
     uint32_t sampleRate, uint16_t channels, uint64_t frameIndex, void* userData);
+/* Float samples are borrowed for this call only; callbacks run on the capture
+   thread and must return promptly without blocking or allocating. */
+typedef void (ANPOD_CALL *FloatPcmCallbackV2)(const float* interleavedPcm, uint32_t frameCount,
+    uint32_t sampleRate, uint16_t channels, uint64_t frameIndex, void* userData);
+
+typedef struct AudioCaptureCapabilitiesV2
+{
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t maxCallbackFrames;
+} AudioCaptureCapabilitiesV2;
+
+typedef struct AudioCaptureFormatV2
+{
+    uint32_t size;
+    uint32_t version;
+    uint32_t mixSampleRate;
+    uint32_t mixChannels;
+    uint32_t mixSampleFormat;
+    uint32_t mixContainerBits;
+    uint32_t mixValidBits;
+    uint32_t mixChannelMask;
+    uint32_t captureSampleRate;
+    uint32_t captureChannels;
+    uint32_t captureSampleFormat;
+    uint32_t conversionFlags;
+} AudioCaptureFormatV2;
+
+#define ANPOD_AUDIO_CAPTURE_CAP_FLOAT32_V2 0x00000001u
+#define ANPOD_AUDIO_SAMPLE_FORMAT_UNKNOWN 0u
+#define ANPOD_AUDIO_SAMPLE_FORMAT_INTEGER 1u
+#define ANPOD_AUDIO_SAMPLE_FORMAT_FLOAT 2u
+#define ANPOD_AUDIO_CONVERSION_RESAMPLED 0x00000001u
+#define ANPOD_AUDIO_CONVERSION_CHANNELS 0x00000002u
+#define ANPOD_AUDIO_CONVERSION_SAMPLE 0x00000004u
 
 /*
  * Initialises WASAPI loopback capture on the current default render endpoint.
@@ -158,6 +194,15 @@ ANPOD_API void ANPOD_CALL AudioCapture_ClearLastError(void);
 
 /* Total PCM payload bytes accepted by successful TCP send calls this session. */
 ANPOD_API uint64_t ANPOD_CALL AudioCapture_GetSentPcmBytes(void);
+
+/* Versioned Float32 capture API. GetCaptureFormatV2 requires either legacy or
+   V2 initialization; V2 structures accept a larger size for forward-compatible
+   tail fields, but require version 2 and at least the known structure size. */
+ANPOD_API int ANPOD_CALL AudioCapture_GetCapabilitiesV2(AudioCaptureCapabilitiesV2* capabilities);
+ANPOD_API int ANPOD_CALL AudioCapture_GetCaptureFormatV2(AudioCaptureFormatV2* format);
+ANPOD_API int ANPOD_CALL AudioCapture_InitializeFloatV2(void);
+/* Register before Start. To clear the callback, call Cleanup first. */
+ANPOD_API int ANPOD_CALL AudioCapture_SetFloatPcmCallbackV2(FloatPcmCallbackV2 callback, void* userData);
 
 #ifdef __cplusplus
 }

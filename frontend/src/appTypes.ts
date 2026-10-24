@@ -3,26 +3,42 @@ export type Device = {
   manufacturer: string; model: string; androidVersion: string; apiLevel: string;
   displayName: string; statusText: string; connectable: boolean;
 };
+export type AoaTarget = { id: string; label: string };
 export type Settings = {
-  schemaVersion: number; autoConnectLastDevice: boolean; lastDeviceId: string | null;
+  schemaVersion: number; lastDeviceId: string | null;
   minimizeToTray: boolean; launchAtLogin: boolean; preferredTransport: "Usb" | "Wifi";
+  wiredMode: "adb" | "aoa"; lastUsbDirectTargetId: string | null; lastUsbDirectBindingReference: string | null;
   wirelessProtocol: "udp" | "adb"; audioBackend: "receiver" | "legacy";
-  autoReconnectWifi: boolean; lastWirelessEndpoint: string | null;
+  lastWirelessEndpoint: string | null;
   lastReceiverEndpoint: string | null;
+  audioQuality: "standard" | "hifi" | "hires";
   playbackMode: "Balanced" | "LowLatency"; appearanceTheme: "System" | "Light" | "Dark";
+};
+export type NegotiatedAudioFormat = {
+  codecVersion: 1 | 2; sampleFormat: "pcm16le" | "pcm24le"; sampleRateHz: number;
+  channels: number; validBitsPerSample: number; bytesPerSample: number; frameBytes: number;
+};
+export type WindowsMixFormat = {
+  sampleRate: number | null; channels: number | null; sampleFormat: "integer" | "float" | null;
+  containerBits: number | null; validBits: number | null;
+};
+export type AndroidOutputFormat = {
+  sampleRate: number | null; channels: number | null; encoding: "pcm16" | "pcm24Packed" | "float32" | null;
 };
 export type Snapshot = {
   state: "noDevice" | "unauthorized" | "ready" | "connecting" | "connected" | "streaming" | "phoneReady" | "paused" | "reconnecting" | "managementOnly" | "error";
   message: string; deviceName: string | null; devices: Device[]; selectedSerial: string | null; sessionSerial: string | null;
-  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | null;
+  sessionReceiverBinding: string | null; sessionTransport: Device["transport"] | "lan" | "aoa" | null;
   sessionGeneration: number | null;
-  sessionConnectionTransport: "usb" | "wireless" | null; sessionWirelessProtocol: "udp" | "adb" | null;
+  sessionConnectionTransport: "usb" | "wireless" | "usbDirect" | null; sessionWirelessProtocol: "udp" | "adb" | null;
   sessionAndroidVersion: string | null; connectionTransport: "usb" | "wireless"; transport: "usb" | "wifi";
   presence: PresenceEntry[];
   sessionCapabilities: ReceiverCapabilities | null; wirelessConnectionOffers: HostDiscoverySnapshot;
   playbackDiagnostics: PlaybackDiagnostics | null;
+  negotiatedAudioFormat: NegotiatedAudioFormat | null;
+  windowsMixFormat: WindowsMixFormat | null; androidOutputFormat: AndroidOutputFormat | null;
   output: "computer" | "phone"; settings: Settings;
-  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; statusDetail: string;
+  busy: boolean; canDisconnect: boolean; canChangeModes: boolean; canChangePlaybackMode: boolean; statusDetail: string;
   audioBitrateBps: number | null; networkRecoverySecondsRemaining?: number | null; version: string;
 };
 export type Credentials = { instanceName: string; password: string; payload: string };

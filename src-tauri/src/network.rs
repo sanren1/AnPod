@@ -1,12 +1,14 @@
+use crate::protocol::{
+    AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
+};
 #[cfg(test)]
 use crate::protocol::{PacketDecoder, ProtocolError, MAX_DATAGRAM_LEN};
-use crate::protocol::{PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Condvar, Mutex, TryLockError,
     },
     thread::{self, JoinHandle},
@@ -15,6 +17,7 @@ use std::{
 
 const PCM_QUEUE_CAPACITY: usize = 8;
 const MAX_CAPTURE_FRAMES: usize = 4096;
+const FLOAT_QUEUE_CHANNELS: u16 = 2;
 const PCM_CHANNELS: u16 = 2;
 const MAX_JITTER_PACKETS: usize = 4;
 const BALANCED_CAPTURE_QUEUE_MS: u64 = 40;
@@ -29,12 +32,12 @@ pub(crate) fn fail_next_udp_send_for_test() {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PcmBlockInfo {
-    frame_count: u32,
-    sample_rate: u32,
-    channels: u16,
-    frame_index: u64,
-    enqueued_at: Instant,
+pub(crate) struct PcmBlockInfo {
+    pub(crate) frame_count: u32,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) frame_index: u64,
+    pub(crate) enqueued_at: Instant,
 }
 
 struct PcmSlot {
@@ -56,6 +59,305 @@ pub struct PcmQueue {
     target_format: Option<PcmFormat>,
     max_queue_ms: u64,
     stopped: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FloatPcmBlockInfo {
+    pub(crate) frame_count: u32,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) frame_index: u64,
+    pub(crate) enqueued_at: Instant,
+}
+
+struct FloatPcmSlot {
+    samples: Box<[f32]>,
+    info: FloatPcmBlockInfo,
+}
+
+struct FloatQueueState {
+    slots: Vec<FloatPcmSlot>,
+    head: usize,
+    len: usize,
+    queued_frames: u64,
+}
+
+/// Preallocated, bounded Float32 capture queue for the high-precision encoder.
+/// It is deliberately independent of the existing PCM16 sender.
+pub struct FloatPcmQueue {
+    state: Mutex<FloatQueueState>,
+    wake: Condvar,
+    dropped_frames: AtomicU64,
+    sample_rate: AtomicU32,
+    max_callback_frames: AtomicU32,
+    max_queue_ms: u64,
+    stopped: AtomicBool,
+}
+
+impl FloatPcmQueue {
+    pub fn new(low_latency: bool) -> Self {
+        let samples_per_slot = MAX_CAPTURE_FRAMES * FLOAT_QUEUE_CHANNELS as usize;
+        let slots = (0..PCM_QUEUE_CAPACITY)
+            .map(|_| FloatPcmSlot {
+                samples: vec![0.0; samples_per_slot].into_boxed_slice(),
+                info: FloatPcmBlockInfo {
+                    frame_count: 0,
+                    sample_rate: 0,
+                    channels: FLOAT_QUEUE_CHANNELS,
+                    frame_index: 0,
+                    enqueued_at: Instant::now(),
+                },
+            })
+            .collect();
+        Self {
+            state: Mutex::new(FloatQueueState {
+                slots,
+                head: 0,
+                len: 0,
+                queued_frames: 0,
+            }),
+            wake: Condvar::new(),
+            dropped_frames: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+            max_callback_frames: AtomicU32::new(0),
+            max_queue_ms: if low_latency {
+                LOW_LATENCY_CAPTURE_QUEUE_MS
+            } else {
+                BALANCED_CAPTURE_QUEUE_MS
+            },
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_expected_format(
+        &self,
+        sample_rate: u32,
+        max_callback_frames: u32,
+    ) -> Result<(), String> {
+        if sample_rate == 0
+            || max_callback_frames == 0
+            || max_callback_frames as usize > MAX_CAPTURE_FRAMES
+        {
+            return Err("Float32 采集格式或最大回调帧数无效。".into());
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("已停止的 Float32 PCM 队列不能重新启动，请创建新队列。".into());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Float32 PCM 队列锁已损坏。")?;
+        if state.len != 0 {
+            return Err("Float32 PCM 队列开始采集后不能更改格式。".into());
+        }
+        let current = self.sample_rate.load(Ordering::Acquire);
+        let current_max = self.max_callback_frames.load(Ordering::Acquire);
+        if (current != 0 && current != sample_rate)
+            || (current_max != 0 && current_max != max_callback_frames)
+        {
+            return Err("Float32 PCM 队列采样率与采集格式不一致。".into());
+        }
+        self.sample_rate.store(sample_rate, Ordering::Release);
+        self.max_callback_frames
+            .store(max_callback_frames, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn expected_format(&self) -> Option<(u32, u16)> {
+        let sample_rate = self.sample_rate.load(Ordering::Acquire);
+        (sample_rate != 0).then_some((sample_rate, FLOAT_QUEUE_CHANNELS))
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn queued_frames(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.queued_frames)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stop_and_clear(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0.0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn clear_queued(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0.0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn queue_age_budget(&self) -> Duration {
+        Duration::from_millis(self.max_queue_ms)
+    }
+
+    pub(crate) fn record_dropped_frames(&self, frames: u64) {
+        self.add_dropped(frames);
+    }
+
+    pub(crate) fn push_raw(
+        &self,
+        samples: *const f32,
+        frame_count: u32,
+        sample_rate: u32,
+        channels: u16,
+        frame_index: u64,
+    ) -> bool {
+        let frames = frame_count as usize;
+        if self.stopped.load(Ordering::Acquire)
+            || samples.is_null()
+            || sample_rate != self.sample_rate.load(Ordering::Acquire)
+            || sample_rate == 0
+            || channels != FLOAT_QUEUE_CHANNELS
+            || frames == 0
+            || frame_count > self.max_callback_frames.load(Ordering::Acquire)
+            || frames > MAX_CAPTURE_FRAMES
+        {
+            self.add_dropped(frame_count as u64);
+            return false;
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
+                self.add_dropped(frame_count as u64);
+                return false;
+            }
+        };
+        if self.stopped.load(Ordering::Acquire) {
+            self.add_dropped(frame_count as u64);
+            return false;
+        }
+        let max_queued_frames = (sample_rate as u64 * self.max_queue_ms / 1000).max(1);
+        let kept_frames = (frames as u64).min(max_queued_frames) as usize;
+        let skipped_frames = frames - kept_frames;
+        let Some(kept_frame_index) = frame_index.checked_add(skipped_frames as u64) else {
+            self.add_dropped(frame_count as u64);
+            return false;
+        };
+        self.add_dropped(skipped_frames as u64);
+        while state.len > 0 {
+            let oldest = state.slots[state.head].info;
+            if oldest.enqueued_at.elapsed() <= Duration::from_millis(self.max_queue_ms)
+                && state.len < PCM_QUEUE_CAPACITY
+                && state.queued_frames + kept_frames as u64 <= max_queued_frames
+            {
+                break;
+            }
+            state.queued_frames -= oldest.frame_count as u64;
+            self.add_dropped(oldest.frame_count as u64);
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+        }
+        let index = (state.head + state.len) % PCM_QUEUE_CAPACITY;
+        let slot = &mut state.slots[index];
+        let sample_count = frames * FLOAT_QUEUE_CHANNELS as usize;
+        let source = unsafe { std::slice::from_raw_parts(samples, sample_count) };
+        let skipped_samples = skipped_frames * FLOAT_QUEUE_CHANNELS as usize;
+        let kept_samples = kept_frames * FLOAT_QUEUE_CHANNELS as usize;
+        slot.samples[..kept_samples].copy_from_slice(&source[skipped_samples..]);
+        slot.info = FloatPcmBlockInfo {
+            frame_count: kept_frames as u32,
+            sample_rate,
+            channels: FLOAT_QUEUE_CHANNELS,
+            frame_index: kept_frame_index,
+            enqueued_at: Instant::now(),
+        };
+        state.len += 1;
+        state.queued_frames += kept_frames as u64;
+        drop(state);
+        self.wake.notify_one();
+        true
+    }
+
+    fn add_dropped(&self, frames: u64) {
+        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    /// Encoder worker consumes blocks into a reusable scratch buffer.
+    pub(crate) fn pop_wait(&self, scratch: &mut Vec<f32>) -> Option<FloatPcmBlockInfo> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            while state.len == 0 && !self.stopped.load(Ordering::Acquire) {
+                state = self.wake.wait(state).ok()?;
+            }
+            if self.stopped.load(Ordering::Acquire) || state.len == 0 {
+                return None;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
+
+    pub(crate) fn pop_timeout(
+        &self,
+        scratch: &mut Vec<f32>,
+        timeout: Duration,
+    ) -> Option<FloatPcmBlockInfo> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            if state.len == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (next, result) = self.wake.wait_timeout(state, remaining).ok()?;
+                state = next;
+                if result.timed_out() && state.len == 0 {
+                    return None;
+                }
+                continue;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
 }
 
 impl PcmQueue {
@@ -125,6 +427,26 @@ impl PcmQueue {
             }
         }
         self.wake.notify_all();
+    }
+
+    pub(crate) fn clear_queued(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.head = 0;
+            state.len = 0;
+            state.queued_frames = 0;
+            for slot in &mut state.slots {
+                slot.samples.fill(0);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn queue_age_budget(&self) -> Duration {
+        Duration::from_millis(self.max_queue_ms)
+    }
+
+    pub(crate) fn record_dropped_frames(&self, frames: u64) {
+        self.add_dropped(frames);
     }
 
     pub(crate) fn push_raw(
@@ -248,7 +570,11 @@ impl PcmQueue {
         self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
     }
 
-    fn pop_wait(&self, stopping: &AtomicBool, scratch: &mut Vec<i16>) -> Option<PcmBlockInfo> {
+    pub(crate) fn pop_wait(
+        &self,
+        stopping: &AtomicBool,
+        scratch: &mut Vec<i16>,
+    ) -> Option<PcmBlockInfo> {
         let mut state = self.state.lock().ok()?;
         loop {
             while state.len == 0 && !stopping.load(Ordering::Acquire) {
@@ -275,6 +601,49 @@ impl PcmQueue {
             scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
             return Some(info);
         }
+    }
+
+    pub(crate) fn pop_timeout(
+        &self,
+        scratch: &mut Vec<i16>,
+        timeout: Duration,
+    ) -> Option<PcmBlockInfo> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            if state.len == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (next, result) = self.wake.wait_timeout(state, remaining).ok()?;
+                state = next;
+                if result.timed_out() && state.len == 0 {
+                    return None;
+                }
+                continue;
+            }
+            let index = state.head;
+            let info = state.slots[index].info;
+            state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
+            state.len -= 1;
+            state.queued_frames -= info.frame_count as u64;
+            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+                self.add_dropped(info.frame_count as u64);
+                continue;
+            }
+            let sample_count = info.frame_count as usize * info.channels as usize;
+            scratch.clear();
+            scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
+            return Some(info);
+        }
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     fn wake_worker(&self) {
@@ -328,6 +697,242 @@ pub struct UdpSender {
     queue: Arc<PcmQueue>,
     worker: Option<JoinHandle<Result<NetworkStats, String>>>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+pub(crate) struct FloatUdpSender {
+    stopping: Arc<AtomicBool>,
+    expected_queue_stop: Arc<AtomicBool>,
+    queue: Arc<FloatPcmQueue>,
+    worker: Option<JoinHandle<Result<NetworkStats, String>>>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+struct FloatSenderSignals {
+    stopping: Arc<AtomicBool>,
+    expected_queue_stop: Arc<AtomicBool>,
+    pcm_payload_bytes_sent: Arc<AtomicU64>,
+}
+
+impl FloatUdpSender {
+    pub(crate) fn spawn_authenticated(
+        remote: SocketAddr,
+        queue: Arc<FloatPcmQueue>,
+        socket: UdpSocket,
+        material: UdpSessionMaterial,
+        format: AudioFormatV2,
+        pcm_payload_bytes_sent: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        format.encode().map_err(|error| error.to_string())?;
+        if !matches!(
+            (format.profile, format.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        ) || format.sample_format != 2
+            || format.channels != 2
+            || format.valid_bits != 24
+            || format.bytes_per_sample != 3
+            || format.frame_bytes != 6
+            || !remote.is_ipv4()
+            || !socket
+                .local_addr()
+                .map_err(|error| error.to_string())?
+                .is_ipv4()
+        {
+            return Err("Unsupported PCM24 format or UDP source for the native sink.".into());
+        }
+        let stopping = Arc::new(AtomicBool::new(false));
+        let expected_queue_stop = Arc::new(AtomicBool::new(false));
+        let worker_expected_queue_stop = expected_queue_stop.clone();
+        let worker_stopping = stopping.clone();
+        let worker_queue = queue.clone();
+        let worker_signals = FloatSenderSignals {
+            stopping: worker_stopping,
+            expected_queue_stop: worker_expected_queue_stop,
+            pcm_payload_bytes_sent: pcm_payload_bytes_sent.clone(),
+        };
+        let worker = thread::Builder::new()
+            .name("AnPod local Float32 UDP audio".into())
+            .spawn(move || {
+                send_float_loop(
+                    socket,
+                    remote,
+                    worker_queue,
+                    worker_signals,
+                    material,
+                    format,
+                )
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stopping,
+            expected_queue_stop,
+            queue,
+            worker: Some(worker),
+            pcm_payload_bytes_sent,
+        })
+    }
+
+    pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
+        self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn expect_queue_stop(&self) {
+        self.expected_queue_stop.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn resume_after_ack(&self) -> Result<(), String> {
+        if self.queue.is_stopped() || self.worker.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(
+                "Float32 sender cannot resume after its queue stopped; reconnect with a fresh queue."
+                    .into(),
+            );
+        }
+        self.expected_queue_stop.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_joined(&self) -> bool {
+        self.worker.is_none()
+    }
+
+    pub(crate) fn stop(mut self) -> Result<NetworkStats, String> {
+        self.stop_worker()
+    }
+
+    pub(crate) fn take_finished_error(&mut self) -> Option<String> {
+        let worker = self.worker.as_ref()?;
+        if !worker.is_finished() {
+            return None;
+        }
+        let worker = self.worker.take().expect("finished Float32 UDP worker");
+        match worker.join() {
+            Ok(Ok(_))
+                if self.expected_queue_stop.load(Ordering::Acquire) && self.queue.is_stopped() =>
+            {
+                None
+            }
+            Ok(Ok(_)) => Some("Float32 UDP sender stopped unexpectedly.".into()),
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("Float32 UDP worker thread panicked.".into()),
+        }
+    }
+
+    fn stop_worker(&mut self) -> Result<NetworkStats, String> {
+        self.stopping.store(true, Ordering::Release);
+        self.expected_queue_stop.store(true, Ordering::Release);
+        self.queue.stop_and_clear();
+        let Some(worker) = self.worker.take() else {
+            return Ok(NetworkStats::default());
+        };
+        worker
+            .join()
+            .map_err(|_| "Float32 UDP worker thread panicked.".to_string())?
+    }
+}
+
+impl Drop for FloatUdpSender {
+    fn drop(&mut self) {
+        let _ = self.stop_worker();
+    }
+}
+
+pub(crate) fn float_to_pcm24(sample: f32) -> Result<i32, &'static str> {
+    if !sample.is_finite() {
+        return Err("Float32 PCM contains a non-finite sample.");
+    }
+    let scaled = (sample.clamp(-1.0, 1.0) * 8_388_608.0).round();
+    Ok((scaled as i32).clamp(-8_388_608, 8_388_607))
+}
+
+fn send_float_loop(
+    socket: UdpSocket,
+    remote: SocketAddr,
+    queue: Arc<FloatPcmQueue>,
+    signals: FloatSenderSignals,
+    material: UdpSessionMaterial,
+    format: AudioFormatV2,
+) -> Result<NetworkStats, String> {
+    let FloatSenderSignals {
+        stopping,
+        expected_queue_stop,
+        pcm_payload_bytes_sent,
+    } = signals;
+    let mut encoder =
+        PacketEncoder::new_v2(&material.key, material.session_id, HOST_TO_RECEIVER, format)
+            .map_err(|error| error.to_string())?;
+    let mut stats = NetworkStats::default();
+    send_packet(
+        &socket,
+        remote,
+        &mut encoder,
+        PacketType::Format,
+        0,
+        &format.encode().map_err(|error| error.to_string())?,
+    )?;
+    stats.packets_sent = 1;
+    let mut samples = Vec::with_capacity(MAX_CAPTURE_FRAMES * FLOAT_QUEUE_CHANNELS as usize);
+    let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
+    let frames_per_packet = MAX_PAYLOAD_LEN / format.frame_bytes as usize;
+
+    while let Some(info) = queue.pop_wait(&mut samples) {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        if info.sample_rate != format.sample_rate || info.channels != format.channels as u16 {
+            return Err(
+                "Float32 queue block does not match the authenticated PCM24 format.".into(),
+            );
+        }
+        let frames = info.frame_count as usize;
+        if samples.len() != frames * info.channels as usize {
+            return Err("Float32 queue block length does not match its frame count.".into());
+        }
+        let mut offset_frames = 0;
+        while offset_frames < frames {
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if info.enqueued_at.elapsed() > Duration::from_millis(queue.max_queue_ms) {
+                queue.add_dropped((frames - offset_frames) as u64);
+                break;
+            }
+            let packet_frames = frames_per_packet.min(frames - offset_frames);
+            let sample_offset = offset_frames * info.channels as usize;
+            let sample_end = sample_offset + packet_frames * info.channels as usize;
+            payload.clear();
+            for sample in &samples[sample_offset..sample_end] {
+                let quantized = float_to_pcm24(*sample).map_err(str::to_string)? as u32;
+                payload.extend_from_slice(&quantized.to_le_bytes()[..3]);
+            }
+            let frame_index = info
+                .frame_index
+                .checked_add(offset_frames as u64)
+                .ok_or_else(|| "PCM sample frame index exhausted.".to_string())?;
+            send_packet_with(
+                &mut encoder,
+                PacketType::Audio,
+                frame_index,
+                &payload,
+                |packet| send_datagram(&socket, remote, packet),
+            )?;
+            stats.packets_sent = stats.packets_sent.saturating_add(1);
+            stats.pcm_payload_bytes_sent = stats
+                .pcm_payload_bytes_sent
+                .saturating_add(payload.len() as u64);
+            pcm_payload_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+            offset_frames += packet_frames;
+        }
+    }
+    if expected_queue_stop.load(Ordering::Acquire) {
+        Ok(stats)
+    } else {
+        Err("Float32 PCM queue stopped while the authenticated sender was active.".into())
+    }
 }
 
 impl UdpSender {

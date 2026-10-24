@@ -23,19 +23,31 @@ if (hasAnyReleaseSigningValue && releaseSigningValues.any { it == null || it.isB
 android {
     namespace 'app.anpod.receiver'
     compileSdk 35
+    ndkVersion '27.0.12077973'
 
     buildFeatures {
         buildConfig true
         compose true
+        prefab true
     }
 
     defaultConfig {
         applicationId 'app.anpod.receiver'
         minSdk 23
         targetSdk 35
-        versionCode 32
-        versionName '0.15.7-v3-flow-candidate'
+        versionCode 43
+        versionName '0.19.1-v3-flow-candidate'
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+        externalNativeBuild {
+            cmake { arguments '-DANDROID_STL=c++_shared' }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
     }
 
     testOptions {
@@ -82,6 +94,7 @@ if (candidateDebugStoreFile) {
 android.sourceSets.main.java.srcDir('../../AnPod.AndroidProtocol/src/main/java')
 
 dependencies {
+    implementation 'com.google.oboe:oboe:1.10.0'
     implementation platform('androidx.compose:compose-bom:2025.06.00')
     implementation 'androidx.activity:activity-compose:1.10.1'
     implementation 'androidx.compose.material3:material3'

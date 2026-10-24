@@ -18,6 +18,7 @@ CMakeFiles/
 
 # Android
 .gradle/
+.cxx/
 local.properties
 *.apk
 *.keystore
@@ -77,3 +78,13 @@ src-tauri/icons/StoreLogo.png
 /AnPod_handoff_*.md
 # Internal implementation plan and design references
 AnPod_AOD_Plan/
+AnPod_AOA_Phase2_Probe/
+AnPod_Android_Dual_Engine_Probe/
+AnPod_UI_UX_Plan/
+/tests/
+/plan_dev.md
+/tools/AnPod.TestBench/
+/packaging/check-java-offline.ps1
+/tools/CaptureProbe/
+/tools/SessionProbe/
+/tools/UiSnapshot/

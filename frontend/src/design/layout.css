@@ -1,0 +1,22 @@
+.app-shell { width: 100%; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) 42px; background: var(--bg); color: var(--text); }
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand img { display: block; width: 30px; height: 30px; object-fit: contain; }
+.brand div { display: flex; flex-direction: column; gap: 2px; }
+.brand strong { font-size: 16px; line-height: 19px; font-weight: 650; }
+.brand span { color: var(--muted); font-size: 11px; line-height: 14px; }
+.icon-button { width: 36px; height: 36px; display: inline-grid; place-items: center; border: 0; border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; }
+.icon-button:hover { background: var(--wash); color: var(--text); }
+.main-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 9px 16px 16px; }
+.main-scroll::-webkit-scrollbar { width: 9px; }
+.main-scroll::-webkit-scrollbar-thumb { background: transparent; border: 2px solid transparent; border-radius: 9px; background-clip: padding-box; }
+.main-scroll:hover::-webkit-scrollbar-thumb { background-color: #99a4b5; }
+.footer { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-top: 1px solid var(--line); background: var(--surface); }
+.footer button { min-height: 34px; display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px; border: 0; border-radius: 5px; color: var(--accent); background: transparent; cursor: pointer; }
+.footer button:hover { background: var(--accent-soft); }
+.footer > span { color: var(--muted); font-size: 10px; }
+
+@media (max-width: 390px) {
+  .app-shell { grid-template-rows: 48px minmax(0, 1fr) 42px; }
+  .main-scroll { padding: 7px 12px 16px; }
+}

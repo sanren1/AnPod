@@ -5,16 +5,20 @@ mod receiver_ops;
 
 use crate::receiver::{self, PlaybackDiagnostics, ReceiverStatus};
 use crate::{
-    audio::AudioActor,
+    aoa_owner::AoaOwner,
+    aoa_winusb::{self, AoaCancel},
+    audio::{AudioActor, CaptureFormatV2},
     discovery::{self, Candidate, HostDiscoverySnapshot, HostOfferListener},
-    network::PcmQueue,
+    network::{FloatPcmQueue, PcmQueue},
     network_interface::{self, Ipv4Interface},
     p5c::{
-        BackgroundTrustSnapshot, HostSession, ReceiverCapabilities, SessionLifecycleState,
-        SessionOwner,
+        BackgroundTrustSnapshot, HostAudioProfile, HostSession, ReceiverCapabilities,
+        SessionAudioQueue, SessionLifecycleState, SessionOwner, TerminalCause,
+        CAP_AOA_SESSION_RESTART, CAP_TERMINAL_CAUSE,
     },
     presence::{PresenceTracker, PresenceView},
-    protocol::PcmFormat,
+    protocol::{AudioFormatV2, PcmFormat},
+    security::BindingStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,13 +61,39 @@ pub struct Device {
     pub connectable: bool,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AoaDeviceTarget {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AoaSwitchResult {
+    pub success: bool,
+    pub message: String,
+    pub requires_refresh: bool,
+}
+
+const ADB_SERVER_KILL_ARGS: &[&str] = &["kill-server"];
+
+async fn with_confirmed_adb_release<F, Fut>(confirmed: bool, run: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if !confirmed {
+        return Err("请确认停止本机 ADB server 后再切换 USB 模式。".into());
+    }
+    run().await
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default = "schema_version")]
     pub schema_version: u32,
-    #[serde(default = "yes")]
-    pub auto_connect_last_device: bool,
     #[serde(default)]
     pub last_device_id: Option<String>,
     #[serde(default = "yes")]
@@ -72,18 +102,24 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     #[serde(default = "usb")]
     pub preferred_transport: String,
+    #[serde(default = "aoa")]
+    pub wired_mode: String,
     #[serde(default)]
     pub wireless_protocol: String,
     #[serde(default = "receiver")]
     pub audio_backend: String,
-    #[serde(default = "yes")]
-    pub auto_reconnect_wifi: bool,
     #[serde(default)]
     pub last_wireless_endpoint: Option<String>,
     /// Last Receiver control endpoint that accepted a session; probed first on the
     /// next wireless search so a known phone answers without a broadcast.
     #[serde(default)]
     pub last_receiver_endpoint: Option<String>,
+    #[serde(default)]
+    pub last_usb_direct_target_id: Option<String>,
+    #[serde(default)]
+    pub last_usb_direct_binding_reference: Option<String>,
+    #[serde(default = "standard")]
+    pub audio_quality: String,
     #[serde(default = "balanced")]
     pub playback_mode: String,
     #[serde(default = "system")]
@@ -102,8 +138,15 @@ fn usb() -> String {
 fn udp() -> String {
     "udp".into()
 }
+
+fn aoa() -> String {
+    "aoa".into()
+}
 fn receiver() -> String {
     "receiver".into()
+}
+fn standard() -> String {
+    "standard".into()
 }
 fn balanced() -> String {
     "Balanced".into()
@@ -116,20 +159,121 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            auto_connect_last_device: true,
             last_device_id: None,
             minimize_to_tray: true,
             launch_at_login: false,
             preferred_transport: usb(),
+            wired_mode: "aoa".into(),
             wireless_protocol: udp(),
             audio_backend: receiver(),
-            auto_reconnect_wifi: true,
             last_wireless_endpoint: None,
             last_receiver_endpoint: None,
+            last_usb_direct_target_id: None,
+            last_usb_direct_binding_reference: None,
+            audio_quality: standard(),
             playback_mode: balanced(),
             appearance_theme: system(),
         }
     }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiatedAudioFormat {
+    pub codec_version: u8,
+    pub sample_format: String,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub valid_bits_per_sample: u8,
+    pub bytes_per_sample: u8,
+    pub frame_bytes: u8,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsMixFormat {
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u32>,
+    pub sample_format: Option<String>,
+    pub container_bits: Option<u32>,
+    pub valid_bits: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidOutputFormat {
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u8>,
+    pub encoding: Option<String>,
+}
+
+fn negotiated_v2_audio_format(format: AudioFormatV2) -> NegotiatedAudioFormat {
+    NegotiatedAudioFormat {
+        codec_version: 2,
+        sample_format: if format.sample_format == 2 {
+            "pcm24le"
+        } else {
+            "pcm16le"
+        }
+        .into(),
+        sample_rate_hz: format.sample_rate,
+        channels: format.channels,
+        valid_bits_per_sample: format.valid_bits,
+        bytes_per_sample: format.bytes_per_sample,
+        frame_bytes: format.frame_bytes as u8,
+    }
+}
+
+fn android_output_format(diagnostics: Option<&PlaybackDiagnostics>) -> Option<AndroidOutputFormat> {
+    let diagnostics = diagnostics?;
+    let encoding = match diagnostics.output_format? {
+        1 => "pcm16",
+        2 => "pcm24Packed",
+        3 => "float32",
+        _ => return None,
+    };
+    Some(AndroidOutputFormat {
+        sample_rate: diagnostics.output_sample_rate,
+        channels: diagnostics.opened_track_channels,
+        encoding: Some(encoding.into()),
+    })
+}
+
+fn windows_mix_format(format: CaptureFormatV2) -> WindowsMixFormat {
+    WindowsMixFormat {
+        sample_rate: (format.mix_sample_rate != 0).then_some(format.mix_sample_rate),
+        channels: (format.mix_channels != 0).then_some(format.mix_channels),
+        sample_format: match format.mix_sample_format {
+            1 => Some("integer".into()),
+            2 => Some("float".into()),
+            _ => None,
+        },
+        container_bits: (format.mix_container_bits != 0).then_some(format.mix_container_bits),
+        valid_bits: (format.mix_valid_bits != 0).then_some(format.mix_valid_bits),
+    }
+}
+
+fn negotiated_audio_format(
+    session_active: bool,
+    output: &str,
+    diagnostics: Option<&PlaybackDiagnostics>,
+) -> Option<NegotiatedAudioFormat> {
+    if !session_active || output != "phone" {
+        return None;
+    }
+    diagnostics
+        .filter(|diagnostics| {
+            diagnostics.sample_rate == Some(48_000) && diagnostics.channels == Some(2)
+        })
+        .map(|_| NegotiatedAudioFormat {
+            codec_version: 1,
+            sample_format: "pcm16le".into(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            valid_bits_per_sample: 16,
+            bytes_per_sample: 2,
+            frame_bytes: 4,
+        })
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +292,9 @@ pub struct AppSnapshot {
     pub session_wireless_protocol: Option<String>,
     pub session_capabilities: Option<ReceiverCapabilities>,
     pub playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    pub windows_mix_format: Option<WindowsMixFormat>,
+    pub android_output_format: Option<AndroidOutputFormat>,
     pub network_recovery_seconds_remaining: Option<u64>,
     pub wireless_connection_offers: HostDiscoverySnapshot,
     pub session_android_version: Option<String>,
@@ -159,10 +306,18 @@ pub struct AppSnapshot {
     pub busy: bool,
     pub can_disconnect: bool,
     pub can_change_modes: bool,
+    pub can_change_playback_mode: bool,
     pub status_detail: String,
     pub audio_bitrate_bps: Option<u64>,
     pub presence: Vec<PresenceView>,
     pub version: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbDirectConfiguration {
+    pub snapshot: AppSnapshot,
+    pub configuration_id: u64,
 }
 
 /// Sanitised snapshot written by `export_diagnostics`.
@@ -184,6 +339,10 @@ pub struct DiagnosticsExport {
     pub session_wireless_protocol: Option<String>,
     pub output: String,
     pub playback_mode: String,
+    pub audio_quality: String,
+    pub negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    pub windows_mix_format: Option<WindowsMixFormat>,
+    pub android_output_format: Option<AndroidOutputFormat>,
     pub audio_backend: String,
     pub audio_bitrate_bps: Option<u64>,
     pub session_capabilities: Option<ReceiverCapabilities>,
@@ -203,6 +362,10 @@ fn diagnostics_export(snapshot: &AppSnapshot) -> DiagnosticsExport {
         session_wireless_protocol: snapshot.session_wireless_protocol.clone(),
         output: snapshot.output.clone(),
         playback_mode: snapshot.settings.playback_mode.clone(),
+        audio_quality: snapshot.settings.audio_quality.clone(),
+        negotiated_audio_format: snapshot.negotiated_audio_format.clone(),
+        windows_mix_format: snapshot.windows_mix_format.clone(),
+        android_output_format: snapshot.android_output_format.clone(),
         audio_backend: snapshot.settings.audio_backend.clone(),
         audio_bitrate_bps: snapshot.audio_bitrate_bps,
         session_capabilities: snapshot.session_capabilities.clone(),
@@ -293,11 +456,16 @@ pub(crate) struct Session {
     reverse: String,
     child: Option<Child>,
     installed_receiver: bool,
+    receiver_owner_id: Option<String>,
+    receiver_generation: Option<u64>,
     output: String,
     output_tail: Arc<Mutex<VecDeque<String>>>,
     network_owner: Option<SessionOwner>,
-    network_sink_queue: Option<Arc<PcmQueue>>,
+    aoa_owner: Option<AoaOwner>,
+    aoa_target_id: Option<String>,
+    network_sink_queue: Option<SessionAudioQueue>,
     network_binding_ref: Option<String>,
+    windows_mix_format: Option<WindowsMixFormat>,
 }
 
 pub(crate) struct ActiveOperation {
@@ -331,6 +499,8 @@ pub(crate) struct ViewState {
     audio_bitrate_bps: Option<u64>,
     session_capabilities: Option<ReceiverCapabilities>,
     playback_diagnostics: Option<PlaybackDiagnostics>,
+    negotiated_audio_format: Option<NegotiatedAudioFormat>,
+    windows_mix_format: Option<WindowsMixFormat>,
     network_recovery_seconds_remaining: Option<u64>,
 }
 
@@ -339,10 +509,9 @@ pub struct AppState {
     host_offer_listener: Mutex<Option<HostOfferListener>>,
     operation: Mutex<Option<ActiveOperation>>,
     operation_generation: AtomicU64,
+    usb_direct_configuration_id: AtomicU64,
+    usb_direct_configuration_sequence: AtomicU64,
     recovering: AtomicBool,
-    wireless_probe_attempted: AtomicBool,
-    failed_auto_connect: Mutex<Option<String>>,
-    suppressed_auto_connect: Mutex<Option<String>>,
     qr_operation: Mutex<Option<ActiveQrOperation>>,
     qr_generation: AtomicU64,
     last_pairing_endpoint: Mutex<Option<String>>,
@@ -453,15 +622,16 @@ impl AppState {
                 audio_bitrate_bps: None,
                 session_capabilities: None,
                 playback_diagnostics: None,
+                negotiated_audio_format: None,
+                windows_mix_format: None,
                 network_recovery_seconds_remaining: None,
             }),
             host_offer_listener: Mutex::new(None),
             operation: Mutex::new(None),
             operation_generation: AtomicU64::new(0),
+            usb_direct_configuration_id: AtomicU64::new(0),
+            usb_direct_configuration_sequence: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
-            wireless_probe_attempted: AtomicBool::new(false),
-            failed_auto_connect: Mutex::new(None),
-            suppressed_auto_connect: Mutex::new(None),
             qr_operation: Mutex::new(None),
             qr_generation: AtomicU64::new(0),
             last_pairing_endpoint: Mutex::new(None),
@@ -551,6 +721,11 @@ impl AppState {
         let _gate = self.gate.lock().await;
         let result = async {
             token_check(&token)?;
+            if intent.is_some() && self.usb_direct_configuration_active() {
+                return Err("USB Direct 配置期间无线连接请求已暂停。".into());
+            }
+            let audio_quality = self.view.lock().expect("view lock").settings.audio_quality.clone();
+            validate_audio_quality(&audio_quality)?;
             if self.session.lock().await.is_some() { return Err("AnPod 已有活动会话；请先断开后再启动网络接收。".into()); }
             {
                 let mut listener = self.host_offer_listener.lock().expect("offer listener lock");
@@ -563,7 +738,24 @@ impl AppState {
                 .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
             audio_initialized = true;
             self.audio.initialize()?;
-            let capture_format = self.audio.pcm_format()?;
+            let playback_mode = if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 };
+            let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality != "standard" {
+                let profile_id = if audio_quality == "hifi" { 2 } else { 3 };
+                let format = AudioFormatV2::for_profile(profile_id, playback_mode)
+                    .map_err(|_| "Unable to construct the authenticated PCM24 format.".to_string())?;
+                let native = self.audio.probe_float_format()?;
+                crate::audio::validate_float_format_for_session(&native, format)?;
+                let mix_format = windows_mix_format(native);
+                let queue = Arc::new(FloatPcmQueue::new(playback_mode == 1));
+                (
+                    PcmFormat { sample_rate: native.capture_sample_rate, channels: native.capture_channels as u16 },
+                    HostAudioProfile::Pcm24(format),
+                    Some(queue),
+                    Some(mix_format),
+                )
+            } else {
+                (self.audio.pcm_format()?, HostAudioProfile::Standard, None, None)
+            };
             let (binding_ref, binding_path, peer) = if let Some(serial) = bootstrap_serial {
                 let address = receiver_address.ok_or_else(|| "USB/bootstrap 需要明确选择手机 IPv4 接口。".to_string())?;
                 let prefix = receiver_prefix.ok_or_else(|| "USB/bootstrap 需要手机接口前缀长度。".to_string())?;
@@ -615,16 +807,22 @@ impl AppState {
             // P5-C handshake still proves the phone holds the same secret.
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
-            let mut owner = if background_authorization_required {
-                SessionOwner::start_on_interface_with_background_authorization(
-                    &interface, peer, binding, parameters, token.clone())?
-            } else if let Some((nonce, required, _)) = &intent {
-                SessionOwner::start_on_interface_with_intent(&interface, peer, binding, parameters, token.clone(), *nonce, *required)?
-            } else { SessionOwner::start_on_interface(&interface, peer, binding, parameters, token.clone())? };
+            let connection_intent = intent.as_ref().map(|(nonce, required, _)| (*nonce, *required));
+            let mut owner = SessionOwner::start_on_interface_with_profile(
+                &interface,
+                peer,
+                binding,
+                parameters,
+                profile,
+                initial_float_queue,
+                token.clone(),
+                connection_intent,
+                background_authorization_required,
+            )?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let queue = loop {
                 token_check(&token)?;
-                if let Some(queue) = owner.pcm_queue() { break Some(queue); }
+                if let Some(queue) = owner.audio_queue() { break Some(queue); }
                 let snapshot = owner.snapshot();
                 if snapshot.state == SessionLifecycleState::Authenticated
                     && snapshot.capabilities.as_ref().is_some_and(|info| info.management_compatible && !info.compatible) {
@@ -643,11 +841,19 @@ impl AppState {
             } else {
                 audio_initialized = true;
                 let queue_ref = queue.as_ref().expect("audio-compatible session queue");
-                if let Err(error) = self.audio.start_pcm_sink(queue_ref.clone()) {
-                    let _ = self.audio.stop_and_cleanup();
-                    let _ = self.audio.restore_muted();
-                    owner.stop();
-                    return Err(error);
+                let sink_result = match queue_ref {
+                    SessionAudioQueue::Pcm16(queue) => self.audio.start_pcm_sink(queue.clone()).map(|()| None),
+                    SessionAudioQueue::Float32(_, _) => self.start_session_audio_sink(queue_ref),
+                };
+                match sink_result {
+                    Ok(Some(format)) => mix_format = Some(format),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = self.audio.stop_and_cleanup();
+                        let _ = self.audio.restore_muted();
+                        owner.stop();
+                        return Err(error);
+                    }
                 }
                 if let Err(error) = self.audio.mute_active() {
                     let _ = self.audio.stop_pcm_sink();
@@ -670,14 +876,23 @@ impl AppState {
                 listener.take();
             }
             let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let owner_snapshot = owner.snapshot();
+            let negotiated_format = owner_snapshot.negotiated_format.map(negotiated_v2_audio_format);
+            let unsupported_v2_format = owner_snapshot
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("PCM24 format"));
+            let capabilities = owner_snapshot.capabilities;
             *self.session.lock().await = Some(Session {
                 generation: session_generation,
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
                 installed_receiver: false, output: session_output.into(), output_tail: Arc::new(Mutex::new(VecDeque::new())),
+                receiver_owner_id: None, receiver_generation: None,
                 network_owner: Some(owner), network_sink_queue: queue, network_binding_ref: Some(binding_ref.clone()),
+                aoa_owner: None,
+                aoa_target_id: None,
+                windows_mix_format: mix_format.clone(),
             });
-            let capabilities = self.session.lock().await.as_ref().and_then(|session| session.network_owner.as_ref())
-                .and_then(|owner| owner.snapshot().capabilities);
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = true;
@@ -688,11 +903,14 @@ impl AppState {
                 view.session_android_version = None;
                 view.session_capabilities = capabilities;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = negotiated_format;
+                view.windows_mix_format = if management_only { None } else { mix_format.clone() };
                 view.network_recovery_seconds_remaining = None;
                 view.output = session_output.into();
                 view.state = if management_only { "managementOnly" } else { "phoneReady" }.into();
-                view.message = if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
-                view.status_detail = if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
+                view.message = if unsupported_v2_format { "Receiver 不支持所选 PCM24 格式" } else if management_only { "Receiver 管理连接已认证，音频协议不兼容" } else { "手机接收已就绪" }.into();
+                view.status_detail = if unsupported_v2_format { "V2 握手已认证，但 Receiver 拒绝所选音频描述符；未启动 BIND、START 或 PCM。请选择 Standard 或更新 Receiver。" }
+                    else if management_only { "P5-A 与管理能力查询已认证；未启动 BIND、START 或 PCM。请通过授权 ADB 或手动安装兼容版本。" }
                     else { "P5-A 已认证；本机 PCM 已接入所选 LAN 接收会话。" }.into();
                 view.audio_bitrate_bps = if management_only { None } else { Some(0) };
             }
@@ -741,6 +959,10 @@ impl AppState {
         begin_operation_slot(&self.operation_generation, &self.operation, true)
     }
 
+    fn try_start_exclusive_operation(&self) -> Option<(u64, CancellationToken)> {
+        try_begin_exclusive_operation(&self.operation_generation, &self.operation)
+    }
+
     fn start_preemptible_background_operation(&self) -> Option<(u64, CancellationToken)> {
         begin_preemptible_background_operation(&self.operation_generation, &self.operation)
     }
@@ -750,11 +972,113 @@ impl AppState {
     }
 
     fn operation_is_current(&self, generation: u64, token: &CancellationToken) -> bool {
-        self.operation_generation.load(Ordering::Acquire) == generation && !token.is_cancelled()
+        operation_generation_matches(&self.operation_generation, generation)
+            && !token.is_cancelled()
+    }
+
+    pub(crate) fn usb_direct_configuration_active(&self) -> bool {
+        self.usb_direct_configuration_id.load(Ordering::Acquire) != 0
     }
 
     fn finish_operation(&self, generation: u64) {
         finish_operation_slot(&self.operation, generation);
+    }
+
+    fn prepare_usb_direct_configuration_operation(&self) -> Result<(), String> {
+        let mut current = self.operation.lock().expect("operation lock");
+        match current.as_ref() {
+            Some(operation) if !operation.background && !operation.token.is_cancelled() => {
+                Err("AnPod 正在执行前台操作；请完成或取消后再配置 USB Direct。".into())
+            }
+            Some(operation) if operation.background => {
+                operation.token.cancel();
+                self.operation_generation.fetch_add(1, Ordering::AcqRel);
+                *current = None;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn begin_usb_direct_configuration(
+        &self,
+        disconnect_current: bool,
+    ) -> Result<UsbDirectConfiguration, String> {
+        let configuration_id = self
+            .usb_direct_configuration_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1);
+        if self
+            .usb_direct_configuration_id
+            .compare_exchange(0, configuration_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("USB Direct 配置窗口已处于打开状态。".into());
+        }
+        let result = async {
+            self.prepare_usb_direct_configuration_operation()?;
+            let _gate = self.gate.lock().await;
+            self.prepare_usb_direct_configuration_operation()?;
+            let session_active = self.session.lock().await.is_some();
+            if session_active && !disconnect_current {
+                return Err("AnPod 有活动会话；请先确认断开后再配置 USB Direct。".into());
+            }
+            if session_active {
+                let cleanup = self.teardown(None).await;
+                let mut view = self.view.lock().expect("app view lock");
+                view.output = "computer".into();
+                view.busy = false;
+                view.device_name = None;
+                if let Err(error) = cleanup {
+                    view.state = "error".into();
+                    view.message = format!("已断开，但清理连接失败：{error}");
+                    view.status_detail = "USB Direct 配置未启动；连接清理需要处理。".into();
+                    return Err(format!("已断开，但清理连接失败：{error}"));
+                }
+                view.state = if view.devices.is_empty() {
+                    "noDevice".into()
+                } else {
+                    "ready".into()
+                };
+                view.message = "已断开连接；正在配置 USB Direct".into();
+                view.status_detail =
+                    "当前自动连接已暂停。关闭配置窗口后，未触发 AOA 切换的情况下会恢复自动连接。"
+                        .into();
+            }
+            let view = self.view.lock().expect("app view lock");
+            if view.busy || view.session_active {
+                return Err(
+                    "AnPod 正在连接或已有活动会话；请先结束操作后再配置 USB Direct。".into(),
+                );
+            }
+            drop(view);
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = self.usb_direct_configuration_id.compare_exchange(
+                configuration_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Err(error);
+        }
+        Ok(UsbDirectConfiguration {
+            snapshot: self.snapshot(),
+            configuration_id,
+        })
+    }
+
+    pub fn end_usb_direct_configuration(&self, configuration_id: u64) -> AppSnapshot {
+        let _ = self.usb_direct_configuration_id.compare_exchange(
+            configuration_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.snapshot()
     }
 
     fn start_qr_operation(&self) -> (u64, CancellationToken) {
@@ -803,6 +1127,18 @@ impl AppState {
             || view.session_active
             || (view.state == "error" && view.device_name.is_some());
         let can_change_modes = !view.busy && !can_disconnect;
+        let can_change_playback_mode = view.session_active
+            && !view.busy
+            && match view.session_transport.as_deref() {
+                Some("usb" | "wifi" | "lan") => true,
+                Some("aoa") => view
+                    .session_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| {
+                        capabilities.capability_bits & CAP_AOA_SESSION_RESTART != 0
+                    }),
+                _ => false,
+            };
         AppSnapshot {
             state: view.state.clone(),
             message: view.message.clone(),
@@ -825,6 +1161,22 @@ impl AppState {
                 .map(str::to_owned),
             session_capabilities: view.session_capabilities.clone(),
             playback_diagnostics: view.playback_diagnostics.clone(),
+            negotiated_audio_format: (view.session_active && view.output == "phone")
+                .then(|| {
+                    negotiated_audio_format(
+                        view.session_active,
+                        &view.output,
+                        view.playback_diagnostics.as_ref(),
+                    )
+                    .or_else(|| view.negotiated_audio_format.clone())
+                })
+                .flatten(),
+            windows_mix_format: (view.session_active && view.output == "phone")
+                .then(|| view.windows_mix_format.clone())
+                .flatten(),
+            android_output_format: (view.session_active && view.output == "phone")
+                .then(|| android_output_format(view.playback_diagnostics.as_ref()))
+                .flatten(),
             network_recovery_seconds_remaining: view.network_recovery_seconds_remaining,
             wireless_connection_offers: self.wireless_connection_offers(),
             session_android_version: view.session_android_version.clone(),
@@ -836,6 +1188,7 @@ impl AppState {
             busy: view.busy,
             can_disconnect,
             can_change_modes,
+            can_change_playback_mode,
             status_detail: view.status_detail.clone(),
             audio_bitrate_bps: view.audio_bitrate_bps,
             presence: self.presence.lock().expect("presence lock").view(),
@@ -853,6 +1206,8 @@ impl AppState {
         let generation = active.generation;
         let bytes = if let Some(owner) = active.network_owner.as_ref() {
             owner.pcm_payload_bytes_sent()
+        } else if let Some(owner) = active.aoa_owner.as_ref() {
+            owner.snapshot().pcm_payload_bytes_sent
         } else if let Ok(bytes) = self.audio.sent_pcm_bytes() {
             bytes
         } else {
@@ -920,6 +1275,7 @@ impl AppState {
             active.generation == generation
                 && active.serial == serial
                 && active.network_owner.is_none()
+                && active.aoa_owner.is_none()
                 && active.output == "phone"
         }) else {
             return false;
@@ -946,7 +1302,7 @@ impl AppState {
             (
                 "streaming",
                 "正在手机播放",
-                "Receiver 已确认 AudioTrack 正在播放。",
+                "Receiver 已确认播放引擎正在播放。",
             )
         } else {
             (
@@ -996,6 +1352,21 @@ impl AppState {
         self.view.lock().expect("app view lock").settings = settings;
     }
 
+    fn remember_usb_direct_target(
+        &self,
+        target_id: &str,
+        binding_reference: &str,
+    ) -> Result<(), String> {
+        let mut view = self.view.lock().expect("app view lock");
+        let mut settings = view.settings.clone();
+        settings.last_usb_direct_target_id = Some(target_id.into());
+        settings.last_usb_direct_binding_reference = Some(binding_reference.into());
+        let settings = normalize_settings(settings);
+        self.save_settings(&settings)?;
+        view.settings = settings;
+        Ok(())
+    }
+
     fn save_settings(&self, settings: &AppSettings) -> Result<(), String> {
         fs::create_dir_all(&self.data_dir).map_err(|e| e.to_string())?;
         let path = self.data_dir.join("settings.json");
@@ -1034,13 +1405,593 @@ impl AppState {
     }
 
     pub async fn refresh_devices(&self) -> Result<AppSnapshot, String> {
+        if self.usb_direct_configuration_active() {
+            return Ok(self.snapshot());
+        }
+        if self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.aoa_owner.is_some())
+        {
+            return Ok(self.snapshot());
+        }
         self.refresh_devices_with_cancel(None).await
+    }
+
+    pub async fn refresh_devices_from_ui(&self) -> Result<AppSnapshot, String> {
+        let _gate = self.gate.lock().await;
+        if self.usb_direct_configuration_active() {
+            return Ok(self.snapshot());
+        }
+        self.refresh_devices_with_cancel(None).await
+    }
+
+    pub async fn list_aoa_targets(&self) -> Result<Vec<AoaDeviceTarget>, String> {
+        let targets = tokio::task::spawn_blocking(aoa_winusb::discover_targets)
+            .await
+            .map_err(|error| format!("USB Direct 设备枚举任务失败：{error}"))?
+            .map_err(|error| format!("无法读取 USB Direct 设备：{error}"))?;
+        Ok(targets
+            .into_iter()
+            .map(|target| AoaDeviceTarget {
+                label: target.label(),
+                id: target.id,
+            })
+            .collect())
+    }
+
+    pub async fn list_aoa_switch_targets(&self) -> Result<Vec<AoaDeviceTarget>, String> {
+        let targets = tokio::task::spawn_blocking(aoa_winusb::discover_switch_targets)
+            .await
+            .map_err(|error| format!("AOA 切换目标枚举任务失败：{error}"))?
+            .map_err(|error| format!("无法读取 iQOO 11 WinUSB 接口：{error}"))?;
+        Ok(targets
+            .into_iter()
+            .map(|target| AoaDeviceTarget {
+                label: target.label(),
+                id: target.id,
+            })
+            .collect())
+    }
+
+    pub async fn switch_aoa_mode(
+        &self,
+        app: &AppHandle,
+        target_id: &str,
+        release_adb_server: bool,
+    ) -> Result<AoaSwitchResult, String> {
+        if !self.usb_direct_configuration_active() {
+            return Err("USB Direct 配置窗口未处于活动状态；请重新打开后再切换。".into());
+        }
+        if !release_adb_server {
+            return Err("请确认停止本机 ADB server 后再切换 USB 模式。".into());
+        }
+        let (generation, token) = self
+            .try_start_exclusive_operation()
+            .ok_or_else(|| "AnPod 正在处理其他操作；请稍后再切换 USB 模式。".to_string())?;
+        let result: Result<AoaSwitchResult, String> = async {
+            let _gate = self.gate.lock().await;
+            token_check(&token)?;
+            if !self.usb_direct_configuration_active() {
+                return Err("USB Direct 配置窗口已关闭；请重新打开后再切换。".into());
+            }
+            if self.session.lock().await.is_some() {
+                return Err("AnPod 有活动会话；请先断开后再切换 USB 模式。".into());
+            }
+            {
+                let mut view = self.view.lock().expect("view lock");
+                if view.busy || view.session_active {
+                    return Err(
+                        "AnPod 正在连接或已有活动会话；请先结束操作后再切换 USB 模式。".into(),
+                    );
+                }
+                view.busy = true;
+                view.state = "connecting".into();
+                view.message = "正在停止 ADB server 并请求切换 USB 模式…".into();
+                view.device_name = Some("iQOO 11 V2243A".into());
+                view.status_detail = "正在停止本机 ADB server（会影响该服务上的全部调试连接），随后通过已确认的 WinUSB MI_02 接口发送 Android Open Accessory 请求。".into();
+            }
+            self.emit(app);
+
+            let selected_id = target_id.to_owned();
+            let fresh_targets = tokio::task::spawn_blocking(aoa_winusb::discover_switch_targets)
+                .await
+                .map_err(|error| format!("重新检查 iQOO 11 WinUSB 接口失败：{error}"))?
+                .map_err(|error| format!("重新检查 iQOO 11 WinUSB 接口失败：{error}"))?;
+            if !fresh_targets.iter().any(|target| target.id == selected_id) {
+                return Err("所选 iQOO 11 WinUSB 接口已不可用或发生变化；请刷新设备列表后重试。".into());
+            }
+
+            with_confirmed_adb_release(release_adb_server, || async {
+                let stopped = adb_run(
+                    &self.adb_path,
+                    None,
+                    ADB_SERVER_KILL_ARGS,
+                    Duration::from_secs(5),
+                    Some(&token),
+                )
+                .await?;
+                if stopped.success {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "无法停止本机 ADB server，未尝试打开 WinUSB 接口。请检查 ADB server 状态后重试。{}{}",
+                        stopped.stderr.trim(),
+                        stopped.stdout.trim()
+                    ))
+                }
+            })
+            .await?;
+
+            let worker_token = token.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                aoa_winusb::switch_to_accessory(&selected_id, || worker_token.is_cancelled())
+            });
+            let switch_result = tokio::select! {
+                result = &mut worker => result
+                    .map_err(|error| format!("AOA 切换 worker 失败：{error}"))?
+                    .map_err(|error| format!("AOA 切换失败：{error}")),
+                _ = token.cancelled() => {
+                    match worker.await
+                        .map_err(|error| format!("取消 AOA 切换 worker 失败：{error}"))?
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            Err("AOA 切换已取消。".into())
+                        }
+                        Err(error) => Err(format!("AOA 切换失败：{error}")),
+                    }
+                }
+            };
+            switch_result.map_err(|error| {
+                format!(
+                    "{error}。请确认该接口仍使用 WinUSB 驱动，并关闭其他正在使用此 USB 接口的工具后重试。"
+                )
+            })?;
+            Ok(AoaSwitchResult {
+                success: true,
+                message: "已发送 AOA 切换请求；手机的 USB 连接将断开，等待手机重新枚举。".into(),
+                requires_refresh: true,
+            })
+        }
+        .await;
+        self.finish_operation(generation);
+        if operation_generation_matches(&self.operation_generation, generation) {
+            let mut view = self.view.lock().expect("view lock");
+            if result.is_ok() && view.message == "正在停止 ADB server 并请求切换 USB 模式…"
+            {
+                view.busy = false;
+                view.state = "noDevice".into();
+                view.message = "等待手机重新枚举".into();
+                view.device_name = None;
+                view.status_detail =
+                    "已发送 AOA 切换请求；手机 USB 设备重新出现后可选择 USB Direct。".into();
+            } else if result.is_err() && view.message == "正在停止 ADB server 并请求切换 USB 模式…"
+            {
+                view.busy = false;
+                view.state = if view.devices.is_empty() {
+                    "noDevice"
+                } else {
+                    "ready"
+                }
+                .into();
+                view.message = "USB 模式切换未完成".into();
+                view.device_name = None;
+                view.status_detail = result.as_ref().unwrap_err().clone();
+            }
+        }
+        self.emit(app);
+        result
+    }
+
+    #[cfg(windows)]
+    pub async fn start_aoa_audio(
+        &self,
+        app: &AppHandle,
+        target_id: &str,
+        binding_reference: &str,
+    ) -> Result<AppSnapshot, String> {
+        if !valid_binding_reference(binding_reference) {
+            return Err("请选择有效的已保存 Receiver 绑定。".into());
+        }
+        let (generation, token) = self.start_operation();
+        let _gate = self.gate.lock().await;
+        if let Err(error) = token_check(&token) {
+            self.finish_operation(generation);
+            return Err(error);
+        }
+        if self.session.lock().await.is_some() {
+            self.finish_operation(generation);
+            return Err("AnPod 已有活动会话；请先断开后再启动 USB Direct。".into());
+        }
+        let label = match aoa_winusb::discover_targets()
+            .map_err(|error| format!("无法读取 USB Direct 设备：{error}"))
+        {
+            Err(error) => {
+                self.finish_operation(generation);
+                return Err(error);
+            }
+            Ok(targets) => match targets.into_iter().find(|target| target.id == target_id) {
+                Some(target) => target.label(),
+                None => {
+                    self.finish_operation(generation);
+                    return Err("所选 USB Direct 设备已不可用；请重新读取设备列表。".into());
+                }
+            },
+        };
+        {
+            let mut view = self.view.lock().expect("view lock");
+            view.busy = true;
+            view.state = "connecting".into();
+            view.message = "正在连接 USB Direct Receiver…".into();
+            view.device_name = Some(label.clone());
+            view.output = "computer".into();
+            view.session_serial = None;
+            view.status_detail = "正在验证所选绑定并建立 USB Direct 会话。".into();
+        }
+        self.emit(app);
+        let mut audio_initialized = true;
+        let result = async {
+            token_check(&token)?;
+            let settings = self.view.lock().expect("view lock").settings.clone();
+            if settings.preferred_transport != "Usb" || settings.wired_mode != "aoa" {
+                return Err("请先选择 USB Direct 有线模式。".into());
+            }
+            validate_audio_quality(&settings.audio_quality)?;
+            let mode = if settings.playback_mode.eq_ignore_ascii_case("lowlatency") {
+                1
+            } else {
+                0
+            };
+            let profile = match settings.audio_quality.as_str() {
+                "standard" => 1,
+                "hifi" => 2,
+                "hires" => 3,
+                _ => return Err("所选音质不可用。".into()),
+            };
+            let format = AudioFormatV2::for_profile(profile, mode)
+                .map_err(|_| "无法建立所选 USB Direct 音频格式。".to_string())?;
+            let (owner, queue, mix_format) = self
+                .create_aoa_owner(target_id, binding_reference, format, &token)
+                .await?;
+            token_check(&token)?;
+            let sink = match &queue {
+                SessionAudioQueue::Pcm16(queue) => {
+                    self.audio.start_pcm_sink(queue.clone()).map(|()| None)
+                }
+                SessionAudioQueue::Float32(_, _) => self.start_session_audio_sink(&queue),
+            };
+            let mix_format = match sink {
+                Ok(Some(format)) => Some(format),
+                Ok(None) => mix_format,
+                Err(error) => {
+                    let _ = owner.stop();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.audio.mute_active() {
+                let _ = self.audio.stop_pcm_sink();
+                let _ = self.audio.restore_muted();
+                let _ = owner.stop();
+                audio_initialized = false;
+                return Err(error);
+            }
+            token_check(&token)?;
+            if let Err(error) = self.remember_usb_direct_target(target_id, binding_reference) {
+                let _ = owner.stop();
+                return Err(error);
+            }
+            let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let owner_snapshot = owner.snapshot();
+            *self.session.lock().await = Some(Session {
+                generation: session_generation,
+                serial: String::new(),
+                transport: "aoa".into(),
+                reverse: String::new(),
+                child: None,
+                installed_receiver: false,
+                receiver_owner_id: None,
+                receiver_generation: None,
+                output: "phone".into(),
+                output_tail: Arc::new(Mutex::new(VecDeque::new())),
+                network_owner: None,
+                aoa_owner: Some(owner),
+                aoa_target_id: Some(target_id.to_owned()),
+                network_sink_queue: None,
+                network_binding_ref: Some(binding_reference.to_owned()),
+                windows_mix_format: mix_format.clone(),
+            });
+            {
+                let mut view = self.view.lock().expect("view lock");
+                view.busy = false;
+                view.session_active = true;
+                view.session_serial = None;
+                view.session_receiver_binding = Some(binding_reference.to_owned());
+                view.session_generation = Some(session_generation);
+                view.session_transport = Some("aoa".into());
+                view.session_android_version = None;
+                view.session_capabilities = Some(owner_snapshot.capabilities);
+                view.playback_diagnostics = owner_snapshot.playback_progress;
+                view.negotiated_audio_format = Some(negotiated_v2_audio_format(format));
+                view.windows_mix_format = mix_format;
+                view.network_recovery_seconds_remaining = None;
+                view.output = "phone".into();
+                view.state = "phoneReady".into();
+                view.message = "USB Direct Receiver 已就绪".into();
+                view.status_detail =
+                    "已通过 USB Direct 完成 ANPB 绑定认证；音频使用独立 ANPD v2 会话。".into();
+                view.audio_bitrate_bps = Some(0);
+            }
+            *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+            Ok(self.snapshot())
+        }
+        .await;
+        if result.is_err() && audio_initialized {
+            let _ = self.audio.stop_pcm_sink();
+            let _ = self.audio.stop_and_cleanup();
+            let _ = self.audio.restore_muted();
+        }
+        self.finish_operation(generation);
+        if result.is_err() && operation_generation_matches(&self.operation_generation, generation) {
+            let mut view = self.view.lock().expect("view lock");
+            view.busy = false;
+            if !view.session_active {
+                view.state = if view.devices.is_empty() {
+                    "noDevice"
+                } else {
+                    "ready"
+                }
+                .into();
+                view.message = "USB Direct 连接失败或已取消".into();
+                view.status_detail = result.as_ref().err().cloned().unwrap_or_default();
+                view.device_name = None;
+                view.output = "computer".into();
+            }
+        }
+        self.emit(app);
+        result
+    }
+
+    #[cfg(windows)]
+    async fn create_aoa_owner(
+        &self,
+        target_id: &str,
+        binding_reference: &str,
+        format: AudioFormatV2,
+        token: &CancellationToken,
+    ) -> Result<(AoaOwner, SessionAudioQueue, Option<WindowsMixFormat>), String> {
+        let target = aoa_winusb::discover_targets()
+            .map_err(|error| format!("无法读取 USB Direct 设备：{error}"))?
+            .into_iter()
+            .find(|target| target.id == target_id)
+            .ok_or_else(|| "所选 USB Direct 设备已不可用；请重新读取设备列表。".to_string())?;
+        let (queue, mix_format) = if format.profile == 1 {
+            self.audio.initialize()?;
+            let actual = self.audio.pcm_format()?;
+            if actual
+                != (PcmFormat {
+                    sample_rate: format.sample_rate,
+                    channels: format.channels as u16,
+                })
+            {
+                return Err("Standard USB Direct 只支持当前 48 kHz stereo PCM16 采集格式。".into());
+            }
+            (
+                SessionAudioQueue::Pcm16(Arc::new(PcmQueue::for_session(actual, format.mode == 1))),
+                None,
+            )
+        } else {
+            let native = self.audio.probe_float_format()?;
+            crate::audio::validate_float_format_for_session(&native, format)?;
+            let queue = Arc::new(FloatPcmQueue::new(format.mode == 1));
+            queue.set_expected_format(format.sample_rate, 4096)?;
+            (
+                SessionAudioQueue::Float32(queue, format),
+                Some(windows_mix_format(native)),
+            )
+        };
+        let path = binding_store_path(&self.data_dir, binding_reference)?;
+        if !path.is_file() {
+            return Err("所选 Receiver 绑定不存在；请先通过配对建立该绑定。".into());
+        }
+        let material = BindingStore::load(&path)
+            .map_err(|_| "本机 DPAPI Receiver 绑定材料不可用。".to_string())?;
+        token_check(token)?;
+        let cancel_slot = Arc::new(Mutex::new(None::<AoaCancel>));
+        let worker_cancel_slot = cancel_slot.clone();
+        let worker_token = token.clone();
+        let worker_queue = queue.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let stream = aoa_winusb::open_target(&target)
+                .map_err(|error| format!("无法打开 USB Direct 设备：{error}"))?;
+            let cancel = stream.cancel.clone();
+            *worker_cancel_slot.lock().expect("AOA cancel slot") = Some(cancel.clone());
+            if worker_token.is_cancelled() {
+                cancel.cancel();
+            }
+            AoaOwner::connect(stream, material, format, worker_queue)
+        });
+        let mut worker = worker;
+        let owner = tokio::select! {
+            result = &mut worker => result.map_err(|error| format!("USB Direct worker failed: {error}"))??,
+            _ = token.cancelled() => {
+                if let Some(cancel) = cancel_slot.lock().expect("AOA cancel slot").as_ref() {
+                    cancel.cancel();
+                }
+                let _ = worker.await;
+                return Err("USB Direct 连接已取消。".into());
+            }
+        };
+        token_check(token)?;
+        Ok((owner, queue, mix_format))
+    }
+
+    #[cfg(windows)]
+    async fn restart_aoa_session_locked(
+        &self,
+        app: &AppHandle,
+        target_id: &str,
+        binding_reference: &str,
+        format: AudioFormatV2,
+        output: &str,
+        token: &CancellationToken,
+    ) -> Result<(), String> {
+        token_check(token)?;
+        let mut session = self.session.lock().await;
+        let active = session
+            .as_mut()
+            .filter(|session| session.aoa_owner.is_some())
+            .ok_or_else(|| "USB Direct 会话已结束。".to_string())?;
+        let old_owner = active.aoa_owner.take().expect("AOA session owner");
+        if let Err(error) = old_owner.stop_for_restart() {
+            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+            drop(session);
+            self.emit(app);
+            return Err(detail);
+        }
+        if let Err(error) = self
+            .audio
+            .stop_pcm_sink()
+            .and_then(|()| self.audio.restore_muted())
+        {
+            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+            drop(session);
+            self.emit(app);
+            return Err(detail);
+        }
+        let (owner, queue, mix_format) = match self
+            .create_aoa_owner(target_id, binding_reference, format, token)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+                drop(session);
+                self.emit(app);
+                return Err(detail);
+            }
+        };
+        if output == "phone" {
+            let sink = match &queue {
+                SessionAudioQueue::Pcm16(queue) => {
+                    self.audio.start_pcm_sink(queue.clone()).map(|()| None)
+                }
+                SessionAudioQueue::Float32(_, _) => self.start_session_audio_sink(&queue),
+            };
+            if let Err(error) = sink.and_then(|_| self.audio.mute_active()) {
+                let _ = owner.stop();
+                let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+                drop(session);
+                self.emit(app);
+                return Err(detail);
+            }
+        } else if let Err(error) = owner
+            .pause()
+            .and_then(|()| self.audio.stop_pcm_sink())
+            .and_then(|()| self.audio.restore_muted())
+        {
+            let _ = owner.stop();
+            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+            drop(session);
+            self.emit(app);
+            return Err(detail);
+        }
+        if let Err(error) = token_check(token) {
+            let _ = owner.stop();
+            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
+            drop(session);
+            self.emit(app);
+            return Err(detail);
+        }
+        active.generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        active.aoa_owner = Some(owner);
+        active.aoa_target_id = Some(target_id.to_owned());
+        active.network_binding_ref = Some(binding_reference.to_owned());
+        active.output = output.to_owned();
+        active.windows_mix_format = mix_format.clone();
+        let generation = active.generation;
+        let snapshot = active.aoa_owner.as_ref().expect("new AOA owner").snapshot();
+        let mut view = self.view.lock().expect("app view lock");
+        view.session_generation = Some(generation);
+        view.session_capabilities = Some(snapshot.capabilities);
+        view.playback_diagnostics = snapshot.playback_progress;
+        view.negotiated_audio_format = Some(negotiated_v2_audio_format(format));
+        view.windows_mix_format = (output == "phone").then_some(mix_format).flatten();
+        view.output = output.into();
+        view.state = if output == "phone" {
+            "phoneReady"
+        } else {
+            "connected"
+        }
+        .into();
+        view.message = if output == "phone" {
+            "USB Direct Receiver 已就绪".into()
+        } else {
+            "已连接 · 电脑播放".into()
+        };
+        view.status_detail = if output == "phone" {
+            "USB Direct 已建立新的认证会话并应用所选播放模式。".into()
+        } else {
+            "USB Direct 新会话已按当前播放模式暂停；电脑声音已恢复。".into()
+        };
+        Ok(())
+    }
+
+    fn clear_aoa_session_after_restart_failure(
+        &self,
+        session: &mut Option<Session>,
+        error: String,
+    ) -> String {
+        *session = None;
+        let mut cleanup = Vec::new();
+        if let Err(stop_error) = self.audio.stop_and_cleanup() {
+            cleanup.push(stop_error);
+        }
+        if let Err(restore_error) = self.audio.restore_muted() {
+            cleanup.push(restore_error);
+        }
+        let detail = if cleanup.is_empty() {
+            error
+        } else {
+            format!("{error}；{}", cleanup.join("；"))
+        };
+        let mut view = self.view.lock().expect("app view lock");
+        view.session_active = false;
+        view.session_serial = None;
+        view.session_receiver_binding = None;
+        view.session_generation = None;
+        view.session_transport = None;
+        view.session_capabilities = None;
+        view.playback_diagnostics = None;
+        view.negotiated_audio_format = None;
+        view.windows_mix_format = None;
+        view.network_recovery_seconds_remaining = None;
+        view.output = "computer".into();
+        view.state = "error".into();
+        view.message = "USB Direct 会话重启失败".into();
+        view.status_detail = format!("本机音频和 USB Direct 会话已清理：{detail}");
+        detail
+    }
+
+    #[cfg(not(windows))]
+    pub async fn start_aoa_audio(
+        &self,
+        _app: &AppHandle,
+        _target_id: &str,
+        _binding_reference: &str,
+    ) -> Result<AppSnapshot, String> {
+        Err("USB Direct WinUSB 仅在 Windows 上可用。".into())
     }
 
     async fn refresh_devices_with_cancel(
         &self,
         cancel: Option<&CancellationToken>,
     ) -> Result<AppSnapshot, String> {
+        if self.usb_direct_configuration_active() {
+            return Ok(self.snapshot());
+        }
         let result = adb_run(
             &self.adb_path,
             None,
@@ -1054,6 +2005,9 @@ impl AppState {
         }
         let mut devices = parse_devices(&result.stdout);
         for device in &mut devices {
+            if self.usb_direct_configuration_active() {
+                break;
+            }
             if device.transport == "unknown"
                 || device.model.is_empty()
                 || device.manufacturer.is_empty()
@@ -1159,101 +2113,16 @@ impl AppState {
         Ok(self.snapshot())
     }
 
-    #[cfg(windows)]
-    async fn connect_pending_wireless_offer(&self, app: &AppHandle) -> bool {
-        {
-            let view = self.view.lock().expect("app view lock");
-            if view.session_active
-                || view.busy
-                || !view
-                    .settings
-                    .preferred_transport
-                    .eq_ignore_ascii_case("wifi")
-                || view.settings.wireless_protocol != "udp"
-            {
-                return false;
-            }
-        }
-        let snapshot = self.wireless_connection_offers();
-        // Several pending targets require explicit selection; hints never establish identity.
-        if !snapshot.active || snapshot.offers.len() != 1 {
-            return false;
-        }
-        let candidate = {
-            let listener = self
-                .host_offer_listener
-                .lock()
-                .expect("offer listener lock");
-            listener.as_ref().and_then(|current| {
-                current
-                    .automatic_binding
-                    .clone()
-                    .zip(snapshot.interface_address)
-                    .map(|(binding, address)| (binding, address, current.cancellation()))
-            })
-        };
-        let Some((binding, address, cancellation)) = candidate else {
-            return false;
-        };
-        let Some(reservation) = self.start_preemptible_background_operation() else {
-            return false;
-        };
-        let offer = self
-            .host_offer_listener
-            .lock()
-            .expect("offer listener lock")
-            .as_ref()
-            .and_then(|current| {
-                if cancellation.is_cancelled() {
-                    None
-                } else {
-                    current.take_offer(&snapshot.offers[0].id)
-                }
-            });
-        let Some(offer) = offer else {
-            self.finish_operation(reservation.0);
-            return false;
-        };
-        let generation = reservation.0;
-        let result = self
-            .start_network_audio_inner(
-                app,
-                &address.to_string(),
-                &offer.endpoint.to_string(),
-                None,
-                None,
-                None,
-                Some(&binding),
-                Some((offer.nonce, true, cancellation)),
-                Some(reservation),
-                false,
-            )
-            .await;
-        if let Err(error) = result {
-            self.log(&format!("Wireless reception intent failed: {error}"));
-            let mut view = self.view.lock().expect("app view lock");
-            if !view.session_active
-                && self.operation_generation.load(Ordering::Acquire) == generation
-            {
-                view.state = "error".into();
-                view.device_name = None;
-                view.message = "手机自动连接未完成".into();
-                view.status_detail = error;
-            }
-            drop(view);
-            self.emit(app);
-        }
-        true
-    }
-
     pub async fn monitor_once(&self, app: &AppHandle) {
-        #[cfg(windows)]
-        if self.connect_pending_wireless_offer(app).await {
+        if self.usb_direct_configuration_active() {
             return;
         }
         let Ok(_gate) = self.gate.try_lock() else {
             return;
         };
+        if self.usb_direct_configuration_active() {
+            return;
+        }
         if self
             .operation
             .lock()
@@ -1261,6 +2130,9 @@ impl AppState {
             .as_ref()
             .is_some_and(|operation| !operation.token.is_cancelled())
         {
+            return;
+        }
+        if self.monitor_aoa_session(app).await {
             return;
         }
         if self.monitor_network_session(app).await {
@@ -1308,6 +2180,8 @@ impl AppState {
                 session.output_tail.clone(),
                 session.reverse.clone(),
                 session.installed_receiver,
+                session.receiver_owner_id.clone(),
+                session.receiver_generation,
                 exited,
             )
         });
@@ -1319,6 +2193,8 @@ impl AppState {
             tail,
             session_key,
             installed_receiver,
+            receiver_owner_id,
+            receiver_generation,
             exited,
         )) = session
         {
@@ -1330,9 +2206,58 @@ impl AppState {
             });
             let connected = self.audio.is_connected().unwrap_or(false);
             let capture_error = self.audio.take_last_error().ok().flatten();
-            if session_is_lost(device_present, exited, connected) || capture_error.is_some() {
+            let mut receiver_status = None;
+            let mut receiver_failure = None;
+            if installed_receiver && device_present != Some(false) {
+                let Some((generation, token)) = self.start_preemptible_background_operation()
+                else {
+                    return;
+                };
+                let result = receiver::health(
+                    &self.adb_path,
+                    &serial,
+                    &self.receiver_apk_path,
+                    &self.receiver_metadata_path,
+                    &token,
+                )
+                .await;
+                let cancelled = !self.operation_is_current(generation, &token);
+                self.finish_operation(generation);
+                if cancelled || !self.operation_is_current(generation, &token) {
+                    return;
+                }
+                if result.as_ref().is_ok_and(|status| {
+                    status
+                        .was_stopped_by_user_for(receiver_owner_id.as_deref(), receiver_generation)
+                }) {
+                    let device_name = self.snapshot().device_name;
+                    if let Err(error) = self.teardown(Some(app)).await {
+                        self.set_state(
+                            app,
+                            "error",
+                            format!("手机已主动停止；清理连接失败：{error}"),
+                            device_name,
+                        );
+                    } else {
+                        self.set_state(app, "ready", "手机已主动停止音频会话", device_name);
+                    }
+                    self.emit(app);
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        receiver_failure = status.monitoring_error();
+                        receiver_status = Some(status);
+                    }
+                    Err(error) => receiver_failure = Some(error),
+                }
+            }
+            let session_lost = session_is_lost(device_present, exited, connected);
+            if session_lost || capture_error.is_some() || receiver_failure.is_some() {
                 let detail = if let Some(error) = capture_error {
                     error
+                } else if let Some(error) = receiver_failure {
+                    format!("Receiver 健康检查失败：{error}")
                 } else if exited {
                     let output = safe_android_tail(
                         &tail
@@ -1353,8 +2278,25 @@ impl AppState {
                     "手机端音频连接已中断".into()
                 };
                 self.log(&detail);
+                if installed_receiver
+                    && (receiver_owner_id.is_none() || receiver_generation.is_none())
+                {
+                    let _ = self.teardown(Some(app)).await;
+                    let device_name = self.snapshot().device_name;
+                    self.set_state(
+                        app,
+                        "error",
+                        format!(
+                            "{detail}；Receiver 缺少会话身份信息，请更新 Receiver 或手动重新连接。"
+                        ),
+                        device_name,
+                    );
+                    self.emit(app);
+                    return;
+                }
                 self.recover_session_locked(
                     app,
+                    session_generation,
                     serial,
                     transport,
                     output == "phone",
@@ -1364,181 +2306,38 @@ impl AppState {
                 .await;
                 return;
             }
-            if receiver_health_needed(installed_receiver, device_present, exited, connected) {
-                let Some((generation, token)) = self.start_preemptible_background_operation()
-                else {
-                    return;
-                };
-                let result = receiver::health(
-                    &self.adb_path,
-                    &serial,
-                    &self.receiver_apk_path,
-                    &self.receiver_metadata_path,
-                    &token,
-                )
-                .await;
-                let cancelled = !self.operation_is_current(generation, &token);
-                self.finish_operation(generation);
-                if cancelled || !self.operation_is_current(generation, &token) {
-                    return;
-                }
-                let receiver_failure = match result {
-                    Ok(status) => match status.monitoring_error() {
-                        Some(error) => Some(error),
-                        None => {
-                            let format = self.audio.pcm_format().ok();
-                            if self
-                                .update_usb_playback_status(
-                                    session_generation,
-                                    &serial,
-                                    output == "phone",
-                                    status.audio_active,
-                                    status.playback_diagnostics,
-                                    format,
-                                )
-                                .await
-                            {
-                                self.emit(app);
-                            }
-                            None
-                        }
-                    },
-                    Err(error) => Some(error),
-                };
-                if let Some(error) = receiver_failure {
-                    let detail = format!("Receiver 健康检查失败：{error}");
-                    self.log(&detail);
-                    self.recover_session_locked(
-                        app,
-                        serial,
-                        transport,
+            if let Some(status) = receiver_status {
+                let format = self.audio.pcm_format().ok();
+                if self
+                    .update_usb_playback_status(
+                        session_generation,
+                        &serial,
                         output == "phone",
-                        session_key,
-                        detail,
+                        status.audio_active,
+                        status.playback_diagnostics,
+                        format,
                     )
-                    .await;
-                    return;
+                    .await
+                {
+                    self.emit(app);
                 }
             }
-            return;
         }
 
-        let Some(snapshot) = snapshot else {
-            return;
-        };
-        let settings = snapshot.settings.clone();
-        let suppressed = self
-            .suppressed_auto_connect
-            .lock()
-            .expect("auto-connect suppression lock")
-            .clone();
-        if let Some(suppressed) = suppressed {
-            if snapshot
-                .devices
-                .iter()
-                .all(|device| device.serial != suppressed)
-            {
-                *self
-                    .suppressed_auto_connect
-                    .lock()
-                    .expect("auto-connect suppression lock") = None;
+        // Discovery updates the UI; it never establishes a connection.
+    }
+
+    fn start_session_audio_sink(
+        &self,
+        queue: &SessionAudioQueue,
+    ) -> Result<Option<WindowsMixFormat>, String> {
+        match queue {
+            SessionAudioQueue::Pcm16(queue) => {
+                self.audio.start_pcm_sink(queue.clone()).map(|()| None)
             }
-        }
-        if snapshot
-            .settings
-            .last_wireless_endpoint
-            .as_ref()
-            .is_some_and(|endpoint| {
-                snapshot
-                    .devices
-                    .iter()
-                    .any(|device| &device.serial == endpoint)
-            })
-        {
-            self.wireless_probe_attempted
-                .store(false, Ordering::Release);
-        }
-        if !settings.auto_connect_last_device || !selected_transport_allows_auto_adb(&settings) {
-            return;
-        }
-        let target = settings.last_device_id.as_deref();
-        let suppressed = self
-            .suppressed_auto_connect
-            .lock()
-            .expect("auto-connect suppression lock")
-            .clone();
-        let failed = self
-            .failed_auto_connect
-            .lock()
-            .expect("auto-connect failure lock")
-            .clone();
-        if failed.as_ref().is_some_and(|serial| {
-            snapshot
-                .devices
-                .iter()
-                .all(|device| &device.serial != serial)
-        }) {
-            *self
-                .failed_auto_connect
-                .lock()
-                .expect("auto-connect failure lock") = None;
-        }
-        if let Some(device) = snapshot.devices.iter().find(|device| {
-            Some(device.serial.as_str()) == target
-                && Some(device.serial.as_str()) != suppressed.as_deref()
-                && Some(device.serial.as_str()) != failed.as_deref()
-                && device.connectable
-                && device.transport == snapshot.transport
-        }) {
-            if !self.recovering.swap(true, Ordering::AcqRel) {
-                let serial = device.serial.clone();
-                let Some((generation, token)) = self.start_preemptible_background_operation()
-                else {
-                    self.recovering.store(false, Ordering::Release);
-                    return;
-                };
-                let result = self
-                    .connect_locked(app, &serial, generation, &token, false)
-                    .await;
-                self.finish_operation(generation);
-                if let Ok(result) = result {
-                    if !result.success {
-                        *self
-                            .failed_auto_connect
-                            .lock()
-                            .expect("auto-connect failure lock") = Some(serial);
-                        self.log(&format!("Auto-connect failed: {}", result.message));
-                    }
-                } else if let Err(error) = result {
-                    self.log(&format!("Auto-connect failed: {error}"));
-                }
-                self.recovering.store(false, Ordering::Release);
-            }
-            return;
-        }
-        if snapshot.transport == "wifi"
-            && wireless_adb_enabled(&settings)
-            && settings.auto_reconnect_wifi
-        {
-            if let Some(endpoint) = settings
-                .last_wireless_endpoint
-                .filter(|endpoint| endpoint.contains(':'))
-            {
-                if self.wireless_probe_attempted.swap(true, Ordering::AcqRel) {
-                    return;
-                }
-                if checked_adb(
-                    &self.adb_path,
-                    None,
-                    &["connect", &endpoint],
-                    Duration::from_secs(8),
-                    None,
-                )
-                .await
-                .is_ok()
-                {
-                    let _ = self.refresh_devices().await;
-                }
+            SessionAudioQueue::Float32(queue, expected) => {
+                let format = self.audio.start_float_sink(queue.clone(), *expected)?;
+                Ok(Some(windows_mix_format(format)))
             }
         }
     }
@@ -1562,7 +2361,7 @@ impl AppState {
                 .capabilities
                 .as_ref()
                 .is_some_and(|info| info.management_compatible && !info.compatible);
-        let queue = owner.pcm_queue();
+        let queue = owner.audio_queue();
         let mut failure = self.audio.take_last_error().ok().flatten();
         if failure.is_none() && needs_bootstrap {
             failure = Some(
@@ -1583,18 +2382,26 @@ impl AppState {
                 }
             } else if active.output == "phone" {
                 if let Some(queue) = queue.as_ref() {
-                    if pcm_queue_identity_changed(active.network_sink_queue.as_ref(), Some(queue)) {
-                        if let Err(error) = self.audio.start_pcm_sink(queue.clone()) {
-                            failure = Some(error);
-                        } else if let Err(error) = self.audio.mute_active() {
-                            let _ = self.audio.stop_pcm_sink();
-                            let _ = self.audio.restore_muted();
-                            failure = Some(error);
-                        } else {
-                            active.network_sink_queue = Some(queue.clone());
+                    if session_audio_queue_identity_changed(
+                        active.network_sink_queue.as_ref(),
+                        Some(queue),
+                    ) {
+                        match self.start_session_audio_sink(queue) {
+                            Err(error) => failure = Some(error),
+                            Ok(mix_format) => {
+                                if let Err(error) = self.audio.mute_active() {
+                                    let _ = self.audio.stop_pcm_sink();
+                                    let _ = self.audio.restore_muted();
+                                    failure = Some(error);
+                                } else {
+                                    active.network_sink_queue = Some(queue.clone());
+                                    active.windows_mix_format = mix_format;
+                                }
+                            }
                         }
                     }
                 } else if active.network_sink_queue.take().is_some() {
+                    active.windows_mix_format = None;
                     if let Err(error) = self.audio.stop_pcm_sink() {
                         failure = Some(error);
                     }
@@ -1642,6 +2449,8 @@ impl AppState {
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = None;
+                view.windows_mix_format = None;
                 view.network_recovery_seconds_remaining = None;
                 view.session_android_version = None;
                 view.output = "computer".into();
@@ -1689,14 +2498,14 @@ impl AppState {
         } else if state == "streaming" {
             (
                 "正在手机播放".into(),
-                "Receiver 已确认 AudioTrack 收到 PCM 音频。".into(),
+                "Receiver 已确认播放引擎收到 PCM 音频。".into(),
             )
         } else if state == "paused" {
             ("手机播放已暂停".into(), "P5-C 会话已暂停。".into())
         } else {
             (
                 "手机接收已就绪".into(),
-                "P5-A 已认证；等待 Receiver AudioTrack 收到 PCM 音频。".into(),
+                "P5-A 已认证；等待接收端播放引擎收到 PCM 音频。".into(),
             )
         };
         let changed = {
@@ -1713,6 +2522,13 @@ impl AppState {
             view.session_receiver_binding = active.network_binding_ref.clone();
             view.session_capabilities = snapshot.capabilities.clone();
             view.playback_diagnostics = snapshot.playback_diagnostics.clone();
+            view.negotiated_audio_format =
+                snapshot.negotiated_format.map(negotiated_v2_audio_format);
+            if active.output == "computer" || management_only {
+                view.windows_mix_format = None;
+            } else {
+                view.windows_mix_format = active.windows_mix_format.clone();
+            }
             view.network_recovery_seconds_remaining = snapshot.recovery_seconds_remaining;
             changed
         };
@@ -1723,9 +2539,365 @@ impl AppState {
         true
     }
 
+    async fn monitor_aoa_session(&self, app: &AppHandle) -> bool {
+        let mut session = self.session.lock().await;
+        let Some(active) = session
+            .as_mut()
+            .filter(|session| session.aoa_owner.is_some())
+        else {
+            return false;
+        };
+        let snapshot = active
+            .aoa_owner
+            .as_ref()
+            .expect("AOA session owner")
+            .snapshot();
+        let failure = self.audio.take_last_error().ok().flatten().or_else(|| {
+            (snapshot.state == crate::p5c::ReceiverState::Stopped).then(|| {
+                snapshot
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "AOA Receiver session stopped".into())
+            })
+        });
+        match snapshot.terminal_cause {
+            Some(TerminalCause::ReceiverUserStop) => {
+                let generation = active.generation;
+                drop(session);
+                self.finish_aoa_terminal(generation, app, "手机已主动停止音频会话")
+                    .await;
+                return true;
+            }
+            Some(TerminalCause::TransportFailure) => {
+                let generation = active.generation;
+                if snapshot.capabilities.capability_bits & CAP_TERMINAL_CAUSE == 0 {
+                    drop(session);
+                    self.finish_aoa_terminal(
+                        generation,
+                        app,
+                        "手机 Receiver 无法确认会话终止原因，请更新 Receiver 或手动重新连接。",
+                    )
+                    .await;
+                    return true;
+                }
+                let target_id = active.aoa_target_id.clone();
+                let binding = active.network_binding_ref.clone();
+                let format = snapshot.format;
+                let output = active.output.clone();
+                let reason = snapshot
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "USB Direct 连接已中断".into());
+                drop(session);
+                if let (Some(target_id), Some(binding)) = (target_id, binding) {
+                    self.recover_aoa_session_locked(
+                        app, generation, target_id, binding, format, output, reason,
+                    )
+                    .await;
+                } else {
+                    self.finish_aoa_terminal(
+                        generation,
+                        app,
+                        "AOA 会话缺少恢复目标或 Receiver 绑定，请手动重新连接。",
+                    )
+                    .await;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(error) = failure {
+            let _ = self.audio.stop_and_cleanup();
+            let _ = self.audio.restore_muted();
+            if let Some(owner) = active.aoa_owner.take() {
+                let _ = owner.stop();
+            }
+            *session = None;
+            let mut view = self.view.lock().expect("view lock");
+            view.session_active = false;
+            view.session_serial = None;
+            view.session_receiver_binding = None;
+            view.session_generation = None;
+            view.session_transport = None;
+            view.session_capabilities = None;
+            view.playback_diagnostics = None;
+            view.negotiated_audio_format = None;
+            view.windows_mix_format = None;
+            view.output = "computer".into();
+            view.state = "error".into();
+            view.message = "USB Direct 音频会话已停止".into();
+            view.status_detail = format!("本机采集已清理；{error}");
+            view.audio_bitrate_bps = None;
+            drop(view);
+            drop(session);
+            self.emit(app);
+            *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+            return true;
+        }
+        let next_state = match snapshot.state {
+            crate::p5c::ReceiverState::Streaming => "streaming",
+            crate::p5c::ReceiverState::Paused => "paused",
+            crate::p5c::ReceiverState::ReceiverRunning => "phoneReady",
+            _ => "connected",
+        };
+        let changed = {
+            let mut view = self.view.lock().expect("view lock");
+            let changed =
+                view.state != next_state || view.playback_diagnostics != snapshot.playback_progress;
+            view.state = next_state.into();
+            view.message = match next_state {
+                "streaming" => "正在通过 USB Direct 播放".into(),
+                "paused" => "USB Direct 播放已暂停".into(),
+                _ => "USB Direct Receiver 已就绪".into(),
+            };
+            view.status_detail = snapshot
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "USB Direct 已认证；音频通过 ANPD v2 流传输。".into());
+            view.session_capabilities = Some(snapshot.capabilities.clone());
+            view.playback_diagnostics = snapshot.playback_progress.clone();
+            view.negotiated_audio_format = Some(negotiated_v2_audio_format(snapshot.format));
+            view.windows_mix_format = if active.output == "phone" {
+                active.windows_mix_format.clone()
+            } else {
+                None
+            };
+            changed
+        };
+        drop(session);
+        if changed {
+            self.emit(app);
+        }
+        true
+    }
+
+    async fn finish_aoa_terminal(&self, generation: u64, app: &AppHandle, message: &str) {
+        let mut session = self.session.lock().await;
+        if !session
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            return;
+        }
+        let mut cleanup = Vec::new();
+        if let Err(error) = self.audio.stop_and_cleanup() {
+            cleanup.push(error);
+        }
+        if let Err(error) = self.audio.restore_muted() {
+            cleanup.push(error);
+        }
+        if let Some(owner) = session.as_mut().and_then(|active| active.aoa_owner.take()) {
+            if let Err(error) = owner.stop() {
+                cleanup.push(error);
+            }
+        }
+        *session = None;
+        let detail = if cleanup.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message}；清理失败：{}", cleanup.join("；"))
+        };
+        let mut view = self.view.lock().expect("view lock");
+        view.session_active = false;
+        view.session_serial = None;
+        view.session_receiver_binding = None;
+        view.session_generation = None;
+        view.session_transport = None;
+        view.session_capabilities = None;
+        view.playback_diagnostics = None;
+        view.negotiated_audio_format = None;
+        view.windows_mix_format = None;
+        view.output = "computer".into();
+        view.state = if cleanup.is_empty() { "ready" } else { "error" }.into();
+        view.message = detail.clone();
+        view.status_detail = detail;
+        view.audio_bitrate_bps = None;
+        drop(view);
+        drop(session);
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+        self.emit(app);
+    }
+
+    #[cfg(windows)]
+    // Recovery inputs must stay frozen to the generation observed by the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_aoa_session_locked(
+        &self,
+        app: &AppHandle,
+        session_generation: u64,
+        target_id: String,
+        binding: String,
+        format: AudioFormatV2,
+        output: String,
+        reason: String,
+    ) {
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some((operation_generation, token)) = self.start_preemptible_background_operation()
+        else {
+            self.recovering.store(false, Ordering::Release);
+            return;
+        };
+        let mut session = self.session.lock().await;
+        if !session
+            .as_ref()
+            .is_some_and(|active| active.generation == session_generation)
+        {
+            self.finish_operation(operation_generation);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        if let Some(owner) = session.as_mut().and_then(|active| active.aoa_owner.take()) {
+            // The owner already recorded TransportFailure; joining it must not
+            // turn that original link failure into a new cleanup failure.
+            let _ = owner.stop();
+        }
+        let cleanup_result = self
+            .audio
+            .stop_and_cleanup()
+            .and_then(|()| self.audio.restore_muted());
+        if let Err(error) = cleanup_result {
+            drop(session);
+            if !token.is_cancelled() {
+                self.finish_aoa_terminal(
+                    session_generation,
+                    app,
+                    &format!("{reason}；本机音频清理失败：{error}"),
+                )
+                .await;
+            }
+            self.finish_operation(operation_generation);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        if token.is_cancelled() {
+            self.finish_operation(operation_generation);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        drop(session);
+        for attempt in 0..3 {
+            if token.is_cancelled() {
+                break;
+            }
+            self.set_state(
+                app,
+                "reconnecting",
+                format!(
+                    "{reason}，正在恢复 USB Direct 会话（{}/{})…",
+                    attempt + 1,
+                    3
+                ),
+                self.snapshot().device_name,
+            );
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis([1000, 2000, 5000][attempt])) => {}
+            }
+            if token.is_cancelled()
+                || !operation_generation_matches(&self.operation_generation, operation_generation)
+                || !self
+                    .session
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| active.generation == session_generation)
+            {
+                break;
+            }
+            let Ok((owner, queue, mix_format)) = self
+                .create_aoa_owner(&target_id, &binding, format, &token)
+                .await
+            else {
+                continue;
+            };
+            let playback_result = if output == "phone" {
+                self.start_session_audio_sink(&queue)
+                    .and_then(|_| self.audio.mute_active())
+            } else {
+                owner.pause().and_then(|()| {
+                    self.audio.stop_and_cleanup()?;
+                    self.audio.restore_muted()
+                })
+            };
+            if let Err(error) = playback_result {
+                let _ = owner.stop();
+                let _ = self.audio.stop_and_cleanup();
+                let _ = self.audio.restore_muted();
+                self.log(&format!("AOA recovery output setup failed: {error}"));
+                continue;
+            }
+            if token.is_cancelled()
+                || !operation_generation_matches(&self.operation_generation, operation_generation)
+            {
+                let _ = owner.stop();
+                break;
+            }
+            let mut session = self.session.lock().await;
+            let Some(active) = session
+                .as_mut()
+                .filter(|active| active.generation == session_generation)
+            else {
+                let _ = owner.stop();
+                break;
+            };
+            active.generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            active.aoa_owner = Some(owner);
+            active.aoa_target_id = Some(target_id);
+            active.network_binding_ref = Some(binding);
+            active.output = output.clone();
+            active.windows_mix_format = mix_format.clone();
+            let snapshot = active
+                .aoa_owner
+                .as_ref()
+                .expect("recovered AOA owner")
+                .snapshot();
+            let mut view = self.view.lock().expect("view lock");
+            view.session_generation = Some(active.generation);
+            view.session_capabilities = Some(snapshot.capabilities);
+            view.playback_diagnostics = snapshot.playback_progress;
+            view.negotiated_audio_format = Some(negotiated_v2_audio_format(format));
+            view.windows_mix_format = (output == "phone").then_some(mix_format).flatten();
+            view.output = output.clone();
+            view.state = if output == "phone" {
+                "phoneReady"
+            } else {
+                "connected"
+            }
+            .into();
+            view.message = if output == "phone" {
+                "USB Direct Receiver 已恢复"
+            } else {
+                "已连接 · 电脑播放"
+            }
+            .into();
+            view.status_detail = "USB Direct 已在同一目标和格式上重新认证。".into();
+            drop(view);
+            drop(session);
+            self.finish_operation(operation_generation);
+            self.emit(app);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        self.finish_operation(operation_generation);
+        if !token.is_cancelled() {
+            self.finish_aoa_terminal(
+                session_generation,
+                app,
+                "USB Direct 恢复失败，请手动重新连接。",
+            )
+            .await;
+        }
+        self.recovering.store(false, Ordering::Release);
+    }
+
+    // Recovery inputs must stay frozen to the generation observed by the caller.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_session_locked(
         &self,
         app: &AppHandle,
+        session_generation: u64,
         serial: String,
         transport: String,
         was_playing: bool,
@@ -1735,13 +2907,17 @@ impl AppState {
         if self.recovering.swap(true, Ordering::AcqRel) {
             return;
         }
-        let same_session = self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|session| session.serial == serial && session.reverse == session_key);
+        let Some((generation, token)) = self.start_preemptible_background_operation() else {
+            self.recovering.store(false, Ordering::Release);
+            return;
+        };
+        let same_session = self.session.lock().await.as_ref().is_some_and(|session| {
+            session.generation == session_generation
+                && session.serial == serial
+                && session.reverse == session_key
+        });
         if !same_session {
+            self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
         }
@@ -1749,39 +2925,23 @@ impl AppState {
         // still reporting connected must not override a missing ADB device.
         let device_name = self.snapshot().device_name;
         if let Err(error) = self.teardown(Some(app)).await {
-            self.set_state(
-                app,
-                "error",
-                format!("{reason}；清理连接失败：{error}"),
-                device_name,
-            );
+            if !token.is_cancelled() {
+                self.set_state(
+                    app,
+                    "error",
+                    format!("{reason}；清理连接失败：{error}"),
+                    device_name,
+                );
+            }
+            self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
         }
-        let suppressed = self
-            .suppressed_auto_connect
-            .lock()
-            .expect("auto-connect suppression lock")
-            .as_deref()
-            == Some(serial.as_str());
-        if suppressed {
-            self.set_state(app, "error", reason, device_name);
+        if token.is_cancelled() {
+            self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
         }
-        let settings = self.snapshot().settings;
-        if !settings.auto_connect_last_device
-            || (transport == "wifi"
-                && (!settings.auto_reconnect_wifi || !wireless_adb_enabled(&settings)))
-        {
-            self.set_state(app, "error", reason, device_name);
-            self.recovering.store(false, Ordering::Release);
-            return;
-        }
-        let Some((generation, token)) = self.start_preemptible_background_operation() else {
-            self.recovering.store(false, Ordering::Release);
-            return;
-        };
         for attempt in 0..3 {
             if token.is_cancelled() {
                 break;
@@ -1793,15 +2953,11 @@ impl AppState {
                 device_name.clone(),
             );
             tokio::select! { _ = token.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis([1000, 2000, 5000][attempt])) => {} }
-            if transport == "wifi" {
-                let endpoint = settings
-                    .last_wireless_endpoint
-                    .as_deref()
-                    .unwrap_or(&serial);
+            if transport == "wifi" && serial.contains(':') {
                 let _ = checked_adb(
                     &self.adb_path,
                     None,
-                    &["connect", endpoint],
+                    &["connect", &serial],
                     Duration::from_secs(8),
                     Some(&token),
                 )
@@ -1815,7 +2971,9 @@ impl AppState {
                 .snapshot()
                 .devices
                 .iter()
-                .find(|device| device.serial == serial && device.connectable)
+                .find(|device| {
+                    device.serial == serial && device.transport == transport && device.connectable
+                })
                 .cloned()
             {
                 if let Ok(result) = self
@@ -1824,7 +2982,7 @@ impl AppState {
                 {
                     if result.success {
                         if !was_playing {
-                            let _ = self.set_output_locked("computer", &token).await;
+                            let _ = self.set_output_locked(app, "computer", &token).await;
                             self.emit(app);
                         }
                         self.finish_operation(generation);
@@ -1836,11 +2994,9 @@ impl AppState {
             }
         }
         self.finish_operation(generation);
-        if !token.is_cancelled() {
-            *self
-                .failed_auto_connect
-                .lock()
-                .expect("auto-connect failure lock") = Some(serial);
+        if !token.is_cancelled()
+            && operation_generation_matches(&self.operation_generation, generation)
+        {
             self.set_state(app, "error", "重连失败，请手动连接。", device_name);
         }
         self.recovering.store(false, Ordering::Release);
@@ -1877,14 +3033,10 @@ impl AppState {
                     snapshot: self.snapshot(),
                 });
             }
-            if self
-                .session
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|session| session.network_owner.is_some())
-            {
-                return Err("当前是 LAN 直连会话；请先断开后再切换手机。".into());
+            if self.session.lock().await.as_ref().is_some_and(|session| {
+                session.network_owner.is_some() || session.aoa_owner.is_some()
+            }) {
+                return Err("当前是直接连接会话；请先断开后再切换手机。".into());
             }
             let old_session = self
                 .session
@@ -2000,10 +3152,6 @@ impl AppState {
         serial: String,
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
-        *self
-            .failed_auto_connect
-            .lock()
-            .expect("auto-connect failure lock") = None;
         let (generation, token) = self.start_operation();
         let _guard = self.gate.lock().await;
         let result = if !self.operation_is_current(generation, &token) {
@@ -2034,6 +3182,19 @@ impl AppState {
         token: &CancellationToken,
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
+        if play_on_phone {
+            let settings = self.view.lock().expect("view lock").settings.clone();
+            if settings.preferred_transport == "Usb" && settings.wired_mode == "aoa" {
+                return Err(
+                    "USB Direct 有线模式已选；请从 USB Direct 入口连接，或切回 ADB。".into(),
+                );
+            }
+            let quality = settings.audio_quality;
+            validate_audio_quality(&quality)?;
+            if quality != "standard" {
+                return Err("ADB连接仅支持标准音质。".into());
+            }
+        }
         if !self.operation_is_current(generation, token) {
             return Ok(OperationResult {
                 success: false,
@@ -2140,11 +3301,16 @@ impl AppState {
             reverse: reverse.clone(),
             child: None,
             installed_receiver,
+            receiver_owner_id: None,
+            receiver_generation: None,
             output: "computer".into(),
             output_tail: Arc::new(Mutex::new(VecDeque::new())),
             network_owner: None,
+            aoa_owner: None,
+            aoa_target_id: None,
             network_sink_queue: None,
             network_binding_ref: None,
+            windows_mix_format: None,
         });
         self.view.lock().expect("view lock").session_generation = Some(session_generation);
         {
@@ -2155,6 +3321,8 @@ impl AppState {
             view.session_transport = Some(device.transport.clone());
             view.session_capabilities = None;
             view.playback_diagnostics = None;
+            view.negotiated_audio_format = None;
+            view.windows_mix_format = None;
             view.network_recovery_seconds_remaining = None;
             view.session_android_version =
                 (!device.android_version.is_empty()).then(|| device.android_version.clone());
@@ -2168,23 +3336,25 @@ impl AppState {
             .settings
             .playback_mode
             .to_ascii_lowercase();
-        if installed_receiver {
+        let receiver_status = if installed_receiver {
             let playback_mode = if mode == "lowlatency" || mode == "low_latency" {
                 "lowlatency"
             } else {
                 "balanced"
             };
-            receiver::start_audio(
-                &self.adb_path,
-                serial,
-                &self.receiver_apk_path,
-                &self.receiver_metadata_path,
-                &reverse,
-                &token_text,
-                playback_mode,
-                token,
+            Some(
+                receiver::start_audio(
+                    &self.adb_path,
+                    serial,
+                    &self.receiver_apk_path,
+                    &self.receiver_metadata_path,
+                    &reverse,
+                    &token_text,
+                    playback_mode,
+                    token,
+                )
+                .await?,
             )
-            .await?;
         } else {
             checked_adb(
                 &self.adb_path,
@@ -2255,6 +3425,13 @@ impl AppState {
             }
             if let Some(session) = self.session.lock().await.as_mut() {
                 session.child = Some(child);
+            }
+            None
+        };
+        if let Some(status) = receiver_status {
+            if let Some(session) = self.session.lock().await.as_mut() {
+                session.receiver_owner_id = status.operation_owner_id;
+                session.receiver_generation = status.operation_generation;
             }
         }
         token_check(token)?;
@@ -2345,24 +3522,8 @@ impl AppState {
     pub async fn disconnect(&self, app: &AppHandle) -> Result<OperationResult, String> {
         self.cancel_active_operation();
         self.cancel_qr_pairing();
-        let serial = self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .map(|session| session.serial.clone())
-            .or_else(|| {
-                self.view
-                    .lock()
-                    .expect("app view lock")
-                    .selected_serial
-                    .clone()
-            });
-        *self
-            .suppressed_auto_connect
-            .lock()
-            .expect("auto-connect suppression lock") = serial;
         let _guard = self.gate.lock().await;
+        self.cancel_active_operation();
         let cleanup = self.teardown(Some(app)).await;
         let mut view = self.view.lock().expect("view lock");
         view.state = if cleanup.is_err() {
@@ -2410,6 +3571,9 @@ impl AppState {
 
     pub fn select_device(&self, serial: &str) -> Result<AppSnapshot, String> {
         let mut view = self.view.lock().expect("view lock");
+        if view.session_transport.as_deref() == Some("aoa") {
+            return Err("USB Direct 会话没有 ADB serial；请先断开后再选择 ADB 设备。".into());
+        }
         if view.busy {
             return Err("连接期间无法更换手机。请先断开连接。".into());
         }
@@ -2465,6 +3629,42 @@ impl AppState {
     ) -> Result<AppSnapshot, String> {
         let _guard = self.gate.lock().await;
         token_check(token)?;
+        let aoa_session = {
+            let session = self.session.lock().await;
+            session.as_ref().and_then(|active| {
+                let owner = active.aoa_owner.as_ref()?;
+                let binding = active.network_binding_ref.as_ref()?;
+                Some((
+                    active.aoa_target_id.clone()?,
+                    binding.clone(),
+                    owner.snapshot().format,
+                    active.output.clone(),
+                    owner.snapshot().capabilities.capability_bits,
+                ))
+            })
+        };
+        if let Some((target_id, binding, current_format, output, capabilities)) = aoa_session {
+            if kind != "playback" {
+                return Err("USB Direct 会话连接方式和音质已锁定；请先断开。".into());
+            }
+            if capabilities & CAP_AOA_SESSION_RESTART == 0 {
+                return Err(
+                    "手机 Receiver 不支持在连接中切换播放模式；请更新 Receiver 或先断开。".into(),
+                );
+            }
+            let mode = match value {
+                "balanced" => 0,
+                "lowLatency" => 1,
+                _ => return Err("未知的播放模式。".into()),
+            };
+            let format = AudioFormatV2::for_profile(current_format.profile, mode)
+                .map_err(|_| "USB Direct 音频格式不支持所选播放模式。".to_string())?;
+            self.update_mode_setting(kind, value)?;
+            self.restart_aoa_session_locked(app, &target_id, &binding, format, &output, token)
+                .await?;
+            self.emit(app);
+            return Ok(self.snapshot());
+        }
         {
             let session = self.session.lock().await;
             if let Some(active) = session
@@ -2579,7 +3779,6 @@ impl AppState {
 
         if old_transport == "wifi"
             && self.snapshot().settings.wireless_protocol == "adb"
-            && self.snapshot().settings.auto_reconnect_wifi
             && matches!(
                 selection,
                 ReconfigureSelection::WirelessAdb
@@ -2668,7 +3867,7 @@ impl AppState {
                 return Err(result.message);
             }
             if old_output == "computer" {
-                self.set_output_locked("computer", token).await?;
+                self.set_output_locked(app, "computer", token).await?;
             }
         } else {
             let guidance = match selection {
@@ -2718,6 +3917,7 @@ impl AppState {
             "playbackMode" => settings.playback_mode = normalized.into(),
             _ => unreachable!(),
         }
+        let settings = normalize_settings(settings);
         self.save_settings(&settings)?;
         self.host_offer_listener
             .lock()
@@ -2756,7 +3956,7 @@ impl AppState {
             .take();
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
-            let network_session = session.network_owner.is_some();
+            let legacy_adb_session = session.network_owner.is_none() && session.aoa_owner.is_none();
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = false;
@@ -2766,18 +3966,25 @@ impl AppState {
                 view.session_transport = None;
                 view.session_capabilities = None;
                 view.playback_diagnostics = None;
+                view.negotiated_audio_format = None;
+                view.windows_mix_format = None;
                 view.network_recovery_seconds_remaining = None;
                 view.session_android_version = None;
                 view.audio_bitrate_bps = None;
+            }
+            if let Some(mut owner) = session.network_owner.take() {
+                owner.stop();
+            }
+            if let Some(owner) = session.aoa_owner.take() {
+                if let Err(error) = owner.stop() {
+                    errors.push(format!("USB Direct 会话停止失败：{error}"));
+                }
             }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
             if let Err(error) = self.audio.restore_muted() {
                 errors.push(format!("电脑声音恢复失败：{error}"));
-            }
-            if let Some(mut owner) = session.network_owner.take() {
-                owner.stop();
             }
             if session.installed_receiver {
                 if let Err(error) = receiver::stop(
@@ -2810,7 +4017,7 @@ impl AppState {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
-            if !network_session {
+            if legacy_adb_session {
                 if let Err(error) = adb_run(
                     &self.adb_path,
                     Some(&session.serial),
@@ -2899,16 +4106,172 @@ impl AppState {
             }
             return Ok(result.snapshot);
         }
-        self.set_output_locked(output, token).await?;
+        self.set_output_locked(app, output, token).await?;
         self.emit(app);
         Ok(self.snapshot())
     }
 
     async fn set_output_locked(
         &self,
+        app: &AppHandle,
         output: &str,
         token: &CancellationToken,
     ) -> Result<(), String> {
+        if output == "phone" {
+            let restart = {
+                let session = self.session.lock().await;
+                session.as_ref().and_then(|active| {
+                    if active.output != "computer" {
+                        return None;
+                    }
+                    let owner = active.aoa_owner.as_ref()?;
+                    let snapshot = owner.snapshot();
+                    Some((
+                        active.aoa_target_id.clone()?,
+                        active.network_binding_ref.clone()?,
+                        snapshot.format,
+                        snapshot.capabilities.capability_bits,
+                    ))
+                })
+            };
+            if let Some((target_id, binding, format, capabilities)) = restart {
+                if capabilities & CAP_AOA_SESSION_RESTART == 0 {
+                    return Err(
+                        "手机 Receiver 不支持恢复 USB Direct 播放；请更新 Receiver 或重新连接。"
+                            .into(),
+                    );
+                }
+                self.restart_aoa_session_locked(app, &target_id, &binding, format, "phone", token)
+                    .await?;
+                return Ok(());
+            }
+        }
+        {
+            let mut session = self.session.lock().await;
+            if let Some(active) = session
+                .as_mut()
+                .filter(|session| session.aoa_owner.is_some())
+            {
+                token_check(token)?;
+                let owner = active.aoa_owner.as_ref().expect("AOA session owner");
+                let snapshot = owner.snapshot();
+                if output == "phone" {
+                    let quality = self
+                        .view
+                        .lock()
+                        .expect("view lock")
+                        .settings
+                        .audio_quality
+                        .clone();
+                    let expected_profile = match quality.as_str() {
+                        "standard" => 1,
+                        "hifi" => 2,
+                        "hires" => 3,
+                        _ => return Err("所选音质不可用。".into()),
+                    };
+                    if snapshot.format.profile != expected_profile {
+                        return Err(
+                            "USB Direct 会话格式与当前音质设置不符；请断开后重新连接。".into()
+                        );
+                    }
+                }
+                if active.output == output {
+                    return Ok(());
+                }
+                let changed = if output == "computer" {
+                    owner
+                        .pause()
+                        .and_then(|()| self.audio.stop_pcm_sink())
+                        .and_then(|()| self.audio.restore_muted())
+                } else {
+                    let queue = owner.audio_queue();
+                    let sink = match &queue {
+                        SessionAudioQueue::Pcm16(queue) => {
+                            self.audio.start_pcm_sink(queue.clone()).map(|()| None)
+                        }
+                        SessionAudioQueue::Float32(_, _) => self.start_session_audio_sink(&queue),
+                    };
+                    sink.map(|mix| {
+                        active.windows_mix_format =
+                            mix.or_else(|| active.windows_mix_format.clone());
+                    })
+                    .and_then(|()| self.audio.mute_active())
+                    .and_then(|()| owner.resume())
+                };
+                if let Err(error) = changed {
+                    let _ = self.audio.stop_pcm_sink();
+                    let _ = self.audio.restore_muted();
+                    if let Some(owner) = active.aoa_owner.take() {
+                        let _ = owner.stop();
+                    }
+                    *session = None;
+                    let mut view = self.view.lock().expect("view lock");
+                    view.session_active = false;
+                    view.session_serial = None;
+                    view.session_receiver_binding = None;
+                    view.session_generation = None;
+                    view.session_transport = None;
+                    view.session_capabilities = None;
+                    view.playback_diagnostics = None;
+                    view.negotiated_audio_format = None;
+                    view.windows_mix_format = None;
+                    view.output = "computer".into();
+                    view.state = "error".into();
+                    view.message = "USB Direct 输出切换失败".into();
+                    view.status_detail = format!("本机音频和 USB Direct 会话已清理：{error}");
+                    view.audio_bitrate_bps = None;
+                    return Err(error);
+                }
+                active.output = output.into();
+                let mut view = self.view.lock().expect("view lock");
+                view.output = output.into();
+                view.state = if output == "phone" {
+                    "phoneReady"
+                } else {
+                    "connected"
+                }
+                .into();
+                view.message = if output == "phone" {
+                    "USB Direct Receiver 已就绪"
+                } else {
+                    "已连接 · 电脑播放"
+                }
+                .into();
+                view.status_detail = if output == "phone" {
+                    "USB Direct 已恢复；ANPD v2 音频继续传输。"
+                } else {
+                    "USB Direct 会话保持暂停；电脑声音已恢复。"
+                }
+                .into();
+                view.windows_mix_format = if output == "phone" {
+                    active.windows_mix_format.clone()
+                } else {
+                    None
+                };
+                return Ok(());
+            }
+        }
+        if output == "phone" {
+            let quality = self
+                .view
+                .lock()
+                .expect("view lock")
+                .settings
+                .audio_quality
+                .clone();
+            validate_audio_quality(&quality)?;
+            let requested_quality_matches_session = self
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|session| session.network_owner.as_ref())
+                .map(|owner| owner.matches_audio_quality(&quality))
+                .unwrap_or(quality == "standard");
+            if !requested_quality_matches_session {
+                return Err("The active session does not match the requested audio quality; reconnect to negotiate the selected format. USB/ADB TCP playback supports Standard only.".into());
+            }
+        }
         {
             let mut session = self.session.lock().await;
             if let Some(active) = session
@@ -2932,7 +4295,7 @@ impl AppState {
                 let change = async {
                     if output == "phone" {
                         let queue = if active.output == "computer" {
-                            let old_queue = owner.pcm_queue();
+                            let old_queue = owner.audio_queue();
                             owner.reconnect()?;
                             owner.set_paused(false)?;
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -2944,10 +4307,8 @@ impl AppState {
                                         .last_error
                                         .unwrap_or_else(|| "Receiver session stopped".into()));
                                 }
-                                if let Some(queue) = owner.pcm_queue() {
-                                    let is_fresh = old_queue
-                                        .as_ref()
-                                        .is_none_or(|old| !Arc::ptr_eq(old, &queue));
+                                if let Some(queue) = owner.audio_queue() {
+                                    let is_fresh = session_audio_queue_identity_changed(old_queue.as_ref(), Some(&queue));
                                     if is_fresh
                                         && matches!(
                                             snapshot.state,
@@ -2966,16 +4327,30 @@ impl AppState {
                             }
                         } else {
                             owner.set_paused(false)?;
-                            let Some(queue) = owner.pcm_queue() else {
+                            let Some(queue) = owner.audio_queue() else {
                                 return Ok(());
                             };
                             queue
                         };
-                        self.audio.start_pcm_sink(queue.clone())?;
+                        active.windows_mix_format = self.start_session_audio_sink(&queue)?;
                         self.audio.mute_active()?;
                         active.network_sink_queue = Some(queue);
                     } else {
                         owner.set_paused(true)?;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                        loop {
+                            token_check(token)?;
+                            match owner.snapshot().state {
+                                SessionLifecycleState::Paused => break,
+                                SessionLifecycleState::Stopped => {
+                                    return Err("Receiver session stopped while pausing phone output.".into());
+                                }
+                                _ if tokio::time::Instant::now() >= deadline => {
+                                    return Err("Receiver did not confirm pause before stopping local capture.".into());
+                                }
+                                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                            }
+                        }
                         self.audio.stop_pcm_sink()?;
                         self.audio.restore_muted()?;
                         active.network_sink_queue = None;
@@ -3008,6 +4383,8 @@ impl AppState {
                     view.session_transport = None;
                     view.session_capabilities = None;
                     view.playback_diagnostics = None;
+                    view.negotiated_audio_format = None;
+                    view.windows_mix_format = None;
                     view.network_recovery_seconds_remaining = None;
                     view.session_android_version = None;
                     view.output = "computer".into();
@@ -3018,8 +4395,30 @@ impl AppState {
                     return Err(detail);
                 }
                 active.output = output.into();
+                let active_snapshot = active
+                    .network_owner
+                    .as_ref()
+                    .expect("network session owner")
+                    .snapshot();
                 let mut view = self.view.lock().expect("view lock");
                 view.output = output.into();
+                view.negotiated_audio_format = if output == "phone" {
+                    active_snapshot
+                        .negotiated_format
+                        .map(negotiated_v2_audio_format)
+                } else {
+                    None
+                };
+                view.windows_mix_format = if output == "phone" {
+                    active.windows_mix_format.clone()
+                } else {
+                    None
+                };
+                view.playback_diagnostics = if output == "phone" {
+                    active_snapshot.playback_diagnostics
+                } else {
+                    None
+                };
                 view.state = if output == "phone" {
                     "phoneReady".into()
                 } else {
@@ -3141,6 +4540,7 @@ impl AppState {
     pub async fn cancel_operation(&self, app: &AppHandle) -> AppSnapshot {
         self.cancel_active_operation();
         let _guard = self.gate.lock().await;
+        self.cancel_active_operation();
         if self
             .session
             .try_lock()
@@ -3172,9 +4572,11 @@ impl AppState {
             key,
             "transport"
                 | "preferredTransport"
+                | "wiredMode"
                 | "wirelessProtocol"
                 | "audioBackend"
                 | "playbackMode"
+                | "audioQuality"
         ) && self
             .session
             .try_lock()
@@ -3184,17 +4586,18 @@ impl AppState {
         }
         let mut settings = view.settings.clone();
         match key {
-            "autoConnectLastDevice" => {
-                settings.auto_connect_last_device = value.as_bool().ok_or("无效设置值")?
-            }
             "minimizeToTray" => settings.minimize_to_tray = value.as_bool().ok_or("无效设置值")?,
             "launchAtLogin" => settings.launch_at_login = value.as_bool().ok_or("无效设置值")?,
-            "autoReconnectWifi" => {
-                settings.auto_reconnect_wifi = value.as_bool().ok_or("无效设置值")?
-            }
             "preferredTransport" => {
                 settings.preferred_transport =
                     normalize_transport(value.as_str().ok_or("无效连接方式")?).into()
+            }
+            "wiredMode" => {
+                settings.wired_mode = match value.as_str().ok_or("无效有线模式")? {
+                    value if value.eq_ignore_ascii_case("adb") => "adb".into(),
+                    value if value.eq_ignore_ascii_case("aoa") => "aoa".into(),
+                    _ => return Err("有线模式必须为 adb 或 aoa。".into()),
+                }
             }
             "transport" => {
                 settings.preferred_transport = match value.as_str().ok_or("无效连接方式")? {
@@ -3217,6 +4620,16 @@ impl AppState {
                     _ => return Err("Receiver 后端必须为 receiver 或 legacy。".into()),
                 }
             }
+            "audioQuality" => {
+                let quality = value
+                    .as_str()
+                    .ok_or("无效音质设置 / Invalid audio quality")?;
+                validate_audio_quality(quality)?;
+                if adb_transport_enabled(&settings) && quality != "standard" {
+                    return Err("ADB连接仅支持标准音质。".into());
+                }
+                settings.audio_quality = quality.into();
+            }
             "playbackMode" => {
                 settings.playback_mode =
                     normalize_playback(value.as_str().ok_or("无效播放模式")?).into()
@@ -3227,7 +4640,14 @@ impl AppState {
             }
             _ => return Err("未知设置项。".into()),
         }
-        if matches!(key, "transport" | "preferredTransport" | "wirelessProtocol") {
+        if adb_transport_enabled(&settings) {
+            settings.audio_quality = "standard".into();
+        }
+        let settings = normalize_settings(settings);
+        if matches!(
+            key,
+            "transport" | "preferredTransport" | "wiredMode" | "wirelessProtocol"
+        ) {
             self.host_offer_listener
                 .lock()
                 .expect("offer listener lock")

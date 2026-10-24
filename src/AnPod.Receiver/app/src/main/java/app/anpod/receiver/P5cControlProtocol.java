@@ -44,7 +44,11 @@ final class P5cControlProtocol {
     static final int CAP_CONNECTION_INTENT = 0x00000010;
     static final int CAP_BACKGROUND_START_AUTH = 0x00000020;
     static final int CAP_BACKGROUND_TRUST_MANAGEMENT = 0x00000040;
-    static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS;
+    static final int CAP_AUDIO_V2 = 0x00000080;
+    static final int CAP_TERMINAL_CAUSE = 0x00000100;
+    static final int CAP_AOA_SESSION_RESTART = 0x00000200;
+    static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS
+            | CAP_TERMINAL_CAUSE;
     static final int AUTH_PENDING = 0;
     static final int AUTH_ONCE = 1;
     static final int AUTH_EIGHT_HOURS = 2;
@@ -100,15 +104,23 @@ final class P5cControlProtocol {
                     throw new SocketTimeoutException("P5-C control frame read deadline expired");
             }
         }
+        return decodeRaw(frame, key, direction, sessionId);
+    }
+
+    /** Authenticates one raw ANPC frame; byte-stream transports must apply their own record framing. */
+    static Frame decodeRaw(byte[] frame, byte[] key, int direction, long sessionId) throws IOException {
+        if (frame == null || key == null || key.length != 32
+                || frame.length < HEADER_BYTES + TAG_BYTES || frame.length > MAX_FRAME_BYTES)
+            throw new IOException("invalid P5-C control frame");
         int payloadLength = ((frame[28] & 0xff) << 8) | (frame[29] & 0xff);
         if (frame[0] != 'A' || frame[1] != 'N' || frame[2] != 'P' || frame[3] != 'C'
                 || frame[4] != 1 || frame[6] != 0 || frame[7] != 0
                 || getInt(frame, 8) != direction || getLong(frame, 12) != sessionId
-                || length != HEADER_BYTES + payloadLength + TAG_BYTES)
+                || frame.length != HEADER_BYTES + payloadLength + TAG_BYTES)
             throw new IOException("invalid P5-C control identity or length");
         byte[] expected = mac(key, frame, HEADER_BYTES + payloadLength);
         boolean authenticated = MessageDigest.isEqual(expected,
-                Arrays.copyOfRange(frame, HEADER_BYTES + payloadLength, length));
+                Arrays.copyOfRange(frame, HEADER_BYTES + payloadLength, frame.length));
         Arrays.fill(expected, (byte) 0);
         if (!authenticated) throw new IOException("P5-C control authentication failed");
         return new Frame(frame, frame[5] & 0xff, getLong(frame, 20),
@@ -212,6 +224,22 @@ final class P5cControlProtocol {
         putInt(payload, 58, capacityFrames);
         putInt(payload, 62, startThresholdFrames);
         putInt(payload, 66, preRollFrames);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadV2(byte[] legacyPayload, int openedTrackFormat,
+            int openedTrackChannels, int openedTrackSampleRate) {
+        if (legacyPayload == null || legacyPayload.length != 70
+                || openedTrackFormat < 0 || openedTrackFormat > 3
+                || openedTrackChannels < 0 || openedTrackChannels > 2
+                || openedTrackSampleRate < 0)
+            throw new IllegalArgumentException("invalid v2 playback progress fields");
+        byte[] payload = Arrays.copyOf(legacyPayload, 78);
+        payload[70] = 1; // schema
+        payload[71] = (byte) openedTrackFormat;
+        payload[72] = (byte) openedTrackChannels;
+        payload[73] = 0; // reserved
+        putInt(payload, 74, openedTrackSampleRate);
         return payload;
     }
 

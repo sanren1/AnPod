@@ -41,9 +41,13 @@ pub struct Header {
 
 impl Header {
     fn encode(self) -> [u8; HEADER_LEN] {
+        self.encode_version(1)
+    }
+
+    fn encode_version(self, version: u8) -> [u8; HEADER_LEN] {
         let mut bytes = [0; HEADER_LEN];
         bytes[0..4].copy_from_slice(b"ANPD");
-        bytes[4] = 1;
+        bytes[4] = version;
         bytes[5] = self.packet_type as u8;
         bytes[6..8].copy_from_slice(&0u16.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.session_id.to_be_bytes());
@@ -86,6 +90,86 @@ impl PcmFormat {
             sample_rate,
             channels,
         })
+    }
+}
+
+/// Phase 1 descriptor; constructing it does not enable a product audio path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioFormatV2 {
+    pub profile: u8,
+    pub sample_format: u8,
+    pub channels: u8,
+    pub valid_bits: u8,
+    pub bytes_per_sample: u8,
+    pub mode: u8,
+    pub sample_rate: u32,
+    pub frame_bytes: u16,
+}
+
+impl AudioFormatV2 {
+    pub fn for_profile(profile: u8, mode: u8) -> Result<Self, ProtocolError> {
+        if !(1..=3).contains(&profile) || mode > 1 {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let high = profile != 1;
+        Ok(Self {
+            profile,
+            sample_format: if high { 2 } else { 1 },
+            channels: 2,
+            valid_bits: if high { 24 } else { 16 },
+            bytes_per_sample: if high { 3 } else { 2 },
+            mode,
+            sample_rate: if profile == 3 { 96_000 } else { 48_000 },
+            frame_bytes: if high { 6 } else { 4 },
+        })
+    }
+
+    pub fn encode(self) -> Result<[u8; 16], ProtocolError> {
+        if Self::for_profile(self.profile, self.mode)? != self {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let mut bytes = [0; 16];
+        bytes[..7].copy_from_slice(&[
+            2,
+            self.profile,
+            self.sample_format,
+            self.channels,
+            self.valid_bits,
+            self.bytes_per_sample,
+            self.mode,
+        ]);
+        bytes[8..12].copy_from_slice(&self.sample_rate.to_be_bytes());
+        bytes[12..14].copy_from_slice(&self.frame_bytes.to_be_bytes());
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != 16 || bytes[0] != 2 || bytes[7] != 0 || bytes[14..] != [0, 0] {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let expected = Self::for_profile(bytes[1], bytes[6])?;
+        if expected.encode()?.as_slice() != bytes {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        Ok(expected)
+    }
+
+    fn validate_packet(
+        self,
+        kind: PacketType,
+        index: u64,
+        payload: &[u8],
+    ) -> Result<(), ProtocolError> {
+        match kind {
+            PacketType::Format if index == 0 && payload == self.encode()? => Ok(()),
+            PacketType::Audio
+                if !payload.is_empty()
+                    && payload.len().is_multiple_of(self.frame_bytes as usize) =>
+            {
+                Ok(())
+            }
+            _ => Err(ProtocolError::InvalidFormat),
+        }
     }
 }
 
@@ -133,6 +217,7 @@ pub struct PacketEncoder {
     session_id: u64,
     direction: u32,
     next_sequence: Option<u64>,
+    format_v2: Option<AudioFormatV2>,
 }
 
 impl PacketEncoder {
@@ -146,7 +231,20 @@ impl PacketEncoder {
             session_id,
             direction,
             next_sequence: Some(sequence),
+            format_v2: None,
         }
+    }
+
+    pub fn new_v2(
+        key: &[u8; 32],
+        session_id: u64,
+        direction: u32,
+        format: AudioFormatV2,
+    ) -> Result<Self, ProtocolError> {
+        format.encode()?;
+        let mut encoder = Self::new(key, session_id, direction);
+        encoder.format_v2 = Some(format);
+        Ok(encoder)
     }
 
     pub fn encode_next(
@@ -170,6 +268,9 @@ impl PacketEncoder {
         if payload.len() > MAX_PAYLOAD_LEN || payload.len() > u16::MAX as usize {
             return Err(ProtocolError::Oversize);
         }
+        if let Some(format) = self.format_v2 {
+            format.validate_packet(packet_type, sample_frame_index, payload)?;
+        }
         let header = Header {
             packet_type,
             session_id: self.session_id,
@@ -177,7 +278,7 @@ impl PacketEncoder {
             sample_frame_index,
             payload_len: payload.len() as u16,
         }
-        .encode();
+        .encode_version(if self.format_v2.is_some() { 2 } else { 1 });
         let nonce = nonce(self.direction, sequence);
         let nonce = Nonce::try_from(nonce.as_slice()).expect("nonce has fixed length");
         let encrypted = self
@@ -209,6 +310,7 @@ pub struct PacketDecoder {
     session_id: u64,
     direction: u32,
     replay: ReplayWindow,
+    format_v2: Option<AudioFormatV2>,
 }
 
 impl PacketDecoder {
@@ -218,11 +320,25 @@ impl PacketDecoder {
             session_id,
             direction,
             replay: ReplayWindow::default(),
+            format_v2: None,
         }
     }
 
+    pub fn new_v2(
+        key: &[u8; 32],
+        session_id: u64,
+        direction: u32,
+        format: AudioFormatV2,
+    ) -> Result<Self, ProtocolError> {
+        format.encode()?;
+        let mut decoder = Self::new(key, session_id, direction);
+        decoder.format_v2 = Some(format);
+        Ok(decoder)
+    }
+
     pub fn open(&self, datagram: &[u8]) -> Result<DecodedPacket, ProtocolError> {
-        let (header, header_bytes, encrypted) = parse_header(datagram)?;
+        let (header, header_bytes, encrypted) =
+            parse_header_version(datagram, if self.format_v2.is_some() { 2 } else { 1 })?;
         if header.session_id != self.session_id {
             return Err(ProtocolError::WrongSession);
         }
@@ -241,6 +357,9 @@ impl PacketDecoder {
                 },
             )
             .map_err(|_| ProtocolError::Authentication)?;
+        if let Some(format) = self.format_v2 {
+            format.validate_packet(header.packet_type, header.sample_frame_index, &payload)?;
+        }
         Ok(DecodedPacket { header, payload })
     }
 
@@ -288,6 +407,13 @@ impl ReplayWindow {
 }
 
 fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8], &[u8]), ProtocolError> {
+    parse_header_version(datagram, 1)
+}
+
+fn parse_header_version(
+    datagram: &[u8],
+    version: u8,
+) -> Result<(Header, &[u8], &[u8]), ProtocolError> {
     if datagram.len() > MAX_DATAGRAM_LEN {
         return Err(ProtocolError::Oversize);
     }
@@ -297,7 +423,7 @@ fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8], &[u8]), ProtocolError
     if &datagram[0..4] != b"ANPD" {
         return Err(ProtocolError::BadHeader);
     }
-    if datagram[4] != 1 {
+    if datagram[4] != version {
         return Err(ProtocolError::UnsupportedVersion);
     }
     let packet_type = PacketType::try_from(datagram[5])?;

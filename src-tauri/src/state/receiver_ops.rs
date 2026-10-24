@@ -13,10 +13,18 @@ impl AppState {
             self.finish_operation(generation);
             return Err("Receiver 管理操作已取消。".into());
         }
-        let audio_active = self
-            .session
-            .try_lock()
-            .map_or(true, |session| session.is_some());
+        let (audio_active, aoa_active) = self.session.try_lock().map_or((true, false), |session| {
+            (
+                session.is_some(),
+                session
+                    .as_ref()
+                    .is_some_and(|active| active.aoa_owner.is_some()),
+            )
+        });
+        if aoa_active {
+            self.finish_operation(generation);
+            return Err("USB Direct 会话不使用 ADB serial；Receiver ADB 管理操作已拒绝。".into());
+        }
         if reject_active_audio && audio_active {
             self.finish_operation(generation);
             return Err("AnPod 音频会话正在使用此设备；Receiver 管理不会打断它。".into());

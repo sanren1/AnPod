@@ -1,14 +1,10 @@
 package app.anpod.receiver;
 
 import java.io.IOException;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Enumeration;
 import java.util.List;
 
 /** Read-only views of ReceiverService state used by the UI binder. */
@@ -28,21 +24,25 @@ final class ReceiverUiState {
             aodSessionId = -1;
             aodSampler.reset(now);
             return new AodTelemetrySnapshot(-1, AodTelemetrySnapshot.DisplayStatus.DISCONNECTED,
-                    AodTelemetrySnapshot.Transport.UNKNOWN, null, null, null, false, now);
+                    AodTelemetrySnapshot.Transport.UNKNOWN, null, null, null,
+                    -1, -1, -1, "unknown", false, now);
         }
         if (session.id != aodSessionId) {
             aodSessionId = session.id;
             aodSampler.reset(now);
         }
-        boolean udp = session.udpQueue != null;
-        long totalBytes = udp ? session.udpQueue.audioPayloadBytes() : session.inputPcmBytes;
+        boolean aoa = session.request.aoaContext != null;
+        boolean udp = session.request.udpContext != null;
+        long totalBytes = aoa ? session.request.aoaContext.ingress.authenticatedAudioPayloadBytes()
+                : udp ? session.udpReceiver == null ? 0 : session.udpReceiver.authenticatedAudioPayloadBytes()
+                : session.inputPcmBytes;
         aodSampler.recordCumulativeBytes(totalBytes, now);
         PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
         Long bitsPerSecond = aodSampler.bitsPerSecond(now);
-        Float bufferMs = AodMetricsSampler.bufferMs(udp ? metrics.queuedFrames : 0,
+        Float bufferMs = AodMetricsSampler.bufferMs(udp || aoa ? metrics.queuedFrames : 0,
                 metrics.pendingFrames, metrics.sampleRate);
         Float lossPercent = null;
-        if (udp) {
+        if (udp && session.udpQueue != null) {
             aodSampler.updateFrameTotals(session.udpQueue.acceptedAudioFrames(),
                     session.udpQueue.concealedFrames());
             lossPercent = aodSampler.lossPercent();
@@ -53,11 +53,13 @@ final class ReceiverUiState {
                 : AodTelemetrySnapshot.DisplayStatus.CONNECTED;
         if (udp && "reconnecting".equals(ReceiverService.networkAudioState))
             status = AodTelemetrySnapshot.DisplayStatus.RECONNECTING;
-        AodTelemetrySnapshot.Transport transport = udp
-                ? AodTelemetrySnapshot.Transport.WIFI_UDP
+        AodTelemetrySnapshot.Transport transport = aoa
+                ? AodTelemetrySnapshot.Transport.USB_DIRECT
+                : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP
                 : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
-                lossPercent, receivedRecently, now);
+                lossPercent, metrics.sampleRate, metrics.channels, metrics.underrunCount,
+                session.actualOutputEngine, receivedRecently, now);
     }
 
     UiSnapshot snapshot() {
@@ -99,7 +101,8 @@ final class ReceiverUiState {
             grantPersistence = "unavailable";
             authorizationError = service.describeFailure(error);
         }
-        String method = service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
+        String method = service.isAoaSession() ? "usb-aoa"
+                : service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
                 : ReceiverService.currentAudio != null ? "usb-or-local" : "unknown";
         String state = ReceiverUiOperation.displayState(ReceiverService.networkAudioState, ReceiverService.currentAudio != null, ReceiverService.audioActive);
         String mode = ReceiverService.currentAudio == null ? "" : ReceiverService.actualMode;
@@ -107,6 +110,13 @@ final class ReceiverUiState {
         String operationError = service.uiOperation.error();
         if (operationError.isEmpty()) operationError = ReceiverService.networkAudioFailure;
         boolean canRevokeBackgroundTrust = service.canRevokeBackgroundTrust(binding, fingerprint, grantKind);
+        ReceiverService.AudioSession audio = ReceiverService.currentAudio;
+        String requestedEngine = audio == null ? service.requestedOutputEnginePreference()
+                : audio.requestedOutputEngine;
+        String fallbackReason = audio == null
+                ? ("oboeExperimental".equals(requestedEngine)
+                        ? ReceiverService.pendingOboeFallbackReasonForUi() : "")
+                : audio.outputFallbackReason;
         return new UiSnapshot(state, binding, fingerprint, method, mode, BuildConfig.VERSION_NAME,
                 BuildConfig.VERSION_CODE, service.uiOperation.ownerId(), service.uiOperation.phase(), operationError,
                 service.currentOperationGeneration, ReceiverService.networkAudioAddress, ReceiverService.networkAudioPort, service.backgroundStandbyEnabled,
@@ -114,22 +124,17 @@ final class ReceiverUiState {
                 listenerState, grantKind, grantPersistence, grantRemainingMs, pendingRequestId,
                 pendingDeadlineElapsedMs, authorizationError,
                 service.networkCoordinator == null ? new P5cDiscovery.SearchSnapshot(false, Collections.emptyList(), "idle")
-                        : service.networkCoordinator.searchSnapshot());
+                        : service.networkCoordinator.searchSnapshot(),
+                requestedEngine,
+                audio == null ? "unknown" : audio.actualOutputEngine,
+                fallbackReason, audio == null ? -1 : audio.oboeXrunCount);
     }
 
     List<UiInterface> interfaces() {
         ArrayList<UiInterface> result = new ArrayList<>();
         try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                NetworkInterface network = interfaces.nextElement();
-                if (!network.isUp() || network.isLoopback()) continue;
-                for (java.net.InterfaceAddress item : network.getInterfaceAddresses()) {
-                    InetAddress address = item.getAddress();
-                    if (address instanceof Inet4Address && address.isSiteLocalAddress())
-                        result.add(new UiInterface(network.getDisplayName(), address.getHostAddress(), item.getNetworkPrefixLength()));
-                }
-            }
+            for (ReceiverService.AvailableNetwork network : ReceiverService.availableNetworks(service))
+                result.add(new UiInterface(network.interfaceName, network.address.getHostAddress(), network.prefixLength));
         } catch (SocketException ignored) { }
         Collections.sort(result, new Comparator<UiInterface>() {
             @Override

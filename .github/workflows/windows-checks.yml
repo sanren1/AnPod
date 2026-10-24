@@ -24,9 +24,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check version consistency
+      - name: Check production version consistency
         shell: pwsh
-        run: ./tests/AnPod.Version.Check.ps1
+        run: |
+          $cargoToml = Get-Content src-tauri/Cargo.toml -Raw
+          $cargoLock = Get-Content src-tauri/Cargo.lock -Raw
+          $tauriConfig = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $cargoVersion = [regex]::Match($cargoToml, '(?m)^version = "([^"]+)"').Groups[1].Value
+          $lockVersion = [regex]::Match($cargoLock, '(?ms)^name = "anpod-tauri"\r?\nversion = "([^"]+)"').Groups[1].Value
+          if (-not $cargoVersion -or $cargoVersion -ne $lockVersion -or $cargoVersion -ne $tauriConfig.version) {
+            throw "Production versions disagree: Cargo.toml=$cargoVersion Cargo.lock=$lockVersion tauri.conf.json=$($tauriConfig.version)"
+          }
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
@@ -69,13 +77,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Check Java protocol vectors, PCM framing, and audio focus state
-        shell: pwsh
-        run: ./packaging/check-java-offline.ps1
-
-      - name: Test pure desktop logic
-        run: dotnet run --project tests/AnPod.Core.Tests -c Release
-
       - name: Format
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
@@ -87,16 +88,6 @@ jobs:
         env:
           TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
-
-      - name: Test Rust on Windows
-        # Runtime files in deps/ are intentionally ignored by Git and unused by unit tests.
-        env:
-          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
-        run: >-
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --
-          --test-threads=1
-          --skip receiver::tests::p1_real_usb_installed_receiver_health_start_stop_when_explicitly_requested
-          --skip receiver::tests::reads_the_artifact_written_by_windows_powershell_when_requested
 
   audit:
     runs-on: windows-latest

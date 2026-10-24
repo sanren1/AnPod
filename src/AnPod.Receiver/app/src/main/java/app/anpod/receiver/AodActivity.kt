@@ -22,6 +22,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -31,11 +32,23 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -44,6 +57,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
@@ -62,6 +77,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
@@ -92,6 +111,7 @@ class AodActivity : ComponentActivity() {
     private var binder by mutableStateOf<ReceiverUiBinder?>(null)
     private var telemetry by mutableStateOf<AodTelemetrySnapshot?>(null)
     private var waveform by mutableStateOf<PcmWaveformTap.Waveform?>(null)
+    private var displaySettings by mutableStateOf(AodDisplaySettings())
     private var bound = false
 
     private val connection = object : ServiceConnection {
@@ -106,6 +126,8 @@ class AodActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
+        displaySettings = AodDisplaySettings.read(preferences)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         volumeControlStream = AudioManager.STREAM_MUSIC
@@ -146,6 +168,7 @@ class AodActivity : ComponentActivity() {
             AodScreen(
                 telemetry = telemetry,
                 waveform = waveform,
+                settings = displaySettings,
                 onExit = { finish() }
             )
         }
@@ -162,6 +185,7 @@ class AodActivity : ComponentActivity() {
 private fun AodScreen(
     telemetry: AodTelemetrySnapshot?,
     waveform: PcmWaveformTap.Waveform?,
+    settings: AodDisplaySettings,
     onExit: () -> Unit
 ) {
     var now by remember { mutableStateOf(Calendar.getInstance()) }
@@ -197,28 +221,49 @@ private fun AodScreen(
             }
         }
     ) {
-        val clockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
+        val baseClockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
         val density = LocalDensity.current
+        val clockText = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+        val clockMeasurement = rememberTextMeasurer().measure(
+            AnnotatedString(clockText),
+            style = TextStyle(fontFamily = RubikClock, fontWeight = FontWeight.Black,
+                fontSize = baseClockSize.sp, letterSpacing = (-5).sp),
+            maxLines = 1,
+            softWrap = false
+        )
         val screenHeightPx = with(density) { maxHeight.toPx() }
-        val driftXPx = with(density) { drift.first.dp.toPx() }
-        val driftYPx = with(density) { drift.second.dp.toPx() }
         val clearancePx = with(density) { 4.dp.toPx() }
+        var clockTopPx by remember { mutableStateOf(Float.NaN) }
         var clockBottomPx by remember { mutableStateOf(Float.NaN) }
         var footerTopPx by remember { mutableStateOf(Float.NaN) }
+        val clockTop = if (clockTopPx.isFinite()) clockTopPx else screenHeightPx * 0.10f
+        val footerTop = if (footerTopPx.isFinite()) footerTopPx else screenHeightPx * 0.88f
+        val clockSize = AodDisplaySettings.clockSizeSp(
+            baseClockSize,
+            clockMeasurement.size.width.toFloat(),
+            clockMeasurement.size.height.toFloat(),
+            with(density) { (maxWidth * 0.92f).toPx() },
+            (footerTop - clockTop - clearancePx).coerceAtLeast(0f),
+            settings.clockScale
+        )
+        val driftXPx = with(density) { drift.first.dp.toPx() }
+        val driftYPx = with(density) { drift.second.dp.toPx() }
         val waveformLayout = AodWaveformGeometry.layout(
             if (clockBottomPx.isFinite()) clockBottomPx else screenHeightPx * 0.54f,
-            if (footerTopPx.isFinite()) footerTopPx else screenHeightPx * 0.88f,
+            footerTop,
             with(density) { AodDrift.MAX_Y_DP.dp.toPx() },
             clearancePx
         )
         val waveformHeight = with(density) { waveformLayout.regionHeight.toDp() }
         val waveformTop = with(density) { (waveformLayout.centerY - waveformLayout.regionHeight / 2f).toDp() }
         Text(
-            text = String.format(Locale.US, "%02d:%02d", now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE)),
+            text = clockText,
             fontFamily = RubikClock,
             fontWeight = FontWeight.Black,
             fontSize = clockSize.sp,
             letterSpacing = (-5).sp,
+            maxLines = 1,
+            softWrap = false,
             color = Color(0xFFF7F7F7),
             modifier = Modifier.align(Alignment.TopCenter)
                 .padding(top = (maxHeight.value * 0.10f).dp)
@@ -226,7 +271,10 @@ private fun AodScreen(
                 .onGloballyPositioned { coordinates ->
                     // The anchors describe the undrifted layout so the waveform region keeps its size
                     // while every element drifts together.
+                    val top = coordinates.positionInRoot().y - driftYPx
                     val bottom = coordinates.positionInRoot().y + coordinates.size.height - driftYPx
+                    if (clockTopPx.isNaN() || kotlin.math.abs(clockTopPx - top) > 0.5f)
+                        clockTopPx = top
                     if (clockBottomPx.isNaN() || kotlin.math.abs(clockBottomPx - bottom) > 0.5f)
                         clockBottomPx = bottom
                 }
@@ -234,6 +282,7 @@ private fun AodScreen(
         WaveformCanvas(
             waveform,
             waveformLayout.maximumAmplitude,
+            settings.waveformWeight / 100f,
             Modifier.align(Alignment.TopCenter)
                 .offset(y = waveformTop)
                 .fillMaxWidth(0.90f)
@@ -241,7 +290,7 @@ private fun AodScreen(
                 .offset(x = drift.first.dp, y = drift.second.dp)
         )
         MetricsRow(
-            telemetry,
+            telemetry, settings,
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                 .padding(start = 28.dp, end = 28.dp, bottom = 22.dp)
                 .offset(x = drift.first.dp, y = drift.second.dp)
@@ -262,8 +311,104 @@ private fun AodScreen(
             modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 10.dp)
                 .graphicsLayer { alpha = exitAlpha }
         ) {
-            Text(stringResource(R.string.aod_exit), color = Color(0x55FFFFFF), fontSize = 13.sp)
+            Text("Close", color = Color(0x55FFFFFF), fontSize = 13.sp)
         }
+    }
+}
+
+@Composable
+internal fun AodSettingsDialog(
+    settings: AodDisplaySettings,
+    onChange: (AodDisplaySettings) -> Unit,
+    onClose: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text(stringResource(R.string.aod_settings)) },
+        text = {
+            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(stringResource(R.string.aod_preview_label), style = MaterialTheme.typography.titleMedium)
+                AodSettingsPreview(settings)
+                Text(stringResource(R.string.aod_clock_size), style = MaterialTheme.typography.titleMedium)
+                val clockSizeLabel = stringResource(R.string.aod_clock_size)
+                Slider(value = settings.clockScale.toFloat(), onValueChange = {
+                    onChange(settings.copy(clockScale = it.toInt().coerceIn(80, 120)))
+                }, valueRange = 80f..120f, steps = 7,
+                    modifier = Modifier.semantics { contentDescription = clockSizeLabel })
+                Text(stringResource(R.string.aod_clock_size_value, settings.clockScale))
+                Text(stringResource(R.string.aod_waveform_weight), style = MaterialTheme.typography.titleMedium)
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    listOf(80, 100, 120).forEachIndexed { index, weight ->
+                        SegmentedButton(
+                            selected = settings.waveformWeight == weight,
+                            onClick = { onChange(settings.copy(waveformWeight = weight)) },
+                            shape = SegmentedButtonDefaults.itemShape(index, 3),
+                            modifier = Modifier.heightIn(min = 48.dp)
+                        ) {
+                            Text(stringResource(when (weight) {
+                                80 -> R.string.aod_weight_thin
+                                120 -> R.string.aod_weight_bold
+                                else -> R.string.aod_weight_default
+                            }))
+                        }
+                    }
+                }
+                Text(stringResource(R.string.aod_detail_metrics), style = MaterialTheme.typography.titleMedium)
+                AodSettingSwitch(R.string.aod_metric_protocol, settings.showProtocol) {
+                    onChange(settings.copy(showProtocol = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_receive_rate, settings.showReceiveRate) {
+                    onChange(settings.copy(showReceiveRate = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_buffer, settings.showBuffer) {
+                    onChange(settings.copy(showBuffer = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_loss, settings.showLoss) {
+                    onChange(settings.copy(showLoss = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_audio_format, settings.showAudioFormat) {
+                    onChange(settings.copy(showAudioFormat = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_underruns, settings.showUnderruns) {
+                    onChange(settings.copy(showUnderruns = it))
+                }
+                AodSettingSwitch(R.string.aod_metric_output_engine, settings.showOutputEngine) {
+                    onChange(settings.copy(showOutputEngine = it))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(R.string.aod_settings_close))
+            }
+        }
+    )
+}
+
+@Composable
+private fun AodSettingsPreview(settings: AodDisplaySettings) {
+    Column(
+        Modifier.fillMaxWidth().heightIn(min = 132.dp).background(Color.Black, RoundedCornerShape(12.dp)).padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text("21:38", fontFamily = RubikClock, fontWeight = FontWeight.Black,
+            fontSize = (30f * settings.clockScale / 100f).sp, letterSpacing = (-1).sp,
+            color = Color(0xFFF7F7F7), maxLines = 1)
+        WaveformCanvas(null, 1f, settings.waveformWeight / 100f,
+            Modifier.fillMaxWidth(0.84f).height(22.dp))
+        MetricsRow(null, settings, Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+private fun AodSettingSwitch(label: Int, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    val labelText = stringResource(label)
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(labelText, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange,
+            modifier = Modifier.semantics { contentDescription = labelText })
     }
 }
 
@@ -284,7 +429,7 @@ private fun VolumeGestureArea(modifier: Modifier) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false)
             if (audioManager.isVolumeFixed) {
-                Toast.makeText(context, R.string.aod_volume_fixed, Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "This device's media volume is fixed by the system.", Toast.LENGTH_SHORT).show()
                 return@awaitEachGesture
             }
             val minimum = if (Build.VERSION.SDK_INT >= 28)
@@ -305,7 +450,7 @@ private fun VolumeGestureArea(modifier: Modifier) {
                     audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
                 } catch (error: SecurityException) {
                     android.util.Log.w("AnPodAod", "Media volume adjustment denied", error)
-                    Toast.makeText(context, R.string.aod_volume_unavailable, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Android does not allow volume changes here. Use the volume buttons.", Toast.LENGTH_SHORT).show()
                     break
                 }
             }
@@ -333,7 +478,7 @@ internal class AodVolumeDrag(
 }
 
 @Composable
-private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, maximumAmplitude: Float, modifier: Modifier) {
+private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, maximumAmplitude: Float, strokeScale: Float, modifier: Modifier) {
     Canvas(modifier) {
         val center = size.height / 2f
         fun ribbonBrush(color: Color) = Brush.horizontalGradient(
@@ -347,8 +492,8 @@ private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, maximumAmplitude:
         val rightBrush = ribbonBrush(RIGHT_CHANNEL_COLOR)
         if (waveform == null || waveform.silent || maximumAmplitude <= 0f
             || (waveform.left.all { it == 0f } && waveform.right.all { it == 0f })) {
-            drawLine(leftBrush, Offset(0f, center), Offset(size.width, center), 2f)
-            drawLine(rightBrush, Offset(0f, center), Offset(size.width, center), 2f)
+            drawLine(leftBrush, Offset(0f, center), Offset(size.width, center), 2f * strokeScale)
+            drawLine(rightBrush, Offset(0f, center), Offset(size.width, center), 2f * strokeScale)
             return@Canvas
         }
         // Both traces share one baseline. The right channel is inverted, so identical stereo audio
@@ -359,10 +504,10 @@ private fun WaveformCanvas(waveform: PcmWaveformTap.Waveform?, maximumAmplitude:
         val right = smoothWaveformPath(AodWaveformGeometry.centeredCurve(
             waveform.right, maximumAmplitude, waveform.sampledAtNanos, true
         ), center)
-        drawPath(left, leftBrush, alpha = 0.15f, style = Stroke(AodWaveformGeometry.GLOW_STROKE_WIDTH, cap = StrokeCap.Butt, join = StrokeJoin.Round))
-        drawPath(right, rightBrush, alpha = 0.15f, style = Stroke(AodWaveformGeometry.GLOW_STROKE_WIDTH, cap = StrokeCap.Butt, join = StrokeJoin.Round))
-        drawPath(left, leftBrush, style = Stroke(AodWaveformGeometry.STROKE_WIDTH, cap = StrokeCap.Butt, join = StrokeJoin.Round))
-        drawPath(right, rightBrush, style = Stroke(AodWaveformGeometry.STROKE_WIDTH, cap = StrokeCap.Butt, join = StrokeJoin.Round))
+        drawPath(left, leftBrush, alpha = 0.15f, style = Stroke(AodWaveformGeometry.GLOW_STROKE_WIDTH * strokeScale, cap = StrokeCap.Butt, join = StrokeJoin.Round))
+        drawPath(right, rightBrush, alpha = 0.15f, style = Stroke(AodWaveformGeometry.GLOW_STROKE_WIDTH * strokeScale, cap = StrokeCap.Butt, join = StrokeJoin.Round))
+        drawPath(left, leftBrush, style = Stroke(AodWaveformGeometry.STROKE_WIDTH * strokeScale, cap = StrokeCap.Butt, join = StrokeJoin.Round))
+        drawPath(right, rightBrush, style = Stroke(AodWaveformGeometry.STROKE_WIDTH * strokeScale, cap = StrokeCap.Butt, join = StrokeJoin.Round))
     }
 }
 
@@ -390,24 +535,23 @@ private fun DrawScope.smoothWaveformPath(offsets: FloatArray, centerY: Float): P
 }
 
 @Composable
-private fun MetricsRow(telemetry: AodTelemetrySnapshot?, modifier: Modifier) {
-    Row(
-        modifier = modifier,
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceEvenly
-    ) {
+private fun MetricsRow(telemetry: AodTelemetrySnapshot?, settings: AodDisplaySettings, modifier: Modifier) {
+    val items = buildList {
+        if (settings.showProtocol) add("Protocol ${protocolLabel(telemetry)}")
+        if (settings.showReceiveRate) add("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}")
+        if (settings.showBuffer) add("Buffer ${latencyLabel(telemetry?.receiverBufferMs)}")
+        if (settings.showLoss) add("Loss ${lossLabel(telemetry?.udpLossPercent)}")
+        if (settings.showAudioFormat) add("Format ${audioFormatLabel(telemetry)}")
+        if (settings.showUnderruns) add("Underruns ${countLabel(telemetry?.underrunCount)}")
+        if (settings.showOutputEngine) add("Output ${outputEngineLabel(telemetry)}")
+    }
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
             StatusDot(telemetry)
             Text(statusLabel(telemetry), color = Color(0xFFE6E6E6), fontSize = 14.sp)
         }
-        Divider()
-        Text(protocolLabel(telemetry), color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        Divider()
-        Text("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        Divider()
-        Text("Latency ${latencyLabel(telemetry?.receiverBufferMs)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
-        Divider()
-        Text("Loss ${lossLabel(telemetry?.udpLossPercent)}", color = Color(0xFFB3B3B3), fontSize = 14.sp)
+        if (items.isNotEmpty()) Text(items.joinToString("\u00A0|\u00A0"), modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFFB3B3B3), fontSize = 14.sp, textAlign = TextAlign.Center)
     }
 }
 
@@ -422,22 +566,17 @@ private fun StatusDot(telemetry: AodTelemetrySnapshot?) {
     Box(Modifier.size(8.dp).background(color, CircleShape))
 }
 
-@Composable
-private fun Divider() {
-    Text("|", color = Color(0xFF2F3B3F), fontSize = 14.sp)
-}
-
 private fun statusLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.status) {
     AodTelemetrySnapshot.DisplayStatus.RECEIVING -> "Receiving"
     AodTelemetrySnapshot.DisplayStatus.CONNECTED -> "Connected"
     AodTelemetrySnapshot.DisplayStatus.RECONNECTING -> "Reconnecting"
-    else -> "Disconnected"
+    else -> "Not connected"
 }
 
 private fun protocolLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.transport) {
+    AodTelemetrySnapshot.Transport.USB_DIRECT -> "USB Direct"
     AodTelemetrySnapshot.Transport.WIFI_UDP -> "UDP"
-    AodTelemetrySnapshot.Transport.USB_ADB -> "USB ADB"
-    AodTelemetrySnapshot.Transport.WIFI_ADB -> "Wi-Fi ADB"
+    AodTelemetrySnapshot.Transport.USB_ADB, AodTelemetrySnapshot.Transport.WIFI_ADB -> "ADB"
     else -> "—"
 }
 
@@ -452,6 +591,27 @@ private fun latencyLabel(millis: Float?): String =
 
 private fun lossLabel(percent: Float?): String =
     percent?.let { String.format(Locale.US, "%.1f%%", it) } ?: "—"
+
+private fun audioFormatLabel(telemetry: AodTelemetrySnapshot?): String {
+    if (telemetry == null || telemetry.outputSampleRate <= 0 || telemetry.outputChannels <= 0) return "—"
+    val channels = when (telemetry.outputChannels) {
+        1 -> "Mono"
+        2 -> "Stereo"
+        else -> "${telemetry.outputChannels} ch"
+    }
+    val rate = if (telemetry.outputSampleRate % 1000 == 0)
+        "${telemetry.outputSampleRate / 1000}"
+    else String.format(Locale.US, "%.1f", telemetry.outputSampleRate / 1000.0)
+    return "$rate kHz $channels"
+}
+
+private fun countLabel(count: Int?): String = count?.takeIf { it >= 0 }?.toString() ?: "—"
+
+private fun outputEngineLabel(telemetry: AodTelemetrySnapshot?): String = when (telemetry?.actualOutputEngine) {
+    "audioTrack" -> "AudioTrack"
+    "oboeExperimental" -> "Oboe"
+    else -> "—"
+}
 
 private val RubikClock = FontFamily(Font(R.font.rubik_black, FontWeight.Black))
 

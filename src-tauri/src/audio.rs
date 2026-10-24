@@ -1,5 +1,5 @@
-use crate::network::PcmQueue;
-use crate::protocol::PcmFormat;
+use crate::network::{FloatPcmQueue, PcmQueue};
+use crate::protocol::{AudioFormatV2, PcmFormat};
 use libloading::Library;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
@@ -12,6 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 type ConnectCallback = unsafe extern "C" fn(*const c_char);
 type PcmCallback = unsafe extern "C" fn(*const i16, u32, u32, u16, u64, *mut c_void);
+type FloatPcmCallback = unsafe extern "C" fn(*const f32, u32, u32, u16, u64, *mut c_void);
+const FLOAT_CAPTURE_CAPABILITY: u32 = 1;
+const FLOAT_CAPTURE_FORMAT_INTEGER: u32 = 1;
+const FLOAT_CAPTURE_FORMAT_FLOAT: u32 = 2;
+const FLOAT_CONVERSION_FLAGS: u32 = 7;
 static HANDSHAKES: OnceLock<Mutex<Option<async_mpsc::UnboundedSender<String>>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -26,6 +31,12 @@ enum Request {
     Start(mpsc::SyncSender<Result<(), String>>),
     StartPcmSink(Arc<PcmQueue>, mpsc::SyncSender<Result<(), String>>),
     PcmFormat(mpsc::SyncSender<Result<PcmFormat, String>>),
+    ProbeFloatFormat(mpsc::SyncSender<Result<CaptureFormatV2, String>>),
+    StartFloatSink(
+        Arc<FloatPcmQueue>,
+        AudioFormatV2,
+        mpsc::SyncSender<Result<CaptureFormatV2, String>>,
+    ),
     StopPcmSink(mpsc::SyncSender<Result<(), String>>),
     Stream(bool, mpsc::SyncSender<Result<(), String>>),
     StopAndCleanup(mpsc::SyncSender<Result<(), String>>),
@@ -44,6 +55,8 @@ struct NativeFns {
     start: unsafe extern "C" fn() -> i32,
     set_pcm_callback: Option<unsafe extern "C" fn(Option<PcmCallback>, *mut c_void) -> i32>,
     get_pcm_format: Option<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>,
+    v2: Option<NativeV2Fns>,
+    v2_incomplete: bool,
     set_stream: unsafe extern "C" fn(i32),
     stop: unsafe extern "C" fn(),
     cleanup: unsafe extern "C" fn(),
@@ -53,6 +66,139 @@ struct NativeFns {
     clear_error: unsafe extern "C" fn(),
     is_connected: unsafe extern "C" fn(*mut c_char, i32) -> i32,
     sent_pcm_bytes: unsafe extern "C" fn() -> u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CapabilitiesV2 {
+    size: u32,
+    version: u32,
+    flags: u32,
+    max_callback_frames: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CaptureFormatV2 {
+    pub(crate) size: u32,
+    pub(crate) version: u32,
+    pub(crate) mix_sample_rate: u32,
+    pub(crate) mix_channels: u32,
+    pub(crate) mix_sample_format: u32,
+    pub(crate) mix_container_bits: u32,
+    pub(crate) mix_valid_bits: u32,
+    #[allow(dead_code)] // Retained so the cached descriptor preserves the native mix layout.
+    pub(crate) mix_channel_mask: u32,
+    pub(crate) capture_sample_rate: u32,
+    pub(crate) capture_channels: u32,
+    pub(crate) capture_sample_format: u32,
+    pub(crate) conversion_flags: u32,
+}
+
+struct NativeV2Fns {
+    get_capabilities: unsafe extern "C" fn(*mut CapabilitiesV2) -> i32,
+    get_capture_format: unsafe extern "C" fn(*mut CaptureFormatV2) -> i32,
+    initialize_float: unsafe extern "C" fn() -> i32,
+    set_float_callback: unsafe extern "C" fn(Option<FloatPcmCallback>, *mut c_void) -> i32,
+}
+
+fn assemble_v2_functions(
+    get_capabilities: Option<unsafe extern "C" fn(*mut CapabilitiesV2) -> i32>,
+    get_capture_format: Option<unsafe extern "C" fn(*mut CaptureFormatV2) -> i32>,
+    initialize_float: Option<unsafe extern "C" fn() -> i32>,
+    set_float_callback: Option<unsafe extern "C" fn(Option<FloatPcmCallback>, *mut c_void) -> i32>,
+) -> (Option<NativeV2Fns>, bool) {
+    let symbol_count = [
+        get_capabilities.is_some(),
+        get_capture_format.is_some(),
+        initialize_float.is_some(),
+        set_float_callback.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    let functions = match (
+        get_capabilities,
+        get_capture_format,
+        initialize_float,
+        set_float_callback,
+    ) {
+        (
+            Some(get_capabilities),
+            Some(get_capture_format),
+            Some(initialize_float),
+            Some(set_float_callback),
+        ) => Some(NativeV2Fns {
+            get_capabilities,
+            get_capture_format,
+            initialize_float,
+            set_float_callback,
+        }),
+        _ => None,
+    };
+    (functions, symbol_count != 0 && symbol_count != 4)
+}
+
+impl NativeV2Fns {
+    fn validate_capture_format(format: &CaptureFormatV2) -> Result<(), String> {
+        if format.size < std::mem::size_of::<CaptureFormatV2>() as u32 || format.version != 2 {
+            return Err("Native DLL 返回了不兼容的 Float32 格式结构（size/version）。".into());
+        }
+        if format.mix_sample_rate == 0
+            || format.mix_channels == 0
+            || !matches!(
+                format.mix_sample_format,
+                FLOAT_CAPTURE_FORMAT_INTEGER | FLOAT_CAPTURE_FORMAT_FLOAT
+            )
+            || format.mix_container_bits == 0
+            || (format.mix_valid_bits != 0 && format.mix_valid_bits > format.mix_container_bits)
+            || format.capture_sample_rate != format.mix_sample_rate
+            || format.capture_channels != 2
+            || format.capture_sample_format != FLOAT_CAPTURE_FORMAT_FLOAT
+            || format.conversion_flags & !FLOAT_CONVERSION_FLAGS != 0
+        {
+            return Err("Native DLL 返回了不支持的 WASAPI Float32 采集格式。".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_float_format_for_session(
+    format: &CaptureFormatV2,
+    expected: AudioFormatV2,
+) -> Result<(), String> {
+    if AudioFormatV2::for_profile(expected.profile, expected.mode).ok() != Some(expected)
+        || !matches!(
+            (expected.profile, expected.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        )
+        || expected.sample_format != 2
+        || expected.channels != 2
+        || expected.valid_bits != 24
+        || expected.bytes_per_sample != 3
+        || expected.frame_bytes != 6
+    {
+        return Err("Authenticated session does not describe a supported PCM24 format.".into());
+    }
+    if format.mix_sample_rate != expected.sample_rate
+        || format.capture_sample_rate != expected.sample_rate
+        || format.capture_channels != u32::from(expected.channels)
+        || format.capture_sample_format != FLOAT_CAPTURE_FORMAT_FLOAT
+    {
+        let rate_mismatch = if expected.profile == 3
+            && expected.sample_rate == 96_000
+            && format.mix_sample_rate != 96_000
+        {
+            format!(
+                "FORMAT_RATE_MISMATCH: actualHz={}; ",
+                format.mix_sample_rate
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!("{rate_mismatch}Windows mix/capture format does not match the authenticated PCM24 session (expected {} Hz stereo Float32; actual mix {} Hz/{} ch/format {}/{}, capture {} Hz/{} ch/format {}).", expected.sample_rate, format.mix_sample_rate, format.mix_channels, format.mix_sample_format, format.mix_container_bits, format.capture_sample_rate, format.capture_channels, format.capture_sample_format));
+    }
+    Ok(())
 }
 
 impl NativeFns {
@@ -76,6 +222,34 @@ impl NativeFns {
             .get::<unsafe extern "C" fn(*mut u32, *mut u16) -> i32>(b"AudioCapture_GetPcmFormat\0")
             .ok()
             .map(|symbol| *symbol);
+        let get_capabilities_v2 = library
+            .get::<unsafe extern "C" fn(*mut CapabilitiesV2) -> i32>(
+                b"AudioCapture_GetCapabilitiesV2\0",
+            )
+            .ok()
+            .map(|symbol| *symbol);
+        let get_capture_format_v2 = library
+            .get::<unsafe extern "C" fn(*mut CaptureFormatV2) -> i32>(
+                b"AudioCapture_GetCaptureFormatV2\0",
+            )
+            .ok()
+            .map(|symbol| *symbol);
+        let initialize_float_v2 = library
+            .get::<unsafe extern "C" fn() -> i32>(b"AudioCapture_InitializeFloatV2\0")
+            .ok()
+            .map(|symbol| *symbol);
+        let set_float_callback_v2 = library
+            .get::<unsafe extern "C" fn(Option<FloatPcmCallback>, *mut c_void) -> i32>(
+                b"AudioCapture_SetFloatPcmCallbackV2\0",
+            )
+            .ok()
+            .map(|symbol| *symbol);
+        let (v2, v2_incomplete) = assemble_v2_functions(
+            get_capabilities_v2,
+            get_capture_format_v2,
+            initialize_float_v2,
+            set_float_callback_v2,
+        );
         Ok(Self {
             initialize: sym!("AudioCapture_Initialize", unsafe extern "C" fn() -> i32),
             listen: sym!(
@@ -85,6 +259,8 @@ impl NativeFns {
             start: sym!("AudioCapture_Start", unsafe extern "C" fn() -> i32),
             set_pcm_callback,
             get_pcm_format,
+            v2,
+            v2_incomplete,
             set_stream: sym!(
                 "AudioCapture_SetStreamingEnabled",
                 unsafe extern "C" fn(i32)
@@ -147,6 +323,58 @@ impl NativeFns {
             channels,
         })
     }
+
+    fn require_v2(&self) -> Result<&NativeV2Fns, String> {
+        self.v2
+            .as_ref()
+            .ok_or_else(|| missing_v2_error(self.v2_incomplete))
+    }
+
+    fn float_capabilities(&self) -> Result<CapabilitiesV2, String> {
+        let v2 = self.require_v2()?;
+        let mut capabilities = CapabilitiesV2 {
+            size: std::mem::size_of::<CapabilitiesV2>() as u32,
+            version: 2,
+            ..CapabilitiesV2::default()
+        };
+        if unsafe { (v2.get_capabilities)(&mut capabilities) } == 0 {
+            return Err(self.describe_error("无法读取 Native Float32 V2 能力"));
+        }
+        if capabilities.size < std::mem::size_of::<CapabilitiesV2>() as u32
+            || capabilities.version != 2
+        {
+            return Err("Native DLL 返回了不兼容的 Float32 能力结构（size/version）。".into());
+        }
+        if capabilities.flags != FLOAT_CAPTURE_CAPABILITY {
+            return Err("Native DLL 未报告受支持的 Float32 采集能力标志。".into());
+        }
+        if capabilities.max_callback_frames == 0 || capabilities.max_callback_frames > 4096 {
+            return Err("Native DLL 返回了无效的 Float32 最大回调帧数。".into());
+        }
+        Ok(capabilities)
+    }
+
+    fn float_capture_format(&self) -> Result<CaptureFormatV2, String> {
+        let v2 = self.require_v2()?;
+        let mut format = CaptureFormatV2 {
+            size: std::mem::size_of::<CaptureFormatV2>() as u32,
+            version: 2,
+            ..CaptureFormatV2::default()
+        };
+        if unsafe { (v2.get_capture_format)(&mut format) } == 0 {
+            return Err(self.describe_error("无法读取 WASAPI Float32 采集格式"));
+        }
+        NativeV2Fns::validate_capture_format(&format)?;
+        Ok(format)
+    }
+}
+
+fn missing_v2_error(incomplete: bool) -> String {
+    if incomplete {
+        "音频采集组件的 V2 Float32 接口不完整，请更新 Native DLL。".to_string()
+    } else {
+        "当前音频采集组件不支持 Float32 V2；PCM16 仍可使用，请更新 Native DLL。".to_string()
+    }
 }
 
 impl AudioActor {
@@ -160,6 +388,8 @@ impl AudioActor {
         std::thread::Builder::new().name("AnPod audio control".into()).spawn(move || {
             let mut native = None;
             let mut pcm_sink: Option<Arc<PcmQueue>> = None;
+            let mut float_sink: Option<Arc<FloatPcmQueue>> = None;
+            let mut float_capture_format = None;
             let mut muted_ids = Vec::<String>::new();
             while let Ok(request) = rx.recv() {
                 match request {
@@ -197,47 +427,38 @@ impl AudioActor {
                                 let _ = reply.send(Err("音频采集组件不支持 PCM sink。".into()));
                                 continue;
                             };
-                            if pcm_sink.as_ref().is_some_and(|old| Arc::ptr_eq(old, &queue)) {
+                            if pcm_sink.as_ref().is_some_and(|old| Arc::ptr_eq(old, &queue))
+                                && float_sink.is_none()
+                            {
                                 Ok(())
                             } else {
                                 let expected_format = queue.expected_format();
-                                unsafe { (native.cleanup)(); }
-                                if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } == 0 {
-                                    Err(native.describe_error("无法安全注销旧 PCM sink"))
-                                } else {
-                                    drop(pcm_sink.take());
-                                    let initialized = unsafe { (native.initialize)() } != 0;
-                                    if !initialized {
-                                        Err(native.describe_error("无法初始化 PCM sink 采集"))
-                                    } else {
-                                        match native.pcm_format() {
-                                            Err(error) => Err(error),
-                                            Ok(format) if expected_format != Some(format) => Err(format!(
-                                                "WASAPI PCM 格式不匹配；认证会话需要 {:?}，设备输出为 {:?}，电脑声音保持未静音。",
-                                                expected_format, format)),
-                                            Ok(_) => {
-                                                let user_data = Arc::as_ptr(&queue) as *mut c_void;
-                                                pcm_sink = Some(queue);
-                                                if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
-                                                    drop(pcm_sink.take());
-                                                    Err(native.describe_error("无法设置 PCM sink"))
-                                                } else {
-                                                    unsafe { (native.set_stream)(1); }
-                                                    if unsafe { (native.start)() } == 0 {
-                                                        let error = native.describe_error("无法开始 PCM sink 采集");
-                                                        unsafe { (native.cleanup)(); }
-                                                        if unsafe { set_pcm_callback(None, std::ptr::null_mut()) } != 0 {
-                                                            drop(pcm_sink.take());
-                                                        }
-                                                        Err(error)
-                                                    } else {
-                                                        Ok(())
-                                                    }
-                                                }
-                                            }
+                                cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
+                                    .and_then(|()| {
+                                        float_capture_format = None;
+                                        if unsafe { (native.initialize)() } == 0 {
+                                            return Err(native.describe_error("无法初始化 PCM sink 采集"));
                                         }
-                                    }
-                                }
+                                        let format = native.pcm_format()?;
+                                        if expected_format != Some(format) {
+                                            return Err(format!(
+                                                "WASAPI PCM 格式不匹配；认证会话需要 {:?}，设备输出为 {:?}，电脑声音保持未静音。",
+                                                expected_format, format));
+                                        }
+                                        let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                                        pcm_sink = Some(queue.clone());
+                                        if unsafe { set_pcm_callback(Some(on_native_pcm), user_data) } == 0 {
+                                            return Err(native.describe_error("无法设置 PCM sink"));
+                                        }
+                                        unsafe { (native.set_stream)(1); }
+                                        if unsafe { (native.start)() } == 0 {
+                                            return Err(native.describe_error("无法开始 PCM sink 采集"));
+                                        }
+                                        Ok(())
+                                    })
+                                    .inspect_err(|_| {
+                                        let _ = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                                    })
                             }
                         } else { Err("音频采集组件尚未初始化。".into()) };
                         let _ = reply.send(result);
@@ -247,17 +468,89 @@ impl AudioActor {
                             .and_then(NativeFns::pcm_format);
                         let _ = reply.send(result);
                     }
+                    Request::StartFloatSink(queue, expected_format, reply) => {
+                        let result = if let Some(native) = native.as_ref() {
+                            match native.float_capabilities() {
+                                Err(error) => Err(error),
+                                Ok(_capabilities) if can_reuse_float_sink(float_sink.as_ref(), &queue) => {
+                                    float_capture_format
+                                        .filter(|format| validate_float_format_for_session(format, expected_format).is_ok())
+                                        .ok_or_else(|| format!("Cached Float32 sink does not match the authenticated {} Hz session.", expected_format.sample_rate))
+                                }
+                                Ok(capabilities) => {
+                                    cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
+                                        .and_then(|()| {
+                                            float_capture_format = None;
+                                            let v2 = native.require_v2()?;
+                                            if unsafe { (v2.initialize_float)() } == 0 {
+                                                return Err(native.describe_error("无法初始化 WASAPI Float32 采集"));
+                                            }
+                                            let format = native.float_capture_format()?;
+                                            validate_float_format_for_session(&format, expected_format)?;
+                                            queue.set_expected_format(
+                                                format.capture_sample_rate,
+                                                capabilities.max_callback_frames,
+                                            )?;
+                                            if queue.expected_format() != Some((format.capture_sample_rate, 2)) {
+                                                return Err("Float32 PCM 队列格式与 WASAPI 回调格式不匹配。".into());
+                                            }
+                                            let user_data = Arc::as_ptr(&queue) as *mut c_void;
+                                            float_sink = Some(queue.clone());
+                                            if unsafe { (v2.set_float_callback)(Some(on_native_float_pcm), user_data) } == 0 {
+                                                return Err(native.describe_error("无法设置 Float32 PCM sink"));
+                                            }
+                                            float_capture_format = Some(format);
+                                            unsafe { (native.set_stream)(1); }
+                                            if unsafe { (native.start)() } == 0 {
+                                                return Err(native.describe_error("无法开始 Float32 PCM 采集"));
+                                            }
+                                            Ok(format)
+                                        })
+                                        .inspect_err(|_| {
+                                            let _ = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                                            float_capture_format = None;
+                                        })
+                                }
+                            }
+                        } else { Err("音频采集组件尚未初始化。".into()) };
+                        let _ = reply.send(result);
+                    }
+                    Request::ProbeFloatFormat(reply) => {
+                        let result = (|| {
+                            if native.is_none() {
+                                native = Some(unsafe { NativeFns::load(&dll_path)? });
+                            }
+                            let native = native.as_ref().expect("loaded audio capture");
+                            cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink)
+                                .and_then(|()| {
+                                    let probe = (|| {
+                                        let v2 = native.require_v2()?;
+                                        if unsafe { (v2.initialize_float)() } == 0 {
+                                            return Err(native.describe_error("无法查询 WASAPI Float32 格式"));
+                                        }
+                                        let format = native.float_capture_format()?;
+                                        if format.capture_sample_rate != format.mix_sample_rate
+                                            || format.capture_channels != 2
+                                        {
+                                            return Err("Native DLL 的 Float32 格式与 mix 格式不一致。".into());
+                                        }
+                                        Ok(format)
+                                    })();
+                                    let cleanup = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                                    float_capture_format = None;
+                                    match (probe, cleanup) {
+                                        (Ok(format), Ok(())) => Ok(format),
+                                        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                                    }
+                                })
+                        })();
+                        let _ = reply.send(result);
+                    }
                     Request::StopPcmSink(reply) => {
                         let result = if let Some(native) = native.as_ref() {
-                            unsafe { (native.cleanup)(); }
-                            if pcm_sink.is_none() { Ok(()) } else { match native.set_pcm_callback {
-                                Some(set_callback) if unsafe { set_callback(None, std::ptr::null_mut()) } != 0 => {
-                                    drop(pcm_sink.take());
-                                    Ok(())
-                                }
-                                Some(_) => Err(native.describe_error("无法安全注销 PCM sink")),
-                                None => Err("音频采集组件不支持 PCM sink。".into()),
-                            }}
+                            let result = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                            float_capture_format = None;
+                            result
                         } else { Ok(()) };
                         let _ = reply.send(result);
                     }
@@ -267,15 +560,9 @@ impl AudioActor {
                     }
                     Request::StopAndCleanup(reply) => {
                         let result = if let Some(native) = native.as_ref() {
-                            unsafe { (native.cleanup)(); }
-                            if pcm_sink.is_none() { Ok(()) } else { match native.set_pcm_callback {
-                                Some(set_callback) if unsafe { set_callback(None, std::ptr::null_mut()) } != 0 => {
-                                    drop(pcm_sink.take());
-                                    Ok(())
-                                }
-                                Some(_) => Err(native.describe_error("无法安全注销 PCM sink")),
-                                None => Err("音频采集组件不支持 PCM sink。".into()),
-                            }}
+                            let result = cleanup_capture_contexts(native, &mut pcm_sink, &mut float_sink);
+                            float_capture_format = None;
+                            result
                         } else { Ok(()) };
                         let _ = reply.send(result);
                     }
@@ -319,13 +606,10 @@ impl AudioActor {
                 }
             }
             if let Some(native) = native {
-                unsafe {
-                    (native.stop)();
-                    if let Some(set_pcm_callback) = native.set_pcm_callback { set_pcm_callback(None, std::ptr::null_mut()); }
-                    (native.cleanup)();
-                }
+                let _ = cleanup_capture_contexts(&native, &mut pcm_sink, &mut float_sink);
             }
             drop(pcm_sink.take());
+            drop(float_sink.take());
             let _ = restore_endpoints(&marker_path, &mut muted_ids);
         }).expect("create audio worker thread");
         Self {
@@ -348,6 +632,16 @@ impl AudioActor {
     }
     pub fn pcm_format(&self) -> Result<PcmFormat, String> {
         self.call(Request::PcmFormat)
+    }
+    pub(crate) fn probe_float_format(&self) -> Result<CaptureFormatV2, String> {
+        self.call(Request::ProbeFloatFormat)
+    }
+    pub(crate) fn start_float_sink(
+        &self,
+        queue: Arc<FloatPcmQueue>,
+        expected_format: AudioFormatV2,
+    ) -> Result<CaptureFormatV2, String> {
+        self.call(|reply| Request::StartFloatSink(queue, expected_format, reply))
     }
     pub fn stop_pcm_sink(&self) -> Result<(), String> {
         self.call(Request::StopPcmSink)
@@ -449,6 +743,79 @@ pub(crate) unsafe extern "C" fn on_native_pcm(
     }
     let queue = &*user_data.cast::<PcmQueue>();
     queue.push_raw(samples, frame_count, sample_rate, channels, frame_index);
+}
+
+pub(crate) unsafe extern "C" fn on_native_float_pcm(
+    samples: *const f32,
+    frame_count: u32,
+    sample_rate: u32,
+    channels: u16,
+    frame_index: u64,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let queue = &*user_data.cast::<FloatPcmQueue>();
+    queue.push_raw(samples, frame_count, sample_rate, channels, frame_index);
+}
+
+fn can_reuse_float_sink(current: Option<&Arc<FloatPcmQueue>>, queue: &Arc<FloatPcmQueue>) -> bool {
+    !queue.is_stopped() && current.is_some_and(|old| Arc::ptr_eq(old, queue))
+}
+
+fn cleanup_capture_contexts(
+    native: &NativeFns,
+    pcm_sink: &mut Option<Arc<PcmQueue>>,
+    float_sink: &mut Option<Arc<FloatPcmQueue>>,
+) -> Result<(), String> {
+    unsafe {
+        (native.stop)();
+        // Cleanup joins the native capture thread, which closes the callback's
+        // access to userData before either Arc can be released.
+        (native.cleanup)();
+    }
+
+    let mut error = None;
+    if pcm_sink.is_some() {
+        match native.set_pcm_callback {
+            Some(set_callback) if unsafe { set_callback(None, std::ptr::null_mut()) } != 0 => {
+                drop(pcm_sink.take());
+            }
+            Some(_) => error = Some(native.describe_error("无法安全注销 PCM sink")),
+            None => error = Some("音频采集组件不支持 PCM sink。".into()),
+        }
+    }
+    if float_sink.is_some() {
+        match native.require_v2() {
+            Ok(v2) if unsafe { (v2.set_float_callback)(None, std::ptr::null_mut()) } != 0 => {
+                if let Some(queue) = float_sink.take() {
+                    queue.stop_and_clear();
+                }
+            }
+            Ok(_) => {
+                if error.is_none() {
+                    error = Some(native.describe_error("无法安全注销 Float32 PCM sink"));
+                }
+            }
+            Err(v2_error) => {
+                if error.is_none() {
+                    error = Some(v2_error);
+                }
+            }
+        }
+    }
+    error.map_or(Ok(()), Err)
+}
+
+// Staged quantizer for the future worker-side wire encoder; callback path stays Float32.
+#[allow(dead_code)]
+pub(crate) fn float_sample_to_pcm16(sample: f32) -> Result<i16, &'static str> {
+    if !sample.is_finite() {
+        return Err("Float32 PCM contains a non-finite sample.");
+    }
+    let quantized = (sample.clamp(-1.0, 1.0) * 32768.0).round();
+    Ok((quantized as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
 }
 
 #[cfg(windows)]

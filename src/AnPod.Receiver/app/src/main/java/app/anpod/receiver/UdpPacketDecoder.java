@@ -21,14 +21,26 @@ final class UdpPacketDecoder {
 
     private final long expectedSessionId;
     private final byte[] key;
+    private final AudioFormatV2 formatV2;
     private boolean hasHighest;
     private long highestSequence;
     private long replayBits;
 
     UdpPacketDecoder(long expectedSessionId, byte[] key) {
+        this(expectedSessionId, key, null);
+    }
+
+    private UdpPacketDecoder(long expectedSessionId, byte[] key, AudioFormatV2 formatV2) {
         if (key == null || key.length != 32) throw new IllegalArgumentException("AES-256 requires a 32-byte key");
         this.expectedSessionId = expectedSessionId;
         this.key = key.clone();
+        this.formatV2 = formatV2;
+    }
+
+    static UdpPacketDecoder newV2(long expectedSessionId, byte[] key, AudioFormatV2 format) {
+        if (format == null) throw new IllegalArgumentException("v2 format is required");
+        format.encode();
+        return new UdpPacketDecoder(expectedSessionId, key, format);
     }
 
     synchronized Packet open(byte[] datagram, int length) throws ProtocolException {
@@ -36,7 +48,8 @@ final class UdpPacketDecoder {
                 || length > datagram.length) throw new ProtocolException(ProtocolException.LENGTH);
         if (datagram[0] != 'A' || datagram[1] != 'N' || datagram[2] != 'P' || datagram[3] != 'D')
             throw new ProtocolException(ProtocolException.HEADER);
-        if ((datagram[4] & 0xff) != 1) throw new ProtocolException(ProtocolException.VERSION);
+        int expectedVersion = formatV2 == null ? 1 : 2;
+        if ((datagram[4] & 0xff) != expectedVersion) throw new ProtocolException(ProtocolException.VERSION);
         int type = datagram[5] & 0xff;
         if (type != FORMAT && type != AUDIO) throw new ProtocolException(ProtocolException.TYPE);
         if (datagram[6] != 0 || datagram[7] != 0) throw new ProtocolException(ProtocolException.FLAGS);
@@ -63,6 +76,7 @@ final class UdpPacketDecoder {
         } catch (Exception error) {
             throw new ProtocolException(ProtocolException.AUTHENTICATION, error);
         }
+        if (formatV2 != null) validateV2(type, sampleFrameIndex, plaintext);
         if (!wouldAccept(sequence)) throw new ProtocolException(ProtocolException.REPLAY);
         return new Packet(type, sessionId, sequence, sampleFrameIndex, plaintext);
     }
@@ -107,6 +121,48 @@ final class UdpPacketDecoder {
         if ((channels != 1 && channels != 2) || rate < 8000 || rate > 192000)
             throw new ProtocolException(ProtocolException.FORMAT);
         return new Format((int) rate, channels);
+    }
+
+    private void validateV2(int type, long frameIndex, byte[] payload) throws ProtocolException {
+        if (type == FORMAT) {
+            if (frameIndex != 0 || !Arrays.equals(payload, formatV2.encode()))
+                throw new ProtocolException(ProtocolException.FORMAT);
+        } else if (payload.length == 0 || payload.length % formatV2.frameBytes != 0) {
+            throw new ProtocolException(ProtocolException.FORMAT);
+        }
+    }
+
+    static final class AudioFormatV2 {
+        final int profile, sampleFormat, channels, validBits, bytesPerSample, mode, sampleRate, frameBytes;
+        private AudioFormatV2(int profile, int sampleFormat, int channels, int validBits,
+                int bytesPerSample, int mode, int sampleRate, int frameBytes) {
+            this.profile = profile; this.sampleFormat = sampleFormat; this.channels = channels;
+            this.validBits = validBits; this.bytesPerSample = bytesPerSample; this.mode = mode;
+            this.sampleRate = sampleRate; this.frameBytes = frameBytes;
+        }
+        static AudioFormatV2 forProfile(int profile, int mode) {
+            if (profile < 1 || profile > 3 || mode < 0 || mode > 1)
+                throw new IllegalArgumentException("unsupported v2 audio profile");
+            boolean high = profile != 1;
+            return new AudioFormatV2(profile, high ? 2 : 1, 2, high ? 24 : 16, high ? 3 : 2,
+                    mode, profile == 3 ? 96000 : 48000, high ? 6 : 4);
+        }
+        byte[] encode() {
+            ByteBuffer b = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN);
+            b.put((byte) 2).put((byte) profile).put((byte) sampleFormat).put((byte) channels)
+                    .put((byte) validBits).put((byte) bytesPerSample).put((byte) mode).put((byte) 0)
+                    .putInt(sampleRate).putShort((short) frameBytes).putShort((short) 0);
+            return b.array();
+        }
+        static AudioFormatV2 decode(byte[] bytes) {
+            if (bytes.length != 16 || bytes[0] != 2 || bytes[7] != 0 || bytes[14] != 0 || bytes[15] != 0)
+                throw new IllegalArgumentException("invalid v2 audio descriptor");
+            try {
+                AudioFormatV2 f = forProfile(bytes[1] & 0xff, bytes[6] & 0xff);
+                if (!Arrays.equals(f.encode(), bytes)) throw new IllegalArgumentException("invalid v2 audio descriptor");
+                return f;
+            } catch (IllegalArgumentException error) { throw new IllegalArgumentException("invalid v2 audio descriptor", error); }
+        }
     }
 
     static final class Packet {

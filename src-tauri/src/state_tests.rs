@@ -1,5 +1,70 @@
 use super::*;
 
+#[tokio::test]
+async fn usb_direct_configuration_suppression_is_owned_by_its_configuration_id() {
+    let state = AppState::new();
+    let configuration = state.begin_usb_direct_configuration(false).await.unwrap();
+    let configuration_id = configuration.configuration_id;
+    assert!(state.usb_direct_configuration_active());
+    assert!(state
+        .begin_usb_direct_configuration(false)
+        .await
+        .err()
+        .is_some());
+
+    state.end_usb_direct_configuration(configuration_id.wrapping_add(1));
+    assert!(state.usb_direct_configuration_active());
+    state.end_usb_direct_configuration(configuration_id);
+    state.end_usb_direct_configuration(configuration_id);
+    assert!(!state.usb_direct_configuration_active());
+}
+
+#[test]
+fn playback_mode_capability_includes_supported_sessions_and_quality_lock_remains_separate() {
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.session_active = true;
+        view.session_transport = Some("usb".into());
+    }
+    let standard_usb = state.snapshot();
+    assert!(standard_usb.can_change_playback_mode);
+    assert!(!standard_usb.can_change_modes);
+    state.view.lock().unwrap().session_transport = Some("aoa".into());
+    assert!(!state.snapshot().can_change_playback_mode);
+    state.view.lock().unwrap().session_capabilities = Some(ReceiverCapabilities {
+        control_major: 1,
+        audio_major: 2,
+        management_compatible: true,
+        audio_compatible: true,
+        compatible: true,
+        capability_bits: 0x200,
+        version_code: 36,
+    });
+    assert!(state.snapshot().can_change_playback_mode);
+}
+
+#[tokio::test]
+async fn adb_server_release_requires_confirmation_and_uses_kill_server() {
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let declined = with_confirmed_adb_release(false, || async {
+        called.store(true, Ordering::Release);
+        Ok(())
+    })
+    .await;
+    assert!(declined.unwrap_err().contains("确认停止本机 ADB server"));
+    assert!(!called.load(Ordering::Acquire));
+
+    let args = std::sync::Mutex::new(Vec::new());
+    with_confirmed_adb_release(true, || async {
+        *args.lock().unwrap() = ADB_SERVER_KILL_ARGS.to_vec();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(*args.lock().unwrap(), ["kill-server"]);
+}
+
 fn sample_snapshot() -> AppSnapshot {
     AppSnapshot {
         state: "connected".into(),
@@ -15,6 +80,9 @@ fn sample_snapshot() -> AppSnapshot {
         session_wireless_protocol: Some("udp".into()),
         session_capabilities: None,
         playback_diagnostics: Some(PlaybackDiagnostics::default()),
+        negotiated_audio_format: None,
+        windows_mix_format: None,
+        android_output_format: None,
         network_recovery_seconds_remaining: None,
         wireless_connection_offers: HostDiscoverySnapshot::default(),
         session_android_version: Some("15".into()),
@@ -25,6 +93,7 @@ fn sample_snapshot() -> AppSnapshot {
         busy: false,
         can_disconnect: true,
         can_change_modes: false,
+        can_change_playback_mode: true,
         status_detail: "192.168.50.2 已连接".into(),
         audio_bitrate_bps: Some(1_536_000),
         presence: Vec::new(),
@@ -33,9 +102,79 @@ fn sample_snapshot() -> AppSnapshot {
 }
 
 #[test]
+fn audio_quality_defaults_and_rejects_unavailable_profiles_without_changing_playback_mode() {
+    let old_settings: AppSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(old_settings.audio_quality, "standard");
+    assert_eq!(old_settings.wired_mode, "aoa");
+
+    assert!(validate_audio_quality("hifi").is_ok());
+    assert!(validate_audio_quality("hires").is_ok());
+    for quality in ["unsupported"] {
+        assert!(validate_audio_quality(quality).is_err(), "{quality}");
+    }
+    assert!(validate_audio_quality("standard").is_ok());
+
+    let settings = normalize_settings(AppSettings {
+        audio_quality: "standard".into(),
+        playback_mode: "LowLatency".into(),
+        ..AppSettings::default()
+    });
+    assert_eq!(settings.audio_quality, "standard");
+    assert_eq!(settings.playback_mode, "LowLatency");
+}
+
+#[test]
+fn negotiated_audio_format_requires_active_phone_playback_and_confirmed_48khz_stereo() {
+    let diagnostics = PlaybackDiagnostics {
+        sample_rate: Some(48_000),
+        channels: Some(2),
+        ..PlaybackDiagnostics::default()
+    };
+    assert!(negotiated_audio_format(false, "phone", Some(&diagnostics)).is_none());
+    assert!(negotiated_audio_format(true, "computer", Some(&diagnostics)).is_none());
+    assert!(negotiated_audio_format(true, "phone", None).is_none());
+    assert!(negotiated_audio_format(
+        true,
+        "phone",
+        Some(&PlaybackDiagnostics {
+            channels: Some(1),
+            ..diagnostics.clone()
+        })
+    )
+    .is_none());
+    assert!(negotiated_audio_format(
+        true,
+        "phone",
+        Some(&PlaybackDiagnostics {
+            sample_rate: Some(44_100),
+            ..diagnostics.clone()
+        })
+    )
+    .is_none());
+    assert_eq!(
+        negotiated_audio_format(true, "phone", Some(&diagnostics)).map(|format| (
+            format.sample_rate_hz,
+            format.channels,
+            format.sample_format
+        )),
+        Some((48_000, 2, "pcm16le".into()))
+    );
+}
+
+#[test]
 fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
-    let json = serde_json::to_string(&diagnostics_export(&sample_snapshot())).unwrap();
-    for leaked in ["TESTSERIAL", "Test Phone", "phoneA-abcdef", "192.168.50.2"] {
+    let mut snapshot = sample_snapshot();
+    snapshot.settings.last_usb_direct_target_id = Some("usb-target-private".into());
+    snapshot.settings.last_usb_direct_binding_reference = Some("binding-private".into());
+    let json = serde_json::to_string(&diagnostics_export(&snapshot)).unwrap();
+    for leaked in [
+        "TESTSERIAL",
+        "Test Phone",
+        "phoneA-abcdef",
+        "192.168.50.2",
+        "usb-target-private",
+        "binding-private",
+    ] {
         assert!(!json.contains(leaked), "{leaked} leaked into {json}");
     }
     assert!(json.contains("\"schemaVersion\":1"));
@@ -319,6 +458,12 @@ fn settings_keep_schema_one_names_and_defaults() {
     let value = serde_json::to_value(AppSettings::default()).unwrap();
     assert_eq!(value["schemaVersion"], 1);
     assert_eq!(value["preferredTransport"], "Usb");
+    assert_eq!(value["wiredMode"], "aoa");
+    assert_eq!(value["lastUsbDirectTargetId"], serde_json::Value::Null);
+    assert_eq!(
+        value["lastUsbDirectBindingReference"],
+        serde_json::Value::Null
+    );
     assert_eq!(value["wirelessProtocol"], "udp");
     assert_eq!(value["audioBackend"], "receiver");
     assert_eq!(value["playbackMode"], "Balanced");
@@ -348,12 +493,13 @@ fn settings_keep_schema_one_names_and_defaults() {
     assert_eq!(explicit_legacy.audio_backend, "legacy");
     let old_saved = normalize_settings(
         serde_json::from_value(serde_json::json!({
-            "schemaVersion": 1, "preferredTransport": "Wifi"
+            "schemaVersion": 1, "preferredTransport": "Wifi", "audioQuality": "hires"
         }))
         .unwrap(),
     );
     assert_eq!(old_saved.preferred_transport, "Wifi");
     assert_eq!(old_saved.wireless_protocol, "adb");
+    assert_eq!(old_saved.audio_quality, "standard");
     assert_eq!(old_saved.audio_backend, "receiver");
     let new_saved = normalize_settings(
         serde_json::from_value(serde_json::json!({
@@ -363,8 +509,6 @@ fn settings_keep_schema_one_names_and_defaults() {
     );
     assert_eq!(new_saved.wireless_protocol, "udp");
     assert_eq!(new_saved.audio_backend, "receiver");
-    assert_eq!(selected_transport_allows_auto_adb(&old_saved), true);
-    assert_eq!(selected_transport_allows_auto_adb(&new_saved), true);
     let explicit_udp_wifi = normalize_settings(
         serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Wifi", "wirelessProtocol": "udp"
@@ -372,7 +516,20 @@ fn settings_keep_schema_one_names_and_defaults() {
         .unwrap(),
     );
     assert_eq!(explicit_udp_wifi.wireless_protocol, "udp");
-    assert!(!selected_transport_allows_auto_adb(&explicit_udp_wifi));
+    let udp_hires = normalize_settings(AppSettings {
+        preferred_transport: "Wifi".into(),
+        wireless_protocol: "udp".into(),
+        audio_quality: "hires".into(),
+        ..AppSettings::default()
+    });
+    assert_eq!(udp_hires.audio_quality, "hires");
+    let direct_hires = normalize_settings(AppSettings {
+        wired_mode: "aoa".into(),
+        audio_quality: "hires".into(),
+        ..AppSettings::default()
+    });
+    assert_eq!(direct_hires.wired_mode, "aoa");
+    assert_eq!(direct_hires.audio_quality, "hires");
     assert_eq!(
         reconfigure_selection("transport", "wireless", &old_saved),
         Ok(ReconfigureSelection::WirelessAdb)
@@ -452,6 +609,97 @@ fn settings_keep_schema_one_names_and_defaults() {
 }
 
 #[test]
+fn adb_mode_quality_updates_are_atomic_and_usb_direct_memory_is_persisted() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        ".tmp-wired-settings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut state = AppState::new();
+    state.data_dir = root.clone();
+
+    assert!(state
+        .update_setting("wiredMode", serde_json::json!("invalid"))
+        .is_err());
+    state
+        .update_setting("wiredMode", serde_json::json!("aoa"))
+        .unwrap();
+    state
+        .update_setting("audioQuality", serde_json::json!("hires"))
+        .unwrap();
+    assert_eq!(state.snapshot().settings.audio_quality, "hires");
+
+    state
+        .update_setting("preferredTransport", serde_json::json!("Wifi"))
+        .unwrap();
+    state
+        .update_setting("wirelessProtocol", serde_json::json!("adb"))
+        .unwrap();
+    assert_eq!(state.snapshot().settings.audio_quality, "standard");
+    assert!(state
+        .update_setting("audioQuality", serde_json::json!("hifi"))
+        .is_err());
+    state
+        .update_setting("wirelessProtocol", serde_json::json!("udp"))
+        .unwrap();
+    state
+        .update_setting("audioQuality", serde_json::json!("hires"))
+        .unwrap();
+    state
+        .update_setting("wiredMode", serde_json::json!("adb"))
+        .unwrap();
+    state
+        .update_setting("preferredTransport", serde_json::json!("Usb"))
+        .unwrap();
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.settings.audio_quality, "standard");
+    assert_eq!(snapshot.settings.wired_mode, "adb");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["wiredMode"], "adb");
+    assert_eq!(saved["audioQuality"], "standard");
+    assert!(state
+        .update_setting("audioQuality", serde_json::json!("hires"))
+        .is_err());
+
+    state
+        .update_setting("wiredMode", serde_json::json!("aoa"))
+        .unwrap();
+    state
+        .update_setting("audioQuality", serde_json::json!("hifi"))
+        .unwrap();
+    state
+        .remember_usb_direct_target("usb-target-private", "binding-private")
+        .unwrap();
+    let snapshot = state.snapshot();
+    assert_eq!(
+        snapshot.settings.last_usb_direct_target_id.as_deref(),
+        Some("usb-target-private")
+    );
+    assert_eq!(
+        snapshot
+            .settings
+            .last_usb_direct_binding_reference
+            .as_deref(),
+        Some("binding-private")
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["lastUsbDirectTargetId"], "usb-target-private");
+    assert_eq!(saved["lastUsbDirectBindingReference"], "binding-private");
+
+    let mut diagnostic_snapshot = sample_snapshot();
+    diagnostic_snapshot.settings = snapshot.settings;
+    let diagnostic = serde_json::to_string(&diagnostics_export(&diagnostic_snapshot)).unwrap();
+    assert!(!diagnostic.contains("usb-target-private"));
+    assert!(!diagnostic.contains("binding-private"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn operation_owner_cannot_be_cleared_by_an_older_completion() {
     let generation = AtomicU64::new(0);
     let slot = Mutex::new(None);
@@ -468,6 +716,68 @@ fn operation_owner_cannot_be_cleared_by_an_older_completion() {
             |active| active.generation == current_generation && !active.token.is_cancelled()
         ));
     assert!(!current_token.is_cancelled());
+}
+
+#[test]
+fn aoa_switch_reservation_rejects_existing_operations_without_cancelling_them() {
+    let generation = AtomicU64::new(0);
+    let slot = Mutex::new(None);
+    let (_, current) = begin_operation_slot(&generation, &slot, false).unwrap();
+
+    assert!(try_begin_exclusive_operation(&generation, &slot).is_none());
+    assert!(!current.is_cancelled());
+}
+
+#[test]
+fn cancelled_aoa_start_cannot_publish_over_a_new_operation_generation() {
+    let generation = AtomicU64::new(0);
+    let slot = Mutex::new(None);
+    let (old_generation, old_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+    cancel_operation_slot(&generation, &slot);
+    assert!(old_token.is_cancelled());
+    assert!(!operation_generation_matches(&generation, old_generation));
+
+    let (new_generation, new_token) = begin_operation_slot(&generation, &slot, false).unwrap();
+    finish_operation_slot(&slot, old_generation);
+    assert!(operation_generation_matches(&generation, new_generation));
+    assert!(!new_token.is_cancelled());
+    assert!(slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|operation| operation.generation == new_generation));
+}
+
+#[test]
+fn aoa_snapshot_keeps_transport_and_binding_separate_from_adb_identity() {
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.settings.preferred_transport = "Wifi".into();
+        view.selected_serial = Some("existing-adb-serial".into());
+        view.session_active = true;
+        view.session_serial = None;
+        view.session_receiver_binding = Some("b".repeat(64));
+        view.session_transport = Some("aoa".into());
+        view.output = "phone".into();
+    }
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.session_transport.as_deref(), Some("aoa"));
+    assert_eq!(
+        snapshot.session_connection_transport.as_deref(),
+        Some("usbDirect")
+    );
+    assert_eq!(snapshot.session_wireless_protocol, None);
+    assert_eq!(snapshot.session_serial, None);
+    assert_eq!(
+        snapshot.selected_serial.as_deref(),
+        Some("existing-adb-serial")
+    );
+    assert_eq!(snapshot.session_receiver_binding, Some("b".repeat(64)));
+    assert_eq!(snapshot.transport, "wifi");
+    assert_eq!(snapshot.connection_transport, "wireless");
+    assert!(!snapshot.can_change_modes);
 }
 
 #[test]
@@ -539,15 +849,6 @@ fn native_disconnect_is_detected_when_adb_scan_fails() {
     assert!(session_is_lost(None, false, false));
     assert!(!session_is_lost(None, false, true));
     assert!(session_is_lost(Some(false), false, true));
-}
-
-#[test]
-fn receiver_health_monitor_skips_known_local_or_transport_failures() {
-    assert!(receiver_health_needed(true, Some(true), false, true));
-    assert!(!receiver_health_needed(false, Some(true), false, true));
-    assert!(!receiver_health_needed(true, Some(false), false, true));
-    assert!(!receiver_health_needed(true, Some(true), true, true));
-    assert!(!receiver_health_needed(true, Some(true), false, false));
 }
 
 #[test]

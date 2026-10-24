@@ -75,6 +75,15 @@ MIT, ISC, Apache-2.0 and LGPL-3.0-or-later licence texts are included in
 `LICENSES/` where available. Each Rust crate retains the licence terms recorded
 in its published package; see the lockfile for exact versions.
 
+The frontend also includes Motion 14.6.0. Its `motion`, `motion-dom` and
+`motion-utils` packages carry the MIT licence with the copyright notice for
+Motion B.V.; `framer-motion` carries its MIT licence with the copyright notice
+for Framer B.V. Their package manifests name Matt Perry as author. The package
+licence texts are included in `LICENSES/Motion-MIT.txt` and
+`LICENSES/Framer-Motion-MIT.txt`. Motion's `tslib` dependency resolves to
+version 2.8.1 under 0BSD, with Microsoft's copyright and licence text in
+`LICENSES/tslib-0BSD.txt`.
+
 The P3 localhost UDP prototype adds Rust crates `aes-gcm` 0.11.1 for
 AES-256-GCM authenticated encryption, `sha2` 0.10.9 for SHA-256, and
 `getrandom` 0.3.4 for session material. Each is dual-licensed MIT or
@@ -97,9 +106,25 @@ copyright notices and MIT license texts are included in `LICENSES/` as
 `subtle` 2.6.1 is included as `subtle-BSD-3-Clause.txt`. Shared Apache-2.0
 terms are in `LICENSES/Apache-2.0.txt`.
 
-The P6-B shared PCM stream helper bounds stale audio in the existing TCP/USB
-queue and applies a short fade when trimming backlog. This is AnPod-owned code
-and adds no dependency or change to the Native DLL protocol.
+The optional Android experimental output engine uses the published Oboe
+Prefab AAR, `com.google.oboe:oboe:1.10.0`, licensed under Apache-2.0. Its POM
+declares no transitive dependencies; the AAR supplies the Oboe headers and
+native libraries for four Android ABIs. No Oboe source is copied into AnPod.
+The pinned release and package contents are recorded in
+`upstream/SOURCE_VERSIONS.md`; the license text is included in
+`LICENSES/Apache-2.0.txt` and, for the Receiver APK, in
+`src/AnPod.Receiver/app/src/main/assets/licenses/Oboe-Apache-2.0.txt`. The
+APK's `Oboe-ATTRIBUTION.txt` records the upstream version and copyright owner;
+the upstream release does not contain a separate NOTICE file.
+
+The Phase 6 AOA protocol, session owners, USB record framing, Windows WinUSB
+adapter, Android `FileChannel` adapter, and shared PCM ingress are AnPod-owned
+code. They use the existing `windows` crate and Android/Java platform APIs;
+Phase 6 did not add a third-party USB, cryptography, or audio dependency. AOA
+uses a session-only secret derived from the existing ANPB binding and does not
+change the saved binding format. The `AnPod Lab` / `AOA Bulk Probe` echo tool
+remains a separate diagnostic identity from the product `AnPod` / `AnPod USB
+Direct` identity.
 
 The WebView2 Runtime is a Microsoft system prerequisite and is not bundled by
 the portable package. The WPF fallback under `src/AnPod.Desktop/` is an optional

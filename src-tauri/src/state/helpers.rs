@@ -2,6 +2,10 @@ use super::*;
 
 pub(crate) static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(crate) fn operation_generation_matches(generation: &AtomicU64, expected: u64) -> bool {
+    generation.load(Ordering::Acquire) == expected
+}
+
 pub(crate) fn begin_operation_slot(
     generation: &AtomicU64,
     slot: &Mutex<Option<ActiveOperation>>,
@@ -15,6 +19,25 @@ pub(crate) fn begin_preemptible_background_operation(
     slot: &Mutex<Option<ActiveOperation>>,
 ) -> Option<(u64, CancellationToken)> {
     begin_operation_slot_with_preemptibility(generation, slot, true, true)
+}
+
+pub(crate) fn try_begin_exclusive_operation(
+    generation: &AtomicU64,
+    slot: &Mutex<Option<ActiveOperation>>,
+) -> Option<(u64, CancellationToken)> {
+    let mut current = slot.lock().expect("operation lock");
+    if current.is_some() {
+        return None;
+    }
+    let next_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let token = CancellationToken::new();
+    *current = Some(ActiveOperation {
+        generation: next_generation,
+        token: token.clone(),
+        background: false,
+        receiver_preemptible: false,
+    });
+    Some((next_generation, token))
 }
 
 fn begin_operation_slot_with_preemptibility(
@@ -91,15 +114,6 @@ pub(crate) fn session_is_lost(
     audio_connected: bool,
 ) -> bool {
     process_exited || !audio_connected || device_present == Some(false)
-}
-
-pub(crate) fn receiver_health_needed(
-    installed_receiver: bool,
-    device_present: Option<bool>,
-    process_exited: bool,
-    audio_connected: bool,
-) -> bool {
-    installed_receiver && !session_is_lost(device_present, process_exited, audio_connected)
 }
 
 pub(crate) fn merge_usb_playback_diagnostics(
@@ -272,12 +286,30 @@ pub(crate) fn automatic_reception_binding(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pcm_queue_identity_changed(
     current: Option<&Arc<PcmQueue>>,
     next: Option<&Arc<PcmQueue>>,
 ) -> bool {
     match (current, next) {
         (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn session_audio_queue_identity_changed(
+    current: Option<&SessionAudioQueue>,
+    next: Option<&SessionAudioQueue>,
+) -> bool {
+    match (current, next) {
+        (Some(SessionAudioQueue::Pcm16(current)), Some(SessionAudioQueue::Pcm16(next))) => {
+            !Arc::ptr_eq(current, next)
+        }
+        (
+            Some(SessionAudioQueue::Float32(current, current_format)),
+            Some(SessionAudioQueue::Float32(next, next_format)),
+        ) => !Arc::ptr_eq(current, next) || current_format != next_format,
         (None, None) => false,
         _ => true,
     }
@@ -760,6 +792,13 @@ pub(crate) fn normalize_mdns_instance(value: &str) -> String {
         .replace("._adb._tcp", "")
 }
 
+pub(crate) fn validate_audio_quality(value: &str) -> Result<(), String> {
+    match value {
+        "standard" | "hifi" | "hires" => Ok(()),
+        _ => Err("Invalid audio quality; select Standard, HiFi, or Hi-Res.".into()),
+    }
+}
+
 pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.schema_version = 1;
     settings.preferred_transport = match settings.preferred_transport.to_ascii_lowercase().as_str()
@@ -767,6 +806,7 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         "wifi" => "Wifi".into(),
         _ => "Usb".into(),
     };
+    settings.wired_mode = normalize_wired_mode(&settings.wired_mode).into();
     settings.wireless_protocol = if settings.wireless_protocol.is_empty() {
         if settings.preferred_transport == "Wifi" {
             "adb"
@@ -777,6 +817,9 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     } else {
         normalize_wireless_protocol(&settings.wireless_protocol).into()
     };
+    if adb_transport_enabled(&settings) {
+        settings.audio_quality = "standard".into();
+    }
     settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() {
         "lowlatency" | "low_latency" => "LowLatency".into(),
@@ -804,6 +847,20 @@ pub(crate) fn normalize_wireless_protocol(value: &str) -> &'static str {
         "udp"
     }
 }
+pub(crate) fn normalize_wired_mode(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("aoa") {
+        "aoa"
+    } else {
+        "adb"
+    }
+}
+pub(crate) fn adb_transport_enabled(settings: &AppSettings) -> bool {
+    if settings.preferred_transport == "Wifi" {
+        settings.wireless_protocol == "adb"
+    } else {
+        settings.wired_mode == "adb"
+    }
+}
 pub(crate) fn normalize_audio_backend(value: &str) -> &'static str {
     if value.eq_ignore_ascii_case("legacy") {
         "legacy"
@@ -821,9 +878,6 @@ pub(crate) enum ReconfigureSelection {
 }
 pub(crate) fn wireless_adb_enabled(settings: &AppSettings) -> bool {
     settings.wireless_protocol == "adb"
-}
-pub(crate) fn selected_transport_allows_auto_adb(settings: &AppSettings) -> bool {
-    !settings.preferred_transport.eq_ignore_ascii_case("wifi") || wireless_adb_enabled(settings)
 }
 pub(crate) fn reconfigure_selection(
     kind: &str,
@@ -854,6 +908,7 @@ pub(crate) fn selected_connection_transport(preferred: &str) -> &'static str {
 pub(crate) fn session_connection_transport(transport: &str) -> Option<&'static str> {
     match transport {
         "usb" => Some("usb"),
+        "aoa" => Some("usbDirect"),
         "wifi" | "lan" => Some("wireless"),
         _ => None,
     }

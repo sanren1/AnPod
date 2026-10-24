@@ -13,6 +13,7 @@ final class UdpSessionContext {
     final long sessionId;
     final String playbackMode;
     final PairingProtocol.AudioParameters parameters;
+    final UdpPacketDecoder.AudioFormatV2 formatV2;
     private final byte[] key;
     private DatagramSocket socket;
     private boolean destroyed;
@@ -31,6 +32,7 @@ final class UdpSessionContext {
         this.key = key.clone();
         this.playbackMode = playbackMode;
         this.parameters = null;
+        this.formatV2 = null;
     }
 
     UdpSessionContext(DatagramSocket socket, InetSocketAddress expectedPeer,
@@ -48,7 +50,28 @@ final class UdpSessionContext {
         this.sessionId = sessionId;
         this.key = key.clone();
         this.parameters = parameters;
+        this.formatV2 = null;
         this.playbackMode = parameters.mode == 1 ? "lowlatency" : "balanced";
+    }
+
+    UdpSessionContext(DatagramSocket socket, InetSocketAddress expectedPeer,
+            long sessionId, byte[] key, UdpPacketDecoder.AudioFormatV2 formatV2) {
+        if (socket == null || socket.isClosed() || !socket.isBound()
+                || !(socket.getLocalSocketAddress() instanceof InetSocketAddress)
+                || !isPrivateIpv4(socket.getLocalAddress())
+                || expectedPeer == null || !isPrivateIpv4(expectedPeer.getAddress())
+                || expectedPeer.getPort() < 1 || expectedPeer.getPort() > 65535
+                || key == null || key.length != 32 || formatV2 == null)
+            throw new IllegalArgumentException("Invalid authenticated UDP v2 session context");
+        formatV2.encode();
+        this.socket = socket;
+        this.bindAddress = (InetSocketAddress) socket.getLocalSocketAddress();
+        this.expectedPeer = expectedPeer;
+        this.sessionId = sessionId;
+        this.key = key.clone();
+        this.parameters = null;
+        this.formatV2 = formatV2;
+        this.playbackMode = formatV2.mode == 1 ? "lowlatency" : "balanced";
     }
 
     static boolean isPrivateIpv4(InetAddress address) {

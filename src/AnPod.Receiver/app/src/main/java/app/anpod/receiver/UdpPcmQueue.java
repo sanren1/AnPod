@@ -90,6 +90,14 @@ final class UdpPcmQueue {
         }
     }
 
+    UdpPcmQueue(int sampleRate, int channels, String playbackMode) {
+        expectedParameters = null;
+        lowLatency = "lowlatency".equalsIgnoreCase(playbackMode);
+        clock = SYSTEM_CLOCK;
+        format = new UdpPacketDecoder.Format(sampleRate, channels);
+        updateBudget(sampleRate);
+    }
+
     synchronized void configureAudioTrack(int preRollFrames) {
         if (format == null) return;
         // AudioTrack pre-roll is a separate device buffer, not part of this network jitter budget.
@@ -127,10 +135,25 @@ final class UdpPcmQueue {
 
     synchronized void acceptAt(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder, long now)
             throws UdpPacketDecoder.ProtocolException {
+        acceptAt(packet, decoder, now, false);
+    }
+
+    synchronized void acceptV2Pcm16(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder)
+            throws UdpPacketDecoder.ProtocolException {
+        acceptAt(packet, decoder, clock.nowNanos(), true);
+    }
+
+    private void acceptAt(UdpPacketDecoder.Packet packet, UdpPacketDecoder decoder, long now, boolean lockedV2)
+            throws UdpPacketDecoder.ProtocolException {
         if (stopped) throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.AUDIO);
         if (packet.type == UdpPacketDecoder.FORMAT) {
-            if (packet.sequence != 0)
+            if (packet.sequence != 0 || packet.sampleFrameIndex != 0)
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
+            if (lockedV2) {
+                if (format == null) throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
+                decoder.commit(packet.sequence);
+                return;
+            }
             UdpPacketDecoder.Format acceptedFormat = UdpPacketDecoder.decodeFormat(packet);
             if (expectedParameters != null && (acceptedFormat.sampleRate != expectedParameters.sampleRate
                     || acceptedFormat.channels != expectedParameters.channels))

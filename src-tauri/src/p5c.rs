@@ -1,11 +1,11 @@
 #[cfg(test)]
 use crate::protocol::{PacketEncoder, PacketType, HOST_TO_RECEIVER};
 use crate::{
-    network::{PcmQueue, UdpSender, UdpSessionMaterial},
+    network::{FloatPcmQueue, FloatUdpSender, PcmQueue, UdpSender, UdpSessionMaterial},
     network_interface::Ipv4Interface,
-    protocol::PcmFormat,
+    protocol::{AudioFormatV2, PcmFormat},
     receiver::PlaybackDiagnostics,
-    security::{AudioParameters, BindingMaterial, HostHandshake},
+    security::{AudioParameters, BindingMaterial, HostHandshake, HostHandshakeV2},
 };
 use hmac::{Hmac, Mac};
 use serde::Serialize;
@@ -25,42 +25,46 @@ use std::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const CONTROL_MAGIC: &[u8; 4] = b"ANPC";
+pub(crate) const CONTROL_MAGIC: &[u8; 4] = b"ANPC";
 const CONTROL_HEADER_BYTES: usize = 30;
 const CONTROL_TAG_BYTES: usize = 32;
 const MAX_CONTROL_FRAME: usize = 1200;
-const HOST_TO_RECEIVER_CONTROL: u32 = 0x414e_5048;
-const RECEIVER_TO_HOST_CONTROL: u32 = 0x414e_5052;
-const BIND: u8 = 1;
-const SELECT_MODE: u8 = 2;
-const START: u8 = 3;
-const PAUSE: u8 = 4;
-const RESUME: u8 = 5;
-const STOP: u8 = 6;
-const HEARTBEAT: u8 = 7;
-const CAPABILITIES_QUERY: u8 = 8;
-const CAPABILITIES_INFO: u8 = 9;
-const PLAYBACK_PROGRESS_QUERY: u8 = 16;
+pub(crate) const HOST_TO_RECEIVER_CONTROL: u32 = 0x414e_5048;
+pub(crate) const RECEIVER_TO_HOST_CONTROL: u32 = 0x414e_5052;
+pub(crate) const BIND: u8 = 1;
+pub(crate) const SELECT_MODE: u8 = 2;
+pub(crate) const START: u8 = 3;
+pub(crate) const PAUSE: u8 = 4;
+pub(crate) const RESUME: u8 = 5;
+pub(crate) const STOP: u8 = 6;
+pub(crate) const HEARTBEAT: u8 = 7;
+pub(crate) const CAPABILITIES_QUERY: u8 = 8;
+pub(crate) const CAPABILITIES_INFO: u8 = 9;
+pub(crate) const PLAYBACK_PROGRESS_QUERY: u8 = 16;
 const CONNECTION_INTENT: u8 = 17;
 const BACKGROUND_START_REQUEST: u8 = 18;
 const BACKGROUND_START_STATUS: u8 = 19;
 const BACKGROUND_START_CANCEL: u8 = 20;
 const BACKGROUND_TRUST_QUERY: u8 = 21;
 const BACKGROUND_TRUST_REVOKE: u8 = 22;
-const ACK: u8 = 127;
-const RESULT_OK: u8 = 0;
+pub(crate) const ACK: u8 = 127;
+pub(crate) const RESULT_OK: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
 const RESULT_FAILED: u8 = 2;
-const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
-const AUDIO_PROTOCOL_MAJOR: u8 = 1;
+pub(crate) const RESULT_USER_STOPPED: u8 = 3;
+pub(crate) const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
+pub(crate) const AUDIO_PROTOCOL_MAJOR: u8 = 1;
 const CAP_RECEIVER_UI: u32 = 0x0000_0001;
-const CAP_AUTHENTICATED_STATUS: u32 = 0x0000_0002;
-const CAP_PLAYBACK_PROGRESS: u32 = 0x0000_0008;
+pub(crate) const CAP_AUTHENTICATED_STATUS: u32 = 0x0000_0002;
+pub(crate) const CAP_PLAYBACK_PROGRESS: u32 = 0x0000_0008;
 const CAP_CONNECTION_INTENT: u32 = 0x0000_0010;
 const CAP_BACKGROUND_START_AUTH: u32 = 0x0000_0020;
 const CAP_BACKGROUND_TRUST_MANAGEMENT: u32 = 0x0000_0040;
+pub(crate) const CAP_AUDIO_V2: u32 = 0x0000_0080;
+pub(crate) const CAP_TERMINAL_CAUSE: u32 = 0x0000_0100;
+pub(crate) const CAP_AOA_SESSION_RESTART: u32 = 0x0000_0200;
 const IMPLEMENTED_CAPABILITIES: u32 =
-    CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS;
+    CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
 const AUTH_PENDING: u8 = 0;
 const AUTH_ONCE: u8 = 1;
@@ -203,14 +207,29 @@ impl Drop for SessionKeys {
 }
 
 /// Explicit host side of one authenticated P5-C session. It has no listener or product caller.
+#[derive(Clone)]
+pub(crate) enum SessionAudioQueue {
+    Pcm16(Arc<PcmQueue>),
+    Float32(Arc<FloatPcmQueue>, AudioFormatV2),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAudioProfile {
+    Standard,
+    Pcm24(AudioFormatV2),
+}
+
 pub(crate) struct HostSession {
     tcp: Option<TcpStream>,
     udp_socket: Option<UdpSocket>,
     sender: Option<UdpSender>,
+    float_sender: Option<FloatUdpSender>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
     queue: Arc<PcmQueue>,
+    float_queue: Option<Arc<FloatPcmQueue>>,
     keys: SessionKeys,
     parameters: AudioParameters,
+    format_v2: Option<AudioFormatV2>,
     session_id: u64,
     binding_commitment: [u8; 32],
     remote_udp: Option<SocketAddr>,
@@ -221,6 +240,7 @@ pub(crate) struct HostSession {
     last_heartbeat: Instant,
     state: ReceiverState,
     capabilities: Option<ReceiverCapabilities>,
+    terminal_cause: Option<TerminalCause>,
     connection_intent: Option<([u8; 16], bool)>,
     background_request_id: Option<[u8; 16]>,
     background_authorization_required: bool,
@@ -349,13 +369,16 @@ impl HostSession {
             tcp: Some(tcp),
             udp_socket: Some(udp_socket),
             sender: None,
+            float_sender: None,
             pcm_payload_bytes_sent,
             queue: Arc::new(PcmQueue::for_session(
                 format,
                 authenticated_parameters.mode == 1,
             )),
+            float_queue: None,
             keys: session_keys,
             parameters: authenticated_parameters,
+            format_v2: None,
             session_id,
             binding_commitment,
             remote_udp: None,
@@ -366,12 +389,187 @@ impl HostSession {
             last_heartbeat: Instant::now(),
             state: ReceiverState::Authenticated,
             capabilities: None,
+            terminal_cause: None,
             connection_intent: endpoint.connection_intent,
             background_request_id: endpoint.background_request_id,
             background_authorization_required: endpoint.background_authorization_required,
             background_authorized: false,
             cancellation,
         })
+    }
+
+    fn authenticate_v2_on_network(
+        endpoint: SessionEndpoint,
+        material: BindingMaterial,
+        format: AudioFormatV2,
+        float_queue: Arc<FloatPcmQueue>,
+        parent_cancel: CancellationToken,
+    ) -> Result<Self, String> {
+        format
+            .encode()
+            .map_err(|_| "Unsupported P5-C PCM24 format.".to_string())?;
+        if !matches!(
+            (format.profile, format.sample_rate),
+            (2, 48_000) | (3, 96_000)
+        ) || format.channels != 2
+            || format.sample_format != 2
+            || format.valid_bits != 24
+            || format.bytes_per_sample != 3
+            || format.frame_bytes != 6
+        {
+            return Err(
+                "Only 48 kHz HiFi or 96 kHz Hi-Res stereo packed PCM24 is supported.".into(),
+            );
+        }
+        endpoint.validate()?;
+        let cancellation = parent_cancel.child_token();
+        check_cancelled(&cancellation).map_err(|_| "P5-C connection was cancelled.".to_string())?;
+        let udp_socket = UdpSocket::bind((endpoint.local_address, 0)).map_err(|_| {
+            "Unable to bind the P5-C audio socket to the selected interface.".to_string()
+        })?;
+        let mut tcp = connect_cancellable(endpoint.local_address, endpoint.peer, &cancellation)
+            .map_err(|_| {
+                "Receiver endpoint is unavailable on the selected interface.".to_string()
+            })?;
+        tcp.set_read_timeout(Some(SESSION_IO_POLL))
+            .map_err(|_| "Unable to configure P5-C control timeout.".to_string())?;
+        tcp.set_write_timeout(Some(SESSION_IO_POLL))
+            .map_err(|_| "Unable to configure P5-C control timeout.".to_string())?;
+
+        let binding_commitment = material.commitment();
+        let (handshake, hello) = HostHandshakeV2::start(material, format)
+            .map_err(|_| "P5-A v2 handshake could not start.".to_string())?;
+        write_all_cancellable(&mut tcp, &hello, &cancellation)
+            .map_err(|_| "P5-C peer closed during P5-A v2 HELLO.".to_string())?;
+        let mut challenge = [0u8; 104];
+        read_exact_cancellable(&mut tcp, &mut challenge, &cancellation)
+            .map_err(|_| "P5-C peer closed during P5-A v2 CHALLENGE.".to_string())?;
+        let (await_ready, finish) = handshake
+            .accept_challenge(&challenge)
+            .map_err(|_| "P5-A v2 receiver identity or proof was rejected.".to_string())?;
+        write_all_cancellable(&mut tcp, &finish, &cancellation)
+            .map_err(|_| "P5-C peer closed during P5-A v2 FINISH.".to_string())?;
+        let mut ready = [0u8; 40];
+        read_exact_cancellable(&mut tcp, &mut ready, &cancellation)
+            .map_err(|_| "P5-C peer closed during P5-A v2 READY.".to_string())?;
+        let session = await_ready
+            .accept_ready(&ready)
+            .map_err(|_| "P5-A v2 READY proof was rejected.".to_string())?;
+        if session.format != format {
+            return Err("P5-A v2 returned an unexpected audio format.".into());
+        }
+        let session_id = session.session_id;
+        let keys = session.into_keys();
+        let session_keys = SessionKeys {
+            audio: keys.host_to_receiver_audio,
+            control_tx: keys.host_to_receiver_control,
+            control_rx: keys.receiver_to_host_control,
+        };
+        drop(keys);
+        let parameters = AudioParameters {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            mode: format.mode,
+        };
+        let queue = Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: format.sample_rate,
+                channels: format.channels as u16,
+            },
+            format.mode == 1,
+        ));
+        Ok(Self {
+            tcp: Some(tcp),
+            udp_socket: Some(udp_socket),
+            sender: None,
+            float_sender: None,
+            pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+            queue,
+            float_queue: Some(float_queue),
+            keys: session_keys,
+            parameters,
+            format_v2: Some(format),
+            session_id,
+            binding_commitment,
+            remote_udp: None,
+            command_sequence: 0,
+            ack_sequence: 0,
+            last_command: None,
+            last_ack: None,
+            last_heartbeat: Instant::now(),
+            state: ReceiverState::Authenticated,
+            capabilities: None,
+            terminal_cause: None,
+            connection_intent: endpoint.connection_intent,
+            background_request_id: endpoint.background_request_id,
+            background_authorization_required: endpoint.background_authorization_required,
+            background_authorized: false,
+            cancellation,
+        })
+    }
+
+    fn authenticate_for_profile(
+        endpoint: SessionEndpoint,
+        binding: &BindingMaterial,
+        parameters: AudioParameters,
+        profile: HostAudioProfile,
+        initial_float_queue: &mut Option<Arc<FloatPcmQueue>>,
+        cancellation: CancellationToken,
+    ) -> Result<Self, String> {
+        let HostAudioProfile::Pcm24(format) = profile else {
+            return Self::authenticate_on_network(
+                endpoint,
+                binding.duplicate_for_session(),
+                parameters,
+                cancellation,
+            );
+        };
+
+        if AudioFormatV2::for_profile(format.profile, format.mode).ok() != Some(format)
+            || !matches!(
+                (format.profile, format.sample_rate),
+                (2, 48_000) | (3, 96_000)
+            )
+            || parameters.sample_rate != format.sample_rate
+            || parameters.channels != format.channels
+            || parameters.mode != format.mode
+        {
+            return Err("Requested PCM24 audio profile does not match the authenticated session parameters.".into());
+        }
+
+        let mut probe = Self::authenticate_on_network(
+            endpoint,
+            binding.duplicate_for_session(),
+            AudioParameters {
+                sample_rate: 48_000,
+                channels: 2,
+                mode: format.mode,
+            },
+            cancellation.clone(),
+        )?;
+        probe.negotiate_capabilities_probe()?;
+        let supports_v2 = probe.capabilities().is_some_and(|capabilities| {
+            capabilities.compatible && capabilities.capability_bits & CAP_AUDIO_V2 != 0
+        });
+        let close_result = probe.close_probe_after_peer_eof();
+        if let Err(error) = close_result {
+            probe.close_local();
+            return Err(error);
+        }
+        if !supports_v2 {
+            return Err("Receiver does not support authenticated PCM24 audio; update the Receiver or select Standard.".into());
+        }
+
+        let queue = initial_float_queue
+            .take()
+            .unwrap_or_else(|| Arc::new(FloatPcmQueue::new(format.mode == 1)));
+        Self::authenticate_v2_on_network(
+            endpoint,
+            binding.duplicate_for_session(),
+            format,
+            queue,
+            cancellation,
+        )
     }
 
     pub(crate) fn connect_loopback(
@@ -504,6 +702,18 @@ impl HostSession {
     }
 
     fn negotiate_capabilities(&mut self) -> Result<(), String> {
+        self.negotiate_capabilities_with(REQUIRED_CAPABILITIES, true)
+    }
+
+    fn negotiate_capabilities_probe(&mut self) -> Result<(), String> {
+        self.negotiate_capabilities_with(REQUIRED_CAPABILITIES | CAP_AUDIO_V2, false)
+    }
+
+    fn negotiate_capabilities_with(
+        &mut self,
+        required_capabilities: u32,
+        claim_intent: bool,
+    ) -> Result<(), String> {
         if self.state != ReceiverState::Authenticated || self.capabilities.is_some() {
             return Err("P5-C capability query is out of order.".into());
         }
@@ -512,7 +722,7 @@ impl HostSession {
             let payload = encode_capabilities_query(
                 MANAGEMENT_CONTROL_MAJOR,
                 AUDIO_PROTOCOL_MAJOR,
-                REQUIRED_CAPABILITIES,
+                required_capabilities,
             );
             let frame = encode_control(
                 &self.keys.control_tx,
@@ -541,14 +751,16 @@ impl HostSession {
                 .checked_add(1)
                 .ok_or_else(|| "P5-C response sequence exhausted.".to_string())?;
             self.capabilities = Some(info.clone());
-            if let Some((nonce, required)) = self.connection_intent {
-                if info.capability_bits & CAP_CONNECTION_INTENT != 0 {
-                    let ack = self.command(CONNECTION_INTENT, &nonce)?;
-                    if ack.result != RESULT_OK || ack.state != ReceiverState::Authenticated {
-                        return Err("Receiver connection intent expired or was cancelled; start receiving again on the phone.".into());
+            if claim_intent {
+                if let Some((nonce, required)) = self.connection_intent {
+                    if info.capability_bits & CAP_CONNECTION_INTENT != 0 {
+                        let ack = self.command(CONNECTION_INTENT, &nonce)?;
+                        if ack.result != RESULT_OK || ack.state != ReceiverState::Authenticated {
+                            return Err("Receiver connection intent expired or was cancelled; start receiving again on the phone.".into());
+                        }
+                    } else if required {
+                        return Err("Receiver does not support one-click reception; use explicit connection or update through USB.".into());
                     }
-                } else if required {
-                    return Err("Receiver does not support one-click reception; use explicit connection or update through USB.".into());
                 }
             }
             if self.background_authorization_required
@@ -565,6 +777,38 @@ impl HostSession {
             self.close_local();
         }
         result
+    }
+
+    fn close_probe_after_peer_eof(&mut self) -> Result<(), String> {
+        let tcp = self.tcp.as_mut().ok_or("P5-C control channel is closed.")?;
+        tcp.shutdown(std::net::Shutdown::Write)
+            .map_err(|_| "Unable to close the capability probe session.".to_string())?;
+        let deadline = Instant::now() + SESSION_IO_DEADLINE;
+        let mut byte = [0u8; 1];
+        loop {
+            check_cancelled(&self.cancellation)
+                .map_err(|_| "P5-C capability probe was cancelled.".to_string())?;
+            if Instant::now() >= deadline {
+                return Err("Receiver did not release the capability probe session.".into());
+            }
+            match tcp.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    return Err("Unexpected data followed the capability probe response.".into());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    return Err("Receiver closed the capability probe unexpectedly.".into());
+                }
+            }
+        }
+        self.close_local();
+        Ok(())
     }
 
     fn request_background_authorization(&mut self, request_id: &[u8; 16]) -> Result<u8, String> {
@@ -715,6 +959,18 @@ impl HostSession {
     pub(crate) fn pcm_queue(&self) -> Arc<PcmQueue> {
         self.queue.clone()
     }
+
+    pub(crate) fn audio_queue(&self) -> SessionAudioQueue {
+        self.float_queue
+            .as_ref()
+            .zip(self.format_v2)
+            .map(|(queue, format)| SessionAudioQueue::Float32(queue.clone(), format))
+            .unwrap_or_else(|| SessionAudioQueue::Pcm16(self.queue.clone()))
+    }
+
+    pub(crate) fn is_v2_audio(&self) -> bool {
+        self.format_v2.is_some()
+    }
     pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
         self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
     }
@@ -725,12 +981,37 @@ impl HostSession {
                 return Err(error);
             }
         }
+        if let Some(sender) = self.float_sender.as_mut() {
+            if let Some(error) = sender.take_finished_error() {
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn bind_audio(&mut self) -> Result<(), String> {
         if self.state != ReceiverState::Authenticated {
             return Err("P5-C BIND is out of order.".into());
+        }
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|info| !info.compatible)
+        {
+            return Err(if self.format_v2.is_some() {
+                "Receiver rejected the authenticated PCM24 audio format; only supported V2 descriptors can start audio.".into()
+            } else {
+                "Receiver audio capabilities are incompatible; update it or select Standard.".into()
+            });
+        }
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_CONNECTION_INTENT != 0)
+            && self.connection_intent.is_none()
+            && !self.background_authorized
+        {
+            return Err("receiver_requires_connection_offer: Receiver requires a phone-initiated connection offer before BIND.".into());
         }
         if self
             .capabilities
@@ -752,7 +1033,10 @@ impl HostSession {
             || ack.state != ReceiverState::TransportConnected
             || ack.udp_port == 0
         {
-            return Err("P5-C receiver did not confirm the authenticated UDP peer.".into());
+            return Err(format!(
+                "P5-C receiver did not confirm the authenticated UDP peer (result={}, state={:?}, udp_port={}).",
+                ack.result, ack.state, ack.udp_port
+            ));
         }
         let tcp_peer = self
             .tcp
@@ -763,6 +1047,19 @@ impl HostSession {
         self.remote_udp = Some(SocketAddr::new(tcp_peer.ip(), ack.udp_port));
         self.state = ack.state;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_audio_without_connection_intent_for_test(&mut self) -> Result<bool, String> {
+        let port = self
+            .udp_socket
+            .as_ref()
+            .ok_or("P5-C UDP socket is closed.")?
+            .local_addr()
+            .map_err(|_| "Unable to read P5-C UDP source port.".to_string())?
+            .port();
+        self.command(BIND, &port.to_be_bytes())
+            .map(|ack| ack.result == RESULT_REJECTED)
     }
 
     pub(crate) fn select_mode(&mut self) -> Result<(), String> {
@@ -803,14 +1100,25 @@ impl HostSession {
             let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
             let material =
                 UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
-            self.sender = Some(UdpSender::spawn_authenticated(
-                remote,
-                self.queue.clone(),
-                socket,
-                material,
-                self.parameters,
-                self.pcm_payload_bytes_sent.clone(),
-            )?);
+            if let (Some(queue), Some(format)) = (&self.float_queue, self.format_v2) {
+                self.float_sender = Some(FloatUdpSender::spawn_authenticated(
+                    remote,
+                    queue.clone(),
+                    socket,
+                    material,
+                    format,
+                    self.pcm_payload_bytes_sent.clone(),
+                )?);
+            } else {
+                self.sender = Some(UdpSender::spawn_authenticated(
+                    remote,
+                    self.queue.clone(),
+                    socket,
+                    material,
+                    self.parameters,
+                    self.pcm_payload_bytes_sent.clone(),
+                )?);
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -868,6 +1176,9 @@ impl HostSession {
             return Err("P5-C PAUSE was rejected.".into());
         }
         self.state = ack.state;
+        if let Some(sender) = &self.float_sender {
+            sender.expect_queue_stop();
+        }
         Ok(())
     }
 
@@ -879,18 +1190,35 @@ impl HostSession {
         if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
             return Err("P5-C RESUME was rejected.".into());
         }
+        if let Some(sender) = &self.float_sender {
+            sender.resume_after_ack()?;
+        }
         self.state = ack.state;
         Ok(())
     }
 
     pub(crate) fn heartbeat(&mut self) -> Result<ReceiverState, String> {
         let ack = self.command(HEARTBEAT, &[])?;
-        if ack.result != RESULT_OK {
+        if ack.result == RESULT_USER_STOPPED {
+            if ack.state != ReceiverState::Stopped
+                || !self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
+            {
+                return Err("Receiver returned an invalid authenticated terminal cause.".into());
+            }
+            self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+        } else if ack.result != RESULT_OK {
             return Err("P5-C heartbeat was rejected.".into());
         }
         self.last_heartbeat = Instant::now();
         self.state = ack.state;
         Ok(self.state)
+    }
+
+    pub(crate) fn terminal_cause(&self) -> Option<TerminalCause> {
+        self.terminal_cause
     }
 
     fn playback_progress(&mut self) -> Result<Option<PlaybackDiagnostics>, String> {
@@ -1011,7 +1339,14 @@ impl HostSession {
             self.session_id,
             &self.cancellation,
         )?;
-        let ack = decode_ack(&ack_frame, self.ack_sequence, kind, sequence)?;
+        let ack = decode_ack_with_format(
+            &ack_frame,
+            self.ack_sequence,
+            kind,
+            sequence,
+            self.format_v2.is_some(),
+        )?;
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1067,7 +1402,14 @@ impl HostSession {
         if Instant::now() >= deadline {
             return Err("P5-C approval deadline expired.".into());
         }
-        let ack = decode_ack(&ack_frame, self.ack_sequence, kind, sequence)?;
+        let ack = decode_ack_with_format(
+            &ack_frame,
+            self.ack_sequence,
+            kind,
+            sequence,
+            self.format_v2.is_some(),
+        )?;
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1143,7 +1485,14 @@ impl HostSession {
             request_cancellation,
             deadline,
         )?;
-        let ack = decode_ack(&ack_frame, self.ack_sequence, kind, sequence)?;
+        let ack = decode_ack_with_format(
+            &ack_frame,
+            self.ack_sequence,
+            kind,
+            sequence,
+            self.format_v2.is_some(),
+        )?;
+        self.record_terminal_cause(&ack)?;
         if ack
             .background_trust
             .as_ref()
@@ -1167,10 +1516,33 @@ impl HostSession {
         Ok(ack)
     }
 
+    fn record_terminal_cause(&mut self, ack: &Ack) -> Result<(), String> {
+        if ack.result != RESULT_USER_STOPPED {
+            return Ok(());
+        }
+        if ack.state != ReceiverState::Stopped
+            || !self
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.capability_bits & CAP_TERMINAL_CAUSE != 0)
+        {
+            return Err("P5-C Receiver terminal cause was invalid.".into());
+        }
+        self.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+        self.state = ReceiverState::Stopped;
+        Ok(())
+    }
+
     fn close_local(&mut self) {
         self.cancellation.cancel();
         self.queue.stop_and_clear();
+        if let Some(queue) = &self.float_queue {
+            queue.stop_and_clear();
+        }
         if let Some(sender) = self.sender.take() {
+            let _ = sender.stop();
+        }
+        if let Some(sender) = self.float_sender.take() {
             let _ = sender.stop();
         }
         drop(self.udp_socket.take());
@@ -1378,6 +1750,13 @@ pub(crate) enum SessionLifecycleState {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalCause {
+    ReceiverUserStop,
+    HostStop,
+    TransportFailure,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SessionSnapshot {
     pub(crate) state: SessionLifecycleState,
@@ -1387,7 +1766,9 @@ pub(crate) struct SessionSnapshot {
     pub(crate) capabilities: Option<ReceiverCapabilities>,
     pub(crate) paused: bool,
     pub(crate) last_error: Option<String>,
+    pub(crate) terminal_cause: Option<TerminalCause>,
     pub(crate) playback_diagnostics: Option<PlaybackDiagnostics>,
+    pub(crate) negotiated_format: Option<AudioFormatV2>,
     pub(crate) recovery_seconds_remaining: Option<u64>,
     recovery_started_at: Option<Instant>,
     recovery_window: Duration,
@@ -1423,6 +1804,8 @@ enum OwnerCommand {
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<BackgroundTrustSnapshot, String>>,
     },
+    #[cfg(test)]
+    TestSenderBarrier(std::sync::mpsc::SyncSender<bool>),
     Stop,
 }
 
@@ -1435,6 +1818,7 @@ pub(crate) struct SessionOwner {
     commands: mpsc::Sender<OwnerCommand>,
     status: Arc<Mutex<SessionSnapshot>>,
     queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,
+    float_queue: Arc<Mutex<Option<Arc<FloatPcmQueue>>>>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
@@ -1466,6 +1850,32 @@ impl SessionOwner {
             SessionEndpoint::on_interface(interface, peer),
             binding,
             parameters,
+            caller_cancel,
+            DEFAULT_SESSION_TIMING,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_on_interface_with_profile(
+        interface: &Ipv4Interface,
+        peer: SocketAddr,
+        binding: BindingMaterial,
+        parameters: AudioParameters,
+        profile: HostAudioProfile,
+        initial_float_queue: Option<Arc<FloatPcmQueue>>,
+        caller_cancel: CancellationToken,
+        connection_intent: Option<([u8; 16], bool)>,
+        background_authorization_required: bool,
+    ) -> Result<Self, String> {
+        let mut endpoint = SessionEndpoint::on_interface(interface, peer);
+        endpoint.connection_intent = connection_intent;
+        endpoint.background_authorization_required = background_authorization_required;
+        Self::start_with_endpoint_and_profile(
+            endpoint,
+            binding,
+            parameters,
+            profile,
+            initial_float_queue,
             caller_cancel,
             DEFAULT_SESSION_TIMING,
         )
@@ -1526,9 +1936,29 @@ impl SessionOwner {
     }
 
     fn start_with_endpoint(
+        endpoint: SessionEndpoint,
+        binding: BindingMaterial,
+        parameters: AudioParameters,
+        caller_cancel: CancellationToken,
+        timing: SessionTiming,
+    ) -> Result<Self, String> {
+        Self::start_with_endpoint_and_profile(
+            endpoint,
+            binding,
+            parameters,
+            HostAudioProfile::Standard,
+            None,
+            caller_cancel,
+            timing,
+        )
+    }
+
+    fn start_with_endpoint_and_profile(
         mut endpoint: SessionEndpoint,
         binding: BindingMaterial,
         parameters: AudioParameters,
+        profile: HostAudioProfile,
+        initial_float_queue: Option<Arc<FloatPcmQueue>>,
         caller_cancel: CancellationToken,
         timing: SessionTiming,
     ) -> Result<Self, String> {
@@ -1546,18 +1976,22 @@ impl SessionOwner {
             capabilities: None,
             paused: false,
             last_error: None,
+            terminal_cause: None,
             playback_diagnostics: None,
+            negotiated_format: None,
             recovery_seconds_remaining: None,
             recovery_started_at: None,
             recovery_window: timing.recovery_window,
         }));
         let queue = Arc::new(Mutex::new(None));
+        let float_queue = Arc::new(Mutex::new(None));
         let pcm_payload_bytes_sent = Arc::new(AtomicU64::new(0));
         let (commands, receiver) = mpsc::channel();
         let owner_cancel = cancellation.clone();
         let owner_enabled = enabled.clone();
         let owner_status = status.clone();
         let owner_queue = queue.clone();
+        let owner_float_queue = float_queue.clone();
         let owner_bytes = pcm_payload_bytes_sent.clone();
         let worker = thread::Builder::new()
             .name("AnPod P5-D session owner".into())
@@ -1571,8 +2005,11 @@ impl SessionOwner {
                     receiver,
                     owner_status,
                     owner_queue,
+                    owner_float_queue,
                     owner_bytes,
                     timing,
+                    profile,
+                    initial_float_queue,
                 )
             })
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
@@ -1584,6 +2021,7 @@ impl SessionOwner {
             commands,
             status,
             queue,
+            float_queue,
             pcm_payload_bytes_sent,
             worker: Some(worker),
         })
@@ -1667,6 +2105,37 @@ impl SessionOwner {
             .clone()
     }
 
+    pub(crate) fn audio_queue(&self) -> Option<SessionAudioQueue> {
+        if let Some(queue) = self
+            .float_queue
+            .lock()
+            .expect("P5-D Float32 queue lock poisoned")
+            .clone()
+        {
+            let format = self
+                .status
+                .lock()
+                .expect("P5-D session status lock poisoned")
+                .negotiated_format?;
+            Some(SessionAudioQueue::Float32(queue, format))
+        } else {
+            self.pcm_queue().map(SessionAudioQueue::Pcm16)
+        }
+    }
+
+    pub(crate) fn matches_audio_quality(&self, quality: &str) -> bool {
+        let profile = self
+            .status
+            .lock()
+            .expect("P5-D session status lock poisoned")
+            .negotiated_format
+            .map(|format| format.profile);
+        matches!(
+            (quality, profile),
+            ("standard", None) | ("hifi", Some(2)) | ("hires", Some(3))
+        )
+    }
+
     pub(crate) fn pcm_payload_bytes_sent(&self) -> u64 {
         self.pcm_payload_bytes_sent.load(Ordering::Relaxed)
     }
@@ -1675,6 +2144,17 @@ impl SessionOwner {
         self.commands
             .send(OwnerCommand::SetPaused(paused))
             .map_err(|_| "P5-D session owner has stopped.".to_string())
+    }
+
+    #[cfg(test)]
+    fn sender_barrier_for_test(&self, timeout: Duration) -> Result<bool, String> {
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(OwnerCommand::TestSenderBarrier(reply))
+            .map_err(|_| "P5-D session owner has stopped.".to_string())?;
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| "P5-D sender barrier was not reached.".to_string())
     }
 
     pub(crate) fn set_mode(&self, mode: u8) -> Result<(), String> {
@@ -1805,10 +2285,16 @@ fn execute_background_trust_command(
             } else {
                 session.query_background_trust_until(deadline, &cancellation)
             };
-            let connection_failed = session.state() == ReceiverState::Stopped;
+            let receiver_user_stopped =
+                session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
+            let connection_failed =
+                !receiver_user_stopped && session.state() == ReceiverState::Stopped;
             let error = result.as_ref().err().cloned();
             let _ = reply.send(result);
-            if connection_failed {
+            if receiver_user_stopped {
+                enabled.store(false, Ordering::Release);
+                BackgroundTrustCommandOutcome::Stop
+            } else if connection_failed {
                 BackgroundTrustCommandOutcome::ConnectionFailed(error.unwrap_or_else(|| {
                     "P5-C control channel closed during background trust query.".into()
                 }))
@@ -1829,7 +2315,9 @@ fn execute_background_trust_command(
             } else {
                 session.revoke_background_trust_until(deadline, &cancellation)
             };
-            if result.is_ok() {
+            let receiver_user_stopped =
+                session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
+            if result.is_ok() || receiver_user_stopped {
                 enabled.store(false, Ordering::Release);
                 let _ = reply.send(result);
                 BackgroundTrustCommandOutcome::Stop
@@ -1858,8 +2346,11 @@ fn run_session_owner(
     commands: mpsc::Receiver<OwnerCommand>,
     status: Arc<Mutex<SessionSnapshot>>,
     queue: Arc<Mutex<Option<Arc<PcmQueue>>>>,
+    float_queue: Arc<Mutex<Option<Arc<FloatPcmQueue>>>>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
     timing: SessionTiming,
+    mut profile: HostAudioProfile,
+    mut initial_float_queue: Option<Arc<FloatPcmQueue>>,
 ) {
     let mut endpoint = endpoint;
     let mut parameters = parameters;
@@ -1875,6 +2366,11 @@ fn run_session_owner(
         if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
             break;
         }
+        {
+            let mut snapshot = status.lock().expect("P5-D session status lock poisoned");
+            snapshot.negotiated_format = None;
+            snapshot.playback_diagnostics = None;
+        }
         generation = generation.saturating_add(1);
         attempts = attempts.saturating_add(1);
         publish_session(
@@ -1886,10 +2382,28 @@ fn run_session_owner(
             paused,
             last_error.clone(),
         );
-        let result = HostSession::authenticate_on_network(
+        profile = match profile_for_mode(profile, parameters.mode) {
+            Ok(profile) => profile,
+            Err(error) => {
+                last_error = Some(error);
+                publish_session(
+                    &status,
+                    SessionLifecycleState::Stopped,
+                    generation,
+                    attempts,
+                    None,
+                    paused,
+                    last_error.clone(),
+                );
+                break 'owner;
+            }
+        };
+        let result = HostSession::authenticate_for_profile(
             endpoint,
-            binding.duplicate_for_session(),
+            &binding,
             parameters,
+            profile,
+            &mut initial_float_queue,
             cancellation.clone(),
         );
         let mut session = match result {
@@ -1899,7 +2413,10 @@ fn run_session_owner(
                     break;
                 }
                 last_error = Some(error);
-                if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+                // An owner may recover only after it has actually established a live
+                // session. An explicit discovery/receive intent does not turn a failed
+                // first connection into background retry policy.
+                if last_active_at.is_none() {
                     break 'owner;
                 }
                 publish_session(
@@ -1954,10 +2471,28 @@ fn run_session_owner(
             break 'owner;
         }
         let capabilities = session.capabilities().cloned();
+        let terminal_cause_supported = capabilities
+            .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_TERMINAL_CAUSE != 0);
         status
             .lock()
             .expect("P5-D session status lock poisoned")
             .capabilities = capabilities.clone();
+        status
+            .lock()
+            .expect("P5-D session status lock poisoned")
+            .negotiated_format = session.format_v2;
+        if session.format_v2.is_some()
+            && capabilities.as_ref().is_some_and(|info| {
+                info.management_compatible
+                    && !info.compatible
+                    && info.capability_bits & CAP_AUDIO_V2 != 0
+            })
+        {
+            last_error = Some(
+                "Receiver rejected the requested authenticated PCM24 format; this V2 descriptor is unsupported.".into(),
+            );
+        }
         publish_session(
             &status,
             SessionLifecycleState::Authenticated,
@@ -1965,7 +2500,7 @@ fn run_session_owner(
             attempts,
             Some(session.session_id()),
             paused,
-            None,
+            last_error.clone(),
         );
         if !capabilities
             .as_ref()
@@ -1995,10 +2530,26 @@ fn run_session_owner(
                     break;
                 }
                 if Instant::now() >= next_heartbeat {
-                    if let Err(error) = session.heartbeat() {
-                        management_error = Some(error);
-                        restart = true;
-                        break;
+                    match session.heartbeat() {
+                        Ok(ReceiverState::Stopped)
+                            if finish_receiver_user_stop(&mut session, &status) =>
+                        {
+                            stop_owner = true;
+                            break;
+                        }
+                        Ok(ReceiverState::Stopped) => {
+                            management_error = Some(
+                                "Receiver stopped without an authenticated terminal cause.".into(),
+                            );
+                            restart = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            management_error = Some(error);
+                            restart = true;
+                            break;
+                        }
                     }
                     next_heartbeat = Instant::now() + timing.heartbeat_interval;
                     continue;
@@ -2038,6 +2589,8 @@ fn run_session_owner(
                             }
                         }
                     }
+                    #[cfg(test)]
+                    Ok(OwnerCommand::TestSenderBarrier(reply)) => drop(reply),
                     Ok(OwnerCommand::UpdateEndpoint(next)) => {
                         endpoint = next;
                         restart = true;
@@ -2067,12 +2620,29 @@ fn run_session_owner(
                     }
                 }
             }
+            if finish_receiver_user_stop(&mut session, &status) {
+                last_error = None;
+                stop_owner = true;
+            }
             session.close_local();
             drop(session);
             if stop_owner || !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
                 break 'owner;
             }
             last_error = management_error.clone();
+            if management_error.is_some() && (last_active_at.is_none() || !terminal_cause_supported)
+            {
+                publish_session(
+                    &status,
+                    SessionLifecycleState::Stopped,
+                    generation,
+                    attempts,
+                    None,
+                    paused,
+                    last_error.clone(),
+                );
+                break 'owner;
+            }
             publish_session(
                 &status,
                 SessionLifecycleState::Reconnecting,
@@ -2107,6 +2677,9 @@ fn run_session_owner(
         }
         if let Err(error) = session.authorize_background_start() {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
             publish_session(
                 &status,
@@ -2121,8 +2694,11 @@ fn run_session_owner(
         }
         if let Err(error) = session.bind_audio().and_then(|_| session.select_mode()) {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
-            if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+            if last_active_at.is_none() {
                 break 'owner;
             }
             publish_session(
@@ -2203,8 +2779,11 @@ fn run_session_owner(
             }
         }) {
             last_error = Some(error);
+            if finish_receiver_user_stop(&mut session, &status) {
+                break 'owner;
+            }
             drop(session);
-            if endpoint.connection_intent.is_some() && last_active_at.is_none() {
+            if last_active_at.is_none() {
                 break 'owner;
             }
             publish_session(
@@ -2249,8 +2828,20 @@ fn run_session_owner(
             .recovery_started_at = None;
         let session_id = session.session_id();
         let mut last_session_bytes = 0;
-        let session_queue = session.pcm_queue();
-        *queue.lock().expect("P5-D PCM queue lock poisoned") = Some(session_queue);
+        match session.audio_queue() {
+            SessionAudioQueue::Pcm16(session_queue) => {
+                *queue.lock().expect("P5-D PCM queue lock poisoned") = Some(session_queue);
+                *float_queue
+                    .lock()
+                    .expect("P5-D Float32 queue lock poisoned") = None;
+            }
+            SessionAudioQueue::Float32(session_queue, _) => {
+                *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
+                *float_queue
+                    .lock()
+                    .expect("P5-D Float32 queue lock poisoned") = Some(session_queue);
+            }
+        }
         publish_session(
             &status,
             if paused {
@@ -2283,10 +2874,26 @@ fn run_session_owner(
             last_session_bytes = sent;
             if Instant::now() >= next_heartbeat {
                 match session.heartbeat() {
+                    Ok(ReceiverState::Stopped)
+                        if session.terminal_cause() == Some(TerminalCause::ReceiverUserStop) =>
+                    {
+                        let mut current = status.lock().expect("P5-D session status lock poisoned");
+                        current.state = SessionLifecycleState::Stopped;
+                        current.session_id = None;
+                        current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+                        stop_owner = true;
+                        break;
+                    }
+                    Ok(ReceiverState::Stopped) => {
+                        last_error = Some(
+                            "P5-C receiver stopped without an authenticated terminal cause.".into(),
+                        );
+                        break;
+                    }
                     Ok(state) => {
                         match session.playback_progress() {
                             Ok(Some(mut diagnostics)) => {
-                                let queue = session.pcm_queue();
+                                let audio_queue = session.audio_queue();
                                 let previous = status
                                     .lock()
                                     .expect("P5-D session status lock poisoned")
@@ -2295,8 +2902,16 @@ fn run_session_owner(
                                     .and_then(|current| current.underrun_count);
                                 diagnostics.sample_rate = Some(session.parameters.sample_rate);
                                 diagnostics.channels = Some(session.parameters.channels);
-                                diagnostics.pc_dropped_frames = Some(queue.dropped_frames());
-                                diagnostics.pc_queued_frames = Some(queue.queued_frames());
+                                let (dropped_frames, queued_frames) = match audio_queue {
+                                    SessionAudioQueue::Pcm16(queue) => {
+                                        (queue.dropped_frames(), queue.queued_frames())
+                                    }
+                                    SessionAudioQueue::Float32(queue, _) => {
+                                        (queue.dropped_frames(), queue.queued_frames())
+                                    }
+                                };
+                                diagnostics.pc_dropped_frames = Some(dropped_frames);
+                                diagnostics.pc_queued_frames = Some(queued_frames);
                                 diagnostics.underrun_increment =
                                     match (previous, diagnostics.underrun_count) {
                                         (Some(previous), Some(current)) if current >= previous => {
@@ -2374,6 +2989,14 @@ fn run_session_owner(
                         }
                     }
                 }
+                #[cfg(test)]
+                Ok(OwnerCommand::TestSenderBarrier(reply)) => {
+                    let sender_joined = session
+                        .float_sender
+                        .as_ref()
+                        .is_none_or(FloatUdpSender::worker_joined);
+                    let _ = reply.send(sender_joined);
+                }
                 Ok(OwnerCommand::UpdateEndpoint(next_endpoint)) => {
                     endpoint_changed = endpoint != next_endpoint;
                     endpoint = next_endpoint;
@@ -2397,6 +3020,9 @@ fn run_session_owner(
                     break;
                 }
                 Ok(OwnerCommand::Reconnect) => {
+                    if finish_receiver_user_stop(&mut session, &status) {
+                        stop_owner = true;
+                    }
                     session.close_local();
                     endpoint_changed = true;
                     break;
@@ -2425,6 +3051,10 @@ fn run_session_owner(
                     if let Err(error) = session.stop() {
                         last_error = Some(error);
                     }
+                    status
+                        .lock()
+                        .expect("P5-D session status lock poisoned")
+                        .terminal_cause = Some(TerminalCause::HostStop);
                     stop_owner = true;
                     break;
                 }
@@ -2436,27 +3066,52 @@ fn run_session_owner(
                 }
             }
         }
+        if finish_receiver_user_stop(&mut session, &status) {
+            last_error = None;
+            stop_owner = true;
+        }
+        let receiver_user_stopped =
+            session.terminal_cause() == Some(TerminalCause::ReceiverUserStop);
         session.close_local();
         let sent = session.pcm_payload_bytes_sent();
         pcm_payload_bytes_sent
             .fetch_add(sent.saturating_sub(last_session_bytes), Ordering::Relaxed);
         *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
+        *float_queue
+            .lock()
+            .expect("P5-D Float32 queue lock poisoned") = None;
+        status
+            .lock()
+            .expect("P5-D session status lock poisoned")
+            .negotiated_format = None;
         drop(session);
         if stop_owner || !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
             break 'owner;
         }
-        if endpoint_changed {
-            recovery_started_at = None;
-            status
-                .lock()
-                .expect("P5-D session status lock poisoned")
-                .recovery_started_at = None;
-        } else if last_active_at.is_some() && recovery_started_at.is_none() {
+        if last_active_at.is_some() && recovery_started_at.is_none() {
             recovery_started_at = Some(Instant::now());
             status
                 .lock()
                 .expect("P5-D session status lock poisoned")
                 .recovery_started_at = recovery_started_at;
+        }
+        if receiver_user_stopped || stop_owner {
+            break 'owner;
+        }
+        if !endpoint_changed && !terminal_cause_supported {
+            last_error = Some(
+                "Receiver disconnected without terminal-cause capability; update it or reconnect manually.".into(),
+            );
+            publish_session(
+                &status,
+                SessionLifecycleState::Stopped,
+                generation,
+                attempts,
+                None,
+                paused,
+                last_error.clone(),
+            );
+            break 'owner;
         }
         publish_session(
             &status,
@@ -2495,6 +3150,15 @@ fn run_session_owner(
         }
     }
     *queue.lock().expect("P5-D PCM queue lock poisoned") = None;
+    *float_queue
+        .lock()
+        .expect("P5-D Float32 queue lock poisoned") = None;
+    {
+        let mut current = status.lock().expect("P5-D session status lock poisoned");
+        if current.terminal_cause.is_none() && last_error.is_some() {
+            current.terminal_cause = Some(TerminalCause::TransportFailure);
+        }
+    }
     publish_session(
         &status,
         SessionLifecycleState::Stopped,
@@ -2515,6 +3179,18 @@ fn lifecycle_from_receiver(state: ReceiverState) -> SessionLifecycleState {
         ReceiverState::Paused => SessionLifecycleState::Paused,
         ReceiverState::Stopped => SessionLifecycleState::Stopped,
     }
+}
+
+fn finish_receiver_user_stop(session: &mut HostSession, status: &Mutex<SessionSnapshot>) -> bool {
+    if session.terminal_cause() != Some(TerminalCause::ReceiverUserStop) {
+        return false;
+    }
+    let mut current = status.lock().expect("P5-D session status lock poisoned");
+    current.state = SessionLifecycleState::Stopped;
+    current.session_id = None;
+    current.terminal_cause = Some(TerminalCause::ReceiverUserStop);
+    current.last_error = None;
+    true
 }
 
 fn publish_session(
@@ -2566,6 +3242,8 @@ fn apply_pending_commands(
     loop {
         match commands.try_recv() {
             Ok(OwnerCommand::SetPaused(value)) => *paused = value,
+            #[cfg(test)]
+            Ok(OwnerCommand::TestSenderBarrier(reply)) => drop(reply),
             Ok(command @ OwnerCommand::BackgroundTrustQuery { .. })
             | Ok(command @ OwnerCommand::BackgroundTrustRevoke { .. }) => {
                 reject_background_trust_command(
@@ -2623,6 +3301,8 @@ fn wait_for_reconnect(
             .min(SESSION_IO_POLL);
         match commands.recv_timeout(remaining) {
             Ok(OwnerCommand::SetPaused(value)) => *paused = value,
+            #[cfg(test)]
+            Ok(OwnerCommand::TestSenderBarrier(reply)) => drop(reply),
             Ok(command @ OwnerCommand::BackgroundTrustQuery { .. })
             | Ok(command @ OwnerCommand::BackgroundTrustRevoke { .. }) => {
                 reject_background_trust_command(
@@ -2665,6 +3345,15 @@ fn recovery_window_expired(active_since: Option<Instant>, window: Duration, now:
     active_since.is_some_and(|active_since| now.saturating_duration_since(active_since) >= window)
 }
 
+fn profile_for_mode(profile: HostAudioProfile, mode: u8) -> Result<HostAudioProfile, String> {
+    match profile {
+        HostAudioProfile::Standard => Ok(HostAudioProfile::Standard),
+        HostAudioProfile::Pcm24(format) => AudioFormatV2::for_profile(format.profile, mode)
+            .map(HostAudioProfile::Pcm24)
+            .map_err(|error| error.to_string()),
+    }
+}
+
 fn random_request_id() -> Result<[u8; 16], String> {
     loop {
         let mut request_id = [0; 16];
@@ -2676,11 +3365,11 @@ fn random_request_id() -> Result<[u8; 16], String> {
     }
 }
 
-struct Ack {
-    result: u8,
-    state: ReceiverState,
-    udp_port: u16,
-    playback_progress: Option<PlaybackDiagnostics>,
+pub(crate) struct Ack {
+    pub(crate) result: u8,
+    pub(crate) state: ReceiverState,
+    pub(crate) udp_port: u16,
+    pub(crate) playback_progress: Option<PlaybackDiagnostics>,
     background_authorization: Option<([u8; 16], u8)>,
     background_trust: Option<BackgroundTrustSnapshot>,
 }
@@ -2693,7 +3382,7 @@ pub(crate) struct BackgroundTrustSnapshot {
     pub(crate) remaining_ms: u64,
 }
 
-fn encode_control(
+pub(crate) fn encode_control(
     key: &[u8; 32],
     direction: u32,
     session_id: u64,
@@ -2718,7 +3407,11 @@ fn encode_control(
     Ok(frame)
 }
 
-fn encode_capabilities_query(control_major: u16, audio_major: u8, required: u32) -> [u8; 8] {
+pub(crate) fn encode_capabilities_query(
+    control_major: u16,
+    audio_major: u8,
+    required: u32,
+) -> [u8; 8] {
     let mut payload = [0; 8];
     payload[..2].copy_from_slice(&control_major.to_be_bytes());
     payload[2] = audio_major;
@@ -2726,7 +3419,7 @@ fn encode_capabilities_query(control_major: u16, audio_major: u8, required: u32)
     payload
 }
 
-fn decode_capabilities_info(
+pub(crate) fn decode_capabilities_info(
     frame: &[u8],
     response_sequence: u64,
     query_sequence: u64,
@@ -2863,7 +3556,21 @@ fn read_frame(
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, String> {
     let frame = read_raw_frame(tcp, cancellation)?;
-    if &frame[..4] != CONTROL_MAGIC
+    verify_control_frame(&frame, key, direction, session_id)?;
+    Ok(frame)
+}
+
+/// Validates a length-delimited P5-C frame. AOA's ANPU envelope supplies its
+/// length; LAN keeps its existing TCP prefix and calls this same validator.
+pub(crate) fn verify_control_frame(
+    frame: &[u8],
+    key: &[u8; 32],
+    direction: u32,
+    session_id: u64,
+) -> Result<(), String> {
+    if frame.len() < CONTROL_HEADER_BYTES + CONTROL_TAG_BYTES
+        || frame.len() > MAX_CONTROL_FRAME
+        || &frame[..4] != CONTROL_MAGIC
         || frame[4] != 1
         || frame[6..8] != [0, 0]
         || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
@@ -2879,8 +3586,7 @@ fn read_frame(
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
     mac.update(&frame[..body_len]);
     mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
-    Ok(frame)
+        .map_err(|_| "P5-C control authentication failed.".into())
 }
 
 fn read_frame_until(
@@ -2901,23 +3607,7 @@ fn read_frame_until(
     let mut frame = vec![0; length];
     read_exact_cancellable_until(tcp, &mut frame, cancellation, deadline)
         .map_err(|_| "P5-C control peer closed or approval deadline expired.".to_string())?;
-    if &frame[..4] != CONTROL_MAGIC
-        || frame[4] != 1
-        || frame[6..8] != [0, 0]
-        || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
-        || u64::from_be_bytes(frame[12..20].try_into().unwrap()) != session_id
-    {
-        return Err("P5-C control identity or header was rejected.".into());
-    }
-    let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
-    if frame.len() != CONTROL_HEADER_BYTES + payload_len + CONTROL_TAG_BYTES {
-        return Err("P5-C control length was rejected.".into());
-    }
-    let body_len = CONTROL_HEADER_BYTES + payload_len;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
-    mac.update(&frame[..body_len]);
-    mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
+    verify_control_frame(&frame, key, direction, session_id)?;
     Ok(frame)
 }
 
@@ -2956,23 +3646,7 @@ fn read_frame_until_request(
     .map_err(|_| {
         "P5-C background trust peer closed, expired, or request was cancelled.".to_string()
     })?;
-    if &frame[..4] != CONTROL_MAGIC
-        || frame[4] != 1
-        || frame[6..8] != [0, 0]
-        || u32::from_be_bytes(frame[8..12].try_into().unwrap()) != direction
-        || u64::from_be_bytes(frame[12..20].try_into().unwrap()) != session_id
-    {
-        return Err("P5-C control identity or header was rejected.".into());
-    }
-    let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
-    if frame.len() != CONTROL_HEADER_BYTES + payload_len + CONTROL_TAG_BYTES {
-        return Err("P5-C control length was rejected.".into());
-    }
-    let body_len = CONTROL_HEADER_BYTES + payload_len;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| "P5-C HMAC key was invalid.")?;
-    mac.update(&frame[..body_len]);
-    mac.verify_slice(&frame[body_len..])
-        .map_err(|_| "P5-C control authentication failed.")?;
+    verify_control_frame(&frame, key, direction, session_id)?;
     Ok(frame)
 }
 
@@ -2982,17 +3656,29 @@ fn decode_ack(
     command: u8,
     command_sequence: u64,
 ) -> Result<Ack, String> {
+    decode_ack_with_format(frame, expected_sequence, command, command_sequence, false)
+}
+
+pub(crate) fn decode_ack_with_format(
+    frame: &[u8],
+    expected_sequence: u64,
+    command: u8,
+    command_sequence: u64,
+    v2_audio: bool,
+) -> Result<Ack, String> {
     let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
+    let terminal_ack = payload_len == 13 && frame[CONTROL_HEADER_BYTES + 9] == RESULT_USER_STOPPED;
     if frame[5] != ACK
         || u64::from_be_bytes(frame[20..28].try_into().unwrap()) != expected_sequence
-        || match command {
-            PLAYBACK_PROGRESS_QUERY => payload_len != 83,
-            BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
-                payload_len != 30
-            }
-            BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE => payload_len != 55,
-            _ => payload_len != 13,
-        }
+        || (!terminal_ack
+            && match command {
+                PLAYBACK_PROGRESS_QUERY => payload_len != if v2_audio { 91 } else { 83 },
+                BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
+                    payload_len != 30
+                }
+                BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE => payload_len != 55,
+                _ => payload_len != 13,
+            })
     {
         return Err("P5-C ACK sequence or type was invalid.".into());
     }
@@ -3003,15 +3689,29 @@ fn decode_ack(
         return Err("P5-C ACK did not match its command.".into());
     }
     let state = ReceiverState::from_wire(payload[10])?;
-    let playback_progress = if command == PLAYBACK_PROGRESS_QUERY {
-        Some(decode_playback_progress(&payload[13..])?)
+    let result = payload[9];
+    if result > RESULT_USER_STOPPED {
+        return Err("P5-C ACK result code was invalid.".into());
+    }
+    let udp_port = u16::from_be_bytes([payload[11], payload[12]]);
+    if result == RESULT_USER_STOPPED
+        && (payload_len != 13 || state != ReceiverState::Stopped || udp_port != 0)
+    {
+        return Err("P5-C Receiver terminal cause was invalid.".into());
+    }
+    let playback_progress = if command == PLAYBACK_PROGRESS_QUERY && !terminal_ack {
+        Some(decode_playback_progress_with_format(
+            &payload[13..],
+            v2_audio,
+        )?)
     } else {
         None
     };
-    let background_authorization = if matches!(
-        command,
-        BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL
-    ) {
+    let background_authorization = if !terminal_ack
+        && matches!(
+            command,
+            BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL
+        ) {
         let request_id: [u8; 16] = payload[13..29].try_into().unwrap();
         let status = payload[29];
         if status > AUTH_CANCELLED {
@@ -3021,27 +3721,28 @@ fn decode_ack(
     } else {
         None
     };
-    let background_trust = if matches!(command, BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE) {
-        let commitment: [u8; 32] = payload[13..45].try_into().unwrap();
-        let kind = payload[45];
-        let persistence = payload[46];
-        let remaining_ms = u64::from_be_bytes(payload[47..55].try_into().unwrap());
-        if !valid_background_trust(kind, persistence, remaining_ms) {
-            return Err("P5-C background trust fields were invalid.".into());
-        }
-        Some(BackgroundTrustSnapshot {
-            commitment,
-            kind,
-            persistence,
-            remaining_ms,
-        })
-    } else {
-        None
-    };
+    let background_trust =
+        if !terminal_ack && matches!(command, BACKGROUND_TRUST_QUERY | BACKGROUND_TRUST_REVOKE) {
+            let commitment: [u8; 32] = payload[13..45].try_into().unwrap();
+            let kind = payload[45];
+            let persistence = payload[46];
+            let remaining_ms = u64::from_be_bytes(payload[47..55].try_into().unwrap());
+            if !valid_background_trust(kind, persistence, remaining_ms) {
+                return Err("P5-C background trust fields were invalid.".into());
+            }
+            Some(BackgroundTrustSnapshot {
+                commitment,
+                kind,
+                persistence,
+                remaining_ms,
+            })
+        } else {
+            None
+        };
     Ok(Ack {
-        result: payload[9],
+        result,
         state,
-        udp_port: u16::from_be_bytes([payload[11], payload[12]]),
+        udp_port,
         playback_progress,
         background_authorization,
         background_trust,
@@ -3072,7 +3773,14 @@ fn background_trust_management_state(state: ReceiverState) -> bool {
 }
 
 fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> {
-    if data.len() != 70 {
+    decode_playback_progress_with_format(data, false)
+}
+
+fn decode_playback_progress_with_format(
+    data: &[u8],
+    v2_audio: bool,
+) -> Result<PlaybackDiagnostics, String> {
+    if data.len() != if v2_audio { 78 } else { 70 } {
         return Err("Receiver playback progress payload length was invalid.".into());
     }
     let advancing = match data[45] {
@@ -3091,7 +3799,7 @@ fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> 
         let value = u64_at(offset);
         (value != u64::MAX).then_some(value)
     };
-    Ok(PlaybackDiagnostics {
+    let mut diagnostics = PlaybackDiagnostics {
         receiver_sample_rate: metric_u32(0),
         receiver_channels: (data[4] != 0xff).then_some(data[4]),
         udp_jitter_target_frames: metric_u32(5),
@@ -3108,7 +3816,20 @@ fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> 
         start_threshold_frames: metric_u32(62),
         pre_roll_frames: metric_u32(66),
         ..PlaybackDiagnostics::default()
-    })
+    };
+    if v2_audio {
+        if data[70] != 1 || data[73] != 0 || data[71] > 3 || !matches!(data[72], 0..=2) {
+            return Err("Receiver v2 playback output format was invalid.".into());
+        }
+        let output_sample_rate = u32_at(74);
+        if data[71] == 0 && (data[72] != 0 || output_sample_rate != 0) {
+            return Err("Receiver unknown v2 output format had populated track fields.".into());
+        }
+        diagnostics.output_format = (data[71] != 0).then_some(data[71]);
+        diagnostics.opened_track_channels = (data[72] != 0).then_some(data[72]);
+        diagnostics.output_sample_rate = (output_sample_rate != 0).then_some(output_sample_rate);
+    }
+    Ok(diagnostics)
 }
 
 pub(crate) fn hex_string(bytes: &[u8]) -> String {

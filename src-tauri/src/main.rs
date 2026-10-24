@@ -1,5 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[allow(dead_code)]
+mod aoa;
+#[allow(dead_code)]
+mod aoa_owner;
+#[allow(dead_code)]
+mod aoa_winusb;
 mod audio;
 mod receiver;
 mod state;
@@ -21,7 +27,7 @@ mod protocol;
 #[allow(dead_code)]
 mod security;
 
-use state::{AppSnapshot, AppState, OperationResult};
+use state::{AoaDeviceTarget, AppSnapshot, AppState, OperationResult, UsbDirectConfiguration};
 use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
@@ -34,9 +40,45 @@ async fn refresh_devices(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    let snapshot = state.refresh_devices().await?;
+    let snapshot = state.refresh_devices_from_ui().await?;
     let _ = app.emit("anpod://snapshot", &snapshot);
     Ok(snapshot)
+}
+
+#[tauri::command]
+async fn list_aoa_targets(state: State<'_, AppState>) -> Result<Vec<AoaDeviceTarget>, String> {
+    state.list_aoa_targets().await
+}
+
+#[tauri::command]
+async fn list_aoa_switch_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<AoaDeviceTarget>, String> {
+    state.list_aoa_switch_targets().await
+}
+
+#[tauri::command]
+async fn switch_aoa_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+    release_adb_server: bool,
+) -> Result<state::AoaSwitchResult, String> {
+    state
+        .switch_aoa_mode(&app, &target_id, release_adb_server)
+        .await
+}
+
+#[tauri::command]
+async fn start_aoa_audio(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+    binding_reference: String,
+) -> Result<AppSnapshot, String> {
+    state
+        .start_aoa_audio(&app, &target_id, &binding_reference)
+        .await
 }
 
 #[tauri::command]
@@ -331,6 +373,21 @@ async fn reconfigure_session(
 }
 
 #[tauri::command]
+async fn begin_usb_direct_configuration(
+    state: State<'_, AppState>,
+    disconnect_current: bool,
+) -> Result<UsbDirectConfiguration, String> {
+    state
+        .begin_usb_direct_configuration(disconnect_current)
+        .await
+}
+
+#[tauri::command]
+fn end_usb_direct_configuration(state: State<'_, AppState>, configuration_id: u64) -> AppSnapshot {
+    state.end_usb_direct_configuration(configuration_id)
+}
+
+#[tauri::command]
 fn show_main_window(window: tauri::WebviewWindow) -> Result<(), String> {
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
@@ -421,6 +478,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             refresh_devices,
+            list_aoa_targets,
+            list_aoa_switch_targets,
+            switch_aoa_mode,
+            start_aoa_audio,
             select_device,
             connect_device,
             connect_device_only,
@@ -454,6 +515,8 @@ fn main() {
             accept_wireless_connection_offer,
             cancel_qr_pairing,
             reconfigure_session,
+            begin_usb_direct_configuration,
+            end_usb_direct_configuration,
             show_main_window,
             open_logs,
             export_diagnostics,

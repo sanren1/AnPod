@@ -7,6 +7,10 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.app.ActivityManager;
 import android.content.Intent;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -29,6 +33,9 @@ import android.os.Process;
 import android.os.Binder;
 
 import com.anpod.server.Pcm16FrameStream;
+import com.anpod.server.FloatPcmFrameQueue;
+import com.anpod.server.FloatPcmDriftController;
+import com.anpod.server.Pcm24PackedCodec;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -39,7 +46,6 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.security.MessageDigest;
-import java.util.Enumeration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -48,6 +54,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.UUID;
 
@@ -57,10 +64,15 @@ import java.util.UUID;
  * with the app_process implementation; see upstream/PATCHES.md for changes.
  */
 public final class ReceiverService extends Service {
+    private static final Object OBOE_OUTPUT_LOCK = new Object();
+    private static String pendingOboeFallbackReason = "";
+    private static OboePlaybackOutput deferredOboeClose;
     public static final String ACTION_UI_START_NETWORK_AUDIO = "app.anpod.receiver.action.UI_START_NETWORK_AUDIO";
+    public static final String ACTION_UI_START_AOA_AUDIO = "app.anpod.receiver.action.UI_START_AOA_AUDIO";
     private static final String ACTION_NOTIFICATION_STOP = "app.anpod.receiver.action.NOTIFICATION_STOP";
     static final String ACTION_BACKGROUND_AUTH_DECISION = "app.anpod.receiver.action.BACKGROUND_AUTH_DECISION";
     private static final String EXTRA_UI_REQUEST_ID = "uiRequestId";
+    private static final String EXTRA_AOA_ACCESSORY = "aoaAccessory";
     static final String CHANNEL_ID = "receiver-management";
     private static final int NOTIFICATION_ID = 1;
     static final int AUTH_NOTIFICATION_ID = 2;
@@ -78,6 +90,8 @@ public final class ReceiverService extends Service {
     static final String EXTRA_AUTH_DEADLINE = "authDeadline";
     static final String EXTRA_AUTH_DECISION = "authDecision";
     private static final long MAX_RUN_MS = 120_000L;
+    private static final long AOA_RECOVERY_WINDOW_MS = 30_000L;
+    private static final long[] AOA_RECOVERY_DELAYS_MS = {0, 1_000, 2_000, 5_000};
     private static final Object STATUS_LOCK = new Object();
     private static volatile ReceiverService activeService;
     private static final AtomicLong NEXT_AUDIO_ID = new AtomicLong();
@@ -104,6 +118,11 @@ public final class ReceiverService extends Service {
     static volatile String networkAudioFailure = "";
     static volatile String networkAudioAddress = "";
     static volatile int networkAudioPort;
+    static volatile String operationOwnerId = "";
+    static volatile long operationGeneration = -1;
+    static volatile String terminalCause = "";
+    static volatile String terminalOwnerId = "";
+    static volatile long terminalGeneration = -1;
     private static long statusAudioId;
 
 
@@ -119,6 +138,8 @@ public final class ReceiverService extends Service {
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
     final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
     private String pendingUiStartRequestId = "";
+    private String pendingAoaRequestId = "";
+    private UsbAccessory pendingAoaAccessory;
     private boolean pendingUiStandbyStart;
     private boolean pendingUiReceiveIntent;
     String networkCoordinatorOwnerId = "";
@@ -129,6 +150,15 @@ public final class ReceiverService extends Service {
     private boolean cleanupFailed;
     private String cleanupError = "";
     private int latestDeliveredStartId;
+    volatile AoaReceiverCoordinator aoaCoordinator;
+    volatile UsbAccessory aoaAccessory;
+    volatile String aoaOwnerId = "";
+    volatile long aoaOwnerGeneration;
+    private volatile Thread aoaBootstrapThread;
+    private volatile long aoaRecoveryDeadlineElapsedMs;
+    private volatile int aoaRecoveryAttempt;
+    private volatile String aoaRecoveryFailure = "";
+    private BroadcastReceiver aoaDetachReceiver;
     final ReceiverBackgroundAuthorization authorization = new ReceiverBackgroundAuthorization(this);
     private final ReceiverUiBinder uiBinder = new ReceiverUiBinder(this);
     final ReceiverUiState uiState = new ReceiverUiState(this);
@@ -191,8 +221,10 @@ public final class ReceiverService extends Service {
         if (intent != null && ACTION_NOTIFICATION_STOP.equals(intent.getAction())) {
             String ownerId = intent.getStringExtra(EXTRA_UI_OWNER_ID);
             long generation = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
-            if (uiOperation.owns(ownerId, generation, currentOperationGeneration))
+            if (uiOperation.owns(ownerId, generation, currentOperationGeneration)) {
+                recordManualStop(ownerId, generation);
                 requestTermination(ownerId, generation, false, "");
+            }
             return START_NOT_STICKY;
         }
         if (intent != null && BootstrapActivity.ACTION_STOP.equals(intent.getAction())) {
@@ -210,13 +242,19 @@ public final class ReceiverService extends Service {
             }
             int disposition = uiOperation.bootstrapStopDisposition();
             if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_OWNER) {
-                requestTermination(uiOperation.ownerId(), currentOperationGeneration, false, "");
+                String ownerId = uiOperation.ownerId();
+                long generation = currentOperationGeneration;
+                if (uiOperation.owns(ownerId, generation, networkBootstrapGeneration.get())) {
+                    recordManualStop(ownerId, generation);
+                    requestTermination(ownerId, generation, false, "");
+                }
             } else if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_IDLE) {
                 stopSelf(startId);
             }
             return START_NOT_STICKY;
         }
         boolean uiNetworkAudio = intent != null && ACTION_UI_START_NETWORK_AUDIO.equals(intent.getAction());
+        boolean uiAoaAudio = intent != null && ACTION_UI_START_AOA_AUDIO.equals(intent.getAction());
         boolean requestedBackgroundStandby = uiNetworkAudio
                 && intent.getBooleanExtra(EXTRA_BACKGROUND_STANDBY, false);
         boolean requestedKeepReceiveIntent = uiNetworkAudio
@@ -241,6 +279,37 @@ public final class ReceiverService extends Service {
                 stopRejectedStartIfIdle();
                 return START_NOT_STICKY;
             }
+        } else if (uiAoaAudio) {
+            ownerId = intent.getStringExtra(EXTRA_UI_OWNER_ID);
+            generation = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
+            String requestId = intent.getStringExtra(EXTRA_UI_REQUEST_ID);
+            UsbAccessory requestedAccessory = usbAccessoryExtra(intent);
+            if (!uiOperation.owns(ownerId) || !ReceiverUiOperation.STARTING.equals(uiOperation.phase())
+                    || generation != currentOperationGeneration || generation != networkBootstrapGeneration.get()
+                    || !requestIdEqualsPendingAoa(requestId) || requestedAccessory == null
+                    || pendingAoaAccessory == null
+                    || !AoaReceiverCoordinator.isProductAccessory(requestedAccessory)) {
+                stopRejectedStartIfIdle();
+                return START_NOT_STICKY;
+            }
+            UsbManager manager = getSystemService(UsbManager.class);
+            try {
+                if (manager == null || !manager.hasPermission(pendingAoaAccessory)) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return START_NOT_STICKY;
+                }
+                if (!manager.hasPermission(requestedAccessory)) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return START_NOT_STICKY;
+                }
+                if (!requestedAccessory.equals(pendingAoaAccessory)) {
+                    stopRejectedStartIfIdle();
+                    return START_NOT_STICKY;
+                }
+            } catch (SecurityException permissionLost) {
+                requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                return START_NOT_STICKY;
+            }
         } else if (audio && currentAudio != null && (ReceiverUiOperation.RUNNING.equals(uiOperation.phase())
                 || ReceiverUiOperation.STARTING.equals(uiOperation.phase()))) {
             ownerId = uiOperation.ownerId();
@@ -251,6 +320,7 @@ public final class ReceiverService extends Service {
             if (!uiOperation.begin(ownerId)) return START_NOT_STICKY;
             generation = networkBootstrapGeneration.incrementAndGet();
             currentOperationGeneration = generation;
+            beginHealthOperation(ownerId, generation);
             backgroundStandbyEnabled = false;
             receiveIntentEnabled = false;
             networkAudioState = "stopped";
@@ -266,12 +336,16 @@ public final class ReceiverService extends Service {
         // shortService or attach a short-service timeout to the audio session.
         try {
             Notification notification = serviceNotification(
-                    audio ? "AnPod 音频连接正在运行。" : networkAudio
+                    audio ? "AnPod 音频连接正在运行。" : uiAoaAudio
+                            ? "正在连接 AnPod USB Direct，可随时停止。" : networkAudio
                             ? receiveIntentEnabled ? "正在等待电脑连接，可随时停止。" : "无线接收正在准备，可随时停止。"
                             : "管理检查进行中；当前不播放音频。",
-                    ownerId, generation, networkAudio || audio && currentAudio != null);
+                    ownerId, generation, networkAudio || uiAoaAudio || audio && currentAudio != null);
             if (Build.VERSION.SDK_INT >= 34) {
-                int type = audio
+                int type = uiAoaAudio
+                        ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                                | ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        : audio
                         ? playbackForegroundServiceType()
                         : receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                                 : ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
@@ -321,6 +395,26 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
 
+        if (uiAoaAudio) {
+            pendingAoaRequestId = "";
+            pendingAoaAccessory = null;
+            if (timeout != null) handler.removeCallbacks(timeout);
+            timeout = null;
+            uiOperation.running(ownerId);
+            UsbAccessory accessory = usbAccessoryExtra(intent);
+            aoaAccessory = accessory;
+            aoaOwnerId = ownerId;
+            aoaOwnerGeneration = generation;
+            aoaRecoveryDeadlineElapsedMs = 0;
+            aoaRecoveryAttempt = 0;
+            aoaRecoveryFailure = "";
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            if (!registerAoaDetachReceiver(accessory, ownerId, generation)) return START_NOT_STICKY;
+            startAoaBootstrap(accessory, ownerId, generation);
+            return START_NOT_STICKY;
+        }
+
         if (timeout != null) handler.removeCallbacks(timeout);
         uiOperation.running(ownerId);
         timeout = () -> requestTermination(ownerId, generation, false, "");
@@ -332,8 +426,203 @@ public final class ReceiverService extends Service {
         return requestId != null && requestId.equals(pendingUiStartRequestId);
     }
 
+    private boolean requestIdEqualsPendingAoa(String requestId) {
+        return requestId != null && requestId.equals(pendingAoaRequestId);
+    }
+
+    private static UsbAccessory usbAccessoryExtra(Intent intent) {
+        if (intent == null) return null;
+        if (Build.VERSION.SDK_INT >= 33)
+            return intent.getParcelableExtra(EXTRA_AOA_ACCESSORY, UsbAccessory.class);
+        @SuppressWarnings("deprecation") UsbAccessory accessory =
+                (UsbAccessory) intent.getParcelableExtra(EXTRA_AOA_ACCESSORY);
+        return accessory;
+    }
+
     boolean notificationPermissionAvailable() {
         return ReceiverNotifications.canPost(this, CHANNEL_ID);
+    }
+
+    private void startAoaBootstrap(UsbAccessory accessory, String ownerId, long generation) {
+        Thread bootstrap = new Thread(() -> {
+            PairingProtocol.BindingMaterial binding = null;
+            try {
+                if (!isCurrentOperation(ownerId, generation)) throw new IOException("AoaOwnerGenerationExpired");
+                binding = new BindingStore(getFilesDir()).load();
+                UsbManager manager = getSystemService(UsbManager.class);
+                AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.openAccessory(manager, accessory,
+                        binding, aoaPlaybackEndpoint(ownerId, generation), ownerId, generation);
+                binding = null; // The coordinator now owns and destroys the saved binding material.
+                synchronized (networkCoordinatorLock) { aoaCoordinator = coordinator; }
+                Thread monitor = new Thread(() -> monitorAoaCoordinator(coordinator, ownerId, generation),
+                        "AnPod AOA owner monitor");
+                monitor.setDaemon(true);
+                monitor.start();
+                if (!isCurrentOperation(ownerId, generation)) coordinator.cancel("AoaOwnerGenerationExpired");
+            } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
+                if (binding != null) binding.close();
+                String failure = error instanceof IOException && error.getMessage() != null
+                        ? error.getMessage() : error.getClass().getSimpleName();
+                if (isCurrentOperation(ownerId, generation)) {
+                    if (aoaRecoveryDeadlineElapsedMs > 0) {
+                        scheduleAoaRecovery(ownerId, generation, describeAoaFailure(failure));
+                    } else requestTermination(ownerId, generation, true, describeAoaFailure(failure));
+                }
+            } finally {
+                synchronized (networkCoordinatorLock) {
+                    if (aoaBootstrapThread == Thread.currentThread()) aoaBootstrapThread = null;
+                }
+                handler.post(() -> {
+                    if (ReceiverUiOperation.STOPPING.equals(uiOperation.phase())
+                            && uiOperation.owns(ownerId)) finishTerminationIfReady(ownerId, currentOperationGeneration);
+                });
+            }
+        }, "AnPod AOA accessory open");
+        bootstrap.setDaemon(true);
+        synchronized (networkCoordinatorLock) {
+            aoaBootstrapThread = bootstrap;
+            bootstrap.start();
+        }
+    }
+
+    private void monitorAoaCoordinator(AoaReceiverCoordinator coordinator, String ownerId, long generation) {
+        try { coordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        String failure = coordinator.failureMessage();
+        handler.post(() -> {
+            if (aoaCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            boolean restartRequested = failure.isEmpty() && coordinator.restartRequested();
+            boolean unexpectedFailure = coordinator.shouldRecoverUnexpectedFailure();
+            if ((restartRequested || unexpectedFailure) && aoaAccessory != null) {
+                aoaCoordinator = null;
+                if (aoaRecoveryDeadlineElapsedMs == 0) {
+                    aoaRecoveryDeadlineElapsedMs = android.os.SystemClock.elapsedRealtime()
+                            + AOA_RECOVERY_WINDOW_MS;
+                    aoaRecoveryAttempt = 0;
+                }
+                scheduleAoaRecovery(ownerId, generation, failure);
+                return;
+            }
+            requestTermination(ownerId, generation, !failure.isEmpty(), failure);
+        });
+    }
+
+    void scheduleAoaRecovery(String ownerId, long generation, String failure) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> scheduleAoaRecovery(ownerId, generation, failure));
+            return;
+        }
+        if (!isCurrentOperation(ownerId, generation) || !ownerId.equals(aoaOwnerId)
+                || aoaOwnerGeneration != generation) return;
+        aoaRecoveryFailure = failure == null ? "" : failure;
+        long now = android.os.SystemClock.elapsedRealtime();
+        long remaining = aoaRecoveryDeadlineElapsedMs - now;
+        if (remaining <= 0) {
+            aoaRecoveryDeadlineElapsedMs = 0;
+            requestTermination(ownerId, generation, true,
+                    aoaRecoveryFailure.isEmpty() ? "USB Direct 恢复窗口已结束" : aoaRecoveryFailure);
+            return;
+        }
+        UsbAccessory accessory = aoaAccessory;
+        if (accessory == null || !shouldAttemptAoaRecovery(
+                isCurrentOperation(ownerId, generation), isManualStop(ownerId, generation),
+                now, aoaRecoveryDeadlineElapsedMs)) {
+            aoaRecoveryDeadlineElapsedMs = 0;
+            return;
+        }
+        int delayIndex = Math.min(aoaRecoveryAttempt, AOA_RECOVERY_DELAYS_MS.length - 1);
+        long delay = Math.min(AOA_RECOVERY_DELAYS_MS[delayIndex], remaining);
+        aoaRecoveryAttempt++;
+        handler.postDelayed(() -> {
+            long callbackNow = android.os.SystemClock.elapsedRealtime();
+            if (!isCurrentOperation(ownerId, generation) || aoaAccessory != accessory) return;
+            if (isManualStop(ownerId, generation)) {
+                aoaRecoveryDeadlineElapsedMs = 0;
+                return;
+            }
+            if (callbackNow >= aoaRecoveryDeadlineElapsedMs) {
+                aoaRecoveryDeadlineElapsedMs = 0;
+                requestTermination(ownerId, generation, true,
+                        aoaRecoveryFailure.isEmpty() ? "USB Direct 恢复窗口已结束" : aoaRecoveryFailure);
+                return;
+            }
+            startAoaBootstrap(accessory, ownerId, generation);
+        }, delay);
+    }
+
+    static boolean shouldAttemptAoaRecovery(boolean currentOperation, boolean manualStop,
+            long nowElapsedMs, long deadlineElapsedMs) {
+        return currentOperation && !manualStop && nowElapsedMs < deadlineElapsedMs;
+    }
+
+    void noteAoaPlaybackStarted(String ownerId, long generation) {
+        if (!isCurrentOperation(ownerId, generation) || generation != aoaOwnerGeneration
+                || !ownerId.equals(aoaOwnerId)) return;
+        aoaRecoveryDeadlineElapsedMs = 0;
+        aoaRecoveryAttempt = 0;
+        aoaRecoveryFailure = "";
+    }
+
+    private boolean registerAoaDetachReceiver(UsbAccessory accessory, String ownerId, long generation) {
+        unregisterAoaDetachReceiver();
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override public void onReceive(android.content.Context context, Intent intent) {
+                if (!UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(intent.getAction())
+                        || !isCurrentOperation(ownerId, generation)
+                        || !ownerId.equals(aoaOwnerId) || aoaOwnerGeneration != generation
+                        || accessory != aoaAccessory) return;
+                UsbManager manager = getSystemService(UsbManager.class);
+                if (manager == null) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return;
+                }
+                try {
+                    if (!manager.hasPermission(accessory)) {
+                        requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                        return;
+                    }
+                    UsbAccessory[] attached = manager.getAccessoryList();
+                    if (attached != null) for (UsbAccessory current : attached) {
+                        if (!manager.hasPermission(current)) continue;
+                        if (accessory.equals(current) && AoaReceiverCoordinator.isProductAccessory(current)) return;
+                    }
+                } catch (SecurityException permissionLost) {
+                    requestTermination(ownerId, generation, true, "UsbAccessoryPermissionOrAttachmentLost");
+                    return;
+                }
+                requestTermination(ownerId, generation, true, "AoaAccessoryDetached");
+            }
+        };
+        try {
+            aoaDetachReceiver = receiver;
+            IntentFilter filter = new IntentFilter(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+            // USB broadcasts originate outside this app; the handler rechecks UsbManager state before stopping.
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_EXPORTED);
+            else registerReceiver(receiver, filter);
+            return true;
+        } catch (RuntimeException error) {
+            aoaDetachReceiver = null;
+            requestTermination(ownerId, generation, true, "AoaDetachReceiverUnavailable");
+            return false;
+        }
+    }
+
+    private String describeAoaFailure(String failure) {
+        if ("AoaSessionCleanupPending".equals(failure)) return getString(R.string.usb_direct_cleanup_pending);
+        if ("UsbAccessoryPermissionOrAttachmentLost".equals(failure)
+                || "UsbAccessoryChangedDuringOpen".equals(failure)
+                || "UsbAccessoryPermissionCheckFailed".equals(failure))
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        if ("UsbAccessoryOpenFailed".equals(failure)) return getString(R.string.usb_direct_open_failed);
+        if ("AoaDetachReceiverUnavailable".equals(failure)) return getString(R.string.usb_direct_receiver_unavailable);
+        return failure;
+    }
+
+    private void unregisterAoaDetachReceiver() {
+        BroadcastReceiver receiver = aoaDetachReceiver;
+        aoaDetachReceiver = null;
+        if (receiver != null) try { unregisterReceiver(receiver); }
+        catch (IllegalArgumentException ignored) { }
     }
 
     private boolean applicationIsVisible() {
@@ -429,6 +718,9 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         currentAudio = null;
         if (session != null) cancelAudio(session, "AudioServiceDestroyed");
+        AoaReceiverCoordinator aoa = aoaCoordinator;
+        if (aoa != null) aoa.cancel("AudioServiceDestroyed");
+        unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator;
         synchronized (networkCoordinatorLock) {
             coordinator = networkCoordinator;
@@ -459,15 +751,15 @@ public final class ReceiverService extends Service {
     String startFromUi(String address, int prefixLength, String requestId,
             boolean backgroundStandby, boolean keepReceiveIntent) {
         if (requestId == null || requestId.isEmpty()) return "启动请求无效，请重试。";
-        if (keepReceiveIntent && !applicationIsVisible()) return "请在 Receiver 前台界面中开始接收。";
+        if (keepReceiveIntent && !applicationIsVisible()) return "请在 AnPod 界面中点击“连接电脑”。";
         if (backgroundStandby && !applicationIsVisible()) return "请在 Receiver 前台界面中启用后台待机。";
-        if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 Receiver 通知，再开始接收。";
+        if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 AnPod 通知，再连接电脑。";
         if (!uiOperation.canBegin() || currentAudio != null || networkCoordinator != null) return "已有接收会话正在运行。";
         try {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();
             if (!"saved".equals(binding.state)) throw new IOException("请先通过 USB 完成电脑绑定。");
             InetAddress selected = parseIpv4(address);
-            if (!isAssignedPrivateAddress(selected, prefixLength)) throw new IOException("所选网络接口已不可用，请重新选择。");
+            findNetworkForInterface(selected, prefixLength);
             String ownerId = UUID.randomUUID().toString();
             long generation;
             synchronized (networkCoordinatorLock) {
@@ -476,6 +768,7 @@ public final class ReceiverService extends Service {
                     return "已有接收会话正在运行。";
                 generation = networkBootstrapGeneration.incrementAndGet();
                 currentOperationGeneration = generation;
+                beginHealthOperation(ownerId, generation);
                 backgroundStandbyEnabled = backgroundStandby;
                 receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
                 pendingUiStartRequestId = requestId;
@@ -507,15 +800,83 @@ public final class ReceiverService extends Service {
         }
     }
 
+    String startAoaFromUi(UsbAccessory accessory, String requestId) {
+        if (requestId == null || requestId.isEmpty()) return getString(R.string.operation_failed_retry);
+        if (Build.VERSION.SDK_INT < 24) return getString(R.string.usb_direct_requires_api24);
+        if (!applicationIsVisible()) return getString(R.string.usb_direct_foreground_required);
+        if (!getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_USB_ACCESSORY))
+            return getString(R.string.usb_direct_not_supported);
+        if (!AoaReceiverCoordinator.isProductAccessory(accessory)) return getString(R.string.usb_direct_wrong_accessory);
+        UsbManager manager = getSystemService(UsbManager.class);
+        if (manager == null)
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        boolean attached = false;
+        try {
+            if (!manager.hasPermission(accessory))
+                return getString(R.string.usb_direct_detached_or_permission_lost);
+            UsbAccessory[] accessories = manager.getAccessoryList();
+            if (accessories != null) for (UsbAccessory current : accessories)
+                if (manager.hasPermission(current) && accessory.equals(current)
+                        && AoaReceiverCoordinator.isProductAccessory(current)) attached = true;
+        } catch (SecurityException permissionLost) {
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        }
+        if (!attached)
+            return getString(R.string.usb_direct_detached_or_permission_lost);
+        try {
+            BindingStore.Status binding = new BindingStore(getFilesDir()).status();
+            if (!"saved".equals(binding.state)) return getString(R.string.usb_direct_requires_pairing);
+        } catch (IOException | PairingProtocol.Failure error) {
+            return getString(R.string.binding_status_temporarily_unavailable);
+        }
+        String ownerId = UUID.randomUUID().toString();
+        long generation;
+        synchronized (networkCoordinatorLock) {
+            if (!uiOperation.canBegin() || currentAudio != null || pendingAudio != null
+                    || networkCoordinator != null || aoaCoordinator != null || aoaBootstrapThread != null
+                    || !uiOperation.begin(ownerId)) return getString(R.string.usb_direct_busy);
+            generation = networkBootstrapGeneration.incrementAndGet();
+            currentOperationGeneration = generation;
+            beginHealthOperation(ownerId, generation);
+            backgroundStandbyEnabled = false;
+            receiveIntentEnabled = false;
+            pendingAoaRequestId = requestId;
+            pendingAoaAccessory = accessory;
+            aoaAccessory = accessory;
+            aoaOwnerId = ownerId;
+            aoaOwnerGeneration = generation;
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            networkAudioAddress = "";
+            networkAudioPort = 0;
+            startFailure = "";
+        }
+        Intent start = new Intent(this, ReceiverService.class).setAction(ACTION_UI_START_AOA_AUDIO)
+                .setData(Uri.parse("anpod://receiver/aoa/" + Uri.encode(ownerId) + "/" + generation))
+                .putExtra(EXTRA_UI_REQUEST_ID, requestId)
+                .putExtra(EXTRA_UI_OWNER_ID, ownerId)
+                .putExtra(EXTRA_UI_GENERATION, generation)
+                .putExtra(EXTRA_AOA_ACCESSORY, accessory);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(start); else startService(start);
+        } catch (RuntimeException error) {
+            requestTermination(ownerId, generation, true, error.getClass().getSimpleName());
+            return error.getClass().getSimpleName();
+        }
+        return "";
+    }
+
     boolean stopFromUi(String ownerId) {
         if (!uiOperation.owns(ownerId) || !(ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                 || ReceiverUiOperation.RUNNING.equals(uiOperation.phase()))) return false;
+        recordManualStop(ownerId, currentOperationGeneration);
         requestTermination(ownerId, currentOperationGeneration, false, "");
         return true;
     }
 
     boolean stopFromUi(String ownerId, long generation) {
         if (!isCurrentOperation(ownerId, generation)) return false;
+        recordManualStop(ownerId, generation);
         requestTermination(ownerId, generation, false, "");
         return true;
     }
@@ -618,6 +979,25 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private static synchronized void beginHealthOperation(String ownerId, long generation) {
+        operationOwnerId = ownerId;
+        operationGeneration = generation;
+        terminalCause = "";
+        terminalOwnerId = "";
+        terminalGeneration = -1;
+    }
+
+    private static synchronized void recordManualStop(String ownerId, long generation) {
+        terminalCause = "USER_STOP";
+        terminalOwnerId = ownerId;
+        terminalGeneration = generation;
+    }
+
+    private static synchronized boolean isManualStop(String ownerId, long generation) {
+        return "USER_STOP".equals(terminalCause) && ownerId.equals(terminalOwnerId)
+                && generation == terminalGeneration;
+    }
+
     void requestTermination(String ownerId, long generation, boolean failed, String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() -> beginTermination(ownerId, generation, failed, reason));
@@ -625,6 +1005,22 @@ public final class ReceiverService extends Service {
     }
 
     private void beginTermination(String ownerId, long generation, boolean failed, String reason) {
+        if (!failed && (reason == null || reason.isEmpty()) && isManualStop(ownerId, generation)) {
+            AoaReceiverCoordinator activeAoa;
+            P5cReceiverCoordinator activeNetwork;
+            synchronized (networkCoordinatorLock) {
+                activeAoa = ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation
+                        ? aoaCoordinator : null;
+                activeNetwork = ownerId.equals(networkCoordinatorOwnerId)
+                        && generation == currentOperationGeneration ? networkCoordinator : null;
+            }
+            if (activeAoa != null) {
+                if (activeAoa.requestUserStop()) return;
+            }
+            if (activeNetwork != null) {
+                if (activeNetwork.requestUserStop()) return;
+            }
+        }
         synchronized (networkCoordinatorLock) {
             if (!uiOperation.owns(ownerId) || generation != currentOperationGeneration
                     || generation != networkBootstrapGeneration.get() || !uiOperation.stop(ownerId)) return;
@@ -644,6 +1040,8 @@ public final class ReceiverService extends Service {
         if (timeout != null) handler.removeCallbacks(timeout);
         timeout = null;
         pendingUiStartRequestId = "";
+        pendingAoaRequestId = "";
+        pendingAoaAccessory = null;
         pendingUiStandbyStart = false;
         pendingUiReceiveIntent = false;
         networkRecoveryDeadlineElapsedMs = 0;
@@ -652,7 +1050,17 @@ public final class ReceiverService extends Service {
 
         AudioSession session = currentAudio;
         if (session != null && ownerId.equals(session.ownerId))
-            cancelAudio(session, session.request.udpContext != null ? "NetworkSessionStopped" : "UiSessionStopped");
+            cancelAudio(session, session.request.usesPacketIngress() ? "NetworkSessionStopped" : "UiSessionStopped");
+        Thread opening = null;
+        AoaReceiverCoordinator aoa = null;
+        synchronized (networkCoordinatorLock) {
+            if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                opening = aoaBootstrapThread;
+                aoa = aoaCoordinator;
+            }
+        }
+        if (aoa != null) aoa.cancel("AoaOwnerStopped");
+        unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator = null;
         synchronized (networkCoordinatorLock) {
             if (networkCoordinator != null && ownerId.equals(networkCoordinatorOwnerId)) {
@@ -673,6 +1081,64 @@ public final class ReceiverService extends Service {
                     finishTerminationIfReady(ownerId, terminatingGeneration);
                 });
             }, "AnPod receiver cleanup").start();
+        }
+        if (opening != null || aoa != null) {
+            Thread openingThread = opening;
+            AoaReceiverCoordinator initialCoordinator = aoa;
+            cleanupCoordinatorClosed = false;
+            long terminatingGeneration = cleanupGeneration;
+            new Thread(() -> {
+                boolean interrupted = false;
+                if (openingThread != null && openingThread != Thread.currentThread()) {
+                    while (openingThread.isAlive()) try { openingThread.join(); }
+                    catch (InterruptedException error) { interrupted = true; }
+                }
+                AoaReceiverCoordinator completedCoordinator = initialCoordinator;
+                synchronized (networkCoordinatorLock) {
+                    if (completedCoordinator == null && ownerId.equals(aoaOwnerId)
+                            && aoaOwnerGeneration == generation) completedCoordinator = aoaCoordinator;
+                }
+                if (completedCoordinator != null) {
+                    completedCoordinator.cancel("AoaOwnerCleanup");
+                    for (;;) try {
+                        completedCoordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+                        break;
+                    } catch (InterruptedException error) { interrupted = true; }
+                    String aoaCleanupFailure = completedCoordinator.failureMessage();
+                    if (!aoaCleanupFailure.isEmpty()) {
+                        cleanupFailed = true;
+                        cleanupError = cleanupError.isEmpty() ? aoaCleanupFailure
+                                : cleanupError + "; " + aoaCleanupFailure;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+                AoaReceiverCoordinator cleaned = completedCoordinator;
+                handler.post(() -> {
+                    if (!isPendingCleanup(ownerId, terminatingGeneration)) return;
+                    synchronized (networkCoordinatorLock) {
+                        if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                            if (cleaned == null || aoaCoordinator == cleaned) aoaCoordinator = null;
+                            aoaAccessory = null;
+                            aoaOwnerId = "";
+                            aoaOwnerGeneration = 0;
+                            aoaBootstrapThread = null;
+                        }
+                    }
+                    unregisterAoaDetachReceiver();
+                    cleanupCoordinatorClosed = true;
+                    finishTerminationIfReady(ownerId, terminatingGeneration);
+                });
+            }, "AnPod AOA session cleanup").start();
+        } else if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+            synchronized (networkCoordinatorLock) {
+                if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                    aoaCoordinator = null;
+                    aoaAccessory = null;
+                    aoaOwnerId = "";
+                    aoaOwnerGeneration = 0;
+                    aoaBootstrapThread = null;
+                }
+            }
         }
         networkAudioState = "stopping";
         networkAudioAddress = "";
@@ -726,8 +1192,12 @@ public final class ReceiverService extends Service {
     }
 
     private AudioSession startAudio(AudioRequest request) {
+        return startAudio(request, uiOperation.ownerId(), networkBootstrapGeneration.get());
+    }
+
+    private AudioSession startAudio(AudioRequest request, String ownerId, long generation) {
         WAVEFORM.reset();
-        if (destroyed) return null;
+        if (destroyed || !isCurrentOperation(ownerId, generation)) return null;
         AudioSession existing = currentAudio;
         if (existing != null) {
             if (pendingAudio != null) pendingAudio.destroy();
@@ -735,7 +1205,7 @@ public final class ReceiverService extends Service {
             cancelAudio(existing, "AudioSessionReplaced");
             return null;
         }
-        if (request.udpContext == null && (request.socketName == null || request.socketName.isEmpty()
+        if (request.udpContext == null && request.aoaContext == null && (request.socketName == null || request.socketName.isEmpty()
                 || request.connectCode == null || request.connectCode.isEmpty())) {
             recordStartFailure("InvalidAudioRequest");
             request.destroy();
@@ -743,7 +1213,9 @@ public final class ReceiverService extends Service {
             return null;
         }
         AudioSession session = new AudioSession(NEXT_AUDIO_ID.incrementAndGet(), request,
-                uiOperation.ownerId(), networkBootstrapGeneration.get());
+                ownerId, generation);
+        session.requestedOutputEngine = requestedOutputEnginePreference();
+        session.actualOutputEngine = "unknown";
         currentAudio = session;
         synchronized (STATUS_LOCK) {
             statusAudioId = session.id;
@@ -762,7 +1234,7 @@ public final class ReceiverService extends Service {
             tcpDroppedBacklogFrames = -1;
             startFailure = "";
         }
-        if (request.udpContext != null) PCM_BYTES_WRITTEN.set(0);
+        if (request.usesPacketIngress()) PCM_BYTES_WRITTEN.set(0);
         session.thread = new Thread(() -> receiveAudio(session), "AnPod audio receiver");
         session.thread.start();
         handler.post(() -> {
@@ -795,12 +1267,130 @@ public final class ReceiverService extends Service {
         else if (!handler.post(start)) context.destroy();
     }
 
+    /** Starts one already-authenticated AOA session before START is ACKed; the caller retains context ownership. */
+    AudioSession startAoaAudio(AoaSessionContext context, String ownerId, long generation) throws IOException {
+        if (context == null) throw new NullPointerException("context");
+        AudioStartTicket ticket = new AudioStartTicket();
+        Runnable start = () -> {
+            synchronized (ticket) {
+                try {
+                    if (ticket.cancelled || !isCurrentOperation(ownerId, generation)
+                            || currentAudio != null || pendingAudio != null) {
+                        context.stopQueue();
+                        return;
+                    }
+                    AudioSession accepted = startAudio(AudioRequest.aoa(context), ownerId, generation);
+                    if (accepted == null || accepted.request.aoaContext != context || currentAudio != accepted)
+                        throw new IOException("AoaAudioSessionNotAccepted");
+                    ticket.accepted = accepted;
+                } catch (IOException | RuntimeException error) {
+                    context.stopQueue();
+                    if (isCurrentOperation(ownerId, generation))
+                        requestTermination(ownerId, generation, true,
+                                error instanceof IOException ? error.getMessage() : error.getClass().getSimpleName());
+                } finally { ticket.finished.countDown(); }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) start.run();
+        else if (!handler.post(start)) {
+            context.stopQueue();
+            throw new IOException("AoaAudioServiceUnavailable");
+        }
+        try {
+            if (!ticket.finished.await(3, TimeUnit.SECONDS)) {
+                AudioSession accepted;
+                synchronized (ticket) {
+                    accepted = ticket.accepted;
+                    if (accepted == null) ticket.cancelled = true;
+                }
+                if (accepted == null) {
+                    context.stopQueue();
+                    throw new IOException("AoaAudioSessionStartTimedOut");
+                }
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            AudioSession accepted;
+            synchronized (ticket) {
+                accepted = ticket.accepted;
+                if (accepted == null) ticket.cancelled = true;
+            }
+            if (accepted != null) {
+                Runnable cancel = () -> {
+                    if (isCurrentOperation(ownerId, generation) && currentAudio == accepted)
+                        cancelAudio(accepted, "AoaAudioStartInterrupted");
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) cancel.run(); else handler.post(cancel);
+            }
+            context.stopQueue();
+            throw new IOException("AoaAudioSessionStartInterrupted", interrupted);
+        }
+        if (ticket.accepted == null || currentAudio != ticket.accepted || !isCurrentOperation(ownerId, generation))
+            throw new IOException("AoaAudioSessionNotAccepted");
+        return ticket.accepted;
+    }
+
+    AoaReceiverCoordinator.PlaybackEndpoint aoaPlaybackEndpoint(String ownerId, long generation) {
+        return new AoaReceiverCoordinator.PlaybackEndpoint() {
+            private AudioSession ownedSession;
+            private boolean current() { return isCurrentOperation(ownerId, generation); }
+
+            @Override public boolean isCurrent(String expectedOwner, long expectedGeneration) {
+                return ownerId.equals(expectedOwner) && generation == expectedGeneration && current();
+            }
+
+            @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) {
+                return format != null && format.profile >= 1 && format.profile <= 3;
+            }
+
+            @Override public void start(AoaSessionContext context) throws IOException {
+                if (!current()) throw new IOException("AoaOwnerStopped");
+                AudioSession accepted = startAoaAudio(context, ownerId, generation);
+                ownedSession = accepted;
+                noteAoaPlaybackStarted(ownerId, generation);
+            }
+
+            @Override public void pause() throws IOException {
+                runOnMainForOwner(ownerId, generation, () -> setUdpAudioPaused(ownedSession, true));
+            }
+
+            @Override public void resume() throws IOException {
+                runOnMainForOwner(ownerId, generation, () -> setUdpAudioPaused(ownedSession, false));
+            }
+
+            @Override public void stop() {
+                AudioSession session = ownedSession;
+                if (session == null) return;
+                Runnable stop = () -> {
+                    if (currentAudio == session && isCurrentOperation(ownerId, generation))
+                        cancelAudio(session, "AoaSessionStopped");
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) stop.run(); else handler.post(stop);
+            }
+
+            @Override public boolean streaming() throws IOException {
+                if (!current()) throw new IOException("AoaOwnerStopped");
+                AudioSession session = ownedSession;
+                if (session == null || currentAudio != session) throw new IOException("AoaAudioSessionNotOwned");
+                return session.isStreamingAt(System.nanoTime());
+            }
+
+            @Override public byte[] playbackProgressPayloadV2() {
+                AudioSession session = ownedSession;
+                byte[] legacy = ReceiverService.playbackProgressPayload();
+                return P5cControlProtocol.playbackProgressPayloadV2(legacy,
+                        session == null ? 0 : session.openedTrackFormatV2,
+                        session == null ? 0 : session.openedTrackChannelsV2,
+                        session == null ? 0 : session.openedTrackSampleRateV2);
+            }
+        };
+    }
+
     private void startNetworkBootstrap(String address, int prefixLength, long generation, String ownerId,
             boolean backgroundStandby, boolean keepReceiveIntent) {
         try {
             if (!isCurrentOperation(ownerId, generation)) return;
             InetAddress local = parseIpv4(address);
-            if (!isAssignedPrivateAddress(local, prefixLength)) throw new IOException("InvalidReceiverInterface");
             Network selectedNetwork = findNetworkForInterface(local, prefixLength);
             PairingProtocol.BindingMaterial binding;
             synchronized (BindingStore.storageLock()) {
@@ -822,6 +1412,22 @@ public final class ReceiverService extends Service {
                 private boolean current() { return isCurrentOperation(ownerId, generation); }
 
                 @Override public boolean supportsPlaybackProgress() { return true; }
+                @Override public boolean supportsAudioV2() { return true; }
+                @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+                    return supportsPcm24AudioFormatV2(format);
+                }
+                @Override public int openedTrackFormatV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackFormatV2;
+                }
+                @Override public int openedTrackChannelsV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackChannelsV2;
+                }
+                @Override public int openedTrackSampleRateV2() {
+                    AudioSession session = ownedSession;
+                    return session == null ? 0 : session.openedTrackSampleRateV2;
+                }
 
                 @Override public boolean requiresBackgroundStartAuthorization() {
                     return backgroundStandby && current();
@@ -1050,6 +1656,7 @@ public final class ReceiverService extends Service {
             }
             Thread waiter = new Thread(() -> {
                 long nextStandbyCheckAt = 0;
+                long nextNetworkCheckAt = 0;
                 long nextSearchMaintenanceAt = 0;
                 try {
                     while (true) {
@@ -1068,6 +1675,19 @@ public final class ReceiverService extends Service {
                             } catch (IOException searchError) {
                                 networkAudioFailure = searchError.getMessage() == null
                                         ? searchError.getClass().getSimpleName() : searchError.getMessage();
+                            }
+                        }
+                        if (now >= nextNetworkCheckAt && (keepReceiveIntent
+                                || (currentAudio == null && "prepared".equals(networkAudioState)))) {
+                            nextNetworkCheckAt = now + 1_000L;
+                            try {
+                                if (!isNetworkForInterface(selectedNetwork, local, prefixLength)) {
+                                    requestTermination(ownerId, generation, true, "ReceiveInterfaceChanged");
+                                    return;
+                                }
+                            } catch (IOException unavailable) {
+                                requestTermination(ownerId, generation, true, "ReceiveInterfaceUnavailable");
+                                return;
                             }
                         }
                         if (keepReceiveIntent && now >= nextStandbyCheckAt) {
@@ -1092,15 +1712,6 @@ public final class ReceiverService extends Service {
                             }
                             if (!notificationPermissionAvailable()) {
                                 requestTermination(ownerId, generation, true, "ReceiveNotificationsUnavailable");
-                                return;
-                            }
-                            try {
-                                if (!selectedNetwork.equals(findNetworkForInterface(local, prefixLength))) {
-                                    requestTermination(ownerId, generation, true, "ReceiveInterfaceChanged");
-                                    return;
-                                }
-                            } catch (IOException unavailable) {
-                                requestTermination(ownerId, generation, true, "ReceiveInterfaceUnavailable");
                                 return;
                             }
                         }
@@ -1148,6 +1759,10 @@ public final class ReceiverService extends Service {
                 && (ReceiverUiOperation.STARTING.equals(phase) || ReceiverUiOperation.RUNNING.equals(phase));
     }
 
+    boolean isAoaSession() {
+        return aoaOwnerId != null && !aoaOwnerId.isEmpty();
+    }
+
     private void runOnMainForOwner(String ownerId, long generation, MainOwnerCommand command) throws IOException {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             if (!isCurrentOperation(ownerId, generation)) throw new IOException("NetworkSessionStopped");
@@ -1193,32 +1808,117 @@ public final class ReceiverService extends Service {
         });
     }
 
-    private static boolean isAssignedPrivateAddress(InetAddress address, int prefixLength) throws SocketException {
-        if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress() || prefixLength < 1 || prefixLength > 32) return false;
-        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-        while (interfaces != null && interfaces.hasMoreElements()) {
-            NetworkInterface network = interfaces.nextElement();
-            if (!network.isUp() || network.isLoopback()) continue;
-            for (java.net.InterfaceAddress item : network.getInterfaceAddresses())
-                if (address.equals(item.getAddress()) && item.getNetworkPrefixLength() == prefixLength) return true;
+    static final class AvailableNetwork {
+        final Network network;
+        final String interfaceName;
+        final int interfaceIndex;
+        final InetAddress address;
+        final int prefixLength;
+
+        AvailableNetwork(Network network, String interfaceName, int interfaceIndex, InetAddress address, int prefixLength) {
+            this.network = network;
+            this.interfaceName = interfaceName;
+            this.interfaceIndex = interfaceIndex;
+            this.address = address;
+            this.prefixLength = prefixLength;
         }
+    }
+
+    static List<AvailableNetwork> availableNetworks(android.content.Context context) throws SocketException {
+        ConnectivityManager connectivity = context.getSystemService(ConnectivityManager.class);
+        if (connectivity == null) return Collections.emptyList();
+        ArrayList<AvailableNetwork> result = new ArrayList<>();
+        for (Network network : connectivity.getAllNetworks()) {
+            LinkProperties properties = connectivity.getLinkProperties(network);
+            if (properties == null || properties.getInterfaceName() == null
+                    || properties.getInterfaceName().isEmpty()) continue;
+            NetworkInterface networkInterface = NetworkInterface.getByName(properties.getInterfaceName());
+            if (networkInterface == null || !networkInterface.isUp() || networkInterface.isLoopback()) continue;
+            for (LinkAddress link : properties.getLinkAddresses()) {
+                InetAddress address = link.getAddress();
+                int prefixLength = link.getPrefixLength();
+                if (!isSelectableNetworkAddress(properties, address, prefixLength)
+                        || !isAssignedAddress(networkInterface, address, prefixLength)) continue;
+                boolean alreadyListed = false;
+                for (AvailableNetwork existing : result)
+                    if (address.equals(existing.address) && prefixLength == existing.prefixLength) {
+                        alreadyListed = true;
+                        break;
+                    }
+                if (!alreadyListed) result.add(new AvailableNetwork(network, properties.getInterfaceName(),
+                        networkInterface.getIndex(), address, prefixLength));
+            }
+        }
+        return result;
+    }
+
+    private static boolean isAssignedAddress(NetworkInterface networkInterface, InetAddress address,
+            int prefixLength) {
+        for (java.net.InterfaceAddress item : networkInterface.getInterfaceAddresses())
+            if (address.equals(item.getAddress()) && prefixLength == item.getNetworkPrefixLength()) return true;
+        return false;
+    }
+
+    private static boolean isSelectableNetworkAddress(LinkProperties properties, InetAddress address,
+            int prefixLength) {
+        if (properties == null || properties.getInterfaceName() == null
+                || properties.getInterfaceName().isEmpty()
+                || !(address instanceof Inet4Address) || !address.isSiteLocalAddress()
+                || prefixLength < 1 || prefixLength > 32) return false;
+        for (LinkAddress link : properties.getLinkAddresses())
+            if (address.equals(link.getAddress()) && prefixLength == link.getPrefixLength()) return true;
         return false;
     }
 
     private Network findNetworkForInterface(InetAddress address, int prefixLength) throws IOException {
-        NetworkInterface selected = NetworkInterface.getByInetAddress(address);
-        ConnectivityManager connectivity = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        if (selected == null || !selected.isUp() || connectivity == null)
-            throw new IOException("所选网络接口已不可用，请重新选择。");
-        for (Network network : connectivity.getAllNetworks()) {
-            LinkProperties properties = connectivity.getLinkProperties(network);
-            if (properties == null || !selected.getName().equals(properties.getInterfaceName())) continue;
-            for (LinkAddress link : properties.getLinkAddresses()) {
-                if (address.equals(link.getAddress()) && link.getPrefixLength() == prefixLength)
-                    return network;
-            }
+        if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress()
+                || prefixLength < 1 || prefixLength > 32)
+            throw new IOException("所选 Android 网络已不可用或发生变化。");
+        try {
+            for (AvailableNetwork available : availableNetworks(this))
+                if (address.equals(available.address) && prefixLength == available.prefixLength)
+                    return available.network;
+        } catch (SocketException unavailable) {
+            throw new IOException("所选 Android 网络已不可用或发生变化。", unavailable);
         }
         throw new IOException("所选 Android 网络已不可用或发生变化。");
+    }
+
+    boolean isNetworkForInterface(Network network, InetAddress address, int prefixLength)
+            throws IOException {
+        try {
+            for (AvailableNetwork available : availableNetworks(this))
+                if (network.equals(available.network) && address.equals(available.address)
+                        && prefixLength == available.prefixLength) return true;
+            return false;
+        } catch (SocketException unavailable) {
+            throw new IOException("Connectivity service unavailable", unavailable);
+        }
+    }
+
+    boolean clearNetworkSelectionFailure(String address, int prefixLength) {
+        if (currentAudio != null || networkCoordinator != null || !uiOperation.canBegin()) return false;
+        String ownerId = uiOperation.ownerId();
+        String error = uiOperation.error();
+        if (!isNetworkSelectionFailure(error)) return false;
+        try { findNetworkForInterface(parseIpv4(address), prefixLength); }
+        catch (IOException unavailable) { return false; }
+        synchronized (networkCoordinatorLock) {
+            if (currentAudio != null || networkCoordinator != null || !uiOperation.canBegin()
+                    || !uiOperation.clearFailure(ownerId, error)) return false;
+            networkAudioState = "stopped";
+            networkAudioFailure = "";
+            startFailure = "";
+            return true;
+        }
+    }
+
+    private static boolean isNetworkSelectionFailure(String error) {
+        return "InvalidReceiverInterface".equals(error)
+                || "ReceiveInterfaceChanged".equals(error)
+                || "ReceiveInterfaceUnavailable".equals(error)
+                || "所选 Android 网络已不可用或发生变化。".equals(error)
+                || "所选网络接口已不可用，请重新选择。".equals(error);
     }
 
     private static InetAddress parseIpv4(String text) throws IOException {
@@ -1244,44 +1944,686 @@ public final class ReceiverService extends Service {
 
     /** Internal pause hook: drop pending and incoming history without adding a control datagram. */
     private void setUdpAudioPaused(AudioSession session, boolean paused) throws IOException {
-        if (session == null || currentAudio != session || session.request.udpContext == null)
+        if (session == null || currentAudio != session || !session.request.usesPacketIngress())
             throw new IOException("NetworkAudioSessionNotOwned");
-        IOException failure = null;
+        PlaybackOutput output;
+        boolean shouldPause = false;
+        boolean shouldResume = false;
+        Exception pauseRequestFailure = null;
         synchronized (session) {
             ensureRunning(session);
             AudioFocusState.Action action = session.focusState.setUserPaused(paused);
             if (session.udpQueue != null) session.udpQueue.setPaused(!session.focusState.canPlay());
-            if (action == AudioFocusState.Action.PAUSE && session.audioTrack != null
+            if (session.floatQueue != null) session.floatQueue.setPaused(!session.focusState.canPlay());
+            output = session.playbackOutput;
+            if (action == AudioFocusState.Action.PAUSE && output != null
                     && (session.trackPlaying || !session.trackReady)) {
-                try { pauseAndFlushTrack(session, session.audioTrack); }
-                catch (RuntimeException error) {
-                    session.focusState.cancel();
-                    failure = new IOException("AudioPauseFailed: " + describeFailure(error), error);
+                shouldPause = true;
+                if (session.playbackOutput == output) {
+                    try { output.requestPause(); }
+                    catch (IOException | RuntimeException error) { pauseRequestFailure = error; }
                 }
             } else if (!paused && session.trackReady && !session.trackPlaying
-                    && session.audioTrack != null && session.focusState.canPlay()) {
-                try {
-                    session.audioTrack.play();
-                    session.trackPlaying = true;
-                    session.focusState.markTrackPlaying();
-                    synchronized (STATUS_LOCK) {
-                        if (statusAudioId == session.id) audioActive = true;
-                    }
-                } catch (IllegalStateException error) {
-                    throw new IOException("AudioTrack resume failed", error);
-                }
+                    && output != null && session.focusState.canPlay()) {
+                shouldResume = true;
             }
             session.notifyAll();
         }
-        if (failure != null) {
+        try {
+            if (shouldPause) {
+                if (pauseRequestFailure instanceof IOException) throw (IOException) pauseRequestFailure;
+                if (pauseRequestFailure instanceof RuntimeException) throw (RuntimeException) pauseRequestFailure;
+                pauseAndFlushOutput(session, output);
+            } else if (shouldResume) {
+                synchronized (session) {
+                    if (session.playbackOutput == output && session.focusState.canPlay())
+                        {
+                            String failure = resumeFocusedOutput(session, output);
+                            if (!failure.isEmpty()) throw new IOException(failure);
+                        }
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            if (!noteOboeRuntimeFailureIfActive(session, output, error)) return;
+            session.focusState.cancel();
+            IOException failure = new IOException("Audio pause/resume failed: " + describeFailure(error), error);
             cancelAudio(session, failure.getMessage());
             throw failure;
         }
     }
 
-    private void receiveAudio(AudioSession session) {
+    private void receiveFloatAudio(AudioSession session) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
+        PlaybackOutput output = null;
+        AudioManager manager = null;
+        AudioFocusRequest focusRequest = null;
+        AudioManager.OnAudioFocusChangeListener focusListener = null;
+        FloatPcmFrameQueue queue = null;
+        UdpReceiver receiver = null;
+        Thread networkThread = null;
+        WifiManager.WifiLock wifiLock = null;
+        String failure = "";
+        try {
+            UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.formatV2();
+            if (!supportsPcm24AudioFormatV2(sourceFormat))
+                throw new IOException("Unsupported audio format for high-resolution playback");
+            ensureRunning(session);
+            boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.playbackMode);
+            if (session.request.aoaContext != null) {
+                queue = session.request.aoaContext.floatQueue;
+                if (queue == null) throw new IOException("AOA Float queue missing");
+                synchronized (session) {
+                    ensureRunning(session);
+                    queue.setPaused(!session.focusState.canPlay());
+                }
+            } else {
+                WifiManager wifi = getSystemService(WifiManager.class);
+                if (wifi == null) throw new IOException("WiFi service unavailable");
+                int wifiMode = Build.VERSION.SDK_INT >= 29
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+                wifiLock.acquire();
+                queue = new FloatPcmFrameQueue(sourceFormat.sampleRate, lowLatency);
+                receiver = new UdpReceiver(session.request.udpContext, queue);
+                UdpReceiver receiverForThread = receiver;
+                networkThread = new Thread(() -> {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+                    receiverForThread.run();
+                }, "AnPod Float32 UDP packet receiver");
+                synchronized (session) {
+                    ensureRunning(session);
+                    session.floatQueue = queue;
+                    queue.setPaused(!session.focusState.canPlay());
+                    session.udpReceiver = receiver;
+                    session.networkThread = networkThread;
+                    networkThread.start();
+                }
+            }
+
+            output = openOboeOutputIfRequested(session, sourceFormat.sampleRate, sourceFormat.channels,
+                    lowLatency, Math.max(1, sourceFormat.sampleRate / 200));
+            OpenedV2Track openedTrack = null;
+            if (output == null) {
+                openedTrack = openV2AudioTrack(sourceFormat.sampleRate, AudioFormat.CHANNEL_OUT_STEREO);
+                output = new AudioTrackPlaybackOutput(openedTrack.track, openedTrack.formatCode, openedTrack.frameBytes);
+                recordOutputOpened(session, output);
+            }
+            track = output.audioTrack();
+            synchronized (session) {
+                ensureRunning(session);
+                session.playbackOutput = output;
+                session.audioTrack = track;
+                session.trackWrittenFrames = 0;
+                if (track != null) session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
+                session.openedTrackFormatV2 = output.formatCode();
+                session.openedTrackChannelsV2 = output.channels();
+                session.openedTrackSampleRateV2 = output.sampleRate();
+            }
+
+            int capacityFrames;
+            int requestedBufferFrames;
+            int acceptedBufferFrames;
+            int effectiveFrames;
+            int thresholdFrames;
+            String configuredMode;
+            if (track != null) {
+                capacityFrames = output.capacityFrames();
+                requestedBufferFrames = Pcm16FrameStream.requestedAudioTrackBufferFrames(
+                        sourceFormat.sampleRate, Math.max(1, capacityFrames), lowLatency);
+                acceptedBufferFrames = Build.VERSION.SDK_INT >= 24
+                        ? track.setBufferSizeInFrames(requestedBufferFrames) : -1;
+                effectiveFrames = output.effectiveBufferFrames();
+                int requestedStartFrames = 0;
+                boolean thresholdLimited = false;
+                thresholdFrames = -1;
+                if (Build.VERSION.SDK_INT >= 31 && lowLatency && acceptedBufferFrames >= 0) {
+                    requestedStartFrames = Math.min(acceptedBufferFrames, Math.max(1,
+                            sourceFormat.sampleRate * Pcm16FrameStream.LOW_LATENCY_START_THRESHOLD_MS / 1000));
+                    int acceptedStartFrames = track.setStartThresholdInFrames(requestedStartFrames);
+                    thresholdLimited = acceptedStartFrames < 0 || acceptedStartFrames != requestedStartFrames;
+                    thresholdFrames = output.startThresholdFrames();
+                }
+                configuredMode = acceptedBufferFrames < 0 ? "balanced-fallback"
+                        : acceptedBufferFrames == requestedBufferFrames && !thresholdLimited
+                                ? (lowLatency ? "low-latency" : "balanced")
+                                : (lowLatency ? "low-latency-limited" : "balanced-limited");
+                if (lowLatency && requestedStartFrames > 0 && thresholdFrames != requestedStartFrames)
+                    configuredMode = "low-latency-limited";
+            } else {
+                int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                        : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+                requestedBufferFrames = sourceFormat.sampleRate * budgetMs / 1000;
+                capacityFrames = output.capacityFrames();
+                acceptedBufferFrames = output.effectiveBufferFrames();
+                effectiveFrames = output.effectiveBufferFrames();
+                thresholdFrames = -1;
+                configuredMode = lowLatency ? "low-latency" : "balanced";
+            }
+            publishMode(session, configuredMode);
+            int minBufferFrames = openedTrack == null ? Math.max(1, sourceFormat.sampleRate / 200)
+                    : Math.max(1, (openedTrack.minBufferBytes + openedTrack.frameBytes - 1)
+                            / openedTrack.frameBytes);
+            int preRollFrames = lowLatency && thresholdFrames > 0
+                    ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
+            if (output instanceof OboePlaybackOutput) {
+                preRollFrames = Math.min(preRollFrames, output.ringCapacityFrames());
+                if (preRollFrames < output.framesPerBurst())
+                    throw new IOException("Oboe ring cannot hold one callback burst of pre-roll");
+                requestedBufferFrames = output.info()[11];
+                acceptedBufferFrames = output.effectiveBufferFrames();
+                effectiveFrames = output.effectiveBufferFrames();
+            }
+            publishMetrics(session, output.sampleRate(), output.channels(), capacityFrames,
+                    requestedBufferFrames, acceptedBufferFrames, effectiveFrames, thresholdFrames,
+                    output.underrunCount(), preRollFrames, configuredMode);
+            session.oboeXrunCount = output.oboeXrunCount();
+
+            int chunkFrames = Math.max(1, sourceFormat.sampleRate / 200);
+            float[] samples = new float[(chunkFrames + 1) * sourceFormat.channels];
+            byte[] packed = openedTrack != null && openedTrack.formatCode == 2
+                    ? new byte[(chunkFrames + 1) * openedTrack.frameBytes] : null;
+            manager = getSystemService(AudioManager.class);
+            final AudioSession focusSession = session;
+            final PlaybackOutput focusOutput = output;
+            focusListener = change -> handler.post(() ->
+                    handleAudioFocusChange(focusSession, focusOutput, change));
+            boolean focusRequested = false;
+            while (true) {
+                V2PreRollProgress preRoll = new V2PreRollProgress(session.focusState.writeGeneration());
+                while (preRoll.completedFrames() < preRollFrames) {
+                    ensureRunning(session);
+                    long blockGeneration = session.focusState.writeGeneration();
+                    preRoll.observeGeneration(blockGeneration);
+                    int count = readFloatFrames(queue, samples,
+                            Math.min(chunkFrames, preRollFrames - preRoll.completedFrames()));
+                    if (count < 0) throw new IOException("FloatAudioStreamEndedBeforePlayback");
+                    boolean complete = writeV2Frames(session, output, samples, count, packed,
+                            blockGeneration);
+                    long currentGeneration = session.focusState.writeGeneration();
+                    preRoll.recordWrite(blockGeneration, currentGeneration, count, complete);
+                }
+                publishPreRollFrames(session, preRoll.completedFrames());
+                synchronized (session) {
+                    ensureRunning(session);
+                    if (session.focusState.writeGeneration() != preRoll.generation()) continue;
+                    if (!focusRequested) {
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                                    .setWillPauseWhenDucked(true).setOnAudioFocusChangeListener(focusListener).build();
+                            if (manager.requestAudioFocus(focusRequest) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+                                throw new IOException("Audio focus denied");
+                        } else if (manager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
+                                AudioManager.AUDIOFOCUS_GAIN) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                            throw new IOException("Audio focus denied");
+                        }
+                        focusRequested = true;
+                    }
+                    ensureRunning(session);
+                    session.trackReady = true;
+                    if (session.focusState.canPlay()) {
+                        output.play();
+                        if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                            throw new IOException("AudioTrack did not start");
+                        session.trackPlaying = true;
+                        session.focusState.markTrackPlaying();
+                    }
+                    synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) audioActive = session.focusState.canPlay();
+                    }
+                }
+                break;
+            }
+
+            FloatPcmDriftController drift = new FloatPcmDriftController(sourceFormat.sampleRate,
+                    queue.initialTargetFrames());
+            long driftNow = System.nanoTime();
+            drift.reset(driftNow);
+            long initialPlaybackHead = output.playbackHeadPosition();
+            if (initialPlaybackHead >= 0) session.driftPlaybackHead.reset((int) initialPlaybackHead, driftNow);
+            long observedDriftResetGeneration = session.driftResetGeneration;
+            long observedConcealedFrames = queue.concealedFrames();
+            long observedDroppedFrames = queue.droppedFrames();
+            long observedExpiredFrames = queue.expiredFrames();
+            long observedOversizedGapSkips = queue.oversizedGapSkips();
+            int observedUnderruns = output.discontinuityCount();
+            session.oboeXrunCount = output.oboeXrunCount();
+
+            while (true) {
+                ensureRunning(session);
+                awaitFocusResume(session);
+                long blockGeneration = session.focusState.writeGeneration();
+                int count = readFloatFrames(queue, samples, chunkFrames);
+                if (count < 0) {
+                    failure = "FloatAudioStreamEnded";
+                    break;
+                }
+                if (!session.focusState.acceptsWrite(blockGeneration)) continue;
+                long nowNanos = System.nanoTime();
+                long playbackPosition = output.playbackHeadPosition();
+                long playedFrames = playbackPosition < 0 ? 0
+                        : session.driftPlaybackHead.update((int) playbackPosition, nowNanos);
+                long concealedFrames = queue.concealedFrames();
+                long droppedFrames = queue.droppedFrames();
+                long expiredFrames = queue.expiredFrames();
+                long oversizedGapSkips = queue.oversizedGapSkips();
+                int underrunsBefore = output.discontinuityCount();
+                session.oboeXrunCount = output.oboeXrunCount();
+                boolean discontinuity = concealedFrames != observedConcealedFrames
+                        || droppedFrames != observedDroppedFrames
+                        || expiredFrames != observedExpiredFrames
+                        || oversizedGapSkips != observedOversizedGapSkips
+                        || (observedUnderruns >= 0 && underrunsBefore >= 0
+                                && observedUnderruns != underrunsBefore)
+                        || observedDriftResetGeneration != session.driftResetGeneration;
+                boolean playing = session.trackPlaying
+                        && (playbackPosition < 0 || session.driftPlaybackHead.isAdvancing(nowNanos))
+                        && concealedFrames == observedConcealedFrames;
+                long pendingFrames = output.pendingFrames(session.trackWrittenFrames, playedFrames);
+                long waterlineFrames = (long) queue.queuedFrames() + count + pendingFrames;
+                int adjustment = drift.observe(nowNanos, waterlineFrames, playing, discontinuity);
+                int outputFrames = count;
+                if (adjustment != 0 && (adjustment > 0 ? count >= 3 : count >= 2)) {
+                    outputFrames = queue.adjustDrift(samples, count, chunkFrames + 1, adjustment);
+                    drift.commit(adjustment);
+                }
+                writeV2Frames(session, output, samples, outputFrames, packed, blockGeneration);
+                observedDriftResetGeneration = session.driftResetGeneration;
+                observedConcealedFrames = concealedFrames;
+                observedDroppedFrames = droppedFrames;
+                observedExpiredFrames = expiredFrames;
+                observedOversizedGapSkips = oversizedGapSkips;
+                observedUnderruns = underrunsBefore;
+                int reportedUnderruns = output.underrunCount();
+                if (reportedUnderruns >= 0) {
+                    synchronized (STATUS_LOCK) {
+                        if (statusAudioId == session.id) {
+                            underrunIncrement = underrunCount < 0 || reportedUnderruns < underrunCount
+                                    ? -1 : reportedUnderruns - underrunCount;
+                            underrunCount = reportedUnderruns;
+                        }
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
+            failure = session.cancelled ? session.stopReason : describeFailure(error);
+        } finally {
+            session.trackPlaying = false;
+            String trackReleaseFailure = "";
+            synchronized (session) {
+                if (output != null) {
+                    try { output.close(); }
+                    catch (IOException | RuntimeException error) {
+                        noteOboeRuntimeFailure(session, error);
+                        try { output.close(); }
+                        catch (IOException | RuntimeException retryError) {
+                            error.addSuppressed(retryError);
+                            noteOboeRuntimeFailure(session, retryError);
+                            retainDeferredOboeClose(output);
+                            trackReleaseFailure = "Audio output close failed: " + describeFailure(error);
+                        }
+                    }
+                }
+                if (session.audioTrack == track) session.audioTrack = null;
+                if (session.playbackOutput == output) session.playbackOutput = null;
+                session.openedTrackFormatV2 = 0;
+                session.openedTrackChannelsV2 = 0;
+                session.openedTrackSampleRateV2 = 0;
+            }
+            String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
+            if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
+            if (!focusReleaseFailure.isEmpty()) failure = appendFailure(failure, focusReleaseFailure);
+            if (receiver != null) receiver.close();
+            if (queue != null) queue.stop();
+            if (wifiLock != null) {
+                try { if (wifiLock.isHeld()) wifiLock.release(); }
+                catch (RuntimeException error) { failure = appendFailure(failure, "WiFiLockRelease: " + describeFailure(error)); }
+            }
+            joinNetworkThread(networkThread);
+            session.request.destroy();
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) {
+                    audioActive = false;
+                    if (failure.isEmpty()) failure = session.stopReason.isEmpty() ? "AudioSessionEnded" : session.stopReason;
+                }
+            }
+            synchronized (session) {
+                if (session.udpReceiver == receiver) session.udpReceiver = null;
+                if (session.floatQueue == queue) session.floatQueue = null;
+                if (session.networkThread == networkThread) session.networkThread = null;
+            }
+            String finalFailure = failure;
+            handler.post(() -> finishAudio(session, finalFailure));
+        }
+    }
+
+    static boolean supportsPcm24AudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
+        return format != null && (format.profile == 2 && format.sampleRate == 48_000
+                || format.profile == 3 && format.sampleRate == 96_000)
+                && format.channels == 2 && format.sampleFormat == 2 && format.validBits == 24
+                && format.bytesPerSample == Pcm24PackedCodec.BYTES_PER_SAMPLE && format.frameBytes == 6;
+    }
+
+    String requestedOutputEnginePreference() {
+        String value = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
+                .getString("output_engine", "oboeExperimental");
+        return "oboeExperimental".equals(value) ? "oboeExperimental" : "audioTrack";
+    }
+
+    PlaybackOutput openOboeOutputIfRequested(AudioSession session, int sampleRate, int channels,
+            boolean lowLatency, int maxWriteFrames) {
+        if (!"oboeExperimental".equals(session.requestedOutputEngine)) return null;
+        boolean previousClosed = retryDeferredOboeClose();
+        String nextSessionReason;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            nextSessionReason = pendingOboeFallbackReason;
+            pendingOboeFallbackReason = "";
+        }
+        if (!nextSessionReason.isEmpty()) {
+            session.outputFallbackReason = nextSessionReason;
+            return null;
+        }
+        if (!previousClosed) {
+            session.outputFallbackReason = "Previous Oboe stream has not closed; using AudioTrack";
+            return null;
+        }
+        int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+        int totalBudgetFrames = sampleRate * budgetMs / 1000;
+        try {
+            PlaybackOutput output = OboePlaybackOutput.open(sampleRate, channels, totalBudgetFrames, maxWriteFrames);
+            session.playbackOutput = output;
+            session.actualOutputEngine = output.engine();
+            session.outputFallbackReason = "";
+            return output;
+        } catch (IOException | RuntimeException | UnsatisfiedLinkError error) {
+            session.outputFallbackReason = describeFailure(error);
+            return null;
+        }
+    }
+
+    private static boolean retryDeferredOboeClose() {
+        OboePlaybackOutput deferred;
+        synchronized (OBOE_OUTPUT_LOCK) { deferred = deferredOboeClose; }
+        if (deferred == null) return true;
+        try {
+            deferred.close();
+            synchronized (OBOE_OUTPUT_LOCK) {
+                if (deferredOboeClose == deferred) deferredOboeClose = null;
+            }
+            return true;
+        } catch (IOException | RuntimeException error) {
+            return false;
+        }
+    }
+
+    static void retainDeferredOboeClose(PlaybackOutput output) {
+        if (!(output instanceof OboePlaybackOutput)) return;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            if (deferredOboeClose == null) deferredOboeClose = (OboePlaybackOutput) output;
+        }
+    }
+
+    static void noteOboeRuntimeFailure(AudioSession session, Throwable error) {
+        if (!(error instanceof OboeOutputException)
+                || !"oboeExperimental".equals(session.actualOutputEngine)) return;
+        String reason = describeFailure((Exception) error);
+        session.outputFallbackReason = reason;
+        synchronized (OBOE_OUTPUT_LOCK) {
+            if (pendingOboeFallbackReason.isEmpty()) pendingOboeFallbackReason = reason;
+        }
+    }
+
+    private static boolean noteOboeRuntimeFailureIfActive(AudioSession session, PlaybackOutput output,
+            Throwable error) {
+        synchronized (session) {
+            if (currentAudio != session || session.cancelled || session.playbackOutput != output) return false;
+            noteOboeRuntimeFailure(session, error);
+            return true;
+        }
+    }
+
+    static String pendingOboeFallbackReasonForUi() {
+        synchronized (OBOE_OUTPUT_LOCK) { return pendingOboeFallbackReason; }
+    }
+
+    static void recordOutputOpened(AudioSession session, PlaybackOutput output) {
+        session.playbackOutput = output;
+        session.audioTrack = output.audioTrack();
+        session.actualOutputEngine = output.engine();
+    }
+
+    static OpenedV2Track openV2AudioTrack(int sampleRate, int channelMask) throws IOException {
+        return chooseV2AudioTrack(Build.VERSION.SDK_INT, sampleRate, channelMask,
+                ReceiverService::buildV2AudioTrack);
+    }
+
+    interface V2TrackOpener {
+        OpenedV2Track open(int sampleRate, int channelMask, int encoding, int formatCode) throws IOException;
+    }
+
+    static OpenedV2Track chooseV2AudioTrack(int sdk, int sampleRate, int channelMask,
+            V2TrackOpener opener) throws IOException {
+        IOException packed24Failure = null;
+        if (sdk >= 31) {
+            try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_24BIT_PACKED, 2); }
+            catch (IOException | RuntimeException error) {
+                packed24Failure = error instanceof IOException
+                        ? (IOException) error : new IOException("Packed PCM24 AudioTrack could not be opened", error);
+            }
+        }
+        try { return opener.open(sampleRate, channelMask, AudioFormat.ENCODING_PCM_FLOAT, 3); }
+        catch (IOException | RuntimeException floatFailure) {
+            IOException failure = new IOException("Neither packed PCM24 nor Float32 AudioTrack is supported", floatFailure);
+            if (packed24Failure != null) failure.addSuppressed(packed24Failure);
+            throw failure;
+        }
+    }
+
+    private static OpenedV2Track buildV2AudioTrack(int sampleRate, int channelMask, int encoding, int formatCode)
+            throws IOException {
+        int minBufferBytes;
+        try { minBufferBytes = AudioTrack.getMinBufferSize(sampleRate, channelMask, encoding); }
+        catch (RuntimeException error) { throw new IOException("AudioTrack format probe failed", error); }
+        if (minBufferBytes <= 0) throw new IOException("AudioTrack format is unsupported: " + encoding);
+        AudioTrack track = null;
+        try {
+            AudioTrack.Builder builder = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setAudioFormat(new AudioFormat.Builder().setEncoding(encoding)
+                            .setSampleRate(sampleRate).setChannelMask(channelMask).build())
+                    .setBufferSizeInBytes(minBufferBytes * 2).setTransferMode(AudioTrack.MODE_STREAM);
+            if (Build.VERSION.SDK_INT >= 26) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+            track = builder.build();
+            if (track.getState() != AudioTrack.STATE_INITIALIZED || track.getAudioFormat() != encoding)
+                throw new IOException("AudioTrack initialized with a different format");
+            int channels = track.getChannelCount();
+            if (channels != 2) throw new IOException("AudioTrack did not open stereo output");
+            if (track.getSampleRate() != sampleRate)
+                throw new IOException("AudioTrack opened a different sample rate");
+            int frameBytes = channels * (encoding == AudioFormat.ENCODING_PCM_FLOAT ? 4 : 3);
+            return new OpenedV2Track(track, formatCode, minBufferBytes, frameBytes);
+        } catch (IOException | RuntimeException error) {
+            releaseTrack(track);
+            if (error instanceof IOException) throw (IOException) error;
+            throw new IOException("AudioTrack format could not be opened: " + encoding, error);
+        }
+    }
+
+    static final class OpenedV2Track {
+        final AudioTrack track;
+        final int formatCode;
+        final int minBufferBytes;
+        final int frameBytes;
+        OpenedV2Track(AudioTrack track, int formatCode, int minBufferBytes, int frameBytes) {
+            this.track = track;
+            this.formatCode = formatCode;
+            this.minBufferBytes = minBufferBytes;
+            this.frameBytes = frameBytes;
+        }
+    }
+
+    private static int readFloatFrames(FloatPcmFrameQueue queue, float[] samples, int maxFrames) throws IOException {
+        try { return queue.readFrames(samples, 0, maxFrames); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Float32 playback worker interrupted", interrupted);
+        }
+    }
+
+    boolean writeV2Frames(AudioSession session, AudioTrack track, OpenedV2Track openedTrack,
+            float[] samples, int frameCount, byte[] packed, long generation) throws IOException {
+        if (frameCount <= 0) return true;
+        return writeV2WithGeneration(session.focusState, generation, frameCount, (offsetFrames, remainingFrames) -> {
+            ensureRunning(session);
+            int writtenFrames;
+            int writtenBytes;
+            if (openedTrack.formatCode == 2) {
+                Pcm24PackedCodec.encodeFromFloat(samples, offsetFrames * 2, remainingFrames * 2,
+                        packed, 0);
+                int written = track.write(packed, 0, remainingFrames * openedTrack.frameBytes,
+                        AudioTrack.WRITE_BLOCKING);
+                if (written <= 0) throw new IOException("AudioTrack packed PCM24 write failed: " + written);
+                if (written % openedTrack.frameBytes != 0)
+                    throw new IOException("AudioTrack returned a partial packed PCM24 frame");
+                writtenBytes = written;
+                writtenFrames = written / openedTrack.frameBytes;
+            } else {
+                int written = track.write(samples, offsetFrames * 2, remainingFrames * 2,
+                        AudioTrack.WRITE_BLOCKING);
+                if (written <= 0) throw new IOException("AudioTrack Float32 write failed: " + written);
+                if (written % 2 != 0) throw new IOException("AudioTrack returned a partial Float32 frame");
+                writtenBytes = written * Float.BYTES;
+                writtenFrames = written / 2;
+            }
+            synchronized (session) {
+                if (!session.focusState.acceptsWrite(generation)) return writtenFrames;
+                ensureRunning(session);
+                session.trackWrittenFrames += writtenFrames;
+                PCM_BYTES_WRITTEN.addAndGet(writtenBytes);
+                session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+            }
+            WAVEFORM.accept(samples, offsetFrames * 2, writtenFrames, 2, System.nanoTime());
+            return writtenFrames;
+        });
+    }
+
+    boolean writeV2Frames(AudioSession session, PlaybackOutput output, float[] samples,
+            int frameCount, byte[] packed, long generation) throws IOException {
+        if (frameCount <= 0) return true;
+        if (output instanceof OboePlaybackOutput) {
+            int offset = 0;
+            while (offset < frameCount) {
+                ensureRunning(session);
+                if (!session.focusState.acceptsWrite(generation)) return false;
+                int written = output.writeFloatFrames(samples, offset, frameCount - offset, packed);
+                if (written < 0 || written > frameCount - offset)
+                    throw new IOException("Oboe returned an invalid partial frame count: " + written);
+                if (written == 0) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(250_000L);
+                    if (Thread.currentThread().isInterrupted())
+                        throw new IOException("Oboe output write interrupted");
+                    continue;
+                }
+                synchronized (session) {
+                    if (!session.focusState.acceptsWrite(generation)) return false;
+                    ensureRunning(session);
+                    session.trackWrittenFrames += written;
+                    PCM_BYTES_WRITTEN.addAndGet(written * output.channels() * Float.BYTES);
+                    session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+                }
+                WAVEFORM.accept(samples, offset * output.channels(), written, output.channels(), System.nanoTime());
+                offset += written;
+                if (!session.focusState.acceptsWrite(generation)) return false;
+            }
+            return true;
+        }
+        return writeV2WithGeneration(session.focusState, generation, frameCount, (offsetFrames, remainingFrames) -> {
+            ensureRunning(session);
+            int writtenFrames = output.writeFloatFrames(samples, offsetFrames, remainingFrames, packed);
+            if (writtenFrames <= 0) throw new IOException("AudioTrack V2 write failed: " + writtenFrames);
+            synchronized (session) {
+                if (!session.focusState.acceptsWrite(generation)) return writtenFrames;
+                ensureRunning(session);
+                session.trackWrittenFrames += writtenFrames;
+                PCM_BYTES_WRITTEN.addAndGet(writtenFrames * output.channels()
+                        * (output.formatCode() == 2 ? 3 : Float.BYTES));
+                session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
+            }
+            WAVEFORM.accept(samples, offsetFrames * output.channels(), writtenFrames,
+                    output.channels(), System.nanoTime());
+            return writtenFrames;
+        });
+    }
+
+    interface V2PartialFrameWriter {
+        int write(int offsetFrames, int remainingFrames) throws IOException;
+    }
+
+    static final class V2PreRollProgress {
+        private long generation;
+        private int completedFrames;
+
+        V2PreRollProgress(long generation) { this.generation = generation; }
+
+        void observeGeneration(long currentGeneration) {
+            if (currentGeneration != generation) {
+                generation = currentGeneration;
+                completedFrames = 0;
+            }
+        }
+
+        void recordWrite(long blockGeneration, long currentGeneration, int frames, boolean complete) {
+            if (blockGeneration != generation || currentGeneration != generation) {
+                generation = currentGeneration;
+                completedFrames = 0;
+            } else if (complete) {
+                completedFrames += frames;
+            }
+        }
+
+        long generation() { return generation; }
+        int completedFrames() { return completedFrames; }
+    }
+
+    static boolean writeV2WithGeneration(AudioFocusState focusState, long generation, int frameCount,
+            V2PartialFrameWriter writer) throws IOException {
+        int offset = 0;
+        while (offset < frameCount) {
+            if (!focusState.acceptsWrite(generation)) return false;
+            int writtenFrames = writer.write(offset, frameCount - offset);
+            if (writtenFrames <= 0 || writtenFrames > frameCount - offset)
+                throw new IOException("AudioTrack returned an invalid partial frame count");
+            offset += writtenFrames;
+            if (!focusState.acceptsWrite(generation)) return false;
+        }
+        return true;
+    }
+
+    private static void joinNetworkThread(Thread networkThread) {
+        if (networkThread == null || networkThread == Thread.currentThread()) return;
+        boolean interrupted = Thread.interrupted();
+        while (networkThread.isAlive()) {
+            try { networkThread.join(); }
+            catch (InterruptedException ignored) { interrupted = true; }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private void receiveAudio(AudioSession session) {
+        if (!retryDeferredOboeClose())
+            session.outputFallbackReason = "Previous Oboe stream has not closed; retaining AudioTrack output";
+        if (session.request.usesFloatV2Worker()) {
+            receiveFloatAudio(session);
+            return;
+        }
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+        AudioTrack track = null;
+        PlaybackOutput output = null;
         AudioManager manager = null;
         AudioFocusRequest focusRequest = null;
         AudioManager.OnAudioFocusChangeListener focusListener = null;
@@ -1292,32 +2634,41 @@ public final class ReceiverService extends Service {
         String failure = "";
         try {
             ensureRunning(session);
-            LocalSocket ownedSocket = session.request.udpContext == null ? new LocalSocket() : null;
+            LocalSocket ownedSocket = session.request.usesPacketIngress() ? null : new LocalSocket();
             try (ownedSocket) {
                 InputStream input;
                 UdpPcmQueue.QueueInputStream udpPcmInput = null;
-                if (ownedSocket == null) {
-                    WifiManager wifi = getSystemService(WifiManager.class);
-                    if (wifi == null) throw new IOException("WiFi service unavailable");
-                    int wifiMode = Build.VERSION.SDK_INT >= 29
-                            ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-                    wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
-                    wifiLock.acquire();
-                    udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
-                            session.request.udpContext.playbackMode);
-                    udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
-                    UdpReceiver receiverForThread = udpReceiver;
-                    networkThread = new Thread(() -> {
-                        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
-                        receiverForThread.run();
-                    }, "AnPod UDP packet receiver");
-                    synchronized (session) {
-                        ensureRunning(session);
-                        session.udpQueue = udpQueue;
-                        udpQueue.setPaused(!session.focusState.canPlay());
-                        session.udpReceiver = udpReceiver;
-                        session.networkThread = networkThread;
-                        networkThread.start();
+                if (session.request.usesPacketIngress()) {
+                    if (session.request.aoaContext != null) {
+                        udpQueue = session.request.aoaContext.pcmQueue;
+                        if (udpQueue == null) throw new IOException("AOA PCM16 queue missing");
+                        synchronized (session) {
+                            ensureRunning(session);
+                            udpQueue.setPaused(!session.focusState.canPlay());
+                        }
+                    } else {
+                        WifiManager wifi = getSystemService(WifiManager.class);
+                        if (wifi == null) throw new IOException("WiFi service unavailable");
+                        int wifiMode = Build.VERSION.SDK_INT >= 29
+                                ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                        wifiLock = wifi.createWifiLock(wifiMode, "AnPod:UdpPlayback");
+                        wifiLock.acquire();
+                        udpQueue = new UdpPcmQueue(session.request.udpContext.parameters,
+                                session.request.udpContext.playbackMode);
+                        udpReceiver = new UdpReceiver(session.request.udpContext, udpQueue);
+                        UdpReceiver receiverForThread = udpReceiver;
+                        networkThread = new Thread(() -> {
+                            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
+                            receiverForThread.run();
+                        }, "AnPod UDP packet receiver");
+                        synchronized (session) {
+                            ensureRunning(session);
+                            session.udpQueue = udpQueue;
+                            udpQueue.setPaused(!session.focusState.canPlay());
+                            session.udpReceiver = udpReceiver;
+                            session.networkThread = networkThread;
+                            networkThread.start();
+                        }
                     }
                     udpPcmInput = (UdpPcmQueue.QueueInputStream) udpQueue.asPcmInputStream();
                     input = udpPcmInput;
@@ -1343,6 +2694,9 @@ public final class ReceiverService extends Service {
                 int minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
                 if (minBuffer <= 0) throw new IOException("Unsupported AudioTrack format");
                 int frameBytes = channels * 2;
+                boolean lowLatency = "lowlatency".equalsIgnoreCase(session.request.playbackMode);
+                int maxWriteFrames = Math.max(1, sampleRate / 50);
+                output = openOboeOutputIfRequested(session, sampleRate, channels, lowLatency, maxWriteFrames);
                 int capacityFrames;
                 int requestedBufferFrames = -1;
                 int acceptedBufferFrames = -1;
@@ -1350,7 +2704,7 @@ public final class ReceiverService extends Service {
                 boolean startThresholdRequestLimited = false;
                 String configuredMode;
                 int minBufferFrames = Math.max(1, (minBuffer + frameBytes - 1) / frameBytes);
-                synchronized (session) {
+                if (output == null) synchronized (session) {
                     ensureRunning(session);
                     AudioTrack.Builder builder = new AudioTrack.Builder()
                             .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
@@ -1362,6 +2716,8 @@ public final class ReceiverService extends Service {
                     track = builder.build();
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) throw new IOException("AudioTrack initialization failed");
                     session.audioTrack = track;
+                    output = new AudioTrackPlaybackOutput(track, 1, frameBytes);
+                    recordOutputOpened(session, output);
                     session.trackWrittenFrames = 0;
                     session.playbackActivity.resetPlaybackHead(track.getPlaybackHeadPosition());
                     capacityFrames = Build.VERSION.SDK_INT >= 24
@@ -1406,6 +2762,21 @@ public final class ReceiverService extends Service {
                         configuredMode = "balanced-limited";
                     }
                     publishMode(session, configuredMode);
+                } else {
+                    recordOutputOpened(session, output);
+                    session.trackWrittenFrames = 0;
+                    capacityFrames = output.capacityFrames();
+                    int budgetMs = lowLatency ? Pcm16FrameStream.LOW_LATENCY_AUDIO_TRACK_BUFFER_MS
+                            : Pcm16FrameStream.BALANCED_AUDIO_TRACK_BUFFER_MS;
+                    requestedBufferFrames = sampleRate * budgetMs / 1000;
+                    acceptedBufferFrames = output.effectiveBufferFrames();
+                    configuredMode = lowLatency ? "low-latency" : "balanced";
+                    publishMode(session, configuredMode);
+                }
+                if (session.request.formatV2() != null) {
+                    session.openedTrackFormatV2 = output.formatCode();
+                    session.openedTrackChannelsV2 = output.channels();
+                    session.openedTrackSampleRateV2 = output.sampleRate();
                 }
 
                 int driftReserveFrames = Pcm16FrameStream.driftReserveFrames(sampleRate);
@@ -1416,27 +2787,36 @@ public final class ReceiverService extends Service {
                 Pcm16FrameStream pcm = new Pcm16FrameStream(channels);
                 boolean lowLatencyBacklog = currentMode(session).startsWith("low-latency");
                 int backlogTargetFrames = Pcm16FrameStream.backlogTargetFrames(
-                        track.getSampleRate(), lowLatencyBacklog);
+                        output.sampleRate(), lowLatencyBacklog);
                 int driftReadTargetFrames = udpQueue == null ? backlogTargetFrames
-                        : Math.max(1, track.getSampleRate() / 200);
+                        : Math.max(1, output.sampleRate() / 200);
                 int driftReadLimitBytes = Math.min(buffer.length - driftReserveBytes,
                         driftReadTargetFrames * frameBytes);
                 driftReadLimitBytes -= driftReadLimitBytes % frameBytes;
                 driftReadLimitBytes = Math.max(frameBytes, driftReadLimitBytes);
-                int effectiveFrames = track.getBufferSizeInFrames();
-                int thresholdFrames = Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
+                int effectiveFrames = output.effectiveBufferFrames();
+                int thresholdFrames = output.startThresholdFrames();
                 int preRollFrames = currentMode(session).startsWith("low-latency") && thresholdFrames > 0
                         ? Math.min(effectiveFrames, thresholdFrames) : Math.min(effectiveFrames, minBufferFrames);
-                publishMetrics(session, track.getSampleRate(), track.getChannelCount(), capacityFrames, requestedBufferFrames,
+                if (output instanceof OboePlaybackOutput) {
+                    preRollFrames = Math.min(preRollFrames, output.ringCapacityFrames());
+                    if (preRollFrames < output.framesPerBurst())
+                        throw new IOException("Oboe ring cannot hold one callback burst of pre-roll");
+                    requestedBufferFrames = output.info()[11];
+                    acceptedBufferFrames = output.effectiveBufferFrames();
+                    effectiveFrames = output.effectiveBufferFrames();
+                }
+                publishMetrics(session, output.sampleRate(), output.channels(), capacityFrames, requestedBufferFrames,
                         acceptedBufferFrames, effectiveFrames, thresholdFrames,
-                        Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1, preRollFrames, currentMode(session));
+                        output.underrunCount(), preRollFrames, currentMode(session));
+                session.oboeXrunCount = output.oboeXrunCount();
                 if (udpQueue != null) {
                     udpQueue.configureAudioTrack(preRollFrames);
                 } else {
                     int backlogTriggerFrames = Pcm16FrameStream.backlogTriggerFrames(
-                            track.getSampleRate(), lowLatencyBacklog);
+                            output.sampleRate(), lowLatencyBacklog);
                     pcm.setBacklogLimit(backlogTargetFrames, backlogTriggerFrames,
-                            (track.getSampleRate() * 3 + 999) / 1000);
+                            (output.sampleRate() * 3 + 999) / 1000);
                     synchronized (STATUS_LOCK) {
                         if (statusAudioId == session.id) tcpDroppedBacklogFrames = 0;
                     }
@@ -1445,19 +2825,22 @@ public final class ReceiverService extends Service {
                 int preRolled = 0;
                 while (preRolled < preRollBytes) {
                     ensureRunning(session);
+                    long blockGeneration = session.focusState.writeGeneration();
                     int count = pcm.readFrames(input, buffer, Math.min(buffer.length, preRollBytes - preRolled));
                     if (count < 0) throw new IOException("AudioStreamEndedBeforePlayback");
+                    if (!session.focusState.acceptsWrite(blockGeneration)) { preRolled = 0; continue; }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
-                    writeFrames(session, track, pcm, buffer, count, frameBytes);
-                    preRolled += count;
+                    if (writeFrames(session, output, pcm, buffer, count, frameBytes, blockGeneration))
+                        preRolled += count;
+                    else preRolled = 0;
                 }
                 publishPreRollFrames(session, preRolled / frameBytes);
 
                 manager = getSystemService(AudioManager.class);
                 final AudioSession focusSession = session;
-                final AudioTrack focusTrack = track;
+                final PlaybackOutput focusOutput = output;
                 focusListener = change -> handler.post(() ->
-                        handleAudioFocusChange(focusSession, focusTrack, change));
+                        handleAudioFocusChange(focusSession, focusOutput, change));
                 boolean driftStarted = false;
                 synchronized (session) {
                     ensureRunning(session);
@@ -1477,9 +2860,10 @@ public final class ReceiverService extends Service {
                     session.trackReady = true;
                     if (session.focusState.canPlay()) {
                         long driftStartNanos = System.nanoTime();
-                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), driftStartNanos);
-                        track.play();
-                        if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
+                        long playbackHead = output.playbackHeadPosition();
+                        if (playbackHead >= 0) session.driftPlaybackHead.reset((int) playbackHead, driftStartNanos);
+                        output.play();
+                        if (track != null && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                             throw new IOException("AudioTrack did not start");
                         session.trackPlaying = true;
                         session.focusState.markTrackPlaying();
@@ -1487,9 +2871,8 @@ public final class ReceiverService extends Service {
                     session.driftResetGeneration++;
                     if (session.trackPlaying) {
                         long driftStartNanos = System.nanoTime();
-                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
-                                ? track.getUnderrunCount() : -1;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        session.driftLastOutputDiscontinuities = output.discontinuityCount();
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), driftStartNanos);
                         driftStarted = true;
                     }
@@ -1510,11 +2893,11 @@ public final class ReceiverService extends Service {
                     long driftResetGeneration = session.driftResetGeneration;
                     long nowNanos = System.nanoTime();
                     if (driftResetGeneration != observedDriftResetGeneration) {
-                        driftObservedPlayedFrames = session.driftPlaybackHead.update(
-                                track.getPlaybackHeadPosition(), nowNanos);
-                        int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                        session.driftLastUnderruns = underruns;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        long head = output.playbackHeadPosition();
+                        if (head >= 0) driftObservedPlayedFrames = session.driftPlaybackHead.update((int) head, nowNanos);
+                        int underruns = output.discontinuityCount();
+                        session.driftLastOutputDiscontinuities = underruns;
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
                         observedDriftResetGeneration = driftResetGeneration;
                         driftNeedsRealAudio = false;
@@ -1522,11 +2905,11 @@ public final class ReceiverService extends Service {
                     }
                     if (!driftStarted) {
                         nowNanos = System.nanoTime();
-                        session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), nowNanos);
+                        long head = output.playbackHeadPosition();
+                        if (head >= 0) session.driftPlaybackHead.reset((int) head, nowNanos);
                         driftObservedPlayedFrames = 0;
-                        session.driftLastUnderruns = Build.VERSION.SDK_INT >= 24
-                                ? track.getUnderrunCount() : -1;
-                        pcm.beginDriftCorrection(track.getSampleRate(), udpQueue == null
+                        session.driftLastOutputDiscontinuities = output.discontinuityCount();
+                        pcm.beginDriftCorrection(output.sampleRate(), udpQueue == null
                                 ? backlogTargetFrames : udpQueue.targetFrames(), nowNanos);
                         driftStarted = true;
                     }
@@ -1545,17 +2928,20 @@ public final class ReceiverService extends Service {
                                     || udpExpiredBefore != observedUdpExpired
                                     || udpOversizedGapBefore != observedUdpOversizedGaps
                                     || udpPayloadGenerationBefore != observedUdpPayloadGeneration);
-                    session.driftPlaybackHead.update(track.getPlaybackHeadPosition(), nowNanos);
-                    int previousUnderruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                    boolean headAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
-                    boolean underrunBeforeRead = session.driftLastUnderruns >= 0 && previousUnderruns >= 0
-                            && previousUnderruns != session.driftLastUnderruns;
+                    long readHead = output.playbackHeadPosition();
+                    if (readHead >= 0) session.driftPlaybackHead.update((int) readHead, nowNanos);
+                    int previousUnderruns = output.discontinuityCount();
+                    boolean headAdvancing = readHead >= 0 && session.driftPlaybackHead.isAdvancing(nowNanos);
+                    boolean underrunBeforeRead = session.driftLastOutputDiscontinuities >= 0 && previousUnderruns >= 0
+                            && previousUnderruns != session.driftLastOutputDiscontinuities;
                     int sourceReadAdjustmentFrames = headAdvancing && !underrunBeforeRead
                             && !driftNeedsRealAudio
                                     ? pcm.driftReadFrameAdjustment(nowNanos) : 0;
                     int sourceReadLimitBytes = driftReadLimitBytes
                             + sourceReadAdjustmentFrames * frameBytes;
+                    long blockGeneration = session.focusState.writeGeneration();
                     int count = pcm.readFrames(input, buffer, sourceReadLimitBytes);
+                    if (!session.focusState.acceptsWrite(blockGeneration)) continue;
                     if ((sourceReadAdjustmentFrames != 0 || udpQueue != null) && count >= 0) {
                         int totalRead = count;
                         while (totalRead < sourceReadLimitBytes) {
@@ -1574,10 +2960,14 @@ public final class ReceiverService extends Service {
                     }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
                     nowNanos = System.nanoTime();
-                    int playbackPosition = track.getPlaybackHeadPosition();
-                    long playedFrames = session.driftPlaybackHead.update(playbackPosition, nowNanos);
-                    int underruns = Build.VERSION.SDK_INT >= 24 ? track.getUnderrunCount() : -1;
-                    boolean playbackAdvancing = session.driftPlaybackHead.isAdvancing(nowNanos);
+                    long playbackPosition = output.playbackHeadPosition();
+                    long playedFrames = playbackPosition < 0 ? driftObservedPlayedFrames
+                            : session.driftPlaybackHead.update((int) playbackPosition, nowNanos);
+                    int underruns = output.discontinuityCount();
+                    int trackUnderruns = output.underrunCount();
+                    session.oboeXrunCount = output.oboeXrunCount();
+                    boolean playbackAdvancing = playbackPosition >= 0
+                            && session.driftPlaybackHead.isAdvancing(nowNanos);
                     boolean headAdvanced = playedFrames > driftObservedPlayedFrames;
                     if (headAdvanced) driftObservedPlayedFrames = playedFrames;
                     boolean underrunChanged = previousUnderruns >= 0 && underruns >= 0
@@ -1614,11 +3004,17 @@ public final class ReceiverService extends Service {
                             ? backlogTargetFrames : udpQueue.targetFrames();
                     long sourceBufferedFrames = udpQueue == null
                             ? Math.max(0, input.available() / frameBytes) : udpQueue.sourceBufferedFrames();
-                    outputBytes = pcm.correctDrift(buffer, count, sourceBufferedFrames,
-                            Pcm16FrameStream.pendingFrames(session.trackWrittenFrames, playedFrames),
-                            driftSourceTargetFrames, nowNanos, playbackAdvancing,
-                            discontinuity || syntheticUdpBlock || driftNeedsRealAudio,
-                            readAdjustmentApplied ? sourceReadAdjustmentFrames : 0, headAdvanced);
+                    long pendingOutputFrames = output.pendingFrames(session.trackWrittenFrames, playedFrames);
+                    if (pendingOutputFrames < 0) {
+                        pcm.resetDriftCorrection();
+                        driftStarted = false;
+                        outputBytes = count;
+                    } else {
+                        outputBytes = pcm.correctDrift(buffer, count, sourceBufferedFrames,
+                                pendingOutputFrames, driftSourceTargetFrames, nowNanos, playbackAdvancing,
+                                discontinuity || syntheticUdpBlock || driftNeedsRealAudio,
+                                readAdjustmentApplied ? sourceReadAdjustmentFrames : 0, headAdvanced);
+                    }
                     if (udpQueue != null) {
                         observedUdpDropped = udpDroppedAfter;
                         observedUdpExpired = udpExpiredAfter;
@@ -1626,10 +3022,10 @@ public final class ReceiverService extends Service {
                         observedUdpPayloadGeneration = udpPayloadGenerationAfter;
                     }
                     if (resumeAfterSynthetic) driftNeedsRealAudio = false;
-                    session.driftLastUnderruns = underruns;
-                    writeFrames(session, track, pcm, buffer, outputBytes, frameBytes);
-                    if (Build.VERSION.SDK_INT >= 24) {
-                        int reportedUnderruns = track.getUnderrunCount();
+                    session.driftLastOutputDiscontinuities = underruns;
+                    writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, blockGeneration);
+                    if (trackUnderruns >= 0) {
+                        int reportedUnderruns = output.underrunCount();
                         if (udpQueue != null) udpQueue.reportTrackUnderruns(reportedUnderruns);
                         synchronized (STATUS_LOCK) {
                             if (statusAudioId == session.id) {
@@ -1642,13 +3038,33 @@ public final class ReceiverService extends Service {
                 }
             }
         } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
             failure = session.cancelled ? session.stopReason : describeFailure(error);
         } finally {
             session.trackPlaying = false;
             String trackReleaseFailure;
             synchronized (session) {
+                trackReleaseFailure = "";
+                if (output != null) {
+                    try { output.close(); }
+                    catch (IOException | RuntimeException error) {
+                        noteOboeRuntimeFailure(session, error);
+                        try { output.close(); }
+                        catch (IOException | RuntimeException retryError) {
+                            error.addSuppressed(retryError);
+                            noteOboeRuntimeFailure(session, retryError);
+                            retainDeferredOboeClose(output);
+                            trackReleaseFailure = "Audio output close failed: " + describeFailure(error);
+                        }
+                    }
+                }
                 if (session.audioTrack == track) session.audioTrack = null;
-                trackReleaseFailure = releaseTrack(track);
+                if (session.playbackOutput == output) session.playbackOutput = null;
+                if (session.request.formatV2() != null) {
+                    session.openedTrackFormatV2 = 0;
+                    session.openedTrackChannelsV2 = 0;
+                    session.openedTrackSampleRateV2 = 0;
+                }
             }
             String focusReleaseFailure = abandonAudioFocus(manager, focusRequest, focusListener);
             if (!trackReleaseFailure.isEmpty()) failure = appendFailure(failure, trackReleaseFailure);
@@ -1688,33 +3104,53 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private void writeFrames(AudioSession session, AudioTrack track, Pcm16FrameStream pcm, byte[] buffer, int count, int frameBytes) throws IOException {
+    private boolean writeFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
+            byte[] buffer, int count, int frameBytes, long writeGeneration) throws IOException {
+        boolean[] completed = {true};
         pcm.writeFramesForChannels((data, offset, length) -> {
             ensureRunning(session);
-            long writeGeneration = session.focusState.writeGeneration();
-            if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+            if (!session.focusState.acceptsWrite(writeGeneration)) {
+                completed[0] = false;
+                return length;
+            }
             if (session.udpQueue == null) session.inputPcmBytes += length;
-            WAVEFORM.accept(data, offset, length, frameBytes, System.nanoTime());
-            int written = track.write(data, offset, length, AudioTrack.WRITE_BLOCKING);
+            int written = output.writePcm16(data, offset, length);
+            if (written == 0 && output instanceof OboePlaybackOutput) {
+                if (!session.focusState.acceptsWrite(writeGeneration)) {
+                    completed[0] = false;
+                    return length;
+                }
+                return 0;
+            }
             synchronized (session) {
-                if (!session.focusState.acceptsWrite(writeGeneration)) return length;
+                if (!session.focusState.acceptsWrite(writeGeneration)) {
+                    completed[0] = false;
+                    return length;
+                }
                 ensureRunning(session);
-                if (written <= 0) throw new IOException("AudioTrack.write failed: " + written);
+                if (written <= 0) throw new IOException("Audio output write failed: " + written);
+                if (written % frameBytes != 0) throw new IOException("Audio output returned a partial PCM frame");
                 session.trackWrittenFrames += written / frameBytes;
-                if (session.request.udpContext != null) {
+                if (session.request.usesPacketIngress()) {
                     PCM_BYTES_WRITTEN.addAndGet(written);
                     session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
                 }
+                WAVEFORM.accept(data, offset, written, frameBytes, System.nanoTime());
                 return written;
             }
         }, buffer, count);
         if (count % frameBytes != 0) throw new IOException("PCM frame alignment failed");
+        return completed[0] && session.focusState.acceptsWrite(writeGeneration);
     }
 
-    private void handleAudioFocusChange(AudioSession session, AudioTrack track, int change) {
+    private void handleAudioFocusChange(AudioSession session, PlaybackOutput output, int change) {
         String failure = "";
+        boolean pauseOutput = false;
+        boolean resumeOutput = false;
+        float volume = -1f;
+        Exception outputControlFailure = null;
         synchronized (session) {
-            if (currentAudio != session || session.audioTrack != track
+            if (currentAudio != session || session.playbackOutput != output
                     || session.cancelled || !isCurrentOperation(session.ownerId, session.networkGeneration)) return;
             AudioFocusState.Change focusChange;
             if (change == AudioManager.AUDIOFOCUS_LOSS) focusChange = AudioFocusState.Change.LOSS;
@@ -1725,47 +3161,66 @@ public final class ReceiverService extends Service {
             else return;
 
             AudioFocusState.Action action = session.focusState.onFocusChange(focusChange);
-            try {
-                if (action == AudioFocusState.Action.STOP) {
-                    failure = "AudioFocusLost";
-                } else if (action == AudioFocusState.Action.PAUSE) {
-                    if (session.udpQueue != null) session.udpQueue.setPaused(true);
-                    if (session.trackPlaying || !session.trackReady) pauseAndFlushTrack(session, track);
-                    else synchronized (STATUS_LOCK) {
-                        if (statusAudioId == session.id) audioActive = false;
-                    }
-                } else if (action == AudioFocusState.Action.DUCK) {
-                    track.setVolume(0.2f);
-                } else if (action == AudioFocusState.Action.RESTORE_VOLUME
-                        || action == AudioFocusState.Action.RESTORE_AND_HOLD
-                        || action == AudioFocusState.Action.RESTORE_AND_RESUME) {
-                    track.setVolume(1.0f);
-                    if (action == AudioFocusState.Action.RESTORE_AND_RESUME) failure = resumeFocusedTrack(session, track);
-                    else if (action == AudioFocusState.Action.RESTORE_AND_HOLD) session.trackPlaying = false;
-                } else if (action == AudioFocusState.Action.RESUME) {
-                    failure = resumeFocusedTrack(session, track);
-                } else if (action == AudioFocusState.Action.HOLD) {
-                    session.trackPlaying = false;
-                }
-            } catch (RuntimeException error) {
-                failure = "AudioFocusTransitionFailed: " + describeFailure(error);
+            if (action == AudioFocusState.Action.STOP) failure = "AudioFocusLost";
+            else if (action == AudioFocusState.Action.PAUSE) {
+                if (session.udpQueue != null) session.udpQueue.setPaused(true);
+                if (session.floatQueue != null) session.floatQueue.setPaused(true);
+                pauseOutput = session.trackPlaying || !session.trackReady;
+            } else if (action == AudioFocusState.Action.DUCK) volume = 0.2f;
+            else if (action == AudioFocusState.Action.RESTORE_VOLUME
+                    || action == AudioFocusState.Action.RESTORE_AND_HOLD
+                    || action == AudioFocusState.Action.RESTORE_AND_RESUME) {
+                volume = 1.0f;
+                if (action == AudioFocusState.Action.RESTORE_AND_RESUME) resumeOutput = true;
+                else if (action == AudioFocusState.Action.RESTORE_AND_HOLD) session.trackPlaying = false;
+            } else if (action == AudioFocusState.Action.RESUME) resumeOutput = true;
+            else if (action == AudioFocusState.Action.HOLD) session.trackPlaying = false;
+            if (pauseOutput && session.playbackOutput == output) {
+                try { output.requestPause(); }
+                catch (IOException | RuntimeException error) { outputControlFailure = error; }
             }
-            if (!failure.isEmpty() && !"AudioFocusLost".equals(failure)) {
-                session.focusState.cancel();
+            if (volume >= 0 && session.playbackOutput == output) {
+                try { output.setVolume(volume); }
+                catch (IOException | RuntimeException error) {
+                    if (outputControlFailure == null) outputControlFailure = error;
+                    else outputControlFailure.addSuppressed(error);
+                }
             }
             session.notifyAll();
+        }
+        try {
+            if (outputControlFailure instanceof IOException) throw (IOException) outputControlFailure;
+            if (outputControlFailure instanceof RuntimeException)
+                throw (RuntimeException) outputControlFailure;
+            if (pauseOutput) {
+                pauseAndFlushOutput(session, output);
+            } else if (resumeOutput) {
+                synchronized (session) {
+                    if (session.playbackOutput == output && session.focusState.canPlay())
+                        failure = resumeFocusedOutput(session, output);
+                }
+            }
+        } catch (IOException | RuntimeException error) {
+            if (!noteOboeRuntimeFailureIfActive(session, output, error)) return;
+            failure = "AudioFocusTransitionFailed: " + describeFailure(error);
+        }
+        if (!failure.isEmpty() && !"AudioFocusLost".equals(failure)) {
+            synchronized (session) { session.focusState.cancel(); }
         }
         if (!failure.isEmpty()) cancelAudio(session, failure);
     }
 
     /** Called with the session control monitor held. */
-    private String resumeFocusedTrack(AudioSession session, AudioTrack track) {
+    private String resumeFocusedOutput(AudioSession session, PlaybackOutput output) {
         if (!session.focusState.canPlay()) return "";
         UdpPcmQueue queue = session.udpQueue;
         if (queue != null) queue.setPaused(false);
+        FloatPcmFrameQueue floatQueue = session.floatQueue;
+        if (floatQueue != null) floatQueue.setPaused(false);
         try {
-            session.driftPlaybackHead.reset(track.getPlaybackHeadPosition(), System.nanoTime());
-            track.play();
+            long head = output.playbackHeadPosition();
+            if (head >= 0) session.driftPlaybackHead.reset((int) head, System.nanoTime());
+            output.play();
             session.trackPlaying = true;
             session.focusState.markTrackPlaying();
             session.driftResetGeneration++;
@@ -1773,25 +3228,30 @@ public final class ReceiverService extends Service {
                 if (statusAudioId == session.id) audioActive = true;
             }
             return "";
-        } catch (RuntimeException error) {
+        } catch (IOException | RuntimeException error) {
+            noteOboeRuntimeFailure(session, error);
             return "AudioFocusResumeFailed: " + describeFailure(error);
         }
     }
 
-    /** Called with the session control monitor held for a user or focus pause. */
-    private void pauseAndFlushTrack(AudioSession session, AudioTrack track) {
-        track.pause();
-        track.flush();
-        session.trackWrittenFrames = 0;
-        int playbackPosition = track.getPlaybackHeadPosition();
-        long resetAtNanos = System.nanoTime();
-        session.playbackActivity.resetPlaybackHead(playbackPosition);
-        session.driftPlaybackHead.reset(playbackPosition, resetAtNanos);
-        session.driftResetGeneration++;
-        PCM_BYTES_WRITTEN.set(0);
-        session.trackPlaying = false;
-        synchronized (STATUS_LOCK) {
-            if (statusAudioId == session.id) audioActive = false;
+    /** The generation is invalidated before this control call; it never holds the session monitor while waiting for the worker. */
+    private void pauseAndFlushOutput(AudioSession session, PlaybackOutput output) throws IOException {
+        output.pauseAndFlush();
+        synchronized (session) {
+            if (session.playbackOutput != output) return;
+            session.trackWrittenFrames = 0;
+            long playbackPosition = output.playbackHeadPosition();
+            if (playbackPosition >= 0) {
+                long resetAtNanos = System.nanoTime();
+                session.playbackActivity.resetPlaybackHead((int) playbackPosition);
+                session.driftPlaybackHead.reset((int) playbackPosition, resetAtNanos);
+            }
+            session.driftResetGeneration++;
+            PCM_BYTES_WRITTEN.set(0);
+            session.trackPlaying = false;
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) audioActive = false;
+            }
         }
     }
 
@@ -1826,6 +3286,20 @@ public final class ReceiverService extends Service {
             return;
         }
         if (!uiOperation.owns(session.ownerId) || session.networkGeneration != currentOperationGeneration) return;
+        if (session.request.aoaContext != null) {
+            if ("AoaSessionStopped".equals(session.stopReason)) return;
+            AoaReceiverCoordinator coordinator;
+            synchronized (networkCoordinatorLock) {
+                coordinator = session.ownerId.equals(aoaOwnerId)
+                        && session.networkGeneration == aoaOwnerGeneration ? aoaCoordinator : null;
+            }
+            if (coordinator != null) {
+                if (failure != null && !failure.isEmpty() && !"AudioSessionEnded".equals(failure))
+                    coordinator.reportPlaybackFailure(session.request.aoaContext, new IOException(failure));
+                return;
+            }
+            if (aoaRecoveryDeadlineElapsedMs != 0) return;
+        }
         if (session.request.udpContext != null && "NetworkSessionStopped".equals(failure)) {
             networkAudioState = networkCoordinator != null ? "prepared" : "stopped";
             if (networkCoordinator != null) {
@@ -1888,10 +3362,13 @@ public final class ReceiverService extends Service {
 
     private void cancelAudio(AudioSession session, String reason) {
         String stopFailure = "";
+        IOException outputPauseFailure = null;
         LocalSocket socket;
         UdpReceiver receiver;
         UdpPcmQueue queue;
+        FloatPcmFrameQueue floatQueue;
         Thread networkThread;
+        PlaybackOutput output;
         synchronized (session) {
             if (!session.cancelled) {
                 session.cancelled = true;
@@ -1904,9 +3381,18 @@ public final class ReceiverService extends Service {
                 try { track.stop(); }
                 catch (RuntimeException error) { stopFailure = "AudioTrackStopFailed: " + describeFailure(error); }
             }
+            output = session.playbackOutput;
+            if (output instanceof OboePlaybackOutput) {
+                // The worker closes and clears this output under the same session monitor.
+                // Keep the short mute request in that critical section so stop cannot pause
+                // an adapter that the worker has already closed.
+                try { output.requestPause(); }
+                catch (IOException error) { outputPauseFailure = error; }
+            }
             socket = session.socket;
             receiver = session.udpReceiver;
             queue = session.udpQueue;
+            floatQueue = session.floatQueue;
             networkThread = session.networkThread;
             if (!stopFailure.isEmpty()) session.stopReason = appendFailure(session.stopReason, stopFailure);
         }
@@ -1916,11 +3402,19 @@ public final class ReceiverService extends Service {
             }
         }
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) audioActive = false; }
+        if (outputPauseFailure != null) {
+            noteOboeRuntimeFailure(session, outputPauseFailure);
+            synchronized (STATUS_LOCK) {
+                if (statusAudioId == session.id) startFailure = appendFailure(startFailure,
+                        "Oboe pause request failed: " + describeFailure(outputPauseFailure));
+            }
+        }
         Thread thread = session.thread;
         if (thread != null) thread.interrupt();
         if (socket != null) try { socket.close(); } catch (IOException ignored) {}
         if (receiver != null) receiver.close();
         if (queue != null) queue.stop();
+        if (floatQueue != null) floatQueue.stop();
         if (networkThread != null) networkThread.interrupt();
     }
 
@@ -1964,6 +3458,17 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private static long outputPendingFrames(AudioSession session, PlaybackOutput output) {
+        if (output == null) return -1;
+        try {
+            long position = output.playbackHeadPosition();
+            long played = position < 0 ? 0 : session.playbackActivity.playedFrames((int) position);
+            return output.pendingFrames(session.trackWrittenFrames, played);
+        } catch (IOException | RuntimeException unavailable) {
+            return -1;
+        }
+    }
+
     private void publishMode(AudioSession session, String mode) {
         synchronized (STATUS_LOCK) { if (statusAudioId == session.id) actualMode = mode; }
     }
@@ -1976,18 +3481,25 @@ public final class ReceiverService extends Service {
         AudioSession session = currentAudio;
         if (session == null) return PlaybackMetrics.unknown();
         UdpPcmQueue queue = session.udpQueue;
+        FloatPcmFrameQueue floatQueue = session.floatQueue;
         AudioTrack track = session.audioTrack;
+        PlaybackOutput output = session.playbackOutput;
         int jitter = queue == null ? -1 : queue.targetFrames();
         long expired = queue == null ? -1 : queue.expiredFrames();
-        long queued = queue == null ? -1 : queue.queuedFrames();
-        long pending = trackPendingFrames(session, track);
+        long queued = queue != null ? queue.queuedFrames()
+                : floatQueue != null ? floatQueue.queuedFrames() : -1;
+        long pending = output != null ? outputPendingFrames(session, output) : trackPendingFrames(session, track);
         Boolean advancing = null;
-        if (track != null) {
-            try { advancing = session.playbackActivity.recentlyAdvanced(System.nanoTime(), track.getPlaybackHeadPosition()); }
+        if (output != null) {
+            try {
+                long position = output.playbackHeadPosition();
+                if (position >= 0) advancing = session.playbackActivity.recentlyAdvanced(System.nanoTime(), (int) position);
+            }
             catch (RuntimeException unavailable) { advancing = null; }
+            catch (IOException unavailable) { advancing = null; }
         }
         synchronized (STATUS_LOCK) {
-            if (currentAudio != session || statusAudioId != session.id || session.audioTrack != track)
+            if (currentAudio != session || statusAudioId != session.id || session.playbackOutput != output)
                 return PlaybackMetrics.unknown();
             return new PlaybackMetrics(actualSampleRate, actualChannels, jitter,
                     expired, queued, pending, underrunCount, tcpDroppedBacklogFrames,
@@ -2022,14 +3534,14 @@ public final class ReceiverService extends Service {
         synchronized (STATUS_LOCK) { return statusAudioId == session.id ? actualMode : ""; }
     }
 
-    static String describeFailure(Exception error) {
+    static String describeFailure(Throwable error) {
         String message = error.getMessage();
         if (message == null || message.isEmpty()) return error.getClass().getSimpleName();
         String description = (error.getClass().getSimpleName() + ": " + message).replace('\r', ' ').replace('\n', ' ');
         return description.substring(0, Math.min(description.length(), 180));
     }
 
-    private static String releaseTrack(AudioTrack track) {
+    static String releaseTrack(AudioTrack track) {
         if (track == null) return "";
         String failure = "";
         try { track.pause(); } catch (RuntimeException error) { failure = appendFailure(failure, describeFailure(error)); }
@@ -2051,7 +3563,7 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private static String appendFailure(String previous, String next) {
+    static String appendFailure(String previous, String next) {
         if (previous == null || previous.isEmpty()) return next;
         return previous + "; " + next;
     }
@@ -2073,27 +3585,46 @@ public final class ReceiverService extends Service {
         getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
-    private static final class AudioRequest {
+    static final class AudioRequest {
         final String socketName;
         final String connectCode;
         final String playbackMode;
         final UdpSessionContext udpContext;
+        final AoaSessionContext aoaContext;
 
         AudioRequest(String socketName, String connectCode, String playbackMode) {
-            this(socketName, connectCode, playbackMode, null);
+            this(socketName, connectCode, playbackMode, null, null);
         }
 
-        private AudioRequest(String socketName, String connectCode, String playbackMode, UdpSessionContext udpContext) {
+        private AudioRequest(String socketName, String connectCode, String playbackMode,
+                UdpSessionContext udpContext, AoaSessionContext aoaContext) {
             this.socketName = socketName;
             this.connectCode = connectCode;
             this.playbackMode = playbackMode;
             this.udpContext = udpContext;
+            this.aoaContext = aoaContext;
         }
 
         static AudioRequest udp(UdpSessionContext context) {
-            return new AudioRequest(null, null, context.playbackMode, context);
+            return new AudioRequest(null, null, context.playbackMode, context, null);
         }
 
+        static AudioRequest aoa(AoaSessionContext context) {
+            return new AudioRequest(null, null, context.playbackMode, null, context);
+        }
+
+        UdpPacketDecoder.AudioFormatV2 formatV2() {
+            return udpContext != null ? udpContext.formatV2 : aoaContext == null ? null : aoaContext.formatV2;
+        }
+
+        boolean usesPacketIngress() { return udpContext != null || aoaContext != null; }
+
+        boolean usesFloatV2Worker() {
+            UdpPacketDecoder.AudioFormatV2 format = formatV2();
+            return format != null && format.profile > 1;
+        }
+
+        // AOA context lifetime belongs to its coordinator, which joins transport IO before closing it.
         void destroy() { if (udpContext != null) udpContext.destroy(); }
     }
 
@@ -2115,12 +3646,21 @@ public final class ReceiverService extends Service {
         volatile LocalSocket socket;
         volatile UdpReceiver udpReceiver;
         volatile UdpPcmQueue udpQueue;
+        volatile FloatPcmFrameQueue floatQueue;
         final UdpPlaybackActivity playbackActivity = new UdpPlaybackActivity();
         final Pcm16FrameStream.PlaybackHeadTracker driftPlaybackHead =
                 new Pcm16FrameStream.PlaybackHeadTracker();
         volatile long driftResetGeneration;
-        volatile int driftLastUnderruns = -1;
+        volatile int driftLastOutputDiscontinuities = -1;
+        volatile int oboeXrunCount = -1;
         volatile AudioTrack audioTrack;
+        volatile PlaybackOutput playbackOutput;
+        volatile String requestedOutputEngine = "oboeExperimental";
+        volatile String actualOutputEngine = "unknown";
+        volatile String outputFallbackReason = "";
+        volatile int openedTrackFormatV2;
+        volatile int openedTrackChannelsV2;
+        volatile int openedTrackSampleRateV2;
         boolean trackReady;
         volatile long trackWrittenFrames;
         volatile long inputPcmBytes;
@@ -2134,22 +3674,35 @@ public final class ReceiverService extends Service {
             this.request = request;
             this.ownerId = ownerId;
             this.networkGeneration = networkGeneration;
+            if (request.aoaContext != null) {
+                udpQueue = request.aoaContext.pcmQueue;
+                floatQueue = request.aoaContext.floatQueue;
+            }
         }
 
         boolean isStreamingAt(long nowNanos) throws IOException {
             if (cancelled || !focusState.canPlay() || !trackPlaying) return false;
             UdpPcmQueue queue = udpQueue;
-            AudioTrack track = audioTrack;
-            if (queue == null || track == null) return false;
-            int playbackHead;
+            FloatPcmFrameQueue floatQueue = this.floatQueue;
+            UdpReceiver receiver = udpReceiver;
+            PlaybackOutput output = playbackOutput;
+            if ((queue == null && floatQueue == null) || output == null) return false;
+            long playbackHead;
             try {
-                playbackHead = track.getPlaybackHeadPosition();
-            } catch (IllegalStateException error) {
-                if (audioTrack != track || cancelled) return false;
-                throw new IOException("AudioTrack playback position unavailable", error);
+                playbackHead = output.playbackHeadPosition();
+            } catch (IOException | RuntimeException error) {
+                if (!noteOboeRuntimeFailureIfActive(this, output, error)) return false;
+                throw new IOException("Audio output progress unavailable", error);
             }
-            return playbackActivity.isActive(nowNanos, playbackHead, queue.hasAuthenticatedAudio(),
-                    queue.lastAuthenticatedAudioAtNanos(), focusState.isUserPaused());
+            if (playbackHead < 0) return false;
+            boolean hasAudio = queue != null ? queue.hasAuthenticatedAudio()
+                    : request.aoaContext != null ? request.aoaContext.ingress.hasAuthenticatedAudio()
+                    : receiver != null && receiver.hasAuthenticatedAudio();
+            long lastAudioAt = queue != null ? queue.lastAuthenticatedAudioAtNanos()
+                    : request.aoaContext != null ? request.aoaContext.ingress.lastAuthenticatedAudioAtNanos()
+                    : receiver == null ? 0 : receiver.lastAuthenticatedAudioAtNanos();
+            return playbackActivity.isActive(nowNanos, (int) playbackHead, hasAudio,
+                    lastAudioAt, focusState.isUserPaused());
         }
     }
 }

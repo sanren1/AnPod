@@ -36,6 +36,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     static final int RESULT_OK = 0;
     static final int RESULT_REJECTED = 1;
     static final int RESULT_FAILED = 2;
+    static final int RESULT_USER_STOPPED = 3;
     private static final long HEARTBEAT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long HANDSHAKE_DEADLINE_NANOS = TimeUnit.SECONDS.toNanos(2);
     private static final int MAX_PREAUTH_CONNECTIONS = 2;
@@ -62,10 +63,22 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         boolean streaming() throws IOException;
         void shutdown();
         default boolean keepStandbyAfterPlaybackStop() { return false; }
+        /** True only when the playback endpoint has a working v2 audio-format consumer. */
+        default boolean supportsAudioV2() { return false; }
+        /** Endpoint-owned product policy for a V2 descriptor. */
+        default boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) { return false; }
+        /** Actual opened AudioTrack format: 0 unknown, 1 PCM16, 2 packed24, 3 Float32. */
+        default int openedTrackFormatV2() { return 0; }
+        default int openedTrackChannelsV2() { return 0; }
+        default int openedTrackSampleRateV2() { return 0; }
         default boolean supportsPlaybackProgress() { return false; }
         default byte[] playbackProgressPayload() {
             return P5cControlProtocol.playbackProgressPayload(-1, -1, -1,
                     -1, -1, -1, -1, -1, null, -1, -1, -1, -1, -1, -1);
+        }
+        default byte[] playbackProgressPayloadV2() {
+            return P5cControlProtocol.playbackProgressPayloadV2(playbackProgressPayload(),
+                    openedTrackFormatV2(), openedTrackChannelsV2(), openedTrackSampleRateV2());
         }
         /** True only for an explicitly started standby endpoint; production defaults to the existing manual flow. */
         default boolean requiresBackgroundStartAuthorization() { return false; }
@@ -93,6 +106,25 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         default boolean revokeBackgroundTrust(byte[] bindingCommitment) throws IOException { return false; }
     }
 
+    private static final class SessionMaterial {
+        final int protocolVersion;
+        final long sessionId;
+        final PairingProtocol.AudioParameters parameters;
+        final UdpPacketDecoder.AudioFormatV2 formatV2;
+        final PairingProtocol.SessionKeys keys;
+        final byte[] ready;
+
+        SessionMaterial(int protocolVersion, long sessionId, PairingProtocol.AudioParameters parameters,
+                UdpPacketDecoder.AudioFormatV2 formatV2, PairingProtocol.SessionKeys keys, byte[] ready) {
+            this.protocolVersion = protocolVersion;
+            this.sessionId = sessionId;
+            this.parameters = parameters;
+            this.formatV2 = formatV2;
+            this.keys = keys;
+            this.ready = ready;
+        }
+    }
+
     private final ServerSocket listener;
     private final PairingProtocol.BindingMaterial binding;
     private final PlaybackEndpoint playback;
@@ -115,13 +147,17 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     });
     private volatile Socket activeSocket;
     private volatile Socket authenticatedSocket;
+    private volatile boolean terminalCauseNegotiated;
     private volatile Thread worker;
     private volatile P5cDiscovery discovery;
     private P5cDiscovery.SocketBinder discoverySocketBinder;
     private byte[] bindingSecret;
     private volatile String failure = "";
     private volatile boolean shutdownRequested;
+    private volatile boolean userStopRequested;
     private boolean loopbackConnectionAccepted;
+    private boolean discoveryResumePending;
+    private boolean discoveryDisabledForTest;
     private byte[] connectionIntentNonce;
     private byte[] establishedConnectionIntentNonce;
     private long connectionIntentDeadline;
@@ -159,6 +195,16 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
         P5cReceiverCoordinator coordinator = open(binding, playback, InetAddress.getByName("127.0.0.1"), true, 32, false, 0);
         coordinator.capabilityTestMode = mode;
+        return coordinator;
+    }
+
+    static P5cReceiverCoordinator openLoopbackAudioV2Test(PairingProtocol.BindingMaterial binding,
+            PlaybackEndpoint playback) throws IOException {
+        if (!BuildConfig.DEBUG) throw new IllegalStateException("test hook requires a debug build");
+        // Bound to loopback but permits sequential authenticated probe/formal sessions.
+        P5cReceiverCoordinator coordinator = open(binding, playback,
+                InetAddress.getByName("127.0.0.1"), false, 32, false, 0);
+        coordinator.discoveryDisabledForTest = true;
         return coordinator;
     }
 
@@ -243,10 +289,11 @@ final class P5cReceiverCoordinator implements AutoCloseable {
     }
 
     synchronized void startDiscovery(P5cDiscovery.SocketBinder socketBinder, byte[] discoverySecret) throws IOException {
+        if (discoveryDisabledForTest) return;
         if (worker == null) throw new IllegalStateException("P5-C control listener must be started first");
         if (socketBinder != null) discoverySocketBinder = socketBinder;
         if (discoverySecret != null) bindingSecret = discoverySecret.clone();
-        if (authenticatedSocket != null || discovery != null) return;
+        if (authenticatedSocket != null || !preAuthSockets.isEmpty() || discovery != null) return;
         P5cDiscovery service = P5cDiscovery.open(listener.getInetAddress(), discoveryPrefixLength,
                 listener.getLocalPort(), discoverySocketBinder, bindingSecret);
         service.start();
@@ -387,6 +434,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     String failure() { return failure; }
 
+    boolean requestUserStop() {
+        // Defer service teardown only while an authenticated host can receive the
+        // terminal ACK. A listening or not-yet-negotiated owner must clean up locally.
+        if (shutdownRequested || finished.getCount() == 0 || authenticatedSocket == null
+                || !terminalCauseNegotiated) return false;
+        userStopRequested = true;
+        return true;
+    }
+
     private void serve() {
         try {
             while (!listener.isClosed()) {
@@ -465,7 +521,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         } finally {
             synchronized (this) {
                 ownedSession = authenticatedSocket == socket;
-                if (ownedSession) authenticatedSocket = null;
+                if (ownedSession) {
+                    authenticatedSocket = null;
+                    terminalCauseNegotiated = false;
+                    discoveryResumePending = true;
+                    // If the host disappeared before the requested authenticated
+                    // terminal ACK, finish the manual stop locally after liveness
+                    // timeout instead of accepting a reconnect.
+                    if (userStopRequested) shutdownRequested = true;
+                }
                 preAuthSockets.remove(socket);
                 if (activeSocket == socket) {
                     java.util.Iterator<Socket> remaining = preAuthSockets.keySet().iterator();
@@ -473,16 +537,9 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 }
             }
             try { socket.close(); } catch (IOException ignored) { }
-            if (ownedSession && !listener.isClosed() && !shutdownRequested) {
-                try {
-                    startDiscovery();
-                    synchronized (this) {
-                        if (connectionIntentRequired && !connectionIntentEstablished && connectionIntentNonce != null
-                                && System.nanoTime() < connectionIntentDeadline)
-                            discovery.resumeAutomaticSearch(connectionIntentNonce,
-                                    TimeUnit.NANOSECONDS.toMillis(connectionIntentDeadline - System.nanoTime()));
-                    }
-                } catch (IOException | RuntimeException error) {
+            if (!listener.isClosed() && !shutdownRequested) {
+                try { resumeDiscoveryIfIdle(); }
+                catch (IOException | RuntimeException error) {
                     failure = listenerFailure(error);
                     try { listener.close(); } catch (IOException ignored) { }
                 }
@@ -503,8 +560,25 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         preAuthSockets.remove(socket);
         authenticatedSocket = socket;
         activeSocket = socket;
+        terminalCauseNegotiated = false;
+        discoveryResumePending = false;
         stopDiscovery();
         return true;
+    }
+
+    private synchronized void resumeDiscoveryIfIdle() throws IOException {
+        if (discoveryDisabledForTest) {
+            discoveryResumePending = false;
+            return;
+        }
+        if (!discoveryResumePending || listener.isClosed() || shutdownRequested
+                || authenticatedSocket != null || !preAuthSockets.isEmpty()) return;
+        startDiscovery();
+        discoveryResumePending = false;
+        if (connectionIntentRequired && !connectionIntentEstablished && connectionIntentNonce != null
+                && System.nanoTime() < connectionIntentDeadline)
+            discovery.resumeAutomaticSearch(connectionIntentNonce,
+                    TimeUnit.NANOSECONDS.toMillis(connectionIntentDeadline - System.nanoTime()));
     }
 
     private static String listenerFailure(Exception error) {
@@ -534,23 +608,16 @@ final class P5cReceiverCoordinator implements AutoCloseable {
 
     private void serveHandshakeAndSession(Socket socket, DataInputStream input, DataOutputStream output,
             long deadline, ScheduledFuture<?> deadlineTask) throws IOException, PairingProtocol.Failure {
-        byte[] hello = readHandshake(input, socket, 85, deadline);
-        PairingProtocol.ReceiverHandshake handshake = PairingProtocol.ReceiverHandshake.acceptHello(binding.duplicate(), hello);
-        try (handshake) {
-            output.write(handshake.challenge());
-            output.flush();
-            byte[] finish = readHandshake(input, socket, 38, deadline);
-            PairingProtocol.FinishResult complete = handshake.acceptFinish(finish);
-            if (!claimAuthenticated(socket)) {
-                complete.session.close();
-                throw new IOException("P5-A authenticated session already has an owner");
-            }
-            socket.setSoTimeout(250);
-            try (PairingProtocol.AuthenticatedSession authenticated = complete.session) {
-                PairingProtocol.SessionKeys keys = authenticated.takeKeys();
-                try (keys) {
+        SessionMaterial authenticated = acceptSessionHandshake(socket, input, output, deadline);
+        socket.setSoTimeout(250);
+        try (PairingProtocol.SessionKeys keys = authenticated.keys) {
                     long sessionId = authenticated.sessionId;
                     PairingProtocol.AudioParameters parameters = authenticated.parameters;
+                    UdpPacketDecoder.AudioFormatV2 formatV2 = authenticated.formatV2;
+                    int audioMode = formatV2 == null ? parameters.mode : formatV2.mode;
+                    boolean upgradeProbeOnly = false;
+                    if (formatV2 != null && !playback.supportsAudioV2())
+                        throw new IOException("Receiver playback endpoint does not support audio v2");
                     DatagramSocket audioSocket = null;
                     UdpSessionContext context = null;
                     boolean playbackStarted = false;
@@ -572,7 +639,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                     try {
                         bindingCommitment = binding.commitment();
                         // Keep the authenticated session/keys owned even if READY cannot be written.
-                        output.write(complete.ready);
+                        output.write(authenticated.ready);
                         output.flush();
                         deadlineTask.cancel(false);
             while (true) {
@@ -583,7 +650,12 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             P5cControlProtocol.HOST_TO_RECEIVER, sessionId);
                 } catch (P5cControlProtocol.IdleTimeoutException idle) {
                     continue;
+                } catch (java.io.EOFException closed) {
+                    if (upgradeProbeOnly && state == STATE_AUTHENTICATED && !playbackStarted) return;
+                    throw closed;
                 }
+                if (upgradeProbeOnly)
+                    throw new IOException("v1 audio-v2 capability probe accepts no control commands after its query");
                 checkHeartbeatDeadline(System.nanoTime(), lastHeartbeatAt);
                 if (expectedCommandSequence > 0 && command.sequence == expectedCommandSequence - 1 && lastCommand != null
                         && Arrays.equals(command.raw, lastCommand)) {
@@ -598,7 +670,14 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 byte[] responseExtra = new byte[0];
                 boolean stopAfterAck = false;
                 try {
-                    switch (command.type) {
+                    if (userStopRequested) {
+                        if (playbackStarted) playback.stop();
+                        else if (context != null) context.destroy();
+                        playbackStarted = false;
+                        state = STATE_STOPPED;
+                        result = RESULT_USER_STOPPED;
+                        stopAfterAck = true;
+                    } else switch (command.type) {
                         case P5cControlProtocol.CAPABILITIES_QUERY:
                             if (state != STATE_AUTHENTICATED || command.payload.length != 8
                                     || command.payload[3] != 0)
@@ -606,6 +685,12 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             int requestedControl = P5cControlProtocol.getUnsignedShort(command.payload, 0);
                             int requestedAudio = command.payload[2] & 0xff;
                             int requiredCapabilities = getInt(command.payload, 4);
+                            if (authenticated.protocolVersion == 1
+                                    && (requiredCapabilities & P5cControlProtocol.CAP_AUDIO_V2) != 0) {
+                                if (expectedCommandSequence != 0)
+                                    throw new IOException("v1 audio-v2 capability probe must be the first control command");
+                                upgradeProbeOnly = true;
+                            }
                             if ("unsupported".equals(capabilityTestMode)) {
                                 byte[] oldAck = P5cControlProtocol.encode(keys.receiverToHostControl,
                                         P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
@@ -622,11 +707,15 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     | (connectionIntentRequired ? P5cControlProtocol.CAP_CONNECTION_INTENT : 0)
                                     | (backgroundAuthorizationRequired ? P5cControlProtocol.CAP_BACKGROUND_START_AUTH : 0)
                                     | (playback.supportsBackgroundTrustManagement()
-                                            ? P5cControlProtocol.CAP_BACKGROUND_TRUST_MANAGEMENT : 0);
+                                            ? P5cControlProtocol.CAP_BACKGROUND_TRUST_MANAGEMENT : 0)
+                                    | (playback.supportsAudioV2() ? P5cControlProtocol.CAP_AUDIO_V2 : 0);
                             if ("incompatible".equals(capabilityTestMode)) audioMajor++;
                             if ("missing-capability".equals(capabilityTestMode))
                                 implemented &= ~P5cControlProtocol.CAP_AUTHENTICATED_STATUS;
+                            if ("legacy-terminal-cause".equals(capabilityTestMode))
+                                implemented &= ~P5cControlProtocol.CAP_TERMINAL_CAUSE;
                             boolean compatible = requestedControl == controlMajor && requestedAudio == audioMajor
+                                    && (formatV2 == null || playback.supportsAudioFormatV2(formatV2))
                                     && (requiredCapabilities & ~implemented) == 0;
                             long echoedQuery = "replay".equals(capabilityTestMode) ? command.sequence - 1 : command.sequence;
                             byte[] info = P5cControlProtocol.capabilitiesInfoPayload(echoedQuery,
@@ -636,6 +725,8 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     P5cControlProtocol.RECEIVER_TO_HOST, sessionId, ackSequence++,
                                     P5cControlProtocol.CAPABILITIES_INFO, info);
                             P5cControlProtocol.write(output, response);
+                            terminalCauseNegotiated = (implemented
+                                    & P5cControlProtocol.CAP_TERMINAL_CAUSE) != 0;
                             lastCommand = command.raw; lastAck = response; expectedCommandSequence++;
                             continue;
                         case P5cControlProtocol.CONNECTION_INTENT:
@@ -730,6 +821,10 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             }
                             break;
                         case P5cControlProtocol.BIND:
+                            if (formatV2 != null && !playback.supportsAudioFormatV2(formatV2)) {
+                                result = RESULT_REJECTED;
+                                break;
+                            }
                             boolean bindBackgroundGrant = !backgroundAuthorizationRequired
                                     || backgroundRequestId != null && backgroundAuthorizationGranted(
                                         backgroundAuthorizationStatus = queryBackgroundStartAuthorization(backgroundRequestId,
@@ -749,8 +844,11 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                 candidateSocket.setReuseAddress(false);
                                 candidateSocket.bind(new InetSocketAddress(listener.getInetAddress(), 0));
                                 InetSocketAddress expectedPeer = new InetSocketAddress(socket.getInetAddress(), hostPort);
-                                UdpSessionContext candidateContext = new UdpSessionContext(candidateSocket, expectedPeer, sessionId,
-                                        keys.hostToReceiverAudio, parameters);
+                                UdpSessionContext candidateContext = formatV2 == null
+                                        ? new UdpSessionContext(candidateSocket, expectedPeer, sessionId,
+                                                keys.hostToReceiverAudio, parameters)
+                                        : new UdpSessionContext(candidateSocket, expectedPeer, sessionId,
+                                                keys.hostToReceiverAudio, formatV2);
                                 audioSocket = candidateSocket;
                                 context = candidateContext;
                             } catch (IOException | RuntimeException error) {
@@ -762,7 +860,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             break;
                         case P5cControlProtocol.SELECT_MODE:
                             if (state != STATE_TRANSPORT_CONNECTED || command.payload.length != 1
-                                    || (command.payload[0] & 0xff) != parameters.mode)
+                                    || (command.payload[0] & 0xff) != audioMode)
                                 result = RESULT_REJECTED;
                             else modeSelected = true;
                             break;
@@ -855,7 +953,8 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             break;
                         case P5cControlProtocol.PLAYBACK_PROGRESS_QUERY:
                             if (command.payload.length != 0) result = RESULT_REJECTED;
-                            else responseExtra = playback.playbackProgressPayload();
+                            else responseExtra = formatV2 == null
+                                    ? playback.playbackProgressPayload() : playback.playbackProgressPayloadV2();
                             break;
                         default:
                             result = RESULT_REJECTED;
@@ -923,8 +1022,69 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                         if (bindingCommitment != null) Arrays.fill(bindingCommitment, (byte) 0);
                     }
                 }
+        }
+
+    private SessionMaterial acceptSessionHandshake(Socket socket, DataInputStream input,
+            DataOutputStream output, long deadline) throws IOException, PairingProtocol.Failure {
+        byte[] prefix = readHandshake(input, socket, 6, deadline);
+        if (prefix[0] != 'A' || prefix[1] != 'N' || prefix[2] != 'P' || prefix[3] != '5'
+                || (prefix[5] & 0xff) != 1)
+            throw new IOException("invalid P5-A HELLO prefix");
+        int protocolVersion = prefix[4] & 0xff;
+        if (protocolVersion == 1) {
+            byte[] hello = readHandshakeTail(input, socket, prefix, 85, deadline);
+            PairingProtocol.ReceiverHandshake handshake =
+                    PairingProtocol.ReceiverHandshake.acceptHello(binding.duplicate(), hello);
+            try (handshake) {
+                output.write(handshake.challenge()); // fixed 86-byte v1 CHALLENGE
+                output.flush();
+                PairingProtocol.FinishResult complete = handshake.acceptFinish(readHandshake(input, socket, 38, deadline));
+                if (!claimAuthenticated(socket)) {
+                    complete.session.close();
+                    throw new IOException("P5-A authenticated session already has an owner");
+                }
+                try (PairingProtocol.AuthenticatedSession session = complete.session) {
+                    return new SessionMaterial(1, session.sessionId, session.parameters, null,
+                            session.takeKeys(), complete.ready);
+                }
             }
         }
+        if (protocolVersion == 2) {
+            byte[] lengthBytes = readHandshake(input, socket, 2, deadline);
+            int declaredLength = ((lengthBytes[0] & 0xff) << 8) | (lengthBytes[1] & 0xff);
+            if (declaredLength != 96)
+                throw new IOException("invalid fixed-size P5-A v2 HELLO length");
+            byte[] v2Prefix = Arrays.copyOf(prefix, 8);
+            System.arraycopy(lengthBytes, 0, v2Prefix, 6, 2);
+            byte[] hello = readHandshakeTail(input, socket, v2Prefix, declaredLength, deadline);
+            PairingProtocol.V2.ReceiverAwaitFinish handshake =
+                    PairingProtocol.V2.Receiver.acceptHello(binding.duplicate(), hello);
+            try (handshake) {
+                output.write(handshake.challenge); // fixed 104-byte v2 CHALLENGE
+                output.flush();
+                PairingProtocol.V2.FinishResult complete =
+                        handshake.acceptFinish(readHandshake(input, socket, 40, deadline));
+                if (!claimAuthenticated(socket)) {
+                    complete.session.close();
+                    throw new IOException("P5-A authenticated session already has an owner");
+                }
+                try (PairingProtocol.V2.AuthenticatedSessionV2 session = complete.session) {
+                    return new SessionMaterial(2, session.sessionId, null, session.format,
+                            session.takeKeys(), complete.ready);
+                }
+            }
+        }
+        throw new IOException("unsupported P5-A protocol version");
+    }
+
+    private static byte[] readHandshakeTail(DataInputStream input, Socket socket,
+            byte[] prefix, int totalLength, long deadline) throws IOException {
+        if (prefix == null || prefix.length > totalLength)
+            throw new IOException("invalid P5-A handshake prefix length");
+        byte[] message = Arrays.copyOf(prefix, totalLength);
+        byte[] tail = readHandshake(input, socket, totalLength - prefix.length, deadline);
+        System.arraycopy(tail, 0, message, prefix.length, tail.length);
+        return message;
     }
 
     private static byte[] readHandshake(DataInputStream input, Socket socket, int length, long deadline)

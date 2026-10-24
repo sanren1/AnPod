@@ -12,8 +12,9 @@ export const byTransport = (snapshot: Snapshot) => {
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];
 };
 export const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
-export const connectionLabel = (transport: Snapshot["connectionTransport"] | null, protocol: Snapshot["sessionWirelessProtocol"] | null) =>
-  transport === "usb" ? strings.connection.usb : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
+export const connectionLabel = (transport: Snapshot["connectionTransport"] | Snapshot["sessionConnectionTransport"], protocol: Snapshot["sessionWirelessProtocol"] | null) =>
+  transport === "usb" ? strings.connection.usb : transport === "usbDirect" ? strings.connection.usbDirect
+    : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
 export const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
   snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
 export const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);
@@ -51,7 +52,12 @@ export const readableStatus = (snapshot: Snapshot, cleanupPending: boolean) => {
   } satisfies Record<Snapshot["state"], string>)[snapshot.state];
 };
 export const CAP_PLAYBACK_PROGRESS = 1 << 3;
+export const CAP_AOA_SESSION_RESTART = 1 << 9;
 export const needsReceiverUpdate = (message: string) => message.includes("RECEIVER_UPDATE_REQUIRED:");
+export const windowsRateMismatchHz = (message: string) => {
+  const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];
+  return rate ? Number(rate) : null;
+};
 export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());

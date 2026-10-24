@@ -41,6 +41,7 @@
 #include <mutex>
 
 #include "audio_capture.h"
+#include "audio_capture_float_blocks.h"
 #include "send_exact.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -51,6 +52,8 @@
 /* KSDATAFORMAT_SUBTYPE_PCM without pulling in the larger ksmedia.h header. */
 static const GUID kSubtypePcm =
     { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kSubtypeFloat =
+    { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
 /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT, likewise avoiding ksmedia.h. */
 static const DWORD kStereoChannelMask = 0x1 | 0x2;
@@ -69,6 +72,10 @@ static volatile LONG64 g_sentPcmBytes = 0;
 static std::mutex g_pcmCallbackMutex;
 static PcmCallback g_pcmCallback = NULL;
 static void* g_pcmCallbackUserData = NULL;
+static FloatPcmCallbackV2 g_floatPcmCallback = NULL;
+static void* g_floatPcmCallbackUserData = NULL;
+static BOOL g_bFloatCaptureMode = FALSE;
+static AudioCaptureFormatV2 g_captureFormatV2 = {};
 
 /* What the capture thread forwards. FALSE keeps the socket alive but feeds the
    peer silence, so a session can be muted without being torn down. */
@@ -78,6 +85,7 @@ static BOOL g_bComInitialized = FALSE;
 static BOOL g_bWsaInitialized = FALSE;
 
 static const UINT32 kOutputSampleRate = 48000;
+static const UINT32 kMaxFloatCallbackFrames = ANPOD_AUDIO_CAPTURE_V2_MAX_CALLBACK_FRAMES;
 
 /* Format reported to the Android side. Always stereo PCM16. */
 static const UINT16 kOutputChannels = 2;
@@ -498,6 +506,210 @@ static DWORD WINAPI CaptureThread(LPVOID lpParam)
     return 0;
 }
 
+static BOOL ReadMixFormatV2(IAudioClient* audioClient, AudioCaptureFormatV2* result)
+{
+    WAVEFORMATEX* mix = NULL;
+    HRESULT hr = audioClient->GetMixFormat(&mix);
+    if (FAILED(hr) || mix == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_GET_MIX_FORMAT, DefaultMessageForCode(ANPOD_ERR_GET_MIX_FORMAT));
+        return FALSE;
+    }
+
+    AudioCaptureFormatV2 format = {};
+    format.size = sizeof(format);
+    format.version = 2;
+    format.mixSampleRate = mix->nSamplesPerSec;
+    format.mixChannels = mix->nChannels;
+    format.mixContainerBits = mix->wBitsPerSample;
+    format.mixValidBits = mix->wBitsPerSample;
+    if (mix->wFormatTag == WAVE_FORMAT_PCM)
+    {
+        format.mixSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_INTEGER;
+    }
+    else if (mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+    {
+        format.mixSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_FLOAT;
+    }
+    else if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        mix->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
+    {
+        const WAVEFORMATEXTENSIBLE* extended = (const WAVEFORMATEXTENSIBLE*)mix;
+        format.mixValidBits = extended->Samples.wValidBitsPerSample;
+        format.mixChannelMask = extended->dwChannelMask;
+        if (IsEqualGUID(extended->SubFormat, kSubtypePcm))
+        {
+            format.mixSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_INTEGER;
+        }
+        else if (IsEqualGUID(extended->SubFormat, kSubtypeFloat))
+        {
+            format.mixSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_FLOAT;
+        }
+    }
+
+    CoTaskMemFree(mix);
+    if (format.mixSampleRate == 0 || format.mixChannels == 0 ||
+        format.mixSampleFormat == ANPOD_AUDIO_SAMPLE_FORMAT_UNKNOWN)
+    {
+        SetLastErrorState(ANPOD_ERR_UNSUPPORTED_FORMAT, DefaultMessageForCode(ANPOD_ERR_UNSUPPORTED_FORMAT));
+        return FALSE;
+    }
+
+    format.captureSampleRate = format.mixSampleRate;
+    format.captureChannels = 2;
+    format.captureSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_FLOAT;
+    if (format.mixChannels != format.captureChannels ||
+        (format.mixChannelMask != 0 && format.mixChannelMask != kStereoChannelMask))
+    {
+        format.conversionFlags |= ANPOD_AUDIO_CONVERSION_CHANNELS;
+    }
+    if (format.mixSampleFormat != ANPOD_AUDIO_SAMPLE_FORMAT_FLOAT || format.mixContainerBits != 32)
+    {
+        format.conversionFlags |= ANPOD_AUDIO_CONVERSION_SAMPLE;
+    }
+    *result = format;
+    return TRUE;
+}
+
+static void ReportFloatCaptureFailure(const char* operation, HRESULT hr)
+{
+    char message[160];
+    snprintf(message, sizeof(message), "%s failed (HRESULT 0x%08lX)",
+        operation, (unsigned long)hr);
+    SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+}
+
+static DWORD WINAPI FloatCaptureThread(LPVOID lpParam)
+{
+    (void)lpParam;
+    uint64_t nextFrameIndex = 0;
+    DWORD mmcssTaskIndex = 0;
+    HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    if (mmcssHandle == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "capture thread could not join MMCSS Pro Audio");
+        g_bRunning = FALSE;
+        return 1;
+    }
+
+    timeBeginPeriod(1);
+    const UINT32 maxFrames = kMaxFloatCallbackFrames;
+    float* outBuf = (float*)HeapAlloc(GetProcessHeap(), 0,
+        (SIZE_T)maxFrames * 2 * sizeof(float));
+    if (outBuf == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_OUT_OF_MEMORY, "out of memory allocating Float32 callback buffer");
+        timeEndPeriod(1);
+        AvRevertMmThreadCharacteristics(mmcssHandle);
+        g_bRunning = FALSE;
+        return 1;
+    }
+
+    /* Setter is restricted to before Start and after Cleanup, so this snapshot
+       and its context remain immutable for the thread lifetime. */
+    FloatPcmCallbackV2 callback = g_floatPcmCallback;
+    void* userData = g_floatPcmCallbackUserData;
+
+    while (g_bRunning)
+    {
+        Sleep(1);
+        if (g_pCaptureClient == NULL || !g_bRunning)
+        {
+            break;
+        }
+
+        UINT32 packetLength = 0;
+        HRESULT hr = g_pCaptureClient->GetNextPacketSize(&packetLength);
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+        {
+            SetLastErrorState(ANPOD_ERR_DEVICE_INVALIDATED, DefaultMessageForCode(ANPOD_ERR_DEVICE_INVALIDATED));
+            break;
+        }
+        if (FAILED(hr))
+        {
+            ReportFloatCaptureFailure("WASAPI GetNextPacketSize", hr);
+            g_bRunning = FALSE;
+            break;
+        }
+
+        while (packetLength != 0 && g_bRunning)
+        {
+            BYTE* data = NULL;
+            UINT32 framesAvailable = 0;
+            DWORD flags = 0;
+            hr = g_pCaptureClient->GetBuffer(&data, &framesAvailable, &flags, NULL, NULL);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+            {
+                SetLastErrorState(ANPOD_ERR_DEVICE_INVALIDATED, DefaultMessageForCode(ANPOD_ERR_DEVICE_INVALIDATED));
+                g_bRunning = FALSE;
+                break;
+            }
+            if (FAILED(hr))
+            {
+                ReportFloatCaptureFailure("WASAPI GetBuffer", hr);
+                g_bRunning = FALSE;
+                break;
+            }
+
+            if (framesAvailable > (uint64_t)-1 - nextFrameIndex)
+            {
+                g_pCaptureClient->ReleaseBuffer(framesAvailable);
+                SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "Float32 sample frame index exhausted");
+                g_bRunning = FALSE;
+                break;
+            }
+
+            if (!AnPodDispatchFloatFramesV2(
+                (const float*)data,
+                framesAvailable,
+                g_captureFormatV2.captureSampleRate,
+                (uint16_t)g_captureFormatV2.captureChannels,
+                !g_bStreamingEnabled || (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == NULL,
+                outBuf,
+                &nextFrameIndex,
+                callback,
+                userData))
+            {
+                g_pCaptureClient->ReleaseBuffer(framesAvailable);
+                SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "Float32 packet could not be dispatched without truncation");
+                g_bRunning = FALSE;
+                break;
+            }
+
+            hr = g_pCaptureClient->ReleaseBuffer(framesAvailable);
+            if (FAILED(hr))
+            {
+                ReportFloatCaptureFailure("WASAPI ReleaseBuffer", hr);
+                g_bRunning = FALSE;
+                break;
+            }
+            if (!g_bRunning) break;
+            hr = g_pCaptureClient->GetNextPacketSize(&packetLength);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+            {
+                SetLastErrorState(ANPOD_ERR_DEVICE_INVALIDATED, DefaultMessageForCode(ANPOD_ERR_DEVICE_INVALIDATED));
+                g_bRunning = FALSE;
+                break;
+            }
+            if (FAILED(hr))
+            {
+                ReportFloatCaptureFailure("WASAPI GetNextPacketSize", hr);
+                g_bRunning = FALSE;
+                break;
+            }
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, outBuf);
+    timeEndPeriod(1);
+    if (!AvRevertMmThreadCharacteristics(mmcssHandle))
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "capture thread could not leave MMCSS Pro Audio");
+    }
+    g_bRunning = FALSE;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ exports */
 
 static void ResetSessionState()
@@ -511,6 +723,12 @@ int ANPOD_CALL AudioCapture_Initialize(void)
 {
     HRESULT hr;
 
+    if (g_bFloatCaptureMode)
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT,
+            "Float32 capture is initialized; Cleanup is required before PCM16 initialization");
+        return 0;
+    }
     if (g_pAudioClient != NULL)
     {
         /* Already initialised; treat as success (callers may retry). */
@@ -626,8 +844,222 @@ int ANPOD_CALL AudioCapture_Initialize(void)
     return 1;
 }
 
+int ANPOD_CALL AudioCapture_GetCapabilitiesV2(AudioCaptureCapabilitiesV2* capabilities)
+{
+    if (capabilities == NULL || capabilities->size < sizeof(*capabilities) || capabilities->version != 2)
+    {
+        SetLastErrorState(ANPOD_ERR_UNSUPPORTED_FORMAT, "invalid AudioCaptureCapabilitiesV2 size or version");
+        return 0;
+    }
+    AudioCaptureCapabilitiesV2 value = {};
+    value.size = sizeof(value);
+    value.version = 2;
+    value.flags = ANPOD_AUDIO_CAPTURE_CAP_FLOAT32_V2;
+    value.maxCallbackFrames = kMaxFloatCallbackFrames;
+    *capabilities = value;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
+int ANPOD_CALL AudioCapture_GetCaptureFormatV2(AudioCaptureFormatV2* format)
+{
+    if (format == NULL || format->size < sizeof(*format) || format->version != 2)
+    {
+        SetLastErrorState(ANPOD_ERR_UNSUPPORTED_FORMAT, "invalid AudioCaptureFormatV2 size or version");
+        return 0;
+    }
+    if (g_pAudioClient == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "capture format is unavailable before initialization");
+        return 0;
+    }
+
+    AudioCaptureFormatV2 value = {};
+    if (g_captureFormatV2.mixSampleRate != 0)
+    {
+        value = g_captureFormatV2;
+    }
+    else if (!ReadMixFormatV2(g_pAudioClient, &value))
+    {
+        return 0;
+    }
+
+    if (!g_bFloatCaptureMode)
+    {
+        value.captureSampleRate = kOutputSampleRate;
+        value.captureChannels = kOutputChannels;
+        value.captureSampleFormat = ANPOD_AUDIO_SAMPLE_FORMAT_INTEGER;
+        value.conversionFlags = 0;
+        if (value.mixSampleRate != value.captureSampleRate)
+            value.conversionFlags |= ANPOD_AUDIO_CONVERSION_RESAMPLED;
+        if (value.mixChannels != value.captureChannels ||
+            (value.mixChannelMask != 0 && value.mixChannelMask != kStereoChannelMask))
+            value.conversionFlags |= ANPOD_AUDIO_CONVERSION_CHANNELS;
+        if (value.mixSampleFormat != ANPOD_AUDIO_SAMPLE_FORMAT_INTEGER ||
+            value.mixContainerBits != kOutputBitsPerSample)
+            value.conversionFlags |= ANPOD_AUDIO_CONVERSION_SAMPLE;
+    }
+
+    *format = value;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
+int ANPOD_CALL AudioCapture_InitializeFloatV2(void)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+        if (g_pcmCallback != NULL)
+        {
+            SetLastErrorState(ANPOD_ERR_PCM_CALLBACK,
+                "clear the PCM16 sink before initializing Float32 capture");
+            return 0;
+        }
+    }
+    if (g_pAudioClient != NULL)
+    {
+        if (g_bFloatCaptureMode) return 1;
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT,
+            "legacy PCM16 capture is initialized; Cleanup is required before Float32 initialization");
+        return 0;
+    }
+    if (g_hCaptureThread != NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "Cleanup is required before capture reinitialization");
+        return 0;
+    }
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (hr == RPC_E_CHANGED_MODE)
+    {
+        g_bComInitialized = FALSE;
+    }
+    else if (FAILED(hr))
+    {
+        SetLastErrorState(ANPOD_ERR_COM_INIT, DefaultMessageForCode(ANPOD_ERR_COM_INIT));
+        return 0;
+    }
+    else
+    {
+        g_bComInitialized = TRUE;
+    }
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&g_pEnumerator);
+    if (FAILED(hr) || g_pEnumerator == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_ENUMERATOR, DefaultMessageForCode(ANPOD_ERR_ENUMERATOR));
+        AudioCapture_Cleanup();
+        return 0;
+    }
+
+    IMMDevice* device = NULL;
+    hr = g_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || device == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_NO_ENDPOINT, DefaultMessageForCode(ANPOD_ERR_NO_ENDPOINT));
+        AudioCapture_Cleanup();
+        return 0;
+    }
+
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_pAudioClient);
+    if (FAILED(hr) || g_pAudioClient == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_ACTIVATE, DefaultMessageForCode(ANPOD_ERR_ACTIVATE));
+        device->Release();
+        AudioCapture_Cleanup();
+        return 0;
+    }
+
+    AudioCaptureFormatV2 format = {};
+    if (!ReadMixFormatV2(g_pAudioClient, &format))
+    {
+        device->Release();
+        AudioCapture_Cleanup();
+        return 0;
+    }
+
+    WAVEFORMATEXTENSIBLE target = {};
+    target.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    target.Format.nChannels = 2;
+    target.Format.nSamplesPerSec = format.mixSampleRate;
+    target.Format.wBitsPerSample = 32;
+    target.Format.nBlockAlign = 2 * sizeof(float);
+    target.Format.nAvgBytesPerSec = format.mixSampleRate * target.Format.nBlockAlign;
+    target.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    target.SubFormat = kSubtypeFloat;
+    target.Samples.wValidBitsPerSample = 32;
+    target.dwChannelMask = kStereoChannelMask;
+    hr = g_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        0, 0, (WAVEFORMATEX*)&target, NULL);
+    if (FAILED(hr))
+    {
+        char message[160];
+        snprintf(message, sizeof(message),
+            "WASAPI could not initialize %lu Hz stereo Float32 shared-mode capture (HRESULT 0x%08lX)",
+            (unsigned long)format.mixSampleRate, (unsigned long)hr);
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, message);
+        device->Release();
+        AudioCapture_Cleanup();
+        return 0;
+    }
+    device->Release();
+
+    UINT32 bufferFrameCount = 0;
+    hr = g_pAudioClient->GetBufferSize(&bufferFrameCount);
+    if (FAILED(hr))
+    {
+        SetLastErrorState(ANPOD_ERR_BUFFER_SIZE, DefaultMessageForCode(ANPOD_ERR_BUFFER_SIZE));
+        AudioCapture_Cleanup();
+        return 0;
+    }
+    hr = g_pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&g_pCaptureClient);
+    if (FAILED(hr) || g_pCaptureClient == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_GET_CAPTURE_CLIENT, DefaultMessageForCode(ANPOD_ERR_GET_CAPTURE_CLIENT));
+        AudioCapture_Cleanup();
+        return 0;
+    }
+
+    g_captureFormatV2 = format;
+    g_bFloatCaptureMode = TRUE;
+    ResetSessionState();
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
+int ANPOD_CALL AudioCapture_SetFloatPcmCallbackV2(FloatPcmCallbackV2 callback, void* userData)
+{
+    if (g_hCaptureThread != NULL || g_bRunning)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "Float32 callback can only change before Start or after Cleanup");
+        return 0;
+    }
+    if (callback == NULL && userData != NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "userData must be null when clearing the Float32 callback");
+        return 0;
+    }
+    if (callback != NULL && (!g_bFloatCaptureMode || g_pAudioClient == NULL))
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "Float32 capture must be initialized before registering its callback");
+        return 0;
+    }
+    g_floatPcmCallback = callback;
+    g_floatPcmCallbackUserData = userData;
+    SetLastErrorState(ANPOD_OK, NULL);
+    return 1;
+}
+
 int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
 {
+    if (g_bFloatCaptureMode || g_floatPcmCallback != NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_SOCKET_LISTEN, "TCP listener cannot be used with Float32 capture");
+        return 0;
+    }
     {
         std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
         if (g_pcmCallback != NULL)
@@ -726,6 +1158,11 @@ int ANPOD_CALL AudioCapture_Listen(int port, ConnectCallback callback)
 int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData)
 {
     std::lock_guard<std::mutex> lock(g_pcmCallbackMutex);
+    if (callback != NULL && g_bFloatCaptureMode)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM16 callback cannot be selected in Float32 capture mode");
+        return 0;
+    }
     if (g_bRunning)
     {
         SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM sink can only change while capture is stopped");
@@ -749,6 +1186,11 @@ int ANPOD_CALL AudioCapture_SetPcmCallback(PcmCallback callback, void* userData)
 
 int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channels)
 {
+    if (g_bFloatCaptureMode)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM16 format is unavailable in Float32 capture mode");
+        return 0;
+    }
     if (g_pAudioClient == NULL || sampleRate == NULL || channels == NULL)
     {
         SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "PCM format is unavailable before audio initialization");
@@ -762,9 +1204,19 @@ int ANPOD_CALL AudioCapture_GetPcmFormat(uint32_t* sampleRate, uint16_t* channel
 
 int ANPOD_CALL AudioCapture_Start(void)
 {
+    if (g_hCaptureThread != NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "Cleanup is required before starting another capture thread");
+        return 0;
+    }
     if (g_pAudioClient == NULL)
     {
         SetLastErrorState(ANPOD_ERR_AUDIO_CLIENT_INIT, "capture was not initialised");
+        return 0;
+    }
+    if (g_bFloatCaptureMode && g_floatPcmCallback == NULL)
+    {
+        SetLastErrorState(ANPOD_ERR_PCM_CALLBACK, "Float32 capture requires a callback and has no TCP fallback");
         return 0;
     }
 
@@ -779,7 +1231,8 @@ int ANPOD_CALL AudioCapture_Start(void)
     SetLastErrorState(ANPOD_OK, NULL);
     InterlockedExchange64(&g_sentPcmBytes, 0);
     g_bRunning = TRUE;
-    g_hCaptureThread = CreateThread(NULL, 0, CaptureThread, NULL, 0, NULL);
+    g_hCaptureThread = CreateThread(NULL, 0,
+        g_bFloatCaptureMode ? FloatCaptureThread : CaptureThread, NULL, 0, NULL);
 
     if (g_hCaptureThread == NULL)
     {
@@ -887,6 +1340,10 @@ void ANPOD_CALL AudioCapture_Cleanup(void)
         g_pcmCallback = NULL;
         g_pcmCallbackUserData = NULL;
     }
+    g_floatPcmCallback = NULL;
+    g_floatPcmCallbackUserData = NULL;
+    g_bFloatCaptureMode = FALSE;
+    memset(&g_captureFormatV2, 0, sizeof(g_captureFormatV2));
 
     g_connectCallback = NULL;
     g_bConnected = FALSE;

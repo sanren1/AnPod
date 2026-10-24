@@ -16,6 +16,306 @@ fn session_queue_discards_audio_that_does_not_match_negotiated_format() {
 }
 
 #[test]
+fn float_queue_bounds_capture_frames_and_preserves_callback_samples() {
+    let queue = Arc::new(FloatPcmQueue::new(true));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let samples = (0..1000)
+        .flat_map(|frame| [frame as f32, -(frame as f32)])
+        .collect::<Vec<_>>();
+    unsafe {
+        crate::audio::on_native_float_pcm(samples.as_ptr(), 1000, 48_000, 2, 120, callback_state);
+    }
+
+    let mut scratch = Vec::with_capacity(1920);
+    let info = queue.pop_wait(&mut scratch).unwrap();
+    assert_eq!(info.frame_count, 960);
+    assert_eq!(info.sample_rate, 48_000);
+    assert_eq!(info.channels, 2);
+    assert_eq!(info.frame_index, 160);
+    assert_eq!(scratch.len(), 1920);
+    assert_eq!(&scratch[..4], &[40.0, -40.0, 41.0, -41.0]);
+    assert_eq!(queue.dropped_frames(), 40);
+}
+
+#[test]
+fn float_queue_rejects_native_callbacks_above_the_advertised_maximum() {
+    let queue = Arc::new(FloatPcmQueue::new(true));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let one_frame = [0.25f32, -0.25];
+    unsafe {
+        crate::audio::on_native_float_pcm(one_frame.as_ptr(), 4097, 48_000, 2, 0, callback_state);
+    }
+    assert_eq!(queue.dropped_frames(), 4097);
+    assert_eq!(queue.state.lock().unwrap().len, 0);
+}
+
+#[test]
+fn legacy_pcm16_capture_callback_remains_sample_exact() {
+    let queue = Arc::new(PcmQueue::new());
+    let callback_state = Arc::as_ptr(&queue) as *mut std::ffi::c_void;
+    let samples = [i16::MIN, -1, 0, i16::MAX];
+    unsafe {
+        crate::audio::on_native_pcm(samples.as_ptr(), 2, 48_000, 2, 77, callback_state);
+    }
+    let mut scratch = Vec::new();
+    let info = queue
+        .pop_wait(&AtomicBool::new(false), &mut scratch)
+        .unwrap();
+    assert_eq!(info.frame_index, 77);
+    assert_eq!(scratch, samples);
+}
+
+#[test]
+fn stopped_float_queue_wakes_consumer_and_cannot_be_restarted() {
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let waiting_queue = queue.clone();
+    let waiter = std::thread::spawn(move || {
+        let mut scratch = Vec::with_capacity(8192);
+        waiting_queue.pop_wait(&mut scratch)
+    });
+    std::thread::yield_now();
+    queue.stop_and_clear();
+    assert!(waiter.join().unwrap().is_none());
+    assert!(queue.set_expected_format(48_000, 4096).is_err());
+}
+
+#[test]
+fn pcm24_quantizer_uses_symmetric_q23_rounding_and_rejects_non_finite() {
+    assert_eq!(float_to_pcm24(-1.0), Ok(-8_388_608));
+    assert_eq!(float_to_pcm24(1.0), Ok(8_388_607));
+    assert_eq!(float_to_pcm24(0.5 / 8_388_608.0), Ok(1));
+    assert_eq!(float_to_pcm24(-0.5 / 8_388_608.0), Ok(-1));
+    assert_eq!(float_to_pcm24(0.0), Ok(0));
+    assert_eq!(
+        float_to_pcm24(f32::NAN),
+        Err("Float32 PCM contains a non-finite sample.")
+    );
+    assert_eq!(
+        float_to_pcm24(f32::INFINITY),
+        Err("Float32 PCM contains a non-finite sample.")
+    );
+}
+
+#[test]
+fn float_udp_sender_splits_24bit_packets_on_frame_boundaries() {
+    let format = crate::protocol::AudioFormatV2::for_profile(2, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let mut samples = vec![0.5f32; 480 * 2];
+    samples[0] = 1.0 / 32768.0;
+
+    let key = [0x71; 32];
+    let session_id = 0x0102_0304_0506_0708;
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let send_socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let peer = receiver.local_addr().unwrap();
+    let sender_queue = queue.clone();
+    let expected_queue_stop = Arc::new(AtomicBool::new(false));
+    let worker_expected_queue_stop = expected_queue_stop.clone();
+    let worker = std::thread::spawn(move || {
+        send_float_loop(
+            send_socket,
+            peer,
+            sender_queue,
+            FloatSenderSignals {
+                stopping: Arc::new(AtomicBool::new(false)),
+                expected_queue_stop: worker_expected_queue_stop,
+                pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+            },
+            UdpSessionMaterial { session_id, key },
+            format,
+        )
+    });
+
+    let mut decoder = PacketDecoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format).unwrap();
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+    let format_packet = decoder.open(&datagram[..length]).unwrap();
+    decoder.commit(format_packet.header.sequence);
+    assert_eq!(format_packet.header.packet_type, PacketType::Format);
+    assert!(queue.push_raw(samples.as_ptr(), 480, 48_000, 2, 1000));
+    let mut audio = Vec::new();
+    for _ in 0..3 {
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let packet = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(packet.header.sequence);
+        audio.push(packet);
+    }
+    expected_queue_stop.store(true, Ordering::Release);
+    queue.stop_and_clear();
+    let stats = worker.join().unwrap().unwrap();
+    assert_eq!(stats.packets_sent, 4);
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.header.sample_frame_index)
+            .collect::<Vec<_>>(),
+        [1000, 1191, 1382]
+    );
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.payload.len())
+            .collect::<Vec<_>>(),
+        [1146, 1146, 588]
+    );
+    assert_eq!(&audio[0].payload[..3], &[0, 1, 0]);
+    assert!(audio
+        .iter()
+        .flat_map(|packet| packet.payload.chunks_exact(3).skip(1))
+        .all(|sample| sample == [0, 0, 64]));
+}
+
+#[test]
+fn float_udp_sender_splits_96khz_profile3_and_preserves_low_q23_samples_and_indices() {
+    let format = crate::protocol::AudioFormatV2::for_profile(3, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(96_000, 4096).unwrap();
+    let mut samples = vec![0.0f32; 480 * 2];
+    samples[..4].copy_from_slice(&[
+        1.0 / 8_388_608.0,
+        -1.0 / 8_388_608.0,
+        32_769.0 / 8_388_608.0,
+        -32_769.0 / 8_388_608.0,
+    ]);
+    let key = [0x72; 32];
+    let session_id = 0x1112_1314_1516_1718;
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut sender = FloatUdpSender::spawn_authenticated(
+        receiver.local_addr().unwrap(),
+        queue.clone(),
+        UdpSocket::bind(("127.0.0.1", 0)).unwrap(),
+        UdpSessionMaterial { session_id, key },
+        format,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+
+    let mut decoder = PacketDecoder::new_v2(&key, session_id, HOST_TO_RECEIVER, format).unwrap();
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+    let format_packet = decoder.open(&datagram[..length]).unwrap();
+    decoder.commit(format_packet.header.sequence);
+    assert_eq!(format_packet.header.packet_type, PacketType::Format);
+    assert!(queue.push_raw(samples.as_ptr(), 480, 96_000, 2, 7));
+    let mut audio = Vec::new();
+    for _ in 0..3 {
+        let (length, _) = receiver.recv_from(&mut datagram).unwrap();
+        let packet = decoder.open(&datagram[..length]).unwrap();
+        decoder.commit(packet.header.sequence);
+        audio.push(packet);
+    }
+    sender.expect_queue_stop();
+    queue.stop_and_clear();
+    let stats = sender.stop().unwrap();
+
+    assert_eq!(stats.packets_sent, 4);
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.header.sample_frame_index)
+            .collect::<Vec<_>>(),
+        [7, 198, 389]
+    );
+    assert_eq!(
+        audio
+            .iter()
+            .map(|packet| packet.payload.len())
+            .collect::<Vec<_>>(),
+        [1146, 1146, 588]
+    );
+    assert_eq!(
+        &audio[0].payload[..12],
+        &[1, 0, 0, 255, 255, 255, 1, 128, 0, 255, 127, 255]
+    );
+}
+
+#[test]
+fn float_udp_sender_reports_an_unplanned_active_queue_stop() {
+    let format = crate::protocol::AudioFormatV2::for_profile(2, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let send_socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let peer = receiver.local_addr().unwrap();
+    let sender_queue = queue.clone();
+    let worker = std::thread::spawn(move || {
+        send_float_loop(
+            send_socket,
+            peer,
+            sender_queue,
+            FloatSenderSignals {
+                stopping: Arc::new(AtomicBool::new(false)),
+                expected_queue_stop: Arc::new(AtomicBool::new(false)),
+                pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+            },
+            UdpSessionMaterial {
+                session_id: 99,
+                key: [4; 32],
+            },
+            format,
+        )
+    });
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let _ = receiver.recv_from(&mut datagram).unwrap();
+    queue.stop_and_clear();
+    assert!(worker.join().unwrap().is_err());
+}
+
+#[test]
+fn float_udp_sender_reports_a_queue_stop_after_resume_ack() {
+    let format = crate::protocol::AudioFormatV2::for_profile(2, 0).unwrap();
+    let queue = Arc::new(FloatPcmQueue::new(false));
+    queue.set_expected_format(48_000, 4096).unwrap();
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let sender = FloatUdpSender::spawn_authenticated(
+        receiver.local_addr().unwrap(),
+        queue.clone(),
+        UdpSocket::bind(("127.0.0.1", 0)).unwrap(),
+        UdpSessionMaterial {
+            session_id: 100,
+            key: [5; 32],
+        },
+        format,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+    let mut datagram = [0u8; MAX_DATAGRAM_LEN];
+    let _ = receiver.recv_from(&mut datagram).unwrap();
+
+    sender.expect_queue_stop();
+    sender.resume_after_ack().unwrap();
+    queue.stop_and_clear();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut sender = sender;
+    let mut error = None;
+    while error.is_none() && Instant::now() < deadline {
+        error = sender.take_finished_error();
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        error.as_deref(),
+        Some("Float32 PCM queue stopped while the authenticated sender was active.")
+    );
+    assert!(sender.resume_after_ack().is_err());
+}
+
+#[test]
 fn transient_udp_send_retries_are_bounded_and_never_replay_ciphertext() {
     let mut encoder = PacketEncoder::new(&[7; 32], 9, HOST_TO_RECEIVER);
     let mut attempts = 0;

@@ -990,6 +990,15 @@ fn parses_real_service_health_record() {
 }
 
 #[test]
+fn user_stop_requires_matching_receiver_owner_and_generation() {
+    let health = parse_health("Row: 0 applicationId=app.anpod.receiver, versionName=0.1.0-p1, versionCode=1, serviceActive=true, foreground=true, healthy=true, audioActive=true, operationOwnerId=owner-a, operationGeneration=7, terminalCause=USER_STOP, terminalOwnerId=owner-a, terminalGeneration=7, error=").unwrap();
+    let status = status_from_health(health);
+    assert!(status.was_stopped_by_user_for(Some("owner-a"), Some(7)));
+    assert!(!status.was_stopped_by_user_for(Some("owner-a"), Some(6)));
+    assert!(!status.was_stopped_by_user_for(Some("owner-b"), Some(7)));
+}
+
+#[test]
 fn installed_and_not_installed_package_responses_are_distinct() {
     assert_eq!(
         parse_installed_apk_path(

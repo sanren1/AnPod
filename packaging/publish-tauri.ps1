@@ -18,12 +18,39 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$componentSourceBySha256 = @{
+    'dbdf5fcc250e2d6711d16807ec97e479cd46c346cfddcc004db326a9b8abe94e' = [ordered]@{
+        component = 'Native'
+        sourceCommit = '393628dd2a43a221154b8226d70c03de2629cb66'
+        provenance = 'Phase 2 Native artifact built from the audited source commit.'
+    }
+    '0676594acbbb9489a6f53f661b57a3700544e6e0560f666b59163ea581d2bec7' = [ordered]@{
+        component = 'Legacy'
+        sourceCommit = '52795df94699204b7a3212803487c392217f95c3'
+        provenance = 'Phase 7 Legacy server built from the audited source commit.'
+    }
+}
+
+function Get-AnPodComponentBuildMetadata {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('Native', 'Legacy')][string]$Component,
+        [string]$ExpectedSha256
+    )
+
+    $sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $source = $componentSourceBySha256[$sha256]
+    if (-not $source -or $source.component -ne $Component) { throw "$Component component SHA-256 is not registered for that role: $sha256" }
+    if ($ExpectedSha256 -and $sha256 -ne $ExpectedSha256) { throw "$Component component changed after validation: $Path" }
+    return [ordered]@{ sha256 = $sha256; sourceCommit = $source.sourceCommit; provenance = $source.provenance }
+}
+
 $config = Get-Content -Raw (Join-Path $root 'src-tauri\tauri.conf.json') | ConvertFrom-Json
 if (-not $Version) { $Version = $config.version }
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 . (Join-Path $PSScriptRoot 'source-snapshot.ps1')
 if ($ReviewWorkingTree -and (-not $ReviewPackage -or $ReceiverCandidate -ne 'v3')) { throw '-ReviewWorkingTree requires a local V3 review candidate.' }
-$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1')
+$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1', 'packaging/enter-usb-direct.ps1', 'packaging/AoaHost.cs')
 $desktopInputsSha256 = Get-AnPodSourceSnapshot $root $desktopInputPaths
 $deps = Join-Path $root 'deps'
 $artifacts = Join-Path $root 'artifacts'
@@ -150,14 +177,13 @@ if ($IncludeReceiverCandidate) {
         $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
         $receiverCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
         if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
-        $receiverWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
-        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
+        $receiverWorkingChanges = Test-AnPodSourceModified -Root $root -Paths $receiverInputPaths
         if ($ReviewWorkingTree) {
             if ($receiverMetadata.sourceInputsSha256 -notmatch '^[0-9a-f]{64}$' -or
                 $receiverMetadata.sourceInputsSha256 -ne (Get-AnPodSourceSnapshot $root $receiverInputPaths)) {
                 throw 'Receiver source snapshot differs from the built artifact; rebuild it before packaging.'
             }
-        } elseif ($receiverCommittedChanges.Count -or $receiverWorkingChanges.Count) {
+        } elseif ($receiverCommittedChanges.Count -or $receiverWorkingChanges) {
             throw "V$ReceiverCandidate Receiver build inputs changed after source commit $($receiverMetadata.sourceCommit); rebuild the Receiver artifact before packaging."
         }
         if ($ReuseExistingBuild) {
@@ -247,9 +273,8 @@ if ($IncludeReceiverRelease) {
     $receiverInputPaths = @('src/AnPod.Receiver', 'src/AnPod.AndroidProtocol', 'packaging/build-receiver.ps1', 'packaging/source-snapshot.ps1')
     $releaseCommittedChanges = @(& git -C $root diff --name-only "$($receiverMetadata.sourceCommit)..$currentSourceCommit" -- @receiverInputPaths)
     if ($LASTEXITCODE -ne 0) { throw 'Could not compare the committed Receiver build inputs.' }
-    $releaseWorkingChanges = @(& git -C $root status --porcelain=v1 -- @receiverInputPaths)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the current Receiver build input state.' }
-    if ($releaseCommittedChanges.Count -or $releaseWorkingChanges.Count) {
+    $releaseWorkingChanges = Test-AnPodSourceModified -Root $root -Paths $receiverInputPaths
+    if ($releaseCommittedChanges.Count -or $releaseWorkingChanges) {
         throw 'Receiver build inputs changed after the release artifact was built; rebuild it before packaging.'
     }
     if (-not $AndroidSdkRoot) { $AndroidSdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME } }
@@ -277,6 +302,10 @@ if ($IncludeReceiverRelease) {
 
 $missing = @($required | Where-Object { $source = if ($_ -eq 'audio_capture.dll') { $nativeSource } elseif ($_ -eq 'server') { $legacyPayloadSource } else { $deps }; -not (Test-Path -LiteralPath (Join-Path $source $_) -PathType Leaf) })
 if ($missing.Count) { throw "Missing runtime files in deps/: $($missing -join ', ')" }
+if ($IncludeReceiverRelease) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $nativeSource 'audio_capture.dll') -Component Native
+    $legacyMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $legacyPayloadSource 'server') -Component Legacy
+}
 
 if (-not $ReuseExistingBuild) {
     Push-Location (Join-Path $root 'frontend')
@@ -346,13 +375,36 @@ if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force 
 New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir 'AnPod.exe')
 foreach ($name in $required[0..4]) { $source = if ($name -eq 'audio_capture.dll') { $nativeSource } elseif ($name -eq 'server') { $legacyPayloadSource } else { $deps }; Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $packageDir $name) }
+if ($IncludeReceiverRelease) {
+    $nativeMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $packageDir 'audio_capture.dll') -Component Native -ExpectedSha256 $nativeMetadata.sha256
+    $legacyMetadata = Get-AnPodComponentBuildMetadata -Path (Join-Path $packageDir 'server') -Component Legacy -ExpectedSha256 $legacyMetadata.sha256
+}
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $packageDir
+$readmeSupportFiles = @(
+    'docs\aod-preview.jpg',
+    'docs\AOD.md',
+    'packaging\publish-tauri.ps1',
+    'packaging\SIGNING.md'
+)
+foreach ($relativePath in $readmeSupportFiles) {
+    $source = Join-Path $root $relativePath
+    $destination = Join-Path $packageDir $relativePath
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination
+}
+$audioQualityDocsDir = Join-Path $packageDir 'docs\audio-quality'
+New-Item -ItemType Directory -Path $audioQualityDocsDir -Force | Out-Null
+Get-ChildItem -LiteralPath (Join-Path $root 'docs\audio-quality') -Filter '*.md' -File | Copy-Item -Destination $audioQualityDocsDir
 Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $root 'frontend\public\icon.png') -Destination (Join-Path $packageDir 'icon.png')
 Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $packageDir -Recurse
 Copy-Item -LiteralPath (Join-Path $deps 'PLATFORM_TOOLS_NOTICE.txt') -Destination (Join-Path $packageDir 'LICENSES\PLATFORM_TOOLS_NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'upstream') -Destination $packageDir -Recurse
+$usbDirectDir = Join-Path $packageDir 'USB-Direct'
+New-Item -ItemType Directory -Path $usbDirectDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $root 'packaging\enter-usb-direct.ps1') -Destination $usbDirectDir
+Copy-Item -LiteralPath (Join-Path $root 'packaging\AoaHost.cs') -Destination $usbDirectDir
 if ($IncludeReceiverCandidate -or $IncludeReceiverRelease) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }
@@ -381,6 +433,8 @@ if ($IncludeReceiverRelease) {
         workingTreeDirty = [bool](@(& git -C $root status --porcelain=v1).Count)
         desktop = [ordered]@{ sha256 = (Get-FileHash -LiteralPath (Join-Path $packageDir 'AnPod.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); sourceCommit = $currentSourceCommit; sourceInputsSha256 = $desktopInputsSha256 }
         receiver = [ordered]@{ sha256 = $receiverMetadata.sha256.ToLowerInvariant(); sourceCommit = $receiverMetadata.sourceCommit; sourceInputsSha256 = $receiverMetadata.sourceInputsSha256; sourceModified = $receiverMetadata.sourceModified; versionCode = $receiverMetadata.versionCode; versionName = $receiverMetadata.versionName; targetSdk = $receiverMetadata.targetSdk; variant = $receiverMetadata.variant; signerSha256 = $receiverMetadata.signerSha256.ToLowerInvariant() }
+        native = $nativeMetadata
+        legacyServer = $legacyMetadata
     }
     $buildMetadataPath = Join-Path $packageDir 'build-metadata.json'
     [IO.File]::WriteAllText($buildMetadataPath, ($buildMetadata | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))

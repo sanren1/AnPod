@@ -284,6 +284,10 @@ fn run_host_offer_listener(
                     .expect("host discovery snapshot lock poisoned");
                 discard_expired_offers(&mut current.offers);
                 if current.active && !current.offers.iter().any(|item| item.id == offer.id) {
+                    // One phone may retry several times; keep only its newest request so the user never picks a stale one.
+                    current
+                        .offers
+                        .retain(|item| item.endpoint != offer.endpoint);
                     if current.offers.len() == MAX_CANDIDATES {
                         continue;
                     }

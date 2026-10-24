@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import android.os.Binder;
+import android.hardware.usb.UsbAccessory;
 
 import java.io.IOException;
 import java.util.List;
@@ -16,12 +17,18 @@ import java.util.List;
         public AodTelemetrySnapshot aodSnapshot() { return service.uiState.aodSnapshot(); }
         public PcmWaveformTap.Waveform aodWaveform() { return ReceiverService.aodWaveform(); }
         public List<UiInterface> interfaces() { return service.uiState.interfaces(); }
+        public boolean clearNetworkSelectionFailure(String address, int prefixLength) {
+            return service.clearNetworkSelectionFailure(address, prefixLength);
+        }
         public String start(String address, int prefixLength, String requestId) { return service.startFromUi(address, prefixLength, requestId); }
         public String startReceiving(String address, int prefixLength, String requestId) {
             return service.startFromUi(address, prefixLength, requestId, false, true);
         }
         public String startBackgroundStandby(String address, int prefixLength, String requestId) {
             return service.startFromUi(address, prefixLength, requestId, true, true);
+        }
+        public String startAoaAccessory(UsbAccessory accessory, String requestId) {
+            return service.startAoaFromUi(accessory, requestId);
         }
         public boolean stop(String ownerId) { return service.stopFromUi(ownerId); }
         public boolean stop(String ownerId, long generation) { return service.stopFromUi(ownerId, generation); }

@@ -250,7 +250,7 @@ uses the supported buffer-size getter and retains balanced playback.
 `Pcm16FrameStream.java` retains incomplete frames across socket reads and finishes
 partial AudioTrack writes. Zero or failed writes stop the session with a
 diagnostic. Pre-roll reads are limited to the actual read-array size even when
-the effective playback buffer is larger. The checks in `tests/` exercise
+the effective playback buffer is larger. The local checks exercise
 fragmented frames, partial writes and large pre-roll targets.
 
 ### B9. Installed Receiver service adaptation
@@ -317,6 +317,22 @@ The existing AnPod PCM stream path trims stale queued frames when the consumer
 falls behind and applies a short fade at the trim boundary. This is new AnPod
 code in the shared Android protocol helper; it adds no dependency and does not
 change the Native DLL protocol or the legacy Android service wire format.
+
+### B14. Optional Oboe output adapter *(P5, experimental)*
+
+`AudioTrackPlaybackOutput.java` extracts the existing AudioShare-adapted
+`AudioTrack` writes and release path from the installed Receiver service; the
+default engine and legacy PCM16 byte path remain `AudioTrack`. The optional
+Oboe selection is a local Receiver preference for a new playback session. Its
+Java/native implementation—`OboeNativeBridge.java`, `OboePlaybackOutput.java`,
+`OboeOutputException.java`, `PlaybackOutput.java`, `OboeNativeBridge.cpp`, and
+`SpscFloatRing.h`—including the preallocated Float32 SPSC ring, is AnPod code.
+No Oboe source is copied: the build consumes the pinned
+`com.google.oboe:oboe:1.10.0` Apache-2.0 Prefab AAR described in
+`THIRD_PARTY_NOTICES.md` and `SOURCE_VERSIONS.md`. Runtime Oboe failure closes
+the active audio generation; a later session reports a one-shot same-format
+AudioTrack fallback rather than hot-switching the current stream. An initial
+open failure can use same-format AudioTrack in that session.
 
 ## C. Not modified
 
