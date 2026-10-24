@@ -721,8 +721,10 @@ PC1.12.1 / Receiver0.19.1-v3-flow-candidate/code43。`82e82ec`完成AOD英文居
 
 最终本地交付完成：业务冻结 `707fda3` 独立源码审查通过；仅修正AOD文档后冻结 `f0d1fa1` 并重新封包，实际业务输入不变。PC1.12.1便携包含原签名Receiver43，ZIP为 `artifacts/AnPod-1.12.1-tauri-win-x64-portable.zip`，18,538,812 bytes，SHA-256 `6266d68bd1208deb9d4dba37a57287d4e0a871194e0a05de7a188e26b4db5dd5`。独立制品审计27项全真，根代理另行核对52个ZIP文件与目录一致，11个README本地链接有效；详情与EXE/输入哈希见UI总规划第19节及 `artifacts/project-review-20261023/delivery-audit.*`。可离线实施的UI/UX规划项闭合，P5实机条目按要求保持未测。本轮临时中间产物已清理，旧有效包、报告和用户三个缓存保留；未安装手机、未推送或远程发布。
 
-## 2026-10-24 · 无线请求确认修复（离线检查完成，待封包）
+## 2026-10-24 · 无线请求确认修复（离线验证与本地交付完成）
 
 用户在两端更新、高保真／Hi-Res下报告UDP BIND拒绝。已定位唯一设备直连路径缺少手机请求nonce，由GPT 6 luna high在PC共用启动层修正为既有等待／手动确认流程，独立GPT 6.1 sol high复核。目标PC1.12.2，手机沿用Receiver43；不调整音质、请求时限或授权规则。任务与验收见UI总规划第20节；本轮检查及制品证据保存于 `artifacts/wireless-bind-20261024/`，未将旧测试记作新修复通过。
 
 本轮Rust151项通过，0失败/1忽略/2实机过滤；fmt、Clippy、TypeScript和diff检查通过。浏览器64项布尔全部为真，新增五项包含Hi-Res真实请求、三入口、迟到监听取消和手动停止；本轮未跑布局矩阵。版本脚本夹具通过，实际PC三份版本为1.12.2，Android代码及Receiver43未变。前端stdout未保存，以实际exit0和result.json为证；最终源码审查、封包与实机结论分别记录，不提前称实测通过。
+
+冻结 `69459d772c93e0eca09e2c144c636e70d8b84477`，独立源码及制品审查PASS。新便携包 `artifacts/AnPod-1.12.2-tauri-win-x64-portable.zip`，18,539,342 bytes，SHA-256 `4ee1a97442cd0d0c2cade184632305359d4ebc357a19e34a100bf73b02d6a0f2`。独立15项汇总核验全真、52文件一致，根代理另行打开ZIP全量复算通过；原签名Receiver43字节不变，无需重新安装手机应用。详情及EXE/输入哈希见UI总规划第20节；未远程推送、安装或进行实机无线播放复测，用户三个缓存与旧有效包保留。

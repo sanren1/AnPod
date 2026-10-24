@@ -371,7 +371,7 @@ Java离线协议/PCM检查、版本一致性、源码快照和组件门禁检查
 
 构建时 `workingTreeDirty=true`如实保留，受跟踪输入干净，dirty仅来自三个原有用户缓存。本轮自有Gradle中间目录、AOD Debug输出及隔离基线源码已验证绝对路径后清理；有效APK/ZIP、原始报告、旧有效包和用户缓存保留。交付记录提交位于源码输入范围之外，不改变上述制品来源。未安装手机，未推送或远程发布；实机及生产性能范围继续保持上文NOT_TESTED。
 
-## 20. 2026-10-24 · 无线连接请求确认修复（源码及离线检查完成，待本地封包）
+## 20. 2026-10-24 · 无线连接请求确认修复（离线验证与本地交付完成）
 
 用户确认使用PC1.12.1、Receiver43及高保真／Hi-Res，出现 `result=1, state=Authenticated, udp_port=0`。源码追踪确认：发现唯一手机后直接启动的路径未携带手机连接请求nonce；Receiver的连接意图校验在绑定UDP端口前拒绝，不能将此错误归因于音质不支持或防火墙。
 
@@ -387,3 +387,13 @@ Java离线协议/PCM检查、版本一致性、源码快照和组件门禁检查
 最终实现位于PC共同BIND及前端启动层，连接窗初始选择优先本轮已选网络/手机，手动断开会清除监听意图，监听延迟期间仍可停止。缺nonce测试同时断言PC提前标记与手机对原始BIND的独立拒绝，不削弱手机负向校验。
 
 本轮Rust串行151 passed / 0 failed / 1 ignored / 2 filtered，通过CI相同两项实机过滤；fmt、Clippy、TypeScript及diff检查通过。格式首次失败的换行已修复，原始失败保留为 `fmt-initial.log`，最终 `fmt.log` 记录实际检查退出码0。浏览器64项布尔全部为真，包含三入口、Hi-Res保留、真实offer接受、延迟监听取消、手动断开；本轮未跑布局矩阵。前端stdout未持久化，仅有实际运行退出码0及 `frontend-check/result.json`，不冒称完整原始日志。版本脚本夹具通过，实际桌面三份版本另核对为1.12.2，Android无改动；未重复执行Android全量或未改的C#检查。
+
+### 冻结及本地制品
+
+冻结来源 `69459d772c93e0eca09e2c144c636e70d8b84477`；独立GPT 6.1 sol high源码审查PASS，报告 `source-review.md`。清理失败阻断已做源码验证，未将旧cleanup回归冒充marker与恢复失败组合注入测试。
+
+PC1.12.2便携包 `artifacts/AnPod-1.12.2-tauri-win-x64-portable.zip`，18,539,342 bytes，SHA-256 `4ee1a97442cd0d0c2cade184632305359d4ebc357a19e34a100bf73b02d6a0f2`。EXE SHA-256 `dcf58a166c6b631a99c151cf9f40f6bc519af6cd0437673a0da251224d9ed1c1`，桌面输入快照 `e583b070fbb9df1d0994b3a81e19c49f54d4f5f003dff05270c8f35c4004e14e`。随包Receiver43保持原APK SHA-256 `f912db8dc39935b7d0c3c23dbcf8d54d8053f484e5cb8524b9bba989022f3161`，无需重新安装手机应用。
+
+根代理逐项打开ZIP核对52文件路径、长度和哈希通过，证据 `root-zip-verification.json`。独立GPT 6.1 sol high制品审计PASS，15项汇总检查全真；52文件逐项一致，42文本内容扫描无异常、10个README本地链接有效，EXE版本/来源及Receiver43原字节/原签名通过，详见 `delivery-audit.json` / `.md`。保留原APK v1 META-INF条目警告与Vite产物大小提示，不将其隐藏或误称失败。
+
+发布脚本本地构建退出0，未安装、启动设备或远程发布；旧有效包及三个用户缓存保留，无新增过期临时目录，执行代理自启的Vite预览已停止。全树dirty只来自原有缓存，受跟踪源码构建时干净；随后补写的本节交付记录和开发规划位于制品源码输入范围之外。新修复仍未进行手机实机播放验证。
