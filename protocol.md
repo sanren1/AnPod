@@ -526,8 +526,8 @@ tracker may trust. Verification never replaces P5-A: a verified candidate is
 still an unauthenticated endpoint hint until the session handshake succeeds.
 
 The shared vector (`secret = 00..1f`, `nonce = 00..0f`, control port `41234`)
-is asserted by both `src-tauri/src/discovery.rs` and
-`tests/AnPodDiscoveryAuthCheck.java`: tag `26414e36e4dc63e6`, probe MAC
+is asserted by both `src-tauri/src/discovery.rs` and the local Java check: tag
+`26414e36e4dc63e6`, probe MAC
 `83ec229f58b0088dd60051cb736e6db8`, reply MAC
 `a82f6568b5e977d37c46b22155edcba4`.
 
@@ -762,8 +762,8 @@ output latency.
 
 ## Cross-language vector
 
-The Rust test `protocol::tests::java_jca_aes_gcm_vector` and
-`tests/AnPodUdpVectorCheck.java` use the same key, nonce, 34-byte AAD, and
+The Rust test `protocol::tests::java_jca_aes_gcm_vector` and the local Java
+check use the same key, nonce, 34-byte AAD, and
 payload. The Java entry also sends the fixed packet through the real Android
 parser, then runs the merged parser/queue/loopback checks. Both vector paths
 must produce this complete packet:

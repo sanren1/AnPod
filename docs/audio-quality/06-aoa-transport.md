@@ -302,7 +302,7 @@ authorization and trust behavior remain unchanged.
 
 ## Offline verification and limits
 
-`tests/aoa-v1-vectors.txt` is fixed synthetic data only. It contains a sample
+The local test suite uses fixed synthetic data only. It contains a sample
 ANPB record, derived AOA binding secret, profile descriptors, P5-A v2 handshake
 proofs and keys, P5-C control and ANPD v2 FORMAT/AUDIO records, ANPU wrappers,
 and negative wrong-domain expectations. It never contains a real binding or

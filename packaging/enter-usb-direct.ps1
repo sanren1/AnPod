@@ -24,9 +24,6 @@ if ($answer -cne 'SWITCH AOA') {
 
 try {
     $helper = Join-Path $PSScriptRoot 'AoaHost.cs'
-    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
-        $helper = Join-Path $PSScriptRoot '..\AnPod_AOA_Phase2_Probe\Windows\AoaHost.cs'
-    }
     Add-Type -TypeDefinition (Get-Content -LiteralPath $helper -Raw -Encoding UTF8) -Language CSharp -ErrorAction Stop
     Write-Host ([AnPodAoaPhase2]::SwitchAnPodReceiver())
 } catch {

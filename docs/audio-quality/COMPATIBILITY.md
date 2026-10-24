@@ -127,9 +127,8 @@ tests do not establish runtime recovery through that entrypoint. Physical AOA,
 audio playback/quality, installation/upgrade, and long-duration behavior remain
 `NOT_TESTED`.
 
-The shared fixed vectors are in `tests/audio-v2-vectors.txt`; Rust and Java
-checks independently compare descriptor, handshake, transcript, keys and packet
-bytes against that file. The Java P5-C loopback fixture exposes the authenticated
+The local Rust and Java test suites share fixed vectors to compare descriptor,
+handshake, transcript, keys and packet bytes. The Java P5-C loopback fixture exposes the authenticated
 probe/fresh-session path to the Rust host and uses synthetic playback. Focused
 Rust↔Java upgrade/rejection and two-generation owner pause/restart checks pass;
 the fixture's final PCM24 low-bit result is true only if every requested session
@@ -158,8 +157,8 @@ test then passed focused 1/1, with Java offline checks 7/7. The frontend
 production build and persistent AOA smoke check passed. These are source and
 offline results, not hardware validation. The signed Receiver APK is built.
 Portable build metadata records the actual packaged component hashes and
-registered source commits. Portable ZIP checks and its checksum are recorded
-in `plan_dev.md`, which is not included in the package.
+registered source commits. Portable ZIP checks and its checksum are retained
+in local release records.
 
 The previous Receiver review candidate was version `0.17.0-v3-flow-candidate` / code 34,
 source commit `8ca9638db128f99e36769f42de18ed9244f457c2`, with

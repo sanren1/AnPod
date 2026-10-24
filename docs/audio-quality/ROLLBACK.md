@@ -59,8 +59,7 @@ certificate verified. The portable candidate's `build-metadata.json` records
 the source commit, `sourceInputsSha256`, APK SHA-256, signer, component hashes,
 component source commits when their exact hashes are registered, and
 whole-worktree dirty state. Portable
-ZIP checks and checksum are recorded in `plan_dev.md`, which is not included in
-the package. Receiver source-input
+ZIP checks and checksum are retained in local release records. Receiver source-input
 checks include tracked files and real untracked source, while excluding only
 untracked generated files under `src/AnPod.Receiver/app/.cxx/`; tracked files
 there remain inputs. The workspace may therefore be globally dirty from a

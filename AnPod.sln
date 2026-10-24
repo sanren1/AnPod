@@ -9,10 +9,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AnPod.Core", "src\AnPod.Cor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AnPod.Desktop", "src\AnPod.Desktop\AnPod.Desktop.csproj", "{32981B23-7CB5-4055-898B-2BD286F7AB37}"
 EndProject
-Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{A1B3DC0A-30CB-4AAE-BAD2-99DBDCD4D9DE}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AnPod.Core.Tests", "tests\AnPod.Core.Tests\AnPod.Core.Tests.csproj", "{A2B0DEE3-09F5-4A19-B075-955F741350A3}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -30,14 +26,9 @@ Global
 		{32981B23-7CB5-4055-898B-2BD286F7AB37}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{32981B23-7CB5-4055-898B-2BD286F7AB37}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{32981B23-7CB5-4055-898B-2BD286F7AB37}.Release|Any CPU.Build.0 = Release|Any CPU
-		{A2B0DEE3-09F5-4A19-B075-955F741350A3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A2B0DEE3-09F5-4A19-B075-955F741350A3}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{A2B0DEE3-09F5-4A19-B075-955F741350A3}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{A2B0DEE3-09F5-4A19-B075-955F741350A3}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{99C944DE-D6F7-4EDE-9585-068CE7730317} = {4C0172A4-29F5-47DD-BDC4-67DB532DCB8C}
 		{32981B23-7CB5-4055-898B-2BD286F7AB37} = {4C0172A4-29F5-47DD-BDC4-67DB532DCB8C}
-		{A2B0DEE3-09F5-4A19-B075-955F741350A3} = {A1B3DC0A-30CB-4AAE-BAD2-99DBDCD4D9DE}
 	EndGlobalSection
 EndGlobal

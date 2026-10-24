@@ -5,13 +5,13 @@
 .DESCRIPTION
     Two toolchains are supported, tried in this order:
 
-      1. CMake + Visual Studio  -- the toolchain named in plan.md appendix B.
+      1. CMake + Visual Studio  -- recommended for release builds.
       2. MinGW-w64 g++          -- fallback for machines without Visual Studio.
                                    Verified to produce a working x64 DLL with
                                    the same exports and no non-system imports.
 
     The managed application is x64-only, so the DLL must be x64 too; both paths
-    fail loudly rather than producing a mismatched binary (plan §1.2, §7.2).
+    fail loudly rather than producing a mismatched binary.
 
 .PARAMETER MinGWRoot
     Directory containing bin\g++.exe (for example an extracted w64devkit).
@@ -169,5 +169,5 @@ Copy-Item -Path $built -Destination $destination -Force
 
 $size = (Get-Item $destination).Length
 Write-Host "Copied to $destination ($size bytes)" -ForegroundColor Green
-Write-Host 'Note: the plan.md release toolchain is MSVC/CMake; a MinGW build is'
+Write-Host 'Note: MSVC/CMake is the recommended release toolchain; a MinGW build is'
 Write-Host 'functionally equivalent but should be re-built with MSVC for release.'

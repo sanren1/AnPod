@@ -1,7 +1,0 @@
-cmake_minimum_required(VERSION 3.22.1)
-project(anpod_audio_probe LANGUAGES CXX)
-add_library(anpod_audio_probe SHARED audio_probe.cpp)
-set_target_properties(anpod_audio_probe PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
-find_package(oboe REQUIRED CONFIG)
-target_link_libraries(anpod_audio_probe PRIVATE oboe::oboe log)
-target_link_options(anpod_audio_probe PRIVATE "-Wl,-z,max-page-size=16384")

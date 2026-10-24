@@ -4,13 +4,11 @@
 
 .DESCRIPTION
     The "server" payload is a zip containing classes.dex. It is pushed to
-    /data/local/tmp and started with app_process; it is never installed
-    (plan §3.2).
+    /data/local/tmp and started with app_process; it is never installed.
 
     Two build paths are supported:
 
-      1. Gradle + Android SDK  -- the toolchain named in plan.md appendix B.
-                                  Produces an APK, which is an equally valid
+      1. Gradle + Android SDK  -- produces an APK, which is an equally valid
                                   classes.dex container.
       2. SDK direct            -- javac + d8 + zip, no Gradle. Fallback for
                                   machines without Gradle, and much faster.

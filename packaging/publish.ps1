@@ -47,12 +47,18 @@ function Get-DotNet {
 $dotnet = Get-DotNet
 
 if (-not $SkipTests) {
-    Write-Host 'Running core checks...' -ForegroundColor Cyan
-    # No --nologo here: `dotnet run` forwards unrecognised options to the
-    # application, so it would arrive in the test program's args.
-    & $dotnet run --project (Join-Path $root 'tests\AnPod.Core.Tests\AnPod.Core.Tests.csproj') -c Release
-    if ($LASTEXITCODE -ne 0) {
-        throw "Core checks failed with exit code $LASTEXITCODE."
+    $testProject = Join-Path $root 'tests\AnPod.Core.Tests\AnPod.Core.Tests.csproj'
+    if (Test-Path -LiteralPath $testProject -PathType Leaf) {
+        Write-Host 'Running core checks...' -ForegroundColor Cyan
+        # No --nologo here: `dotnet run` forwards unrecognised options to the
+        # application, so it would arrive in the test program's args.
+        & $dotnet run --project $testProject -c Release
+        if ($LASTEXITCODE -ne 0) {
+            throw "Core checks failed with exit code $LASTEXITCODE."
+        }
+    }
+    else {
+        Write-Warning 'Core tests are not included in the public repository checkout; continuing with the product build.'
     }
 }
 

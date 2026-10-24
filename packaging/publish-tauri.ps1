@@ -50,7 +50,7 @@ if (-not $Version) { $Version = $config.version }
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid package version: $Version" }
 . (Join-Path $PSScriptRoot 'source-snapshot.ps1')
 if ($ReviewWorkingTree -and (-not $ReviewPackage -or $ReceiverCandidate -ne 'v3')) { throw '-ReviewWorkingTree requires a local V3 review candidate.' }
-$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1', 'packaging/enter-usb-direct.ps1', 'AnPod_AOA_Phase2_Probe/Windows/AoaHost.cs')
+$desktopInputPaths = @('src-tauri', 'frontend', 'packaging/publish-tauri.ps1', 'packaging/source-snapshot.ps1', 'packaging/enter-usb-direct.ps1', 'packaging/AoaHost.cs')
 $desktopInputsSha256 = Get-AnPodSourceSnapshot $root $desktopInputPaths
 $deps = Join-Path $root 'deps'
 $artifacts = Join-Path $root 'artifacts'
@@ -384,8 +384,7 @@ $readmeSupportFiles = @(
     'docs\aod-preview.jpg',
     'docs\AOD.md',
     'packaging\publish-tauri.ps1',
-    'packaging\SIGNING.md',
-    'tools\AnPod.TestBench\README.md'
+    'packaging\SIGNING.md'
 )
 foreach ($relativePath in $readmeSupportFiles) {
     $source = Join-Path $root $relativePath
@@ -405,7 +404,7 @@ Copy-Item -LiteralPath (Join-Path $root 'upstream') -Destination $packageDir -Re
 $usbDirectDir = Join-Path $packageDir 'USB-Direct'
 New-Item -ItemType Directory -Path $usbDirectDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'packaging\enter-usb-direct.ps1') -Destination $usbDirectDir
-Copy-Item -LiteralPath (Join-Path $root 'AnPod_AOA_Phase2_Probe\Windows\AoaHost.cs') -Destination $usbDirectDir
+Copy-Item -LiteralPath (Join-Path $root 'packaging\AoaHost.cs') -Destination $usbDirectDir
 if ($IncludeReceiverCandidate -or $IncludeReceiverRelease) {
     foreach ($name in $receiverFiles) { Copy-Item -LiteralPath (Join-Path $receiverSource $name) -Destination (Join-Path $packageDir $name) }
 }

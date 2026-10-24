@@ -250,7 +250,7 @@ uses the supported buffer-size getter and retains balanced playback.
 `Pcm16FrameStream.java` retains incomplete frames across socket reads and finishes
 partial AudioTrack writes. Zero or failed writes stop the session with a
 diagnostic. Pre-roll reads are limited to the actual read-array size even when
-the effective playback buffer is larger. The checks in `tests/` exercise
+the effective playback buffer is larger. The local checks exercise
 fragmented frames, partial writes and large pre-roll targets.
 
 ### B9. Installed Receiver service adaptation
