@@ -728,3 +728,7 @@ PC1.12.1 / Receiver0.19.1-v3-flow-candidate/code43。`82e82ec`完成AOD英文居
 本轮Rust151项通过，0失败/1忽略/2实机过滤；fmt、Clippy、TypeScript和diff检查通过。浏览器64项布尔全部为真，新增五项包含Hi-Res真实请求、三入口、迟到监听取消和手动停止；本轮未跑布局矩阵。版本脚本夹具通过，实际PC三份版本为1.12.2，Android代码及Receiver43未变。前端stdout未保存，以实际exit0和result.json为证；最终源码审查、封包与实机结论分别记录，不提前称实测通过。
 
 冻结 `69459d772c93e0eca09e2c144c636e70d8b84477`，独立源码及制品审查PASS。新便携包 `artifacts/AnPod-1.12.2-tauri-win-x64-portable.zip`，18,539,342 bytes，SHA-256 `4ee1a97442cd0d0c2cade184632305359d4ebc357a19e34a100bf73b02d6a0f2`。独立15项汇总核验全真、52文件一致，根代理另行打开ZIP全量复算通过；原签名Receiver43字节不变，无需重新安装手机应用。详情及EXE/输入哈希见UI总规划第20节；未远程推送、安装或进行实机无线播放复测，用户三个缓存与旧有效包保留。
+
+## 2026-10-24 · 发布安全补丁
+
+用户授权后已推送dev至 `c4852b2`。GitHub检查中业务checks全部通过，但audit发现ctutils0.4.3的 `RUSTSEC-2026-0385`；执行代理仅更新该锁依赖到0.4.4。官方数据库本次刷新到 `21d909e4`，审计0漏洞、无忽略，原三项informational警告保留；安全修补后的151项Rust通过。为区分已交付本地候选，PC版本同步1.12.3，拟发布 `v1.12.3-dev`，Receiver43及旧1.12.2包不变。最终来源、摘要、审查及CI证据放在 `artifacts/wireless-bind-20261024/security-update/`，发布状态以GitHub为准；详情见UI总规划第21节。

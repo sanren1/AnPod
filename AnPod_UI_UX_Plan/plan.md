@@ -397,3 +397,11 @@ PC1.12.2便携包 `artifacts/AnPod-1.12.2-tauri-win-x64-portable.zip`，18,539,3
 根代理逐项打开ZIP核对52文件路径、长度和哈希通过，证据 `root-zip-verification.json`。独立GPT 6.1 sol high制品审计PASS，15项汇总检查全真；52文件逐项一致，42文本内容扫描无异常、10个README本地链接有效，EXE版本/来源及Receiver43原字节/原签名通过，详见 `delivery-audit.json` / `.md`。保留原APK v1 META-INF条目警告与Vite产物大小提示，不将其隐藏或误称失败。
 
 发布脚本本地构建退出0，未安装、启动设备或远程发布；旧有效包及三个用户缓存保留，无新增过期临时目录，执行代理自启的Vite预览已停止。全树dirty只来自原有缓存，受跟踪源码构建时干净；随后补写的本节交付记录和开发规划位于制品源码输入范围之外。新修复仍未进行手机实机播放验证。
+
+## 21. 2026-10-24 · GitHub发布与依赖安全补丁
+
+用户授权推送dev并发布Release。已将第20节的 `c4852b2` 快进推送至远程dev；GitHub运行 `40077711297` 的checks任务全部通过（Android、前端、Java、C#、Format、Clippy及Rust），audit任务发现新公告 `RUSTSEC-2026-0385`。官方公告要求ctutils至少0.4.4，不能通过忽略或关闭审计发布。
+
+由GPT 6 luna high执行最小锁文件更新：ctutils0.4.3→0.4.4及对应checksum；实际依赖路径来自aes-gcm0.11.1的polyval/universal-hash。业务、协议、音质与Receiver43保持不变。刷新官方RustSec数据库到本次获取的 `21d909e4c8bd4e14c7aea58bf980c881a0053ab1` 后，审计0漏洞/exit0/ignore空；三个原有informational警告原样保留。修补后Rust151 passed/0 failed/1 ignored/2 filtered，122.66s；版本同步不重复冒称再次运行全套业务测试。
+
+修补后的PC版本为1.12.3，计划按现有dev预发布规范发布 `v1.12.3-dev`，附便携ZIP与SHA256SUMS；此前1.12.2仅本地交付，原包/原证据保留，尚未公开的Release草稿将更新为新版本。Receiver保持0.19.1/code43及原签名，无需重新安装。最终构建来源、摘要、独立审计与GitHub检查结果见 `artifacts/wireless-bind-20261024/security-update/`；远程发布状态以GitHub Release为准，实机无线播放及长期稳定性仍未测。
