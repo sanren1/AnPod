@@ -29,10 +29,11 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const [receiverInterfaces, setReceiverInterfaces] = useState<ReceiverIpv4Interface[]>([]);
   const [bindings, setBindings] = useState<string[]>([]);
   const [candidates, setCandidates] = useState<NetworkCandidate[]>([]);
-  const [localAddress, setLocalAddress] = useState("");
+  const [localAddress, setLocalAddress] = useState(backgroundStartMode ? backgroundChoicePrefill.localAddress : "");
   const [serial, setSerial] = useState("");
   const [receiverAddress, setReceiverAddress] = useState("");
-  const [bindingReference, setBindingReference] = useState(preferredBindingReference);
+  const [bindingReference, setBindingReference] = useState(backgroundStartMode && backgroundChoicePrefill.bindingReference
+    ? backgroundChoicePrefill.bindingReference : preferredBindingReference);
   const [selectedOfferId, setSelectedOfferId] = useState("");
   const [peer, setPeer] = useState("");
   const [loading, setLoading] = useState(false);

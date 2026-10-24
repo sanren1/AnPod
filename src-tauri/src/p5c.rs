@@ -1007,6 +1007,15 @@ impl HostSession {
         if self
             .capabilities
             .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_CONNECTION_INTENT != 0)
+            && self.connection_intent.is_none()
+            && !self.background_authorized
+        {
+            return Err("receiver_requires_connection_offer: Receiver requires a phone-initiated connection offer before BIND.".into());
+        }
+        if self
+            .capabilities
+            .as_ref()
             .is_some_and(|info| info.capability_bits & CAP_BACKGROUND_START_AUTH != 0)
             && !self.background_authorized
         {
@@ -1038,6 +1047,19 @@ impl HostSession {
         self.remote_udp = Some(SocketAddr::new(tcp_peer.ip(), ack.udp_port));
         self.state = ack.state;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_audio_without_connection_intent_for_test(&mut self) -> Result<bool, String> {
+        let port = self
+            .udp_socket
+            .as_ref()
+            .ok_or("P5-C UDP socket is closed.")?
+            .local_addr()
+            .map_err(|_| "Unable to read P5-C UDP source port.".to_string())?
+            .port();
+        self.command(BIND, &port.to_be_bytes())
+            .map(|ack| ack.result == RESULT_REJECTED)
     }
 
     pub(crate) fn select_mode(&mut self) -> Result<(), String> {

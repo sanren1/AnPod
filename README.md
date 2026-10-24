@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本轮开发版本为 PC 1.12.1 + Receiver 0.19.1-v3-flow-candidate/code 43，尚非公开发布，三链路音频与长期效果仍未验收；公开下载以 Releases 为准。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本轮开发版本为 PC 1.12.2 + Receiver 0.19.1-v3-flow-candidate/code 43，尚非公开发布，三链路音频与长期效果仍未验收；公开下载以 Releases 为准。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置按界面、音频、连接、关于与诊断分组，并区分请求音质档位和实际格式。
 
@@ -26,7 +26,7 @@ PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作
 
 USB Direct 需要 Android 7.0（API 24）或更高；ADB/LAN 仍支持 Android 6.0。
 
-本轮开发版本为 PC 1.12.1 + Receiver 0.19.1-v3-flow-candidate/code 43；尚非公开发布，三链路音频仍未验收。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
+本轮开发版本为 PC 1.12.2 + Receiver 0.19.1-v3-flow-candidate/code 43；尚非公开发布，三链路音频仍未验收。USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前仅对已验证的 iQOO 11 提供 WinUSB 预切换；切换前需明确允许停止电脑上的全局 ADB server。选择 Direct 模式只是连接偏好，不代表手机已完成物理 USB 模式切换，也不会自动开始播放。
 
 1. 首次使用先通过 USB/ADB 安装 Receiver 并完成配对，再在 USB 下选择持久化的 ADB 或 USB Direct 模式。打开 Direct 主按钮或手机卡片可进入配置页。
 2. AnPod 自动刷新只读发现的设备；发现唯一设备时会预选。需要物理切换 USB 模式时，展开切换选项并按提示操作；切换仅支持已验证的 iQOO 11，且须明确允许停止电脑上的全局 ADB server。然后在手机 Receiver 中允许配件权限。
@@ -37,7 +37,7 @@ ADB 仅支持 Standard（48 kHz、16 bit），切换到有效 ADB 连接会自�
 ## 无线 UDP 快速开始
 
 1. 首次使用先用 USB 连接手机，按 PC 端“首次设置”完成配对和手机应用安装。
-2. PC 选择“无线”，点击“连接手机”。需要时选择电脑网络和已配对手机；等待期间可在手机点“连接电脑”，再由 PC 确认请求。
+2. PC 选择“无线”，点击“连接手机”。需要时选择电脑网络和已配对手机；若进入等待，在手机点“连接电脑”，再由 PC 确认请求。高保真／Hi-Res 使用相同流程。
 3. 若要让手机在后台等待 PC，可在“其他设置”中开启“允许电脑连接”，并按手机提示授权。找不到手机时展开连接页的帮助。
 
 监听和已保存授权不会自动开始播放；授权可在两端查看、取消。关闭“允许电脑连接”不等于撤销已保存的授权。

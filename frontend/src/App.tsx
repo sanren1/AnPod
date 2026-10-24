@@ -284,9 +284,32 @@ function App() {
     }
   };
 
-  const startNetworkAudio = (request: NetworkStartRequest) => startNetworkOperation(
-    () => invokeApp<Snapshot>("start_network_audio", { ...request }),
-  );
+  async function startNetworkAudio(request: NetworkStartRequest) {
+    const generation = networkStartGeneration.current + 1;
+    try {
+      return await startNetworkOperation(
+        () => invokeApp<Snapshot>("start_network_audio", { ...request }),
+      );
+    } catch (error) {
+      if (!String(error).includes("receiver_requires_connection_offer:")) throw error;
+      if (generation !== networkStartGeneration.current) return null;
+      const latest = await invokeApp<Snapshot>("get_snapshot");
+      if (generation !== networkStartGeneration.current) return null;
+      if (panelRef.current !== networkStartPanel.current) return null;
+      apply(latest);
+      if (latest.state === "error" && (latest.canDisconnect || latest.message === "网络启动失败，电脑声音恢复失败"))
+        throw new Error(strings.app.cleanupBeforeNetworkStart);
+      if (latest.busy || !request.bindingReference || request.bootstrapSerial) throw error;
+      openNetworkDialog(true, { localAddress: request.localAddress, bindingReference: request.bindingReference }, true);
+      const listenerGeneration = offerListenerGeneration.current + 1;
+      setMainListenerPending(true);
+      try { await setOfferListener(request.localAddress, true, request.bindingReference); }
+      finally { setMainListenerPending(false); }
+      if (generation !== networkStartGeneration.current || listenerGeneration !== offerListenerGeneration.current) return null;
+      if (panelRef.current !== "network") return null;
+      return null;
+    }
+  };
 
   const cancelNetworkStart = async () => {
     if (!networkStartPendingRef.current || cancelOperationLock.current) return;
@@ -815,9 +838,10 @@ function App() {
   const disconnect = async () => {
     setWorking(true);
     try {
+      const listenerStopped = offerListenerChoice.current ? await stopOfferListener() : true;
       const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("disconnect");
       apply(result.snapshot);
-      if (result.success) setNotice(""); else notify(result.message);
+      if (result.success && listenerStopped) setNotice(""); else if (!result.success) notify(result.message);
     } catch (error) { notify(String(error)); }
     finally { setWorking(false); }
   };

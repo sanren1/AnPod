@@ -2117,11 +2117,19 @@ fn verify_connection_intent(classes: &Path) {
                     thread::sleep(Duration::from_millis(200));
                 }
             }
-            if mode == "missing" || mode == "expired" {
+            if mode == "missing" {
+                let error = host.bind_audio().unwrap_err();
                 assert!(
-                    host.bind_audio().is_err(),
-                    "missing or expired intent must block BIND"
+                    error.contains("requires a phone-initiated connection offer"),
+                    "missing intent must be rejected before BIND: {error}"
                 );
+                assert!(
+                    host.bind_audio_without_connection_intent_for_test()
+                        .unwrap(),
+                    "receiver must independently reject a raw BIND without its phone intent"
+                );
+            } else if mode == "expired" {
+                assert!(host.bind_audio().is_err(), "expired intent must block BIND");
             } else {
                 host.bind_audio().unwrap();
                 host.select_mode().unwrap();

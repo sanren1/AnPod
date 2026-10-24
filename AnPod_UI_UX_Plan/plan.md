@@ -370,3 +370,20 @@ Java离线协议/PCM检查、版本一致性、源码快照和组件门禁检查
 独立制品审计27项全真、失败0；ZIP/目录52文件路径、长度、哈希逐项一致，11个本地README链接有效。实际EXE版本/架构、APK身份及v1/v2原证书验签、四ABI、Native/Legacy角色、来源快照/精确登记、冻结文档与许可证、包内容卫生均核验通过。报告 `delivery-audit.json` / `.md`；根代理另行打开最终ZIP全量复算，`root-zip-verification.json`通过。Windows EXE按既有约定未签名；APK的META-INF条目警告保留记录，不影响v2及整包摘要验证。
 
 构建时 `workingTreeDirty=true`如实保留，受跟踪输入干净，dirty仅来自三个原有用户缓存。本轮自有Gradle中间目录、AOD Debug输出及隔离基线源码已验证绝对路径后清理；有效APK/ZIP、原始报告、旧有效包和用户缓存保留。交付记录提交位于源码输入范围之外，不改变上述制品来源。未安装手机，未推送或远程发布；实机及生产性能范围继续保持上文NOT_TESTED。
+
+## 20. 2026-10-24 · 无线连接请求确认修复（源码及离线检查完成，待本地封包）
+
+用户确认使用PC1.12.1、Receiver43及高保真／Hi-Res，出现 `result=1, state=Authenticated, udp_port=0`。源码追踪确认：发现唯一手机后直接启动的路径未携带手机连接请求nonce；Receiver的连接意图校验在绑定UDP端口前拒绝，不能将此错误归因于音质不支持或防火墙。
+
+| 任务 | 类型与依赖 | 验收要求 |
+| --- | --- | --- |
+| 根因诊断 | [SUBAGENT]，独立只读 | 核对CAP_CONNECTION_INTENT、PCM24探测、正式认证及真实offer路径 |
+| 共同连接层修复与回归 | [SERIAL]，单执行代理 | 需手机请求时进入既有等待及确认；三入口共用，保留所选网络/手机、取消与手动停止语义 |
+| 独立审查 | [SUBAGENT]，依赖代码及检查冻结 | GPT 6.1 sol high核对nonce、安全边界、迟到结果及失败清理，无自动接受请求 |
+| PC本地交付 | [SERIAL]，依赖上述验收 | PC1.12.2复用原签名Receiver43；构建、来源快照及ZIP逐项核对 |
+
+执行使用GPT 6 luna high。保留原有音质、10秒连接请求时限、一次性nonce校验和后台授权规则，不降低Hi-Res、不修改Android、不新增重试协议。证据目录 `artifacts/wireless-bind-20261024/`；新修复的实机无线及音频表现仍待验证，旧基线通过不计作本轮通过。
+
+最终实现位于PC共同BIND及前端启动层，连接窗初始选择优先本轮已选网络/手机，手动断开会清除监听意图，监听延迟期间仍可停止。缺nonce测试同时断言PC提前标记与手机对原始BIND的独立拒绝，不削弱手机负向校验。
+
+本轮Rust串行151 passed / 0 failed / 1 ignored / 2 filtered，通过CI相同两项实机过滤；fmt、Clippy、TypeScript及diff检查通过。格式首次失败的换行已修复，原始失败保留为 `fmt-initial.log`，最终 `fmt.log` 记录实际检查退出码0。浏览器64项布尔全部为真，包含三入口、Hi-Res保留、真实offer接受、延迟监听取消、手动断开；本轮未跑布局矩阵。前端stdout未持久化，仅有实际运行退出码0及 `frontend-check/result.json`，不冒称完整原始日志。版本脚本夹具通过，实际桌面三份版本另核对为1.12.2，Android无改动；未重复执行Android全量或未改的C#检查。
