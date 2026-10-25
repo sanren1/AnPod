@@ -345,7 +345,6 @@ internal fun AodSettingsDialog(
         text = {
             Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(stringResource(R.string.aod_preview_label), style = MaterialTheme.typography.titleMedium)
                 AodSettingsPreview(settings)
                 Text(stringResource(R.string.aod_clock_size), style = MaterialTheme.typography.titleMedium)
                 val clockSizeLabel = stringResource(R.string.aod_clock_size)

@@ -52,9 +52,8 @@
     <string name="connection_usb_direct_short">Direct</string>
     <string name="connection_usb_adb_short">ADB</string>
     <string name="connection_wifi">Wi-Fi</string>
-    <string name="connection_direct_description">通过 USB Accessory（AOA）直接连接，适合低延迟传输。</string>
     <string name="connection_adb_description">请在电脑端通过 USB ADB 发起连接；手机不会启动接收服务。</string>
-    <string name="connection_wifi_description">通过当前网络传输音频，请确保手机和电脑可以互相访问。</string>
+    <string name="connection_wifi_description">需与电脑网络互通。</string>
     <string name="adb_waiting_guidance">请在电脑端使用 USB ADB 连接这台手机并启动 AnPod。等待指引不会启动服务。</string>
     <string name="close_connection_guide">关闭连接指引</string>
     <string name="actual_connection">实际连接：%1$s</string>
@@ -135,7 +134,6 @@
     <string name="aod_weight_default">默认</string>
     <string name="aod_weight_bold">粗</string>
     <string name="aod_detail_metrics">详细数据</string>
-    <string name="aod_preview_label">常显预览</string>
     <string name="aod_metric_protocol">协议</string>
     <string name="aod_metric_receive_rate">接收速率</string>
     <string name="aod_metric_buffer">缓冲</string>
@@ -168,7 +166,7 @@
     <string name="next_step_wait_and_allow">电脑连接时，请在手机通知中选择是否允许。</string>
     <string name="next_step_choose_computer">请在电脑上选择这台手机。</string>
     <string name="next_step_play_on_computer">请在电脑上开始播放。</string>
-    <string name="next_step_resume_playback">播放已暂停；继续播放电脑上的声音即可。</string>
+    <string name="next_step_resume_playback">请在电脑上继续播放。</string>
     <string name="next_step_audio_received">手机播放进度正在推进。</string>
     <string name="next_step_check_computer_playback">播放进度暂未变化；请确认电脑正在播放。</string>
     <string name="next_step_start_receiving">点击“连接电脑”，再到电脑选择这台手机。</string>
@@ -187,5 +185,4 @@
     <string name="hide_other_connection_methods">收起其他连接方式</string>
     <string name="other_settings">其他设置</string>
     <string name="hide_other_settings">收起其他设置</string>
-    <string name="other_settings_summary">播放引擎、无线接收等待与授权</string>
 </resources>

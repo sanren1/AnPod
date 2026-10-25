@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import android.os.Build;
+import android.net.LocalSocket;
 import android.os.ParcelFileDescriptor;
 
 import java.io.FileInputStream;
@@ -8,8 +9,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
+import java.net.Socket;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -18,7 +21,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
-/** Owns one AOA descriptor; cancel is nonblocking and awaitClosed is for background cleanup only. */
+/** Owns one authenticated record byte stream; cancel is nonblocking and awaitClosed is background-only. */
 final class AoaAccessoryIo {
     static final int TRANSFER_BYTES = 16 * 1024;
     private static final long RECORD_TIMEOUT_SECONDS = 3;
@@ -67,6 +70,30 @@ final class AoaAccessoryIo {
         }
     }
 
+    static AoaAccessoryIo open(LocalSocket socket) throws IOException {
+        if (socket == null) throw new NullPointerException("socket");
+        try {
+            return new AoaAccessoryIo(Channels.newChannel(socket.getInputStream()),
+                    Channels.newChannel(socket.getOutputStream()), socket);
+        } catch (IOException | RuntimeException error) {
+            try { socket.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
+            if (error instanceof IOException) throw (IOException) error;
+            throw new IOException("ADB LocalSocket stream open failed", error);
+        }
+    }
+
+    static AoaAccessoryIo open(Socket socket) throws IOException {
+        if (socket == null) throw new NullPointerException("socket");
+        try {
+            return new AoaAccessoryIo(Channels.newChannel(socket.getInputStream()),
+                    Channels.newChannel(socket.getOutputStream()), socket);
+        } catch (IOException | RuntimeException error) {
+            try { socket.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
+            if (error instanceof IOException) throw (IOException) error;
+            throw new IOException("TCP record stream open failed", error);
+        }
+    }
+
     /** Package-private seam: tests exercise the same owner, framing, deadline, and shutdown logic. */
     AoaAccessoryIo(ReadableByteChannel input, WritableByteChannel output, AutoCloseable owner) {
         this(input, output, owner, TimeUnit.SECONDS.toMillis(RECORD_TIMEOUT_SECONDS));
@@ -102,8 +129,8 @@ final class AoaAccessoryIo {
                 ByteBuffer source = ByteBuffer.wrap(bytes);
                 while (source.hasRemaining()) {
                     int count = output.write(source);
-                    if (count < 0) throw new IOException("AOA stream write failed");
-                    if (count == 0) pauseOrFail("AOA stream write interrupted without progress");
+                    if (count < 0) throw new IOException("record stream write failed");
+                    if (count == 0) pauseOrFail("record stream write interrupted without progress");
                 }
                 deadline.finish();
                 ensureNotCancelled();
@@ -136,7 +163,7 @@ final class AoaAccessoryIo {
 
     private void begin() throws IOException {
         synchronized (state) {
-            if (cancelled) throw new IOException("AOA transport is closed");
+            if (cancelled) throw new IOException("record stream is closed");
             inFlight++;
         }
     }
@@ -150,7 +177,7 @@ final class AoaAccessoryIo {
 
     private void ensureNotCancelled() throws IOException {
         synchronized (state) {
-            if (cancelled) throw new IOException("AOA transport was cancelled during record I/O");
+            if (cancelled) throw new IOException("record stream was cancelled during I/O");
         }
     }
 
@@ -211,7 +238,7 @@ final class AoaAccessoryIo {
                 do {
                     ByteBuffer buffer = ByteBuffer.wrap(transfer);
                     read = channel.read(buffer);
-                    if (read == 0) pauseOrFail("AOA stream read interrupted without data");
+                    if (read == 0) pauseOrFail("record stream read interrupted without data");
                 } while (read == 0);
                 if (read < 0) return -1;
                 offset = 0;
@@ -243,7 +270,7 @@ final class AoaAccessoryIo {
         }
 
         void finish() throws IOException {
-            if (!active.compareAndSet(true, false)) throw new IOException("AOA record I/O deadline expired");
+            if (!active.compareAndSet(true, false)) throw new IOException("record I/O deadline expired");
             stop();
         }
 

@@ -31,15 +31,15 @@ final class ReceiverUiState {
             aodSessionId = session.id;
             aodSampler.reset(now);
         }
-        boolean aoa = session.request.aoaContext != null;
+        AoaSessionContext record = session.request.aoaContext;
         boolean udp = session.request.udpContext != null;
-        long totalBytes = aoa ? session.request.aoaContext.ingress.authenticatedAudioPayloadBytes()
+        long totalBytes = record != null ? record.ingress.authenticatedAudioPayloadBytes()
                 : udp ? session.udpReceiver == null ? 0 : session.udpReceiver.authenticatedAudioPayloadBytes()
                 : session.inputPcmBytes;
         aodSampler.recordCumulativeBytes(totalBytes, now);
         PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
         Long bitsPerSecond = aodSampler.bitsPerSecond(now);
-        Float bufferMs = AodMetricsSampler.bufferMs(udp || aoa ? metrics.queuedFrames : 0,
+        Float bufferMs = AodMetricsSampler.bufferMs(udp || record != null ? metrics.queuedFrames : 0,
                 metrics.pendingFrames, metrics.sampleRate);
         Float lossPercent = null;
         if (udp && session.udpQueue != null) {
@@ -53,10 +53,8 @@ final class ReceiverUiState {
                 : AodTelemetrySnapshot.DisplayStatus.CONNECTED;
         if (udp && "reconnecting".equals(ReceiverService.networkAudioState))
             status = AodTelemetrySnapshot.DisplayStatus.RECONNECTING;
-        AodTelemetrySnapshot.Transport transport = aoa
-                ? AodTelemetrySnapshot.Transport.USB_DIRECT
-                : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP
-                : AodTelemetrySnapshot.Transport.USB_ADB;
+        AodTelemetrySnapshot.Transport transport = record != null ? record.transport
+                : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
                 lossPercent, metrics.sampleRate, metrics.channels, metrics.underrunCount,
                 session.actualOutputEngine, receivedRecently, now);
@@ -102,6 +100,7 @@ final class ReceiverUiState {
             authorizationError = service.describeFailure(error);
         }
         String method = service.isAoaSession() ? "usb-aoa"
+                : service.isAdbStreamSession() ? "wifi".equals(service.adbConnectionTransport()) ? "wifi-adb" : "usb-adb"
                 : service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
                 : ReceiverService.currentAudio != null ? "usb-or-local" : "unknown";
         String state = ReceiverUiOperation.displayState(ReceiverService.networkAudioState, ReceiverService.currentAudio != null, ReceiverService.audioActive);

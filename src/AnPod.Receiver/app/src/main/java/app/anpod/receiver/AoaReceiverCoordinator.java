@@ -8,8 +8,18 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/** One authenticated AOA session. The coordinator owns transport, keys, and its audio context. */
+/** One authenticated record-stream session; transport-specific checks stay tagged at the boundary. */
 final class AoaReceiverCoordinator implements AutoCloseable {
+    enum TransportTag {
+        USB_DIRECT(AodTelemetrySnapshot.Transport.USB_DIRECT),
+        USB_ADB(AodTelemetrySnapshot.Transport.USB_ADB),
+        WIFI_ADB(AodTelemetrySnapshot.Transport.WIFI_ADB);
+
+        final AodTelemetrySnapshot.Transport telemetry;
+        TransportTag(AodTelemetrySnapshot.Transport telemetry) { this.telemetry = telemetry; }
+        boolean isAdbStream() { return this != USB_DIRECT; }
+    }
+
     interface PlaybackEndpoint {
         boolean isCurrent(String ownerId, long generation);
         boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format);
@@ -18,9 +28,13 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         void resume() throws IOException;
         void stop();
         boolean streaming() throws IOException;
+        default void ready() {}
         byte[] playbackProgressPayloadV2();
         default boolean supportsPlaybackProgressExtension() { return false; }
         default byte[] playbackProgressPayloadExtendedV2() { return null; }
+        default byte[] playbackProgressPayloadExtendedV2(int schema) {
+            return schema == 2 ? playbackProgressPayloadExtendedV2() : null;
+        }
     }
 
     private static final Object OWNER_LOCK = new Object();
@@ -36,6 +50,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     private final String ownerId;
     private final long generation;
     private final long helloTimeoutMillis;
+    private final TransportTag transport;
     private final ArrayBlockingQueue<WriteRequest> writes = new ArrayBlockingQueue<>(8);
     private final Object lifecycle = new Object();
     private final CountDownLatch terminated = new CountDownLatch(1);
@@ -54,6 +69,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     private volatile boolean playbackStarted;
     private volatile boolean playbackEverStarted;
     private volatile boolean hostStopped;
+    private volatile boolean hostStopRequested;
     private volatile IOException failure;
     private volatile IOException cleanupFailure;
     private volatile int state = P5cReceiverCoordinator.STATE_AUTHENTICATED;
@@ -73,7 +89,20 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         if (helloTimeoutMillis <= 0) throw new IllegalArgumentException("hello timeout must be positive");
         synchronized (OWNER_LOCK) {
             ensureNoOwner();
-            return startLocked(io, savedBinding, playback, ownerId, generation, helloTimeoutMillis);
+            return startLocked(io, savedBinding, playback, ownerId, generation, helloTimeoutMillis,
+                    TransportTag.USB_DIRECT);
+        }
+    }
+
+    static AoaReceiverCoordinator startAdbStream(AoaAccessoryIo io,
+            PairingProtocol.BindingMaterial savedBinding, PlaybackEndpoint playback,
+            String ownerId, long generation, TransportTag transport) throws IOException {
+        if (io == null || savedBinding == null || playback == null || ownerId == null
+                || transport == null || !transport.isAdbStream()) throw new NullPointerException();
+        synchronized (OWNER_LOCK) {
+            ensureNoOwner();
+            return startLocked(io, savedBinding, playback, ownerId, generation,
+                    TimeUnit.SECONDS.toMillis(30), transport);
         }
     }
 
@@ -122,7 +151,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                     throw new IOException("UsbAccessoryChangedDuringOpen");
                 io = AoaAccessoryIo.open(descriptor);
                 return startLocked(io, savedBinding, playback, ownerId, generation,
-                        TimeUnit.SECONDS.toMillis(30));
+                        TimeUnit.SECONDS.toMillis(30), TransportTag.USB_DIRECT);
             } catch (IOException | RuntimeException error) {
                 if (io != null) io.cancel();
                 else try { descriptor.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
@@ -136,6 +165,15 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     static boolean isProductAccessory(UsbAccessory accessory) {
         return accessory != null && "AnPod".equals(accessory.getManufacturer())
                 && "AnPod USB Direct".equals(accessory.getModel());
+    }
+
+    private boolean supportsTransportFormat(UdpPacketDecoder.AudioFormatV2 format) {
+        return playback.supportsAudio(format)
+                && (!transport.isAdbStream() || supportsAdbStreamFormat(format));
+    }
+
+    private static boolean supportsAdbStreamFormat(UdpPacketDecoder.AudioFormatV2 format) {
+        return format != null && (format.profile == 4 || format.profile == 5) && format.sampleFormat == 3;
     }
 
     private static boolean isCurrentlyAttached(UsbManager manager, UsbAccessory expected) {
@@ -156,22 +194,24 @@ final class AoaReceiverCoordinator implements AutoCloseable {
 
     private static AoaReceiverCoordinator startLocked(AoaAccessoryIo io,
             PairingProtocol.BindingMaterial savedBinding, PlaybackEndpoint playback,
-            String ownerId, long generation, long helloTimeoutMillis) {
+            String ownerId, long generation, long helloTimeoutMillis, TransportTag transport) {
         AoaReceiverCoordinator next = new AoaReceiverCoordinator(io, savedBinding, playback,
-                ownerId, generation, helloTimeoutMillis);
+                ownerId, generation, helloTimeoutMillis, transport);
         owner = next;
         next.startWorkers();
         return next;
     }
 
     private AoaReceiverCoordinator(AoaAccessoryIo io, PairingProtocol.BindingMaterial binding,
-            PlaybackEndpoint playback, String ownerId, long generation, long helloTimeoutMillis) {
+            PlaybackEndpoint playback, String ownerId, long generation, long helloTimeoutMillis,
+            TransportTag transport) {
         this.io = io;
         this.binding = binding;
         this.playback = playback;
         this.ownerId = ownerId;
         this.generation = generation;
         this.helloTimeoutMillis = helloTimeoutMillis;
+        this.transport = transport;
         reader = new Thread(this::readLoop, "AnPod AOA control reader");
         writer = new Thread(this::writeLoop, "AnPod AOA stream writer");
         watchdog = new Thread(this::watchdogLoop, "AnPod AOA session watchdog");
@@ -232,11 +272,19 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         return true;
     }
 
+    boolean requestHostStop() {
+        if (cancelled || !authenticated) return false;
+        hostStopRequested = true;
+        return true;
+    }
+
     boolean restartRequested() { return restartRequested; }
+    boolean isAdbStream() { return transport.isAdbStream(); }
+    TransportTag transportTag() { return transport; }
 
     boolean shouldRecoverUnexpectedFailure() {
         return shouldRecoverUnexpectedFailure(playbackEverStarted, userStopRequested,
-                hostStopped, restartRequested, failure != null);
+                hostStopped || hostStopRequested, restartRequested, failure != null);
     }
 
     static boolean shouldRecoverUnexpectedFailure(boolean playbackEverStarted,
@@ -264,7 +312,8 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     private PairingProtocol.SessionKeys authenticate() throws IOException, PairingProtocol.Failure {
         AnpuRecordCodec.Record hello = readExpected(AnpuRecordCodec.HANDSHAKE);
         startupDeadlineNanos = System.nanoTime() + FINISH_TIMEOUT_NANOS;
-        PairingProtocol.BindingMaterial derived = binding.deriveAoa();
+            PairingProtocol.BindingMaterial derived = transport.isAdbStream()
+                    ? binding.deriveAdbStream() : binding.deriveAoa();
         PairingProtocol.V2.ReceiverAwaitFinish handshake;
         try { handshake = PairingProtocol.V2.Receiver.acceptHello(derived, hello.body); }
         catch (PairingProtocol.Failure | RuntimeException error) { derived.close(); throw error; }
@@ -314,18 +363,25 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 int requestedControl = P5cControlProtocol.getUnsignedShort(command.payload, 0);
                 int requestedAudio = command.payload[2] & 0xff;
                 int required = readInt(command.payload, 4);
+                boolean supportedFormat = supportsTransportFormat(format);
                 int supported = P5cControlProtocol.CAP_AUTHENTICATED_STATUS
-                        | (playback.supportsAudio(format) ? P5cControlProtocol.CAP_AUDIO_V2 : 0)
-                        | (playback.supportsAudio(format) && format.sampleFormat == 3
+                        | (supportedFormat ? P5cControlProtocol.CAP_AUDIO_V2 : 0)
+                        | (supportedFormat && format.sampleFormat == 3
                                 ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
+                        | (transport.isAdbStream() && supportsAdbStreamFormat(format)
+                                ? P5cControlProtocol.CAP_AUDIO_ADB_STREAM : 0)
                         | (playback.supportsPlaybackProgressExtension()
-                                ? P5cControlProtocol.CAP_PROGRESS_EXT : 0)
+                                ? P5cControlProtocol.CAP_PROGRESS_EXT
+                                        | P5cControlProtocol.CAP_BUFFER_METRICS : 0)
                         | P5cControlProtocol.CAP_PLAYBACK_PROGRESS
                         | P5cControlProtocol.CAP_TERMINAL_CAUSE
-                        | P5cControlProtocol.CAP_AOA_SESSION_RESTART;
+                        | (transport.isAdbStream() ? 0 : P5cControlProtocol.CAP_AOA_SESSION_RESTART);
                 boolean compatible = requestedControl == P5cControlProtocol.MANAGEMENT_CONTROL_MAJOR
                         && requestedAudio == P5cControlProtocol.AUDIO_PROTOCOL_MAJOR
-                        && (required & ~supported) == 0 && playback.supportsAudio(format);
+                        && (required & ~supported) == 0 && supportedFormat
+                        && (!transport.isAdbStream() || (required & P5cControlProtocol.CAP_AUDIO_ADB_STREAM) != 0
+                                && (required & P5cControlProtocol.CAP_AUDIO_V2) != 0
+                                && (required & P5cControlProtocol.CAP_AUDIO_FLOAT32) != 0);
                 byte[] info = P5cControlProtocol.capabilitiesInfoPayload(command.sequence,
                         P5cControlProtocol.MANAGEMENT_CONTROL_MAJOR, P5cControlProtocol.AUDIO_PROTOCOL_MAJOR,
                         compatible ? P5cReceiverCoordinator.RESULT_OK : P5cReceiverCoordinator.RESULT_REJECTED,
@@ -337,6 +393,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 supportedCapabilities = supported;
                 capabilitiesAccepted = true;
                 state = P5cReceiverCoordinator.STATE_AUTHENTICATED;
+                playback.ready();
                 continue;
             }
 
@@ -346,6 +403,9 @@ final class AoaReceiverCoordinator implements AutoCloseable {
             int result = P5cReceiverCoordinator.RESULT_OK;
             if (userStopRequested) {
                 result = RESULT_USER_STOPPED;
+                state = P5cReceiverCoordinator.STATE_STOPPED;
+                terminate = true;
+            } else if (hostStopRequested) {
                 state = P5cReceiverCoordinator.STATE_STOPPED;
                 terminate = true;
             } else switch (command.type) {
@@ -364,7 +424,8 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 case P5cControlProtocol.START:
                     if (!bound || !modeSelected || format == null || command.payload.length != 0 || playbackStarted)
                         throw new IOException("invalid AOA START state");
-                    AoaSessionContext context = new AoaSessionContext(sessionId, keysSnapshot.hostToReceiverAudio, format);
+                    AoaSessionContext context = new AoaSessionContext(sessionId,
+                            keysSnapshot.hostToReceiverAudio, format, transport.telemetry);
                     audio = context;
                     try { playback.start(context); }
                     catch (IOException | RuntimeException error) {
@@ -407,6 +468,11 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                             && (supportedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0) {
                         extra = playback.playbackProgressPayloadExtendedV2();
                         if (extra == null) throw new IOException("AOA progress extension unavailable");
+                    } else if (command.payload.length == 1 && command.payload[0] == 3
+                            && (supportedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
+                            && (supportedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0) {
+                        extra = playback.playbackProgressPayloadExtendedV2(3);
+                        if (extra == null) throw new IOException("AOA schema3 progress unavailable");
                     } else throw new IOException("invalid AOA progress query");
                     break;
                 case P5cControlProtocol.STOP:

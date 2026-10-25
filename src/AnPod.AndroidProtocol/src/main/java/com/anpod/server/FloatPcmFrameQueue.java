@@ -14,6 +14,7 @@ public final class FloatPcmFrameQueue {
     private static final int MIN_PACKET_WINDOW_MS = 5;
     private static final int GAP_WAIT_MS = 5;
     private static final long NANOS_PER_MILLI = 1_000_000L;
+    private static final long LONG_SOURCE_GAP_NANOS = 100 * NANOS_PER_MILLI;
     private static final int CHANNELS = 2;
     private static final int DEFAULT_MAX_PACKET_FRAMES = 1150 / (CHANNELS * Pcm24PackedCodec.BYTES_PER_SAMPLE);
 
@@ -36,6 +37,7 @@ public final class FloatPcmFrameQueue {
     private IOException failure;
     private boolean started;
     private long gapWaitStartedNanos = -1;
+    private long noSourceSinceNanos = -1;
     private int plcFrames;
     private int queuedFrames;
     private long droppedFrames;
@@ -155,6 +157,8 @@ public final class FloatPcmFrameQueue {
         long gapDeadlineNanos = -1;
         while (!stopped) {
             if (failure != null) throw failure;
+            if (started && noSourceSinceNanos >= 0
+                    && System.nanoTime() - noSourceSinceNanos >= LONG_SOURCE_GAP_NANOS) started = false;
             if (paused || !hasPlayoutFrame || (!started && queuedFrames < initialTargetFrames)) {
                 wait();
                 continue;
@@ -162,10 +166,12 @@ public final class FloatPcmFrameQueue {
             int frames = poll(destination, destinationFrameOffset, maxFrames);
             if (frames > 0) {
                 started = true;
+                noSourceSinceNanos = -1;
                 gapWaitStartedNanos = -1;
                 return frames;
             }
             if (packets.isEmpty()) {
+                if (started && noSourceSinceNanos < 0) noSourceSinceNanos = System.nanoTime();
                 gapWaitStartedNanos = -1;
                 wait();
                 continue;
@@ -207,6 +213,7 @@ public final class FloatPcmFrameQueue {
         fadeNext = false;
         fadeInProgressFrames = 0;
         started = false;
+        noSourceSinceNanos = -1;
         gapWaitStartedNanos = -1;
         notifyAll();
     }
@@ -265,6 +272,7 @@ public final class FloatPcmFrameQueue {
             playoutFrame = packets.get(0).frameIndex;
             hasAdvanced = true;
             oversizedGapSkips++;
+            started = false;
             fadeNext = true;
             fadeInProgressFrames = 0;
             hasLastFrame = false;

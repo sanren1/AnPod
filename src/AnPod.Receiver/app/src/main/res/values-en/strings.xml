@@ -52,9 +52,8 @@
     <string name="connection_usb_direct_short">Direct</string>
     <string name="connection_usb_adb_short">ADB</string>
     <string name="connection_wifi">Wi-Fi</string>
-    <string name="connection_direct_description">Connect directly over USB Accessory (AOA) for low-latency audio.</string>
     <string name="connection_adb_description">Start the connection from the computer with USB ADB. The phone will not start the receiver.</string>
-    <string name="connection_wifi_description">Send audio over the current network. The phone and computer must be able to reach each other.</string>
+    <string name="connection_wifi_description">Use a network the phone and computer can reach.</string>
     <string name="adb_waiting_guidance">On the computer, connect this phone with USB ADB and start AnPod. This guide does not start the receiver.</string>
     <string name="close_connection_guide">Close connection guide</string>
     <string name="actual_connection">Actual connection: %1$s</string>
@@ -135,7 +134,6 @@
     <string name="aod_weight_default">Default</string>
     <string name="aod_weight_bold">Bold</string>
     <string name="aod_detail_metrics">Detailed data</string>
-    <string name="aod_preview_label">AOD preview</string>
     <string name="aod_metric_protocol">Protocol</string>
     <string name="aod_metric_receive_rate">Receive rate</string>
     <string name="aod_metric_buffer">Buffer</string>
@@ -168,7 +166,7 @@
     <string name="next_step_wait_and_allow">When the computer connects, choose whether to allow it in the phone notification.</string>
     <string name="next_step_choose_computer">Choose this phone on the computer.</string>
     <string name="next_step_play_on_computer">Start playback on the computer.</string>
-    <string name="next_step_resume_playback">Playback is paused. Resume audio on the computer.</string>
+    <string name="next_step_resume_playback">Resume playback on the computer.</string>
     <string name="next_step_audio_received">Phone playback progress is moving.</string>
     <string name="next_step_check_computer_playback">Playback has not advanced. Check that audio is playing on the computer.</string>
     <string name="next_step_start_receiving">Tap “Connect to computer”, then choose this phone on the computer.</string>
@@ -187,5 +185,4 @@
     <string name="hide_other_connection_methods">Hide other connection methods</string>
     <string name="other_settings">Other settings</string>
     <string name="hide_other_settings">Hide other settings</string>
-    <string name="other_settings_summary">Playback engine, wireless standby, and permission</string>
 </resources>

@@ -35,8 +35,8 @@ android {
         applicationId 'app.anpod.receiver'
         minSdk 23
         targetSdk 35
-        versionCode 45
-        versionName '0.20.0-v3-flow-candidate'
+        versionCode 46
+        versionName '0.21.0-v3-flow-candidate'
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'
         externalNativeBuild {
             cmake { arguments '-DANDROID_STL=c++_shared' }
@@ -107,4 +107,8 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.14.1'
     testImplementation 'androidx.test:core:1.6.1'
+}
+
+tasks.withType(Test).configureEach {
+    inputs.property('anpodAdbLoopbackPort', providers.environmentVariable('ANPOD_ADB_LOOPBACK_PORT').orElse(''))
 }

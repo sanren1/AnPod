@@ -49,6 +49,8 @@ final class P5cControlProtocol {
     static final int CAP_AOA_SESSION_RESTART = 0x00000200;
     static final int CAP_AUDIO_FLOAT32 = 0x00000400;
     static final int CAP_PROGRESS_EXT = 0x00000800;
+    static final int CAP_AUDIO_ADB_STREAM = 0x00001000;
+    static final int CAP_BUFFER_METRICS = 0x00002000;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS
             | CAP_TERMINAL_CAUSE;
     static final int AUTH_PENDING = 0;
@@ -261,6 +263,24 @@ final class P5cControlProtocol {
         for (int i = 0; i < counters.length; i++) putLong(payload, offset + 22 + i * 8, counters[i]);
         putInt(payload, offset + 118, ringPendingFrames);
         putInt(payload, offset + 122, streamPendingFrames);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadSchema3(byte[] schema2Payload, long targetFrames,
+            long observedFrames, int errorFrames, int correctionPpm, int resetReason) {
+        if (schema2Payload == null || (schema2Payload.length != 196 && schema2Payload.length != 204)
+                || targetFrames < -1 || targetFrames > 0xffff_ffffL
+                || observedFrames < -1 || observedFrames > 0xffff_ffffL
+                || (resetReason & ~0xff) != 0)
+            throw new IllegalArgumentException("invalid schema3 playback progress fields");
+        byte[] payload = Arrays.copyOf(schema2Payload, schema2Payload.length + 17);
+        int tail = schema2Payload.length - 126;
+        payload[tail] = 3;
+        putInt(payload, schema2Payload.length, targetFrames < 0 ? -1 : (int) targetFrames);
+        putInt(payload, schema2Payload.length + 4, observedFrames < 0 ? -1 : (int) observedFrames);
+        putInt(payload, schema2Payload.length + 8, errorFrames);
+        putInt(payload, schema2Payload.length + 12, correctionPpm);
+        payload[schema2Payload.length + 16] = (byte) resetReason;
         return payload;
     }
 

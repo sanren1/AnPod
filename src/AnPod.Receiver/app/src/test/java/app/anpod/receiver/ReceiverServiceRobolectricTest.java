@@ -1315,6 +1315,209 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void aodSnapshotReportsActualAdbRecordTransport() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        AoaSessionContext context = new AoaSessionContext(603, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(4, 0), AodTelemetrySnapshot.Transport.WIFI_ADB);
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(603,
+                ReceiverService.AudioRequest.aoa(context), "adb-float-test", 1);
+        assertTrue(context.floatQueue.offer(0, new float[48], 24));
+        ReceiverService.currentAudio = session;
+        setStaticField("statusAudioId", 603L);
+        try {
+            AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
+            assertEquals(AodTelemetrySnapshot.Transport.WIFI_ADB, snapshot.transport);
+            assertEquals(24, ReceiverService.playbackMetricsSnapshot().queuedFrames);
+        } finally {
+            ReceiverService.currentAudio = null;
+            context.destroy();
+        }
+    }
+
+    @Test
+    public void manualStopRoutesToAuthenticatedAdbOwnerBeforeServiceCleanup() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "adb-manual-stop-owner";
+        long generation = 78;
+        service.uiOperation.begin(owner);
+        service.uiOperation.running(owner);
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration", new java.util.concurrent.atomic.AtomicLong(generation));
+        setInstanceField(service, "adbOwnerId", owner);
+        setInstanceField(service, "adbOwnerGeneration", generation);
+        setInstanceField(service, "adbConnectionTransport", "wifi");
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
+                new byte[16], new byte[16], new byte[32]);
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.startAdbStream(
+                new AoaReceiverCoordinatorTest.Duplex().owner(), binding,
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String expectedOwner, long expectedGeneration) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, AoaReceiverCoordinator.TransportTag.WIFI_ADB);
+        service.adbStreamCoordinator = coordinator;
+        org.robolectric.util.ReflectionHelpers.setField(coordinator, "authenticated", true);
+        try {
+            assertTrue(service.stopFromUi(owner, generation));
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertSame("service waits for the authenticated ADB stop ACK", coordinator, service.adbStreamCoordinator);
+        } finally {
+            coordinator.cancel("test-finished");
+            coordinator.awaitTermination(2, TimeUnit.SECONDS);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void lateAdbCompletionCannotStopAReplacementGeneration() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "adb-late-callback-owner";
+        long generation = 79;
+        service.uiOperation.begin(owner);
+        service.uiOperation.running(owner);
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration", new java.util.concurrent.atomic.AtomicLong(generation));
+        setInstanceField(service, "adbOwnerId", owner);
+        setInstanceField(service, "adbOwnerGeneration", generation);
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(
+                new byte[16], new byte[16], new byte[32]);
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.startAdbStream(
+                new AoaReceiverCoordinatorTest.Duplex().owner(), binding,
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String expectedOwner, long expectedGeneration) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, AoaReceiverCoordinator.TransportTag.USB_ADB);
+        coordinator.cancel("old-generation");
+        assertTrue(coordinator.awaitTermination(2, TimeUnit.SECONDS));
+        service.adbStreamCoordinator = coordinator;
+        try {
+            Method monitor = ReceiverService.class.getDeclaredMethod("monitorAdbStreamCoordinator",
+                    AoaReceiverCoordinator.class, String.class, long.class);
+            monitor.setAccessible(true);
+            monitor.invoke(service, coordinator, owner, generation);
+            service.currentOperationGeneration = generation + 1;
+            setInstanceField(service, "networkBootstrapGeneration",
+                    new java.util.concurrent.atomic.AtomicLong(generation + 1));
+            Shadows.shadowOf(Looper.getMainLooper()).idle();
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertSame(coordinator, service.adbStreamCoordinator);
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void oldUsbDetachCallbackCannotStopAdbOwner() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "adb-usb-detach-owner";
+        long generation = 80;
+        service.uiOperation.begin(owner);
+        service.uiOperation.running(owner);
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration", new java.util.concurrent.atomic.AtomicLong(generation));
+        setInstanceField(service, "adbOwnerId", owner);
+        setInstanceField(service, "adbOwnerGeneration", generation);
+        setInstanceField(service, "adbConnectionTransport", "wifi");
+        UsbAccessory accessory = org.robolectric.util.ReflectionHelpers.callConstructor(UsbAccessory.class,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "AnPod USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "USB Direct"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "1"),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, ""),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String.class, "stale-usb-accessory"));
+        service.aoaAccessory = accessory;
+        Method register = ReceiverService.class.getDeclaredMethod("registerAoaDetachReceiver",
+                UsbAccessory.class, String.class, long.class);
+        register.setAccessible(true);
+        try {
+            assertTrue((Boolean) register.invoke(service, accessory, owner, generation));
+            android.content.BroadcastReceiver detachReceiver = org.robolectric.util.ReflectionHelpers
+                    .getField(service, "aoaDetachReceiver");
+            detachReceiver.onReceive(RuntimeEnvironment.getApplication(),
+                    new Intent(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
+                            .putExtra(UsbManager.EXTRA_ACCESSORY, accessory));
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertEquals(owner, getInstanceField(service, "adbOwnerId"));
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void guardedBootstrapStopRejectsStaleAdbSocketAndKeepsCurrentOwner() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "adb-guarded-stop-owner";
+        long generation = 81;
+        service.uiOperation.begin(owner);
+        service.uiOperation.running(owner);
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration", new java.util.concurrent.atomic.AtomicLong(generation));
+        setInstanceField(service, "adbOwnerId", owner);
+        setInstanceField(service, "adbOwnerGeneration", generation);
+        setInstanceField(service, "adbOwnerSocketName", "current-stream-socket");
+        ReceiverService.terminalCause = "";
+        service.foregroundReady = true;
+        try {
+            service.onStartCommand(new Intent(service, ReceiverService.class)
+                    .setAction(BootstrapActivity.ACTION_STOP)
+                    .putExtra("uiOwnerId", owner)
+                    .putExtra("uiGeneration", generation)
+                    .putExtra("socketName", "stale-stream-socket"), 0, 1);
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertEquals(owner, service.uiOperation.ownerId());
+
+            service.onStartCommand(new Intent(service, ReceiverService.class)
+                    .setAction(BootstrapActivity.ACTION_STOP)
+                    .putExtra("uiOwnerId", owner)
+                    .putExtra("uiGeneration", generation), 0, 2);
+            assertEquals("ADB stops require the exact reverse socket name too",
+                    ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+
+            assertTrue(service.uiOperation.stop(owner));
+            assertTrue(service.uiOperation.completeStop(owner));
+            String nextOwner = "adb-next-guarded-stop-owner";
+            long nextGeneration = generation + 1;
+            assertTrue(service.uiOperation.begin(nextOwner));
+            assertTrue(service.uiOperation.running(nextOwner));
+            service.currentOperationGeneration = nextGeneration;
+            setInstanceField(service, "networkBootstrapGeneration",
+                    new java.util.concurrent.atomic.AtomicLong(nextGeneration));
+            setInstanceField(service, "adbOwnerId", nextOwner);
+            setInstanceField(service, "adbOwnerGeneration", nextGeneration);
+            setInstanceField(service, "adbOwnerSocketName", "next-stream-socket");
+            service.onStartCommand(new Intent(service, ReceiverService.class)
+                    .setAction(BootstrapActivity.ACTION_STOP)
+                    .putExtra("uiOwnerId", owner)
+                    .putExtra("uiGeneration", generation)
+                    .putExtra("socketName", "current-stream-socket"), 0, 3);
+            assertEquals("a late stop from the prior session cannot stop the new owner",
+                    ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertEquals(nextOwner, service.uiOperation.ownerId());
+
+            service.onStartCommand(new Intent(service, ReceiverService.class)
+                    .setAction(BootstrapActivity.ACTION_STOP)
+                    .putExtra("uiOwnerId", nextOwner)
+                    .putExtra("uiGeneration", nextGeneration)
+                    .putExtra("socketName", "next-stream-socket"), 0, 4);
+            assertEquals(ReceiverUiOperation.STOPPED, service.uiOperation.phase());
+            assertEquals("host cleanup does not record a phone USER_STOP", "", ReceiverService.terminalCause);
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    @Test
     public void aoaRecoverySchedulesSameOwnerAndSuccessfulStartResetsItsWindow() throws Exception {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
         String owner = "aoa-recovery-owner";

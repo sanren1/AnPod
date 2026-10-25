@@ -51,6 +51,18 @@ final class PairingProtocol {
 
         byte[] discoverySecret() { return secret.clone(); }
 
+        boolean hostIdMatchesHex(String candidate) {
+            if (candidate == null || candidate.length() != 32) return false;
+            int difference = 0;
+            for (int index = 0; index < hostId.length; index++) {
+                int high = lowerHex(candidate.charAt(index * 2));
+                int low = lowerHex(candidate.charAt(index * 2 + 1));
+                if (high < 0 || low < 0) return false;
+                difference |= hostId[index] ^ ((high << 4) | low);
+            }
+            return difference == 0;
+        }
+
         /** Derives an ephemeral transport-specific binding without changing this saved ANPB material. */
         BindingMaterial deriveAoa() throws Failure {
             requireOpen();
@@ -86,6 +98,48 @@ final class PairingProtocol {
                 if (expandInput != null) Arrays.fill(expandInput, (byte) 0);
                 if (derived != null) Arrays.fill(derived, (byte) 0);
             }
+        }
+
+        BindingMaterial deriveAdbStream() throws Failure {
+            requireOpen();
+            byte[] label = "AnPod ADB Stream binding salt v1".getBytes(
+                    java.nio.charset.StandardCharsets.US_ASCII);
+            byte[] saltInput = new byte[label.length + 1 + hostId.length + receiverId.length];
+            byte[] salt = null;
+            byte[] prk = null;
+            byte[] info = "AnPod ADB Stream P5-A binding secret v1".getBytes(
+                    java.nio.charset.StandardCharsets.US_ASCII);
+            byte[] expandInput = null;
+            byte[] derived = null;
+            try {
+                int offset = 0;
+                System.arraycopy(label, 0, saltInput, offset, label.length); offset += label.length;
+                saltInput[offset++] = 0;
+                System.arraycopy(hostId, 0, saltInput, offset, hostId.length); offset += hostId.length;
+                System.arraycopy(receiverId, 0, saltInput, offset, receiverId.length);
+                salt = MessageDigest.getInstance("SHA-256").digest(saltInput);
+                prk = rawHmac(salt, secret);
+                expandInput = Arrays.copyOf(info, info.length + 1);
+                expandInput[info.length] = 1;
+                derived = rawHmac(prk, expandInput);
+                return new BindingMaterial(hostId, receiverId, derived);
+            } catch (GeneralSecurityException error) {
+                throw new Failure("ADB stream binding derivation failed");
+            } finally {
+                Arrays.fill(label, (byte) 0);
+                Arrays.fill(saltInput, (byte) 0);
+                Arrays.fill(info, (byte) 0);
+                if (salt != null) Arrays.fill(salt, (byte) 0);
+                if (prk != null) Arrays.fill(prk, (byte) 0);
+                if (expandInput != null) Arrays.fill(expandInput, (byte) 0);
+                if (derived != null) Arrays.fill(derived, (byte) 0);
+            }
+        }
+
+        private static int lowerHex(char value) {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            return -1;
         }
 
         static BindingMaterial generate() {

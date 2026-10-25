@@ -151,10 +151,17 @@ public final class ReceiverService extends Service {
     private String cleanupError = "";
     private int latestDeliveredStartId;
     volatile AoaReceiverCoordinator aoaCoordinator;
+    volatile AoaReceiverCoordinator adbStreamCoordinator;
     volatile UsbAccessory aoaAccessory;
     volatile String aoaOwnerId = "";
     volatile long aoaOwnerGeneration;
     private volatile Thread aoaBootstrapThread;
+    private volatile Thread adbStreamBootstrapThread;
+    private volatile LocalSocket adbConnectingSocket;
+    private volatile String adbOwnerId = "";
+    private volatile long adbOwnerGeneration;
+    private volatile String adbConnectionTransport = "";
+    private volatile String adbOwnerSocketName = "";
     private volatile long aoaRecoveryDeadlineElapsedMs;
     private volatile int aoaRecoveryAttempt;
     private volatile String aoaRecoveryFailure = "";
@@ -228,6 +235,48 @@ public final class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
         if (intent != null && BootstrapActivity.ACTION_STOP.equals(intent.getAction())) {
+            boolean hasExpectedOwner = intent.hasExtra(EXTRA_UI_OWNER_ID);
+            boolean hasExpectedGeneration = intent.hasExtra(EXTRA_UI_GENERATION);
+            boolean hasExpectedSocketName = intent.hasExtra("socketName");
+            boolean guardedStop = hasExpectedOwner || hasExpectedGeneration || hasExpectedSocketName;
+            if (guardedStop) {
+                String expectedOwner = intent.getStringExtra(EXTRA_UI_OWNER_ID);
+                long expectedGeneration = intent.getLongExtra(EXTRA_UI_GENERATION, -1L);
+                String expectedSocketName = intent.getStringExtra("socketName");
+                boolean activeAdbOwner = expectedOwner != null && expectedOwner.equals(adbOwnerId)
+                        && expectedGeneration == adbOwnerGeneration;
+                boolean matchesTransportOwner = activeAdbOwner
+                        ? hasExpectedSocketName && expectedSocketName != null
+                                && expectedSocketName.equals(adbOwnerSocketName)
+                        : !hasExpectedSocketName;
+                boolean matchesCurrentOwner = hasExpectedOwner && hasExpectedGeneration
+                        && uiOperation.owns(expectedOwner, expectedGeneration, currentOperationGeneration)
+                        && expectedGeneration == networkBootstrapGeneration.get() && matchesTransportOwner;
+                if (!matchesCurrentOwner) {
+                    int disposition = uiOperation.bootstrapStopDisposition();
+                    if (!foregroundReady) {
+                        try {
+                            if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_OWNER) {
+                                Notification active = serviceNotification("正在播放电脑音频。", uiOperation.ownerId(),
+                                        currentOperationGeneration, true);
+                                if (Build.VERSION.SDK_INT >= 34)
+                                    startForeground(NOTIFICATION_ID, active, playbackForegroundServiceType());
+                                else startForeground(NOTIFICATION_ID, active);
+                            } else {
+                                Notification stopping = serviceNotification("正在停止 AnPod 接收…", "", 0, false);
+                                if (Build.VERSION.SDK_INT >= 34)
+                                    startForeground(NOTIFICATION_ID, stopping,
+                                            ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE);
+                                else startForeground(NOTIFICATION_ID, stopping);
+                            }
+                        } catch (RuntimeException ignored) {
+                            // A stale owner request must not terminate the current session on foreground failure.
+                        }
+                    }
+                    if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_IDLE) stopSelf(startId);
+                    return START_NOT_STICKY;
+                }
+            }
             // The invisible trampoline starts us with startForegroundService even when the session
             // just ended; satisfy the 5 s contract before tearing the service down.
             try {
@@ -245,8 +294,11 @@ public final class ReceiverService extends Service {
                 String ownerId = uiOperation.ownerId();
                 long generation = currentOperationGeneration;
                 if (uiOperation.owns(ownerId, generation, networkBootstrapGeneration.get())) {
-                    recordManualStop(ownerId, generation);
-                    requestTermination(ownerId, generation, false, "");
+                    if (guardedStop) requestHostStop(ownerId, generation);
+                    else {
+                        recordManualStop(ownerId, generation);
+                        requestTermination(ownerId, generation, false, "");
+                    }
                 }
             } else if (disposition == ReceiverUiOperation.BOOTSTRAP_STOP_IDLE) {
                 stopSelf(startId);
@@ -261,9 +313,18 @@ public final class ReceiverService extends Service {
                 && intent.getBooleanExtra(EXTRA_KEEP_RECEIVE_INTENT, false);
         boolean networkAudio = intent != null && (BootstrapActivity.ACTION_START_NETWORK_AUDIO.equals(intent.getAction()) || uiNetworkAudio);
         boolean audio = intent != null && BootstrapActivity.ACTION_START_AUDIO.equals(intent.getAction());
+        boolean adbStreamAudio = intent != null
+                && BootstrapActivity.ACTION_START_ADB_STREAM_AUDIO.equals(intent.getAction());
+        String adbSocketName = adbStreamAudio ? intent.getStringExtra("socketName") : null;
+        String adbHostId = adbStreamAudio ? intent.getStringExtra("hostId") : null;
+        String adbTransport = adbStreamAudio ? intent.getStringExtra("connectionTransport") : null;
+        boolean validAdbStreamRequest = !adbStreamAudio || adbSocketName != null && !adbSocketName.isEmpty()
+                && ("usb".equals(adbTransport) || "wifi".equals(adbTransport));
 
         if (networkAudio && networkCoordinator != null) return START_NOT_STICKY;
-        if (!audio && currentAudio != null) return START_NOT_STICKY;
+        if (!audio && !adbStreamAudio && currentAudio != null) return START_NOT_STICKY;
+        if (adbStreamAudio && (currentAudio != null || adbStreamCoordinator != null
+                || adbStreamBootstrapThread != null)) return START_NOT_STICKY;
 
         String ownerId;
         long generation;
@@ -336,16 +397,16 @@ public final class ReceiverService extends Service {
         // shortService or attach a short-service timeout to the audio session.
         try {
             Notification notification = serviceNotification(
-                    audio ? "AnPod 音频连接正在运行。" : uiAoaAudio
+                    audio || adbStreamAudio ? "正在播放电脑音频。" : uiAoaAudio
                             ? "正在连接 AnPod USB Direct，可随时停止。" : networkAudio
                             ? receiveIntentEnabled ? "正在等待电脑连接，可随时停止。" : "无线接收正在准备，可随时停止。"
                             : "管理检查进行中；当前不播放音频。",
-                    ownerId, generation, networkAudio || uiAoaAudio || audio && currentAudio != null);
+                    ownerId, generation, networkAudio || uiAoaAudio || audio && currentAudio != null || adbStreamAudio);
             if (Build.VERSION.SDK_INT >= 34) {
                 int type = uiAoaAudio
                         ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                                 | ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                        : audio
+                        : audio || adbStreamAudio
                         ? playbackForegroundServiceType()
                         : receiveIntentEnabled ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                                 : ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
@@ -366,6 +427,26 @@ public final class ReceiverService extends Service {
             uiOperation.running(ownerId);
             startAudio(new AudioRequest(intent.getStringExtra("socketName"), intent.getStringExtra("connectCode"),
                     intent.getStringExtra("playbackMode")));
+            return START_NOT_STICKY;
+        }
+
+        if (adbStreamAudio) {
+            if (!validAdbStreamRequest) {
+                recordStartFailure("InvalidAdbStreamBootstrap");
+                requestTermination(ownerId, generation, true, startFailure);
+                return START_NOT_STICKY;
+            }
+            if (timeout != null) handler.removeCallbacks(timeout);
+            timeout = () -> requestTermination(ownerId, generation, true, "AdbStreamBootstrapTimeout");
+            handler.postDelayed(timeout, ADB_NETWORK_BOOTSTRAP_TIMEOUT_MS);
+            uiOperation.running(ownerId);
+            adbOwnerId = ownerId;
+            adbOwnerGeneration = generation;
+            adbConnectionTransport = adbTransport;
+            adbOwnerSocketName = adbSocketName;
+            networkAudioState = "starting";
+            networkAudioFailure = "";
+            startAdbStreamBootstrap(adbSocketName, adbHostId, adbTransport, ownerId, generation);
             return START_NOT_STICKY;
         }
 
@@ -451,7 +532,7 @@ public final class ReceiverService extends Service {
                 binding = new BindingStore(getFilesDir()).load();
                 UsbManager manager = getSystemService(UsbManager.class);
                 AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.openAccessory(manager, accessory,
-                        binding, aoaPlaybackEndpoint(ownerId, generation), ownerId, generation);
+                        binding, recordPlaybackEndpoint(ownerId, generation), ownerId, generation);
                 binding = null; // The coordinator now owns and destroys the saved binding material.
                 synchronized (networkCoordinatorLock) { aoaCoordinator = coordinator; }
                 Thread monitor = new Thread(() -> monitorAoaCoordinator(coordinator, ownerId, generation),
@@ -483,6 +564,82 @@ public final class ReceiverService extends Service {
             aoaBootstrapThread = bootstrap;
             bootstrap.start();
         }
+    }
+
+    private void startAdbStreamBootstrap(String socketName, String hostId, String connectionTransport,
+            String ownerId, long generation) {
+        Thread bootstrap = new Thread(() -> {
+            PairingProtocol.BindingMaterial binding = null;
+            AoaAccessoryIo io = null;
+            LocalSocket socket = null;
+            AoaReceiverCoordinator coordinator = null;
+            try {
+                if (!isCurrentOperation(ownerId, generation)) throw new IOException("AdbOwnerGenerationExpired");
+                synchronized (BindingStore.storageLock()) {
+                    binding = new BindingStore(getFilesDir()).load();
+                    if (!binding.hostIdMatchesHex(hostId)) throw new IOException("AdbHostBindingMismatch");
+                }
+                socket = new LocalSocket();
+                synchronized (networkCoordinatorLock) {
+                    if (!isCurrentOperation(ownerId, generation)) throw new IOException("AdbOwnerGenerationExpired");
+                    adbConnectingSocket = socket;
+                }
+                socket.connect(new LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT));
+                if (!isCurrentOperation(ownerId, generation)) throw new IOException("AdbOwnerGenerationExpired");
+                LocalSocket connectedSocket = socket;
+                io = AoaAccessoryIo.open(socket);
+                socket = null;
+                synchronized (networkCoordinatorLock) {
+                    if (adbConnectingSocket == connectedSocket) adbConnectingSocket = null;
+                }
+                AoaReceiverCoordinator.TransportTag transport = "wifi".equals(connectionTransport)
+                        ? AoaReceiverCoordinator.TransportTag.WIFI_ADB
+                        : AoaReceiverCoordinator.TransportTag.USB_ADB;
+                coordinator = AoaReceiverCoordinator.startAdbStream(io, binding,
+                        recordPlaybackEndpoint(ownerId, generation), ownerId, generation, transport);
+                io = null;
+                binding = null;
+                synchronized (networkCoordinatorLock) {
+                    if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation)
+                        adbStreamCoordinator = coordinator;
+                    if (!isCurrentOperation(ownerId, generation)) coordinator.cancel("AdbOwnerGenerationExpired");
+                }
+                monitorAdbStreamCoordinator(coordinator, ownerId, generation);
+            } catch (IOException | PairingProtocol.Failure | RuntimeException error) {
+                if (binding != null) binding.close();
+                if (io != null) io.cancel();
+                if (socket != null) try { socket.close(); } catch (IOException closeError) { error.addSuppressed(closeError); }
+                String failure = error instanceof IOException && error.getMessage() != null
+                        ? error.getMessage() : error.getClass().getSimpleName();
+                if (isCurrentOperation(ownerId, generation)) requestTermination(ownerId, generation, true, failure);
+            } finally {
+                synchronized (networkCoordinatorLock) {
+                    if (adbConnectingSocket == socket) adbConnectingSocket = null;
+                    if (adbStreamBootstrapThread == Thread.currentThread()) adbStreamBootstrapThread = null;
+                }
+                handler.post(() -> {
+                    if (ReceiverUiOperation.STOPPING.equals(uiOperation.phase())
+                            && uiOperation.owns(ownerId)) finishTerminationIfReady(ownerId, currentOperationGeneration);
+                });
+            }
+        }, "AnPod ADB stream bootstrap");
+        bootstrap.setDaemon(true);
+        synchronized (networkCoordinatorLock) {
+            adbStreamBootstrapThread = bootstrap;
+            bootstrap.start();
+        }
+    }
+
+    private void monitorAdbStreamCoordinator(AoaReceiverCoordinator coordinator,
+            String ownerId, long generation) {
+        try { coordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        String failure = coordinator.failureMessage();
+        handler.post(() -> {
+            if (adbStreamCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            adbStreamCoordinator = null;
+            requestTermination(ownerId, generation, !failure.isEmpty(), failure);
+        });
     }
 
     private void monitorAoaCoordinator(AoaReceiverCoordinator coordinator, String ownerId, long generation) {
@@ -720,6 +877,10 @@ public final class ReceiverService extends Service {
         if (session != null) cancelAudio(session, "AudioServiceDestroyed");
         AoaReceiverCoordinator aoa = aoaCoordinator;
         if (aoa != null) aoa.cancel("AudioServiceDestroyed");
+        AoaReceiverCoordinator adbStream = adbStreamCoordinator;
+        if (adbStream != null) adbStream.cancel("AudioServiceDestroyed");
+        LocalSocket connectingAdb = adbConnectingSocket;
+        if (connectingAdb != null) try { connectingAdb.close(); } catch (IOException ignored) {}
         unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator;
         synchronized (networkCoordinatorLock) {
@@ -881,6 +1042,21 @@ public final class ReceiverService extends Service {
         return true;
     }
 
+    private void requestHostStop(String ownerId, long generation) {
+        if (!isCurrentOperation(ownerId, generation)) return;
+        if (isManualStop(ownerId, generation)) {
+            requestTermination(ownerId, generation, false, "");
+            return;
+        }
+        AoaReceiverCoordinator coordinator;
+        synchronized (networkCoordinatorLock) {
+            coordinator = ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation
+                    ? adbStreamCoordinator : null;
+        }
+        if (coordinator != null && coordinator.requestHostStop()) return;
+        requestTermination(ownerId, generation, false, "");
+    }
+
     boolean trustBindingUntilRevokedFromUi(String ownerId, long generation) {
         if (!applicationIsVisible() || !isCurrentOperation(ownerId, generation) || !backgroundStandbyEnabled) return false;
         try {
@@ -1007,15 +1183,21 @@ public final class ReceiverService extends Service {
     private void beginTermination(String ownerId, long generation, boolean failed, String reason) {
         if (!failed && (reason == null || reason.isEmpty()) && isManualStop(ownerId, generation)) {
             AoaReceiverCoordinator activeAoa;
+            AoaReceiverCoordinator activeAdbStream;
             P5cReceiverCoordinator activeNetwork;
             synchronized (networkCoordinatorLock) {
                 activeAoa = ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation
                         ? aoaCoordinator : null;
+                activeAdbStream = ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation
+                        ? adbStreamCoordinator : null;
                 activeNetwork = ownerId.equals(networkCoordinatorOwnerId)
                         && generation == currentOperationGeneration ? networkCoordinator : null;
             }
             if (activeAoa != null) {
                 if (activeAoa.requestUserStop()) return;
+            }
+            if (activeAdbStream != null) {
+                if (activeAdbStream.requestUserStop()) return;
             }
             if (activeNetwork != null) {
                 if (activeNetwork.requestUserStop()) return;
@@ -1053,12 +1235,22 @@ public final class ReceiverService extends Service {
             cancelAudio(session, session.request.usesPacketIngress() ? "NetworkSessionStopped" : "UiSessionStopped");
         Thread opening = null;
         AoaReceiverCoordinator aoa = null;
+        Thread openingAdbStream = null;
+        LocalSocket connectingAdbSocket = null;
+        AoaReceiverCoordinator adbStream = null;
         synchronized (networkCoordinatorLock) {
             if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
                 opening = aoaBootstrapThread;
                 aoa = aoaCoordinator;
             }
+            if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation) {
+                openingAdbStream = adbStreamBootstrapThread;
+                connectingAdbSocket = adbConnectingSocket;
+                adbStream = adbStreamCoordinator;
+            }
         }
+        if (connectingAdbSocket != null) try { connectingAdbSocket.close(); } catch (IOException ignored) {}
+        if (adbStream != null) adbStream.cancel("AdbStreamOwnerStopped");
         if (aoa != null) aoa.cancel("AoaOwnerStopped");
         unregisterAoaDetachReceiver();
         P5cReceiverCoordinator coordinator = null;
@@ -1137,6 +1329,67 @@ public final class ReceiverService extends Service {
                     aoaOwnerId = "";
                     aoaOwnerGeneration = 0;
                     aoaBootstrapThread = null;
+                }
+            }
+        }
+        if (openingAdbStream != null || adbStream != null) {
+            Thread openingThread = openingAdbStream;
+            AoaReceiverCoordinator initialCoordinator = adbStream;
+            cleanupCoordinatorClosed = false;
+            long terminatingGeneration = cleanupGeneration;
+            new Thread(() -> {
+                boolean interrupted = false;
+                if (openingThread != null && openingThread != Thread.currentThread()) {
+                    while (openingThread.isAlive()) try { openingThread.join(); }
+                    catch (InterruptedException error) { interrupted = true; }
+                }
+                AoaReceiverCoordinator completedCoordinator = initialCoordinator;
+                synchronized (networkCoordinatorLock) {
+                    if (completedCoordinator == null && ownerId.equals(adbOwnerId)
+                            && adbOwnerGeneration == generation) completedCoordinator = adbStreamCoordinator;
+                }
+                if (completedCoordinator != null) {
+                    completedCoordinator.cancel("AdbStreamOwnerCleanup");
+                    for (;;) try {
+                        completedCoordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+                        break;
+                    } catch (InterruptedException error) { interrupted = true; }
+                    String streamCleanupFailure = completedCoordinator.failureMessage();
+                    if (!streamCleanupFailure.isEmpty()) {
+                        cleanupFailed = true;
+                        cleanupError = cleanupError.isEmpty() ? streamCleanupFailure
+                                : cleanupError + "; " + streamCleanupFailure;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+                AoaReceiverCoordinator cleaned = completedCoordinator;
+                handler.post(() -> {
+                    if (!isPendingCleanup(ownerId, terminatingGeneration)) return;
+                    synchronized (networkCoordinatorLock) {
+                        if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation) {
+                            if (cleaned == null || adbStreamCoordinator == cleaned) adbStreamCoordinator = null;
+                            adbOwnerId = "";
+                            adbOwnerGeneration = 0;
+                            adbConnectionTransport = "";
+                            adbOwnerSocketName = "";
+                            adbStreamBootstrapThread = null;
+                            adbConnectingSocket = null;
+                        }
+                    }
+                    cleanupCoordinatorClosed = true;
+                    finishTerminationIfReady(ownerId, terminatingGeneration);
+                });
+            }, "AnPod ADB stream cleanup").start();
+        } else if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation) {
+            synchronized (networkCoordinatorLock) {
+                if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation) {
+                    adbStreamCoordinator = null;
+                    adbOwnerId = "";
+                    adbOwnerGeneration = 0;
+                    adbConnectionTransport = "";
+                    adbOwnerSocketName = "";
+                    adbStreamBootstrapThread = null;
+                    adbConnectingSocket = null;
                 }
             }
         }
@@ -1331,6 +1584,10 @@ public final class ReceiverService extends Service {
     }
 
     AoaReceiverCoordinator.PlaybackEndpoint aoaPlaybackEndpoint(String ownerId, long generation) {
+        return recordPlaybackEndpoint(ownerId, generation);
+    }
+
+    AoaReceiverCoordinator.PlaybackEndpoint recordPlaybackEndpoint(String ownerId, long generation) {
         return new AoaReceiverCoordinator.PlaybackEndpoint() {
             private AudioSession ownedSession;
             private boolean current() { return isCurrentOperation(ownerId, generation); }
@@ -1339,15 +1596,24 @@ public final class ReceiverService extends Service {
                 return ownerId.equals(expectedOwner) && generation == expectedGeneration && current();
             }
 
+            @Override public void ready() {
+                handler.post(() -> {
+                    if (!current()) return;
+                    if (timeout != null) handler.removeCallbacks(timeout);
+                    timeout = null;
+                });
+            }
+
             @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) {
                 return format != null && format.profile >= 1 && format.profile <= 5;
             }
 
             @Override public void start(AoaSessionContext context) throws IOException {
-                if (!current()) throw new IOException("AoaOwnerStopped");
+                if (!current()) throw new IOException("RecordOwnerStopped");
                 AudioSession accepted = startAoaAudio(context, ownerId, generation);
                 ownedSession = accepted;
-                noteAoaPlaybackStarted(ownerId, generation);
+                if (context.transport == AodTelemetrySnapshot.Transport.USB_DIRECT)
+                    noteAoaPlaybackStarted(ownerId, generation);
             }
 
             @Override public void pause() throws IOException {
@@ -1363,15 +1629,15 @@ public final class ReceiverService extends Service {
                 if (session == null) return;
                 Runnable stop = () -> {
                     if (currentAudio == session && isCurrentOperation(ownerId, generation))
-                        cancelAudio(session, "AoaSessionStopped");
+                        cancelAudio(session, "RecordSessionStopped");
                 };
                 if (Looper.myLooper() == Looper.getMainLooper()) stop.run(); else handler.post(stop);
             }
 
             @Override public boolean streaming() throws IOException {
-                if (!current()) throw new IOException("AoaOwnerStopped");
+                if (!current()) throw new IOException("RecordOwnerStopped");
                 AudioSession session = ownedSession;
-                if (session == null || currentAudio != session) throw new IOException("AoaAudioSessionNotOwned");
+                if (session == null || currentAudio != session) throw new IOException("RecordAudioSessionNotOwned");
                 return session.isStreamingAt(System.nanoTime());
             }
 
@@ -1379,6 +1645,10 @@ public final class ReceiverService extends Service {
 
             @Override public byte[] playbackProgressPayloadExtendedV2() {
                 return ReceiverService.playbackProgressPayloadExtendedV2();
+            }
+
+            @Override public byte[] playbackProgressPayloadExtendedV2(int schema) {
+                return ReceiverService.playbackProgressPayloadExtended(true, schema);
             }
 
             @Override public byte[] playbackProgressPayloadV2() {
@@ -1533,6 +1803,10 @@ public final class ReceiverService extends Service {
 
                 @Override public byte[] playbackProgressPayloadExtended(boolean audioV2) {
                     return ReceiverService.playbackProgressPayloadExtended(audioV2);
+                }
+
+                @Override public byte[] playbackProgressPayloadExtended(boolean audioV2, int schema) {
+                    return ReceiverService.playbackProgressPayloadExtended(audioV2, schema);
                 }
 
                 @Override public boolean start(UdpSessionContext context,
@@ -1773,6 +2047,9 @@ public final class ReceiverService extends Service {
     boolean isAoaSession() {
         return aoaOwnerId != null && !aoaOwnerId.isEmpty();
     }
+
+    boolean isAdbStreamSession() { return adbOwnerId != null && !adbOwnerId.isEmpty(); }
+    String adbConnectionTransport() { return adbConnectionTransport; }
 
     private void runOnMainForOwner(String ownerId, long generation, MainOwnerCommand command) throws IOException {
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -2236,8 +2513,7 @@ public final class ReceiverService extends Service {
                 boolean playing = session.trackPlaying
                         && (playbackPosition < 0 || session.driftPlaybackHead.isAdvancing(nowNanos))
                         && concealedFrames == observedConcealedFrames;
-                long pendingFrames = output.pendingFrames(session.trackWrittenFrames, playedFrames);
-                long waterlineFrames = (long) queue.queuedFrames() + count + pendingFrames;
+                long waterlineFrames = (long) queue.queuedFrames() + count;
                 int adjustment = drift.observe(nowNanos, waterlineFrames, playing, discontinuity);
                 int outputFrames = count;
                 if (adjustment != 0 && (adjustment > 0 ? count >= 3 : count >= 2)) {
@@ -3330,11 +3606,15 @@ public final class ReceiverService extends Service {
         }
         if (!uiOperation.owns(session.ownerId) || session.networkGeneration != currentOperationGeneration) return;
         if (session.request.aoaContext != null) {
-            if ("AoaSessionStopped".equals(session.stopReason)) return;
+            if ("RecordSessionStopped".equals(session.stopReason)) return;
             AoaReceiverCoordinator coordinator;
             synchronized (networkCoordinatorLock) {
-                coordinator = session.ownerId.equals(aoaOwnerId)
-                        && session.networkGeneration == aoaOwnerGeneration ? aoaCoordinator : null;
+                boolean aoa = session.request.aoaContext.transport == AodTelemetrySnapshot.Transport.USB_DIRECT;
+                coordinator = aoa
+                        ? session.ownerId.equals(aoaOwnerId) && session.networkGeneration == aoaOwnerGeneration
+                                ? aoaCoordinator : null
+                        : session.ownerId.equals(adbOwnerId) && session.networkGeneration == adbOwnerGeneration
+                                ? adbStreamCoordinator : null;
             }
             if (coordinator != null) {
                 if (failure != null && !failure.isEmpty() && !"AudioSessionEnded".equals(failure))
@@ -3565,6 +3845,11 @@ public final class ReceiverService extends Service {
     }
 
     static byte[] playbackProgressPayloadExtended(boolean audioV2) {
+        return playbackProgressPayloadExtended(audioV2, 2);
+    }
+
+    static byte[] playbackProgressPayloadExtended(boolean audioV2, int schema) {
+        if (schema != 2 && schema != 3) throw new IllegalArgumentException("unsupported progress schema");
         AudioSession session = currentAudio;
         PlaybackMetrics metrics = playbackMetricsSnapshot();
         if (session != currentAudio) session = null;
@@ -3631,9 +3916,21 @@ public final class ReceiverService extends Service {
                 }
             }
         }
-        return P5cControlProtocol.playbackProgressPayloadExtended(base,
+        byte[] extended = P5cControlProtocol.playbackProgressPayloadExtended(base,
                 android.os.SystemClock.elapsedRealtimeNanos(), receiverGeneration, outputEpoch, engine,
                 counters, ringPending, streamPending);
+        if (schema == 2) return extended;
+        FloatPcmFrameQueue floatQueue = session == null ? null : session.floatQueue;
+        FloatPcmDriftController drift = session == null ? null : session.floatDriftController;
+        long targetFrames = drift != null ? drift.targetFrames()
+                : floatQueue == null ? -1 : floatQueue.initialTargetFrames();
+        long observedFrames = drift == null ? -1 : drift.observedFrames();
+        int errorFrames = drift == null || !drift.hasFilteredError() ? Integer.MIN_VALUE
+                : (int) Math.max(Integer.MIN_VALUE + 1L, Math.min(Integer.MAX_VALUE, drift.errorFrames()));
+        int correctionPpm = drift == null ? Integer.MIN_VALUE : drift.correctionPpm();
+        int resetReason = drift == null ? 0 : drift.resetReason();
+        return P5cControlProtocol.playbackProgressPayloadSchema3(extended, targetFrames,
+                observedFrames, errorFrames, correctionPpm, resetReason);
     }
 
     static byte[] playbackProgressPayloadExtendedV2() {

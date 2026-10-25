@@ -16,6 +16,7 @@ import android.os.Bundle;
 public final class BootstrapActivity extends Activity {
     public static final String ACTION_START = "app.anpod.receiver.action.START";
     public static final String ACTION_START_AUDIO = "app.anpod.receiver.action.START_AUDIO";
+    public static final String ACTION_START_ADB_STREAM_AUDIO = "app.anpod.receiver.action.START_ADB_STREAM_AUDIO";
     public static final String ACTION_START_NETWORK_AUDIO = "app.anpod.receiver.action.START_NETWORK_AUDIO";
     public static final String ACTION_STOP = "app.anpod.receiver.action.STOP";
 

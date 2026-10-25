@@ -46,10 +46,15 @@ final class AnpdAudioIngress implements AutoCloseable {
         finally { Arrays.fill(key, (byte) 0); }
     }
 
+    static AnpdAudioIngress record(long sessionId, byte[] key, UdpPacketDecoder.AudioFormatV2 format,
+            UdpPcmQueue pcmQueue, FloatPcmFrameQueue floatQueue) {
+        if (format == null) throw new IllegalArgumentException("record stream requires a locked v2 format");
+        return new AnpdAudioIngress(sessionId, key, format, pcmQueue, floatQueue, true);
+    }
+
     static AnpdAudioIngress aoa(long sessionId, byte[] key, UdpPacketDecoder.AudioFormatV2 format,
             UdpPcmQueue pcmQueue, FloatPcmFrameQueue floatQueue) {
-        if (format == null) throw new IllegalArgumentException("AOA requires a locked v2 format");
-        return new AnpdAudioIngress(sessionId, key, format, pcmQueue, floatQueue, true);
+        return record(sessionId, key, format, pcmQueue, floatQueue);
     }
 
     Result accept(byte[] bytes, int length) {

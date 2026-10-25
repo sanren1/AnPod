@@ -39,8 +39,50 @@ public class AoaReceiverCoordinatorTest {
         for (int profile = 1; profile <= 5; profile++) runProfile(profile);
     }
 
+    @Test public void authenticatedAdbStreamUsesItsOwnCapabilityAndRealTransportTag() throws Exception {
+        runProfile(4, false, AoaReceiverCoordinator.TransportTag.USB_ADB);
+        runProfile(5, false, AoaReceiverCoordinator.TransportTag.WIFI_ADB);
+    }
+
     @Test public void phoneStopIsReportedOnNextNonHeartbeatAck() throws Exception {
         runProfile(1, true);
+    }
+
+    @Test public void adbPhoneStopIsReportedWithoutAoaRestartSemantics() throws Exception {
+        runProfile(4, true, AoaReceiverCoordinator.TransportTag.USB_ADB);
+        runProfile(5, true, AoaReceiverCoordinator.TransportTag.WIFI_ADB);
+    }
+
+    @Test public void adbHostCleanupStopDoesNotLookLikePhoneManualStop() throws Exception {
+        runProfile(4, false, AoaReceiverCoordinator.TransportTag.USB_ADB, true);
+        runProfile(5, false, AoaReceiverCoordinator.TransportTag.WIFI_ADB, true);
+    }
+
+    @Test public void adbBindingDerivationMatchesFrozenVectorAndRejectsAoaDomain() throws Exception {
+        byte[] hostId = filled(16, 1), receiverId = filled(16, 2), secret = filled(32, 3);
+        try (PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
+                PairingProtocol.BindingMaterial derived = saved.deriveAdbStream()) {
+            byte[] record = derived.encodedRecord();
+            try {
+                assertArrayEquals(decodeHex("cb76cb157e4c5446d03232534f61486a750cb61ff29ccf8882b09c3ffe1d0c37"),
+                        Arrays.copyOfRange(record, 37, 69));
+            } finally { Arrays.fill(record, (byte) 0); }
+            assertTrue(saved.hostIdMatchesHex("01010101010101010101010101010101"));
+            assertFalse(saved.hostIdMatchesHex("0101010101010101010101010101010a"));
+            assertFalse(saved.hostIdMatchesHex("0101010101010101010101010101010A"));
+        }
+
+        try (PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
+                PairingProtocol.BindingMaterial hostBinding = saved.deriveAdbStream()) {
+            UdpPacketDecoder.AudioFormatV2 format = UdpPacketDecoder.AudioFormatV2.forProfile(4, 0);
+            PairingProtocol.V2.HostStart hostStart = PairingProtocol.V2.Host.start(hostBinding, format);
+            try (hostStart.host; PairingProtocol.BindingMaterial wrongDomain = saved.deriveAoa();
+                    PairingProtocol.V2.ReceiverAwaitFinish receiver =
+                            PairingProtocol.V2.Receiver.acceptHello(wrongDomain, hostStart.hello)) {
+                assertThrows(PairingProtocol.Failure.class,
+                        () -> hostStart.host.acceptChallenge(receiver.challenge));
+            }
+        }
     }
 
     @Test public void noHelloTimesOutAndReleasesTheSingleConnectionOwner() throws Exception {
@@ -78,14 +120,28 @@ public class AoaReceiverCoordinatorTest {
     }
 
     private static void runProfile(int profile, boolean stopFromPhone) throws Exception {
+        runProfile(profile, stopFromPhone, AoaReceiverCoordinator.TransportTag.USB_DIRECT);
+    }
+
+    private static void runProfile(int profile, boolean stopFromPhone,
+            AoaReceiverCoordinator.TransportTag transport) throws Exception {
+        runProfile(profile, stopFromPhone, transport, false);
+    }
+
+    private static void runProfile(int profile, boolean stopFromPhone,
+            AoaReceiverCoordinator.TransportTag transport, boolean stopFromHost) throws Exception {
         byte[] hostId = sequence(0x10, 16), receiverId = sequence(0x20, 16), secret = sequence(0, 32);
         PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
-        PairingProtocol.BindingMaterial hostBinding = saved.deriveAoa();
+        PairingProtocol.BindingMaterial hostBinding = transport.isAdbStream()
+                ? saved.deriveAdbStream() : saved.deriveAoa();
         UdpPacketDecoder.AudioFormatV2 format = UdpPacketDecoder.AudioFormatV2.forProfile(profile, 0);
         PairingProtocol.V2.HostStart hostStart = PairingProtocol.V2.Host.start(hostBinding, format);
         Duplex io = new Duplex();
         Endpoint endpoint = new Endpoint();
-        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(io.owner(), saved, endpoint, "test-owner", profile);
+        AoaReceiverCoordinator coordinator = transport.isAdbStream()
+                ? AoaReceiverCoordinator.startAdbStream(io.owner(), saved, endpoint,
+                        "test-owner", profile, transport)
+                : AoaReceiverCoordinator.start(io.owner(), saved, endpoint, "test-owner", profile);
         PairingProtocol.SessionKeys keys = null;
         try {
             io.send(AnpuRecordCodec.HANDSHAKE, hostStart.hello);
@@ -105,6 +161,7 @@ public class AoaReceiverCoordinatorTest {
                 keys = hostSession.takeKeys();
                 int requiredCapabilities = P5cControlProtocol.CAP_AUDIO_V2
                         | (format.sampleFormat == 3 ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
+                        | (transport.isAdbStream() ? P5cControlProtocol.CAP_AUDIO_ADB_STREAM : 0)
                         | P5cControlProtocol.CAP_PROGRESS_EXT;
                 sendControl(io, keys, hostSession.sessionId, 0, P5cControlProtocol.CAPABILITIES_QUERY,
                         P5cControlProtocol.capabilitiesQueryPayload(3, 1, requiredCapabilities));
@@ -117,6 +174,12 @@ public class AoaReceiverCoordinatorTest {
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AUDIO_FLOAT32);
                 assertEquals(P5cControlProtocol.CAP_PROGRESS_EXT,
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_PROGRESS_EXT);
+                assertEquals(P5cControlProtocol.CAP_BUFFER_METRICS,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_BUFFER_METRICS);
+                assertEquals(transport.isAdbStream() ? P5cControlProtocol.CAP_AUDIO_ADB_STREAM : 0,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AUDIO_ADB_STREAM);
+                assertEquals(transport.isAdbStream() ? 0 : P5cControlProtocol.CAP_AOA_SESSION_RESTART,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AOA_SESSION_RESTART);
 
                 sendControl(io, keys, hostSession.sessionId, 1, P5cControlProtocol.BIND, new byte[] {0, 0});
                 assertAck(io, keys, hostSession.sessionId, 1, P5cControlProtocol.BIND,
@@ -129,6 +192,7 @@ public class AoaReceiverCoordinatorTest {
                         P5cReceiverCoordinator.STATE_RECEIVER_RUNNING);
                 assertNotNull("START ACK must follow endpoint registration", endpoint.context);
                 assertEquals(profile, endpoint.context.formatV2.profile);
+                assertEquals(transport.telemetry, endpoint.context.transport);
                 assertEquals(profile == 1, endpoint.context.pcmQueue != null);
                 assertEquals(profile > 1, endpoint.context.floatQueue != null);
 
@@ -147,17 +211,20 @@ public class AoaReceiverCoordinatorTest {
                 sendControl(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME, new byte[0]);
                 assertAck(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME,
                         P5cReceiverCoordinator.STATE_RECEIVER_RUNNING);
-                if (stopFromPhone) {
-                    assertTrue(coordinator.requestUserStop());
-                    assertFalse("phone stop waits for an authenticated ACK before stopping playback",
-                            endpoint.stopped);
+                if (stopFromPhone || stopFromHost) {
+                    if (stopFromPhone) assertTrue(coordinator.requestUserStop());
+                    else {
+                        assertTrue(coordinator.requestHostStop());
+                        assertFalse(coordinator.shouldRecoverUnexpectedFailure());
+                    }
+                    assertFalse("authenticated stop waits for an ACK before stopping playback", endpoint.stopped);
                     sendControl(io, keys, hostSession.sessionId, 6,
                             P5cControlProtocol.PLAYBACK_PROGRESS_QUERY, new byte[0]);
                     P5cControlProtocol.Frame stopped = receiveControl(io, keys, hostSession.sessionId,
                             P5cControlProtocol.ACK);
                     assertEquals(P5cControlProtocol.PLAYBACK_PROGRESS_QUERY, stopped.payload[0] & 0xff);
                     assertEquals(6, P5cControlProtocol.getLong(stopped.payload, 1));
-                    assertEquals(3, stopped.payload[9] & 0xff);
+                    assertEquals(stopFromPhone ? 3 : P5cReceiverCoordinator.RESULT_OK, stopped.payload[9] & 0xff);
                     assertEquals(P5cReceiverCoordinator.STATE_STOPPED, stopped.payload[10] & 0xff);
                 } else {
                     sendControl(io, keys, hostSession.sessionId, 6,
@@ -168,8 +235,12 @@ public class AoaReceiverCoordinatorTest {
                             new byte[] {2});
                     assertEquals(13 + 204, receiveControl(io, keys, hostSession.sessionId,
                             P5cControlProtocol.ACK).payload.length);
-                    sendControl(io, keys, hostSession.sessionId, 8, P5cControlProtocol.STOP, new byte[0]);
-                    assertAck(io, keys, hostSession.sessionId, 8, P5cControlProtocol.STOP,
+                    sendControl(io, keys, hostSession.sessionId, 8, P5cControlProtocol.PLAYBACK_PROGRESS_QUERY,
+                            new byte[] {3});
+                    assertEquals(13 + 221, receiveControl(io, keys, hostSession.sessionId,
+                            P5cControlProtocol.ACK).payload.length);
+                    sendControl(io, keys, hostSession.sessionId, 9, P5cControlProtocol.STOP, new byte[0]);
+                    assertAck(io, keys, hostSession.sessionId, 9, P5cControlProtocol.STOP,
                             P5cReceiverCoordinator.STATE_STOPPED);
                 }
                 assertTrue(coordinator.awaitTermination(3, TimeUnit.SECONDS));
@@ -232,6 +303,19 @@ public class AoaReceiverCoordinatorTest {
         return bytes;
     }
 
+    private static byte[] filled(int length, int value) {
+        byte[] output = new byte[length];
+        Arrays.fill(output, (byte) value);
+        return output;
+    }
+
+    private static byte[] decodeHex(String value) {
+        byte[] output = new byte[value.length() / 2];
+        for (int index = 0; index < output.length; index++)
+            output[index] = (byte) Integer.parseInt(value.substring(index * 2, index * 2 + 2), 16);
+        return output;
+    }
+
     private static final class Endpoint implements AoaReceiverCoordinator.PlaybackEndpoint {
         volatile AoaSessionContext context;
         volatile boolean stopped;
@@ -245,9 +329,12 @@ public class AoaReceiverCoordinatorTest {
         @Override public boolean supportsPlaybackProgressExtension() { return true; }
         @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
         @Override public byte[] playbackProgressPayloadExtendedV2() { return new byte[204]; }
+        @Override public byte[] playbackProgressPayloadExtendedV2(int schema) {
+            return schema == 2 ? new byte[204] : new byte[221];
+        }
     }
 
-    private static final class Duplex {
+    static final class Duplex {
         final Input input = new Input();
         final Output output = new Output();
         volatile boolean ownerClosed;

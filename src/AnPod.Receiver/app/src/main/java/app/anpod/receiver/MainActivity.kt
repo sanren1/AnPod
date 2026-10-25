@@ -758,19 +758,20 @@ private fun ReceiverScreen(
                             stringResource(actualConnectionLabel(it.connectionMethod))),
                             style = MaterialTheme.typography.bodyMedium)
                     }
-                    Text(
-                        if (shouldShowAdbGuideAsStatusStep(
+                    val statusHint = when {
+                        shouldShowAdbGuideAsStatusStep(
                                 connectionChoice, adbGuideVisible, snapshot != null, needsAttention,
                                 receiverActive, backgroundStandbyEnabled, connectionPending
-                            ))
-                            stringResource(R.string.adb_waiting_guidance)
-                        else if (snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending)
+                            ) -> stringResource(R.string.adb_waiting_guidance)
+                        snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending ->
                             nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
                                 networkChoiceNeeded, notificationPermissionDenied)
-                        else stringResource(connectionChoice.descriptionResource()),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                        else -> connectionChoice.descriptionResource()?.let { stringResource(it) }
+                    }
+                    statusHint?.let {
+                        Text(it, style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     var errorDetailsExpanded by remember(diagnostic) { mutableStateOf(false) }
                     if (diagnostic.isNotEmpty()) {
                         TextButton(
@@ -816,8 +817,10 @@ private fun ReceiverScreen(
                         }
                     }
                     if (!(adbGuideVisible && connectionChoice == ConnectionChoice.USB_ADB)) {
-                        Text(stringResource(connectionChoice.descriptionResource()),
-                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        connectionChoice.descriptionResource()?.let {
+                            Text(stringResource(it), style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                     Button(
                         onClick = {
@@ -904,8 +907,6 @@ private fun ReceiverScreen(
                         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                         Text(stringResource(if (otherSettingsExpanded) R.string.hide_other_settings else R.string.other_settings))
                     }
-                    if (!otherSettingsExpanded) Text(stringResource(R.string.other_settings_summary),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     AnimatedVisibility(visible = otherSettingsExpanded) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutputEnginePicker(snapshot, outputEngine, onOutputEngineChange)
@@ -1228,8 +1229,8 @@ private fun ConnectionChoice.shortLabelResource(): Int = when (this) {
     ConnectionChoice.WIFI -> R.string.connection_wifi
 }
 
-private fun ConnectionChoice.descriptionResource(): Int = when (this) {
-    ConnectionChoice.USB_DIRECT -> R.string.connection_direct_description
+private fun ConnectionChoice.descriptionResource(): Int? = when (this) {
+    ConnectionChoice.USB_DIRECT -> null
     ConnectionChoice.USB_ADB -> R.string.connection_adb_description
     ConnectionChoice.WIFI -> R.string.connection_wifi_description
 }

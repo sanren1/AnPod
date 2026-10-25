@@ -27,4 +27,28 @@ public final class P5cProgressExtensionTest {
         assertEquals(204, P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],
                 101, 202, 3, 2, counters, 17, 23).length);
     }
+
+    @Test public void schema3AddsFixed17ByteBufferMetricsTail() {
+        long[] counters = new long[12];
+        byte[] schema2 = P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],
+                101, 202, 3, 2, counters, 17, 23);
+        byte[] schema3 = P5cControlProtocol.playbackProgressPayloadSchema3(schema2,
+                1920, 1955, 35, 420, 4);
+        assertEquals(221, schema3.length);
+        assertEquals(3, schema3[78] & 0xff);
+        ByteBuffer fields = ByteBuffer.wrap(schema3).order(ByteOrder.BIG_ENDIAN);
+        assertEquals(1920, fields.getInt(204));
+        assertEquals(1955, fields.getInt(208));
+        assertEquals(35, fields.getInt(212));
+        assertEquals(420, fields.getInt(216));
+        assertEquals(4, schema3[220] & 0xff);
+
+        byte[] schema3V1 = P5cControlProtocol.playbackProgressPayloadSchema3(
+                P5cControlProtocol.playbackProgressPayloadExtended(new byte[70],
+                        101, 202, 3, 2, counters, 17, 23), -1, -1,
+                Integer.MIN_VALUE, Integer.MIN_VALUE, 0);
+        assertEquals(213, schema3V1.length);
+        assertEquals(-1, ByteBuffer.wrap(schema3V1).order(ByteOrder.BIG_ENDIAN).getInt(196));
+        assertEquals(Integer.MIN_VALUE, ByteBuffer.wrap(schema3V1).order(ByteOrder.BIG_ENDIAN).getInt(204));
+    }
 }
