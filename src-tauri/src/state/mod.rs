@@ -805,6 +805,16 @@ fn record_adb_cleanup_attempt(
     }
 }
 
+fn adb_reverse_remove_result(result: AdbResult, socket_name: &str) -> Result<(), String> {
+    let stderr = result.stderr.trim();
+    let absent_listener = format!("adb: error: listener 'localabstract:{socket_name}' not found");
+    if result.success || stderr == absent_listener {
+        Ok(())
+    } else {
+        Err("Unable to remove the ADB audio reverse mapping.".into())
+    }
+}
+
 pub(crate) struct ActiveOperation {
     generation: u64,
     token: CancellationToken,
@@ -5018,13 +5028,7 @@ impl AppState {
                 Some(cancel),
             )
             .await
-            .and_then(|result| {
-                if result.success {
-                    Ok(())
-                } else {
-                    Err("Unable to remove the ADB audio reverse mapping.".into())
-                }
-            })
+            .and_then(|result| adb_reverse_remove_result(result, &cleanup.socket_name))
         } else {
             Ok(())
         };

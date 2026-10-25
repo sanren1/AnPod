@@ -29,6 +29,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
+| 0.21.1-v3-flow-candidate / code 47 | `23875c21678c486169c0d5002dff7b143b35e8b33f146bb19dd16fd4fbde28ac` | PC 1.14.2 本地候选，AOD 时钟限高、起播积压裁剪及 ADB 绑定比较修复；source 4e6bc69（sourceModified=false）；实机复测由用户完成 |
 | 0.21.0-v3-flow-candidate / code 46 | `7fd099a7e87907d2fb12c29678fa5082a4ce0640ff55ad8ac75c212936d07d15` | PC 1.14.0 配套的本地候选，ADB Float32 高音质、固定缓冲目标与 schema3 诊断；source e1c856e（sourceModified=false）；实机测试由用户完成 |
 | 0.20.0-v3-flow-candidate / code 45 | `9487984f6cf1f7cb107f10f37cf3663cc6dbde32b2ce191cc83d65f4886f9050` | PC 1.13.1 配套的本地候选，Float32 传输与缓冲诊断；source d3a6aee（sourceModified=false）；持续播放测试由用户完成 |
 | 0.19.2-v3-flow-candidate / code 44 | `5afcd792dea8685f332fe6e2da76cff9b80ac4460b4facb34e815be22be2820b` | PC 1.12.4 配套的独立手机端本地候选，AOD 自适应间距、等比预览及波形粗细；source 416e28c（sourceModified=false）；未进行设备安装或原地升级验证 |

@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本地候选为 PC 1.14.1 + Receiver 0.21.0-v3-flow-candidate/code 46，实机连接、音质与长期播放待用户验证；公开下载以 Releases 为准。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本地候选为 PC 1.14.2 + Receiver 0.21.1-v3-flow-candidate/code 47，实机连接、音质与长期播放待用户验证；公开下载以 Releases 为准。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置按界面、音频、连接、关于与诊断分组，并区分请求音质档位和实际格式。
 
@@ -32,7 +32,7 @@ USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前�
 2. AnPod 自动刷新只读发现的设备；发现唯一设备时会预选。需要物理切换 USB 模式时，展开切换选项并按提示操作；切换仅支持已验证的 iQOO 11，且须明确允许停止电脑上的全局 ADB server。然后在手机 Receiver 中允许配件权限。
 3. 选择已配对的接收端，或使用同一设备的已认证记忆，再明确点击“开始连接”才会播放。初次连接始终手动发起；意外断线仅在同一连接方式内有界恢复，不会自动切换 Direct、ADB 或 LAN；任一端手动停止后不会重连。
 
-Receiver 46 的 USB／无线 ADB、Direct 与 LAN 均支持三档音质；Legacy 和旧版 Receiver 的 ADB 仍仅支持 Standard。Standard 为 48 kHz PCM16，HiFi 为 48 kHz Float32，Hi-Res 为 96 kHz Float32，均为双声道。HiFi／Hi-Res 要求 Windows 混音与采集格式匹配；Android 实际输出以诊断为准，设备可能重采样，Float32 不代表 DAC 位深。Oboe 为默认引擎，AudioTrack 为备用；已有手选设置保留。实机连接、播放与声学表现待验证，见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
+Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音质；Legacy 和更早 Receiver 的 ADB 仍仅支持 Standard。Standard 为 48 kHz PCM16，HiFi 为 48 kHz Float32，Hi-Res 为 96 kHz Float32，均为双声道。HiFi／Hi-Res 要求 Windows 混音与采集格式匹配；Android 实际输出以诊断为准，设备可能重采样，Float32 不代表 DAC 位深。Oboe 为默认引擎，AudioTrack 为备用；已有手选设置保留。实机连接、播放与声学表现待验证，见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
 
 ## 无线 UDP 快速开始
 

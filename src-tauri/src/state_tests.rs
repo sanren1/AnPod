@@ -111,6 +111,49 @@ fn adb_cleanup_keeps_receiver_user_stop_across_reverse_retry() {
     assert!(cleanup.reverse_removed);
 }
 
+#[test]
+fn adb_reverse_cleanup_treats_only_missing_listener_as_already_removed() {
+    assert_eq!(
+        adb_reverse_remove_result(
+            AdbResult {
+                success: false,
+                stderr: "adb: error: listener 'localabstract:anpod_adb_test' not found\n".into(),
+                ..Default::default()
+            },
+            "anpod_adb_test"
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        adb_reverse_remove_result(
+            AdbResult {
+                success: true,
+                ..Default::default()
+            },
+            "anpod_adb_test"
+        ),
+        Ok(())
+    );
+    assert!(adb_reverse_remove_result(
+        AdbResult {
+            success: false,
+            stderr: "adb: error: device offline".into(),
+            ..Default::default()
+        },
+        "anpod_adb_test"
+    )
+    .is_err());
+    assert!(adb_reverse_remove_result(
+        AdbResult {
+            success: false,
+            stderr: "adb: error: listener 'localabstract:other_socket' not found".into(),
+            ..Default::default()
+        },
+        "anpod_adb_test"
+    )
+    .is_err());
+}
+
 #[derive(Default)]
 struct FakeAdbRecoveryOps {
     devices: std::sync::Mutex<VecDeque<Vec<Device>>>,
