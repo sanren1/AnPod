@@ -4,15 +4,12 @@ import type { Settings, Snapshot } from "../appTypes";
 import { Activity, CircleHelp, Smartphone } from "lucide-react";
 import { Modal } from "./Modal";
 import { SettingToggle } from "./SettingToggle";
+import { canSetAudioQuality } from "../appRuntime";
 
-export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onSave: (key: string, value: unknown) => Promise<void>; onClose: () => void }) {
+export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onSave: (key: keyof Settings, value: unknown) => Promise<void>; onClose: () => void }) {
   const [savingKeys, setSavingKeys] = useState<Set<keyof Settings>>(() => new Set());
   const [saveError, setSaveError] = useState(false);
   const settings = snapshot.settings;
-  const adbQualityOnly = settings.audioBackend === "legacy" && (snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
-    ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
-      || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb"
-      : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb");
   const update = async (key: keyof Settings, value: boolean | string, save: () => Promise<void> = () => onSave(key, value)) => {
     setSavingKeys(current => new Set(current).add(key));
     setSaveError(false);
@@ -79,7 +76,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
               const fullLabel = strings.app.audioQualityLabels[quality];
               const requestedSpec = fullLabel.split(" · ").slice(1).join(" · ").replace(/\s*(?:（实验）|\(experimental\))$/i, "");
               return <label className="audio-quality-card" key={quality}>
-                <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || savingKeys.has("audioQuality") || !snapshot.canChangeModes || adbQualityOnly && quality !== "standard"} onChange={() => void update("audioQuality", quality)} />
+                <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || savingKeys.has("audioQuality") || !canSetAudioQuality(snapshot, quality)} onChange={() => void update("audioQuality", quality)} />
                 <span>
                   <strong>{strings.app.audioQualityShortLabels[quality]}</strong>
                   <small>{strings.app.requestedSpecification}: {requestedSpec}</small>

@@ -50,7 +50,6 @@
 .mode-row h2 { font-size: 13px; }
 .mode-switch { width: min(220px, 64%); min-height: 48px; }
 .mode-switch button { min-height: 42px; padding: 6px 8px; }
-.mode-description { margin: 2px 0 0; color: var(--muted); line-height: 19px; overflow-wrap: anywhere; }
 .backend-manager-button { min-height: 44px; padding-inline: 1px; }
 .toast { position: fixed; z-index: 5; right: 16px; bottom: 54px; max-width: min(400px, calc(100vw - 32px)); padding: 11px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: 0 8px 28px #10213a29; line-height: 19px; }
 .loading-shell { height: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); }
@@ -279,21 +278,18 @@
 @media (max-width: 390px) { .output-card { padding-inline: 10px; } .status-device { display: none; } }
 @media (max-width: 390px) { .audio-quality-status div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 @media (max-width: 390px) { .settings-dialog .select-setting { align-items: stretch; flex-direction: column; gap: 5px; } .settings-dialog .select-setting select { width: 100%; max-width: none; } }
-/* Playback mode collapses into a one-line summary; open by default so the choice stays visible. */
-.mode-disclosure { padding-top: 12px; }
-.mode-disclosure > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; font-weight: 650; }
-.mode-disclosure > summary::-webkit-details-marker { display: none; }
-.mode-disclosure > summary strong { margin-left: auto; color: var(--muted); font-weight: 600; }
-.mode-disclosure > summary::after { content: "▾"; color: var(--muted); font-size: 12px; }
-.mode-disclosure[open] > summary::after { content: "▴"; }
-.mode-disclosure .mode-section { border-top: none; padding-top: 0; }
-.mode-disclosure .mode-switch { width: 100%; }
+/* Keep the common mode and quality choices visible and balanced in compact windows. */
+.home-choice-section { padding-top: 9px; border-top: 0; }
+.home-choice-section > h2 { margin: 0 0 6px; font-size: 13px; line-height: 18px; font-weight: 650; }
+.home-choice-section .fluid-segmented-control { width: 100%; min-height: 44px; border-radius: 10px; }
+.home-choice-section .fluid-segmented-control > button { min-height: 38px; padding: 4px 5px; border-radius: 8px; font-size: 13px; line-height: 18px; }
+.home-quality-section { padding-bottom: 8px; }
 
-/* Refresh the existing choice controls without changing their snapshot-confirmed behavior. */
+/* Refresh the existing connection controls without changing their snapshot-confirmed behavior. */
 .fluid-segmented-control.transport-switch { min-height: 40px; border-radius: 11px; }
-.fluid-segmented-control.mode-switch { width: 100%; min-height: 48px; border-radius: 11px; }
+.fluid-segmented-control.mode-switch { width: 100%; min-height: 44px; border-radius: 10px; }
 .fluid-segmented-control.transport-switch > button { min-height: 36px; padding-block: 4px; }
-.fluid-segmented-control.mode-switch > button { min-height: 42px; border-radius: 9px; }
+.fluid-segmented-control.mode-switch > button { min-height: 38px; border-radius: 8px; }
 .fluid-segmented-control.transport-switch > button:disabled,
 .fluid-segmented-control.mode-switch > button:disabled { opacity: .62; }
 
@@ -357,6 +353,6 @@
   .wired-mode-section .mode-row { min-height: 44px; }
   .status-hero { padding-block: 6px; }
   .status-hero .status-line { min-height: 24px; }
-  .mode-disclosure { padding-top: 8px; }
+  .home-choice-section { padding-top: 7px; }
   .settings-dialog .settings-group { margin-inline: 12px; }
 }

@@ -12,6 +12,14 @@ export const byTransport = (snapshot: Snapshot) => {
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];
 };
 export const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
+export const canSetAudioQuality = (snapshot: Snapshot, quality: Snapshot["settings"]["audioQuality"]) => {
+  const settings = snapshot.settings;
+  const adbQualityOnly = settings.audioBackend === "legacy" && (snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
+    ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
+      || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb"
+      : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb");
+  return snapshot.canChangeModes && (!adbQualityOnly || quality === "standard");
+};
 export const connectionLabel = (transport: Snapshot["connectionTransport"] | Snapshot["sessionConnectionTransport"], protocol: Snapshot["sessionWirelessProtocol"] | null) =>
   transport === "usb" ? strings.connection.usb : transport === "usbDirect" ? strings.connection.usbDirect
     : transport === "wireless" ? protocol === "udp" ? strings.connection.udp : strings.connection.adb : strings.connection.unknown;
