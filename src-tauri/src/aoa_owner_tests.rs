@@ -41,6 +41,22 @@ impl RecordReader for FakeReader {
     }
 }
 
+struct PanicAfterReader {
+    rx: ChannelReceiver<Record>,
+    reads_left: usize,
+}
+impl RecordReader for PanicAfterReader {
+    fn read_record(&mut self) -> io::Result<Record> {
+        if self.reads_left == 0 {
+            panic!("injected record reader panic");
+        }
+        self.reads_left -= 1;
+        self.rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
+    }
+}
+
 struct FakeWriter {
     tx: Sender<Record>,
 }
@@ -501,6 +517,53 @@ fn run_stalled_receiver(
     }
 }
 
+fn run_closed_transport_receiver(
+    rx: ChannelReceiver<Record>,
+    tx: Sender<Record>,
+    material: crate::security::BindingMaterial,
+    format: AudioFormatV2,
+) {
+    let hello = read_record(&rx, RecordType::Handshake);
+    let (await_finish, challenge) =
+        ReceiverHandshakeV2::accept_hello(material.derive_aoa_transport(), &hello.body).unwrap();
+    let session_id = u64::from_be_bytes(hello.body[72..80].try_into().unwrap());
+    send_record(&tx, RecordType::Handshake, challenge);
+    let finish = read_record(&rx, RecordType::Handshake);
+    let (ready, authenticated) = await_finish.accept_finish(&finish.body).unwrap();
+    send_record(&tx, RecordType::Handshake, ready);
+    let keys = authenticated.into_keys();
+
+    let caps = read_record(&rx, RecordType::Control);
+    send_capabilities_with_bits(
+        &tx,
+        &keys,
+        session_id,
+        &caps,
+        CAP_AUTHENTICATED_STATUS | CAP_AUDIO_V2 | CAP_TERMINAL_CAUSE,
+    );
+    for (sequence, expected_command, state) in [
+        (1, BIND, ReceiverState::TransportConnected),
+        (2, SELECT_MODE, ReceiverState::TransportConnected),
+        (3, START, ReceiverState::ReceiverRunning),
+    ] {
+        let command = read_record(&rx, RecordType::Control);
+        assert_eq!(command.body[5], expected_command);
+        send_ack(&tx, &keys, session_id, sequence, &command, state, 0);
+    }
+    let decoder = PacketDecoder::new_v2(
+        &keys.host_to_receiver_audio,
+        session_id,
+        HOST_TO_RECEIVER,
+        format,
+    )
+    .unwrap();
+    let descriptor = read_record(&rx, RecordType::Audio);
+    assert_eq!(
+        decoder.open(&descriptor.body).unwrap().header.packet_type,
+        PacketType::Format
+    );
+}
+
 fn run_user_stopped_progress_receiver(
     rx: ChannelReceiver<Record>,
     tx: Sender<Record>,
@@ -909,6 +972,99 @@ fn unexpected_active_queue_stop_fails_owner_and_joins_reader() {
         .is_some_and(|error| error.contains("queue stopped")));
     drop(owner);
     assert!(cancelled.load(Ordering::Acquire));
+    peer.join().unwrap();
+}
+
+#[test]
+fn confirmed_transport_failure_cancels_owner_and_joins_without_remote_stop() {
+    let format = AudioFormatV2::for_profile(1, 0).unwrap();
+    let material = test_binding_material();
+    let peer_material = material.duplicate_for_session();
+    let (to_server_tx, to_server_rx) = mpsc::channel();
+    let (to_host_tx, to_host_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        run_closed_transport_receiver(to_server_rx, to_host_tx, peer_material, format)
+    });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let queue = SessionAudioQueue::Pcm16(Arc::new(PcmQueue::for_session(
+        PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        false,
+    )));
+    let owner = AoaOwner::connect_io(
+        FakeReader {
+            rx: to_host_rx,
+            cancelled: cancelled.clone(),
+        },
+        FakeWriter { tx: to_server_tx },
+        FakeCancel(cancelled.clone()),
+        material,
+        format,
+        queue.clone(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while owner.snapshot().terminal_cause != Some(TerminalCause::TransportFailure)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        owner.snapshot().terminal_cause,
+        Some(TerminalCause::TransportFailure)
+    );
+    owner.cancel_after_transport_failure().unwrap();
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(matches!(&queue, SessionAudioQueue::Pcm16(q) if q.is_stopped()));
+    peer.join().unwrap();
+}
+
+#[test]
+fn transport_failure_cleanup_preserves_reader_thread_panic() {
+    let format = AudioFormatV2::for_profile(1, 0).unwrap();
+    let material = test_binding_material();
+    let peer_material = material.duplicate_for_session();
+    let (to_server_tx, to_server_rx) = mpsc::channel();
+    let (to_host_tx, to_host_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        run_closed_transport_receiver(to_server_rx, to_host_tx, peer_material, format)
+    });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let queue = SessionAudioQueue::Pcm16(Arc::new(PcmQueue::for_session(
+        PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        false,
+    )));
+    let owner = AoaOwner::connect_io(
+        PanicAfterReader {
+            rx: to_host_rx,
+            reads_left: 6,
+        },
+        FakeWriter { tx: to_server_tx },
+        FakeCancel(cancelled),
+        material,
+        format,
+        queue,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while owner.snapshot().terminal_cause != Some(TerminalCause::TransportFailure)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        owner.snapshot().terminal_cause,
+        Some(TerminalCause::TransportFailure)
+    );
+    assert_eq!(
+        owner.cancel_after_transport_failure().unwrap_err(),
+        "AOA reader worker panicked."
+    );
     peer.join().unwrap();
 }
 

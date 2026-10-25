@@ -65,6 +65,8 @@ export type PlaybackDiagnostics = {
   underrunCount: number | null; underrunIncrement: number | null; playbackAdvancing: boolean | null;
   requestedBufferFrames: number | null; acceptedBufferFrames: number | null; effectiveBufferFrames: number | null;
   capacityFrames: number | null; startThresholdFrames: number | null; preRollFrames: number | null;
+  driftTargetFrames: number | null; driftObservedFrames: number | null; driftErrorFrames: number | null;
+  driftCorrectionPpm: number | null; driftResetReason: number | null;
 };
 export type ReceiverPackageCandidate = { versionCode: number; versionName: string; sizeBytes: number; currentVersionCode: number | null; bindingReference: string | null };
 export type BindingResetPreview = { serial: string; androidUser: string; bindingReference: string; phoneState: string; phoneCommitment: string | null; pcState: string; pcCommitment: string | null; receiverBusy: boolean };

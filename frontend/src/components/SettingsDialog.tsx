@@ -9,10 +9,10 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
   const [savingKeys, setSavingKeys] = useState<Set<keyof Settings>>(() => new Set());
   const [saveError, setSaveError] = useState(false);
   const settings = snapshot.settings;
-  const adbQualityOnly = snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
+  const adbQualityOnly = settings.audioBackend === "legacy" && (snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
     ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
       || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb"
-    : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb";
+      : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb");
   const update = async (key: keyof Settings, value: boolean | string, save: () => Promise<void> = () => onSave(key, value)) => {
     setSavingKeys(current => new Set(current).add(key));
     setSaveError(false);
@@ -24,10 +24,25 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
   const mix = snapshot.windowsMixFormat;
   const android = snapshot.androidOutputFormat;
   const actualFormat = negotiated
-    ? `${negotiated.sampleRateHz / 1000} kHz · ${strings.app.audioSampleFormats[negotiated.sampleFormat]} · ${negotiated.channels} ch · ${negotiated.sampleFormat === "float32le" ? strings.app.float32Representation : `${negotiated.validBitsPerSample} ${strings.app.validBits}`}`
+    ? [
+      `${negotiated.sampleRateHz / 1000} kHz`,
+      strings.app.audioSampleFormats[negotiated.sampleFormat],
+      `${negotiated.channels} ch`,
+      ...(negotiated.sampleFormat === "float32le" ? [] : [`${negotiated.validBitsPerSample} ${strings.app.validBits}`]),
+    ].join(" · ")
     : strings.app.audioFormatNotConfirmed;
   const mixFormat = mix
-    ? `${mix.sampleRate === null ? strings.app.audioFormatUnknown : `${mix.sampleRate / 1000} kHz`} · ${mix.sampleFormat === null ? strings.app.audioFormatUnknown : strings.app.mixSampleFormats[mix.sampleFormat]} · ${mix.channels === null ? strings.app.audioFormatUnknown : `${mix.channels} ch`} · ${mix.containerBits === null ? strings.app.audioFormatUnknown : `${mix.containerBits} ${strings.app.containerBits}`} · ${mix.validBits === null ? strings.app.audioFormatUnknown : `${mix.validBits} ${strings.app.validBits}`}`
+    ? [
+      mix.sampleRate === null ? strings.app.audioFormatUnknown : `${mix.sampleRate / 1000} kHz`,
+      mix.sampleFormat === null ? strings.app.audioFormatUnknown : mix.sampleFormat === "float"
+        ? `${strings.app.mixSampleFormats.float}${mix.containerBits === null ? "" : mix.containerBits}`
+        : strings.app.mixSampleFormats.integer,
+      mix.channels === null ? strings.app.audioFormatUnknown : `${mix.channels} ch`,
+      ...(mix.sampleFormat === "integer" ? [
+        mix.containerBits === null ? strings.app.audioFormatUnknown : `${mix.containerBits} ${strings.app.containerBits}`,
+        mix.validBits === null ? strings.app.audioFormatUnknown : `${mix.validBits} ${strings.app.validBits}`,
+      ] : []),
+    ].join(" · ")
     : strings.app.audioFormatUnknown;
   const outputFormat = android
     ? `${android.sampleRate === null ? strings.app.audioFormatUnknown : `${android.sampleRate / 1000} kHz`} · ${android.encoding === null ? strings.app.audioFormatUnknown : strings.app.androidSampleFormats[android.encoding]} · ${android.channels === null ? strings.app.audioFormatUnknown : `${android.channels} ch`}`
@@ -73,7 +88,6 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
               </label>;
             })}
           </div>
-          {adbQualityOnly && <p className="dialog-footnote">{strings.app.adbStandardQualityOnly}</p>}
           <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
           <details className="audio-format-disclosure">
             <summary>{strings.app.audioFormatDetails}</summary>

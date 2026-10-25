@@ -79,6 +79,222 @@ fn diagnostics_sample_requires_matching_session_generation() {
 }
 
 #[test]
+fn adb_cleanup_keeps_receiver_user_stop_across_reverse_retry() {
+    let mut cleanup = PendingAdbCleanup {
+        serial: "192.0.2.10:5555".into(),
+        transport: "wifi".into(),
+        socket_name: "anpod_adb_test".into(),
+        installed_receiver: true,
+        receiver_owner_id: Some("owner".into()),
+        receiver_generation: Some(7),
+        receiver_stopped: false,
+        receiver_user_stopped: false,
+        reverse_removed: false,
+    };
+
+    assert!(record_adb_cleanup_attempt(
+        &mut cleanup,
+        Ok(()),
+        true,
+        Err("temporary reverse removal failure".into()),
+    )
+    .is_err());
+    assert!(cleanup.receiver_stopped);
+    assert!(cleanup.receiver_user_stopped);
+    assert!(!cleanup.reverse_removed);
+
+    assert_eq!(
+        record_adb_cleanup_attempt(&mut cleanup, Ok(()), false, Ok(())),
+        Ok(AdbCleanupOutcome::ReceiverUserStopped)
+    );
+    assert!(cleanup.receiver_user_stopped);
+    assert!(cleanup.reverse_removed);
+}
+
+#[derive(Default)]
+struct FakeAdbRecoveryOps {
+    devices: std::sync::Mutex<VecDeque<Vec<Device>>>,
+    cleanup: std::sync::Mutex<Option<Result<AdbCleanupOutcome, String>>>,
+    cancel_during_cleanup: std::sync::atomic::AtomicBool,
+    bootstrap_succeeds: bool,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl AdbRecoveryAttemptOps for FakeAdbRecoveryOps {
+    fn find_device<'a>(
+        &'a self,
+        _serial: &'a str,
+        _transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Vec<Device>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push("refresh".into());
+            if cancel.is_cancelled() {
+                Vec::new()
+            } else {
+                self.devices.lock().unwrap().pop_front().unwrap_or_default()
+            }
+        })
+    }
+
+    fn cleanup_pending<'a>(
+        &'a self,
+        _serial: &'a str,
+        _transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<AdbCleanupOutcome, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.cancel_during_cleanup.load(Ordering::Acquire) {
+                cancel.cancel();
+            }
+            let outcome = self
+                .cleanup
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(AdbCleanupOutcome::Complete));
+            let mut calls = self.calls.lock().unwrap();
+            if matches!(&outcome, Err(error) if error == "owner changed") {
+                calls.push("owner-mismatch".into());
+            } else {
+                calls.extend(["guarded-stop".into(), "remove-old-reverse".into()]);
+            }
+            outcome
+        })
+    }
+
+    fn bootstrap<'a>(
+        &'a self,
+        _device: Device,
+        _cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push("bootstrap".into());
+            self.bootstrap_succeeds
+        })
+    }
+}
+
+fn recovery_test_device(serial: &str, transport: &str, connectable: bool) -> Device {
+    Device {
+        serial: serial.into(),
+        physical_id: None,
+        transport: transport.into(),
+        state: "device".into(),
+        manufacturer: String::new(),
+        model: String::new(),
+        android_version: String::new(),
+        api_level: String::new(),
+        display_name: serial.into(),
+        status_text: String::new(),
+        connectable,
+    }
+}
+
+#[tokio::test]
+async fn adb_recovery_attempt_waits_for_same_transport_then_cleans_before_bootstrap() {
+    let ops = FakeAdbRecoveryOps {
+        devices: std::sync::Mutex::new(VecDeque::from([
+            vec![],
+            vec![recovery_test_device("192.0.2.10:5555", "wifi", true)],
+        ])),
+        bootstrap_succeeds: true,
+        ..Default::default()
+    };
+    let token = CancellationToken::new();
+    assert!(matches!(
+        run_adb_recovery_attempt(&ops, "192.0.2.10:5555", "wifi", &token).await,
+        AdbRecoveryAttempt::Offline
+    ));
+    assert_eq!(*ops.calls.lock().unwrap(), ["refresh"]);
+
+    assert!(matches!(
+        run_adb_recovery_attempt(&ops, "192.0.2.10:5555", "wifi", &token).await,
+        AdbRecoveryAttempt::Connected
+    ));
+    assert_eq!(
+        *ops.calls.lock().unwrap(),
+        [
+            "refresh",
+            "refresh",
+            "guarded-stop",
+            "remove-old-reverse",
+            "bootstrap"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn adb_recovery_attempt_never_bootstraps_after_cancel_user_stop_or_owner_mismatch() {
+    let cancel_during_cleanup = FakeAdbRecoveryOps {
+        devices: std::sync::Mutex::new(VecDeque::from([vec![recovery_test_device(
+            "SERIAL", "usb", true,
+        )]])),
+        cancel_during_cleanup: std::sync::atomic::AtomicBool::new(true),
+        ..Default::default()
+    };
+    let token = CancellationToken::new();
+    assert!(matches!(
+        run_adb_recovery_attempt(&cancel_during_cleanup, "SERIAL", "usb", &token).await,
+        AdbRecoveryAttempt::Cancelled
+    ));
+    assert!(!cancel_during_cleanup
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"bootstrap".into()));
+
+    let user_stopped = FakeAdbRecoveryOps {
+        devices: std::sync::Mutex::new(VecDeque::from([vec![recovery_test_device(
+            "SERIAL", "usb", true,
+        )]])),
+        cleanup: std::sync::Mutex::new(Some(Ok(AdbCleanupOutcome::ReceiverUserStopped))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        run_adb_recovery_attempt(&user_stopped, "SERIAL", "usb", &CancellationToken::new()).await,
+        AdbRecoveryAttempt::ReceiverUserStopped
+    ));
+    assert!(!user_stopped
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"bootstrap".into()));
+
+    let wrong_owner = FakeAdbRecoveryOps {
+        devices: std::sync::Mutex::new(VecDeque::from([vec![recovery_test_device(
+            "SERIAL", "usb", true,
+        )]])),
+        cleanup: std::sync::Mutex::new(Some(Err("owner changed".into()))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        run_adb_recovery_attempt(&wrong_owner, "SERIAL", "usb", &CancellationToken::new()).await,
+        AdbRecoveryAttempt::CleanupFailed(error) if error == "owner changed"
+    ));
+    let calls = wrong_owner.calls.lock().unwrap();
+    assert_eq!(*calls, ["refresh", "owner-mismatch"]);
+    assert!(!calls.contains(&"bootstrap".into()));
+}
+
+#[tokio::test]
+async fn adb_recovery_attempt_rejects_stale_or_other_transport_devices() {
+    let ops = FakeAdbRecoveryOps {
+        devices: std::sync::Mutex::new(VecDeque::from([vec![
+            recovery_test_device("192.0.2.10:5555", "usb", true),
+            recovery_test_device("192.0.2.11:5555", "wifi", true),
+            recovery_test_device("192.0.2.10:5555", "wifi", false),
+        ]])),
+        ..Default::default()
+    };
+    assert!(matches!(
+        run_adb_recovery_attempt(&ops, "192.0.2.10:5555", "wifi", &CancellationToken::new()).await,
+        AdbRecoveryAttempt::Offline
+    ));
+    assert_eq!(*ops.calls.lock().unwrap(), ["refresh"]);
+}
+
+#[test]
 fn diagnostics_timeline_prunes_samples_older_than_one_hour() {
     let mut timeline = DiagnosticsTimelineBuffer::new();
     let start = timeline.started_at;
@@ -98,6 +314,11 @@ fn diagnostics_timeline_prunes_samples_older_than_one_hour() {
         android_output_format: None,
         pc_queued_frames: None,
         pc_dropped_frames: None,
+        drift_target_frames: None,
+        drift_observed_frames: None,
+        drift_error_frames: None,
+        drift_correction_ppm: None,
+        drift_reset_reason: None,
         playback: None,
     };
     timeline.push(sample(0), start);
@@ -612,8 +833,16 @@ fn settings_keep_schema_one_names_and_defaults() {
     );
     assert_eq!(old_saved.preferred_transport, "Wifi");
     assert_eq!(old_saved.wireless_protocol, "adb");
-    assert_eq!(old_saved.audio_quality, "standard");
+    assert_eq!(old_saved.audio_quality, "hires");
     assert_eq!(old_saved.audio_backend, "receiver");
+    let legacy_adb = normalize_settings(
+        serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "preferredTransport": "Wifi",
+            "wirelessProtocol": "adb", "audioBackend": "legacy", "audioQuality": "hires"
+        }))
+        .unwrap(),
+    );
+    assert_eq!(legacy_adb.audio_quality, "standard");
     let new_saved = normalize_settings(
         serde_json::from_value(serde_json::json!({
             "schemaVersion": 1, "preferredTransport": "Usb", "wirelessProtocol": "udp"
@@ -750,6 +979,13 @@ fn adb_mode_quality_updates_are_atomic_and_usb_direct_memory_is_persisted() {
         .unwrap();
     state
         .update_setting("wirelessProtocol", serde_json::json!("adb"))
+        .unwrap();
+    assert_eq!(state.snapshot().settings.audio_quality, "hires");
+    state
+        .update_setting("audioQuality", serde_json::json!("hifi"))
+        .unwrap();
+    state
+        .update_setting("audioBackend", serde_json::json!("legacy"))
         .unwrap();
     assert_eq!(state.snapshot().settings.audio_quality, "standard");
     assert!(state

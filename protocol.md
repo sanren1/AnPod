@@ -958,3 +958,44 @@ Playback-head advancement is a nullable observation in the local UI snapshot.
 Unknown, waiting for advancement, and recent advancement are distinct; no PCM
 arrival is not itself a control-session disconnect. Advancement is not acoustic
 proof. Long real-device silence and subsequent playback still require acceptance.
+# ADB Receiver Float32 audio stream
+
+ADB Standard and Legacy continue to use their existing PCM16 path. HiFi/Hi-Res
+over USB or wireless ADB use the authenticated loopback stream below; the PC
+binds only `127.0.0.1`, and `adb reverse localabstract:<socketName> tcp:<port>`
+maps the Receiver's abstract LocalSocket to that listener. The Receiver starts
+through the DUMP-protected `START_ADB_STREAM_AUDIO` bootstrap action with only
+`socketName`, the public 32-character lowercase-hex `hostId`, and
+`connectionTransport` (`usb` or `wifi`). Format is selected only after P5-A
+authentication.
+
+The stream reuses ANPU records, ANP5 v2, P5-C and ANPD v2. ADB derives a
+transport-specific binding secret: `salt = SHA256("AnPod ADB Stream binding
+salt v1" || NUL || hostId16 || receiverId16)`, then
+`HKDF-SHA256(savedSecret32, salt, "AnPod ADB Stream P5-A binding secret v1")`
+to 32 bytes. This domain is distinct from the AOA Direct derivation. The host
+requires capability mask `0x1582` (authenticated status, terminal cause,
+ANPD v2, Float32 and ADB stream); `0x200` remains reserved for AOA session
+restart. HiFi is profile 4 (48 kHz stereo Float32LE); Hi-Res is
+profile 5 (96 kHz stereo Float32LE). ANPU record bodies remain at most 1200
+bytes and each Float32 stereo ANPD payload carries at most 143 frames.
+
+**Test-only independent binding vector**: host ID `01` repeated 16 times,
+receiver ID `02` repeated 16 times, and saved secret `03` repeated 32 times
+produce salt `d896877f373dc06ee5de7f1040620ec859e526d3c0d218c22ee0f8f0380e89d9`
+and ADB binding secret
+`cb76cb157e4c5446d03232534f61486a750cb61ff29ccf8882b09c3ffe1d0c37`.
+
+# Playback progress schema 3
+
+P5-C capability `0x2000` advertises buffer metrics. A host sends playback
+progress query payload `[3]` only when this capability is present; otherwise it
+uses the existing `[2]` extension capability `0x800`, or an empty payload. The
+schema 3 tail is 143 bytes: bytes 0–125 keep schema 2 layout with byte 0 set to
+3; offset 126 is `u32 driftTargetFrames`, 130 is `u32 driftObservedFrames`, 134
+is signed `i32 driftErrorFrames`, 138 is signed `i32 driftCorrectionPpm`, and
+142 is `u8 driftResetReason`. Unsigned unknown is `0xffffffff`; signed unknown
+is `INT32_MIN`; reset reason 0 is unknown, and bit flags 1/2/4/8 mean initial,
+not-playing or pause, source/output discontinuity, and observation/source gap.
+Positive ppm means delete frames; negative ppm means insert frames. Target and
+observed queue frames exclude platform output pending frames.

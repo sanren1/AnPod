@@ -65,6 +65,28 @@ pub(crate) struct BindingMaterial {
 }
 
 impl BindingMaterial {
+    pub(crate) fn host_id(&self) -> [u8; 16] {
+        self.host_id
+    }
+
+    pub(crate) fn derive_adb_stream(&self) -> Self {
+        let mut salt_input = b"AnPod ADB Stream binding salt v1\0".to_vec();
+        salt_input.extend_from_slice(&self.host_id);
+        salt_input.extend_from_slice(&self.receiver_id);
+        let salt = Sha256::digest(&salt_input);
+        salt_input.fill(0);
+
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), &self.secret);
+        let mut secret = [0; 32];
+        hkdf.expand(b"AnPod ADB Stream P5-A binding secret v1", &mut secret)
+            .expect("32-byte HKDF output");
+        Self {
+            host_id: self.host_id,
+            receiver_id: self.receiver_id,
+            secret,
+        }
+    }
+
     pub(crate) fn derive_aoa_transport(&self) -> Self {
         let mut salt_input = b"AnPod AOA Direct binding salt v1\0".to_vec();
         salt_input.extend_from_slice(&self.host_id);
@@ -694,6 +716,15 @@ pub(crate) fn test_binding_material() -> BindingMaterial {
         host_id: [0x11; 16],
         receiver_id: [0x22; 16],
         secret: [0x33; 32],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_adb_binding_material() -> BindingMaterial {
+    BindingMaterial {
+        host_id: [0x01; 16],
+        receiver_id: [0x02; 16],
+        secret: [0x03; 32],
     }
 }
 

@@ -140,6 +140,11 @@ pub struct PlaybackDiagnostics {
     pub drift_inserted_frames: Option<u64>,
     pub drift_deleted_frames: Option<u64>,
     pub drift_reset_count: Option<u64>,
+    pub drift_target_frames: Option<u32>,
+    pub drift_observed_frames: Option<u32>,
+    pub drift_error_frames: Option<i32>,
+    pub drift_correction_ppm: Option<i32>,
+    pub drift_reset_reason: Option<u8>,
     pub output_accepted_frames: Option<u64>,
     pub output_consumed_frames: Option<u64>,
     pub oboe_ring_consumed_frames: Option<u64>,
@@ -192,6 +197,13 @@ struct AuditedReceiverArtifact {
 // Every shipped APK must be added here after release, or the next version cannot
 // recognise the installed one; see packaging/SIGNING.md.
 const AUDITED_RECEIVER_ARTIFACTS: &[AuditedReceiverArtifact] = &[
+    AuditedReceiverArtifact {
+        sha256: "7fd099a7e87907d2fb12c29678fa5082a4ce0640ff55ad8ac75c212936d07d15",
+        version_code: 46,
+        version_name: "0.21.0-v3-flow-candidate",
+        source_commit: "e1c856e02cdce1ffde82748ecab5b7279f0a942f",
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573",
+    },
     AuditedReceiverArtifact {
         sha256: "9487984f6cf1f7cb107f10f37cf3663cc6dbde32b2ce191cc83d65f4886f9050",
         version_code: 45,
@@ -610,6 +622,101 @@ pub async fn binding_reference(
     ensure_usb_device(&runner, serial, cancel).await?;
     let user = current_android_user(&runner, serial, cancel).await?;
     Ok(binding_reference_for(serial, &user))
+}
+
+pub async fn adb_binding_material(
+    adb: &Path,
+    serial: &str,
+    transport: &str,
+    data_dir: &Path,
+    apk: &Path,
+    metadata_path: &Path,
+    cancel: &CancellationToken,
+) -> Result<(String, crate::security::BindingMaterial), String> {
+    adb_binding_material_with(
+        &SystemAdb(adb),
+        serial,
+        transport,
+        data_dir,
+        apk,
+        metadata_path,
+        cancel,
+    )
+    .await
+}
+
+async fn adb_binding_material_with(
+    adb: &impl AdbRunner,
+    serial: &str,
+    transport: &str,
+    data_dir: &Path,
+    apk: &Path,
+    metadata_path: &Path,
+    cancel: &CancellationToken,
+) -> Result<(String, crate::security::BindingMaterial), String> {
+    use crate::security::BindingStore;
+
+    if !matches!(transport, "usb" | "wifi") {
+        return Err("ADB Receiver transport was unsupported.".into());
+    }
+    ensure_adb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
+    let metadata = read_artifact(apk, metadata_path)?;
+    if !is_installed(adb, serial, &user, cancel).await? {
+        return Err("Receiver 尚未安装。".into());
+    }
+    verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    let commitment = match read_binding_state(adb, serial, &user, cancel).await? {
+        BindingStatus::Saved(commitment) => commitment,
+        BindingStatus::Pending => {
+            return Err("Receiver 绑定仍在写入；请完成手机上的绑定后重试。".into())
+        }
+        BindingStatus::Empty => return Err("Receiver 尚未保存配对绑定；请先使用 USB 配对。".into()),
+        BindingStatus::Failed(message) => return Err(message.into()),
+    };
+    let directory = data_dir.join("receiver-bindings");
+    if transport == "usb" {
+        let reference = binding_reference_for(serial, &user);
+        let path = directory.join(format!("{reference}.dat"));
+        let material = BindingStore::load(&path)
+            .map_err(|_| "USB Receiver 的本机 DPAPI 绑定材料不可用。".to_string())?;
+        if !hex_digest(&material.commitment()).eq_ignore_ascii_case(&commitment) {
+            return Err("USB Receiver 绑定摘要与此设备的本机材料不匹配。".into());
+        }
+        return Ok((reference, material));
+    }
+
+    let entries =
+        fs::read_dir(&directory).map_err(|_| "无法读取已保存的 Receiver 绑定。".to_string())?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| "无法读取已保存的 Receiver 绑定。".to_string())?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "dat") {
+            continue;
+        }
+        let Some(reference) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !valid_binding_reference(reference) {
+            continue;
+        }
+        let material = BindingStore::load(&path).map_err(|_| {
+            "已保存的 Receiver 绑定中有 DPAPI 材料无法解密；未选择其他绑定。".to_string()
+        })?;
+        if hex_digest(&material.commitment()).eq_ignore_ascii_case(&commitment) {
+            matches.push((reference.to_ascii_lowercase(), material));
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.pop().expect("one matched saved binding")),
+        0 => Err(
+            "无线 ADB Receiver 的绑定摘要没有唯一匹配的本机 DPAPI 材料；请先通过 USB 配对。".into(),
+        ),
+        _ => {
+            Err("无线 ADB Receiver 的绑定摘要匹配多个本机 DPAPI 材料；未选择其中任何一个。".into())
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1929,6 +2036,94 @@ pub async fn start_audio(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn start_adb_stream_audio(
+    adb: &Path,
+    serial: &str,
+    apk: &Path,
+    metadata_path: &Path,
+    socket_name: &str,
+    host_id: &str,
+    connection_transport: &str,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    start_adb_stream_audio_with(
+        &SystemAdb(adb),
+        serial,
+        apk,
+        metadata_path,
+        socket_name,
+        host_id,
+        connection_transport,
+        cancel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_adb_stream_audio_with(
+    adb: &impl AdbRunner,
+    serial: &str,
+    apk: &Path,
+    metadata_path: &Path,
+    socket_name: &str,
+    host_id: &str,
+    connection_transport: &str,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    if socket_name.is_empty()
+        || !socket_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || host_id.len() != 32
+        || !host_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !matches!(connection_transport, "usb" | "wifi")
+    {
+        return Err("ADB audio bootstrap parameters were invalid.".into());
+    }
+    ensure_adb_device(adb, serial, cancel).await?;
+    let user = current_android_user(adb, serial, cancel).await?;
+    let metadata = read_artifact(apk, metadata_path)?;
+    if !is_installed(adb, serial, &user, cancel).await? {
+        return Err("Receiver 尚未安装。".into());
+    }
+    let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
+    if installed.version_code < 46 {
+        return Err(
+            "RECEIVER_UPDATE_REQUIRED:ADB Float32 streaming requires Receiver code 46 or newer."
+                .into(),
+        );
+    }
+    let args = [
+        "shell",
+        "am",
+        "start",
+        "--user",
+        &user,
+        "-W",
+        "-n",
+        "app.anpod.receiver/.BootstrapActivity",
+        "-a",
+        "app.anpod.receiver.action.START_ADB_STREAM_AUDIO",
+        "--es",
+        "socketName",
+        socket_name,
+        "--es",
+        "hostId",
+        host_id,
+        "--es",
+        "connectionTransport",
+        connection_transport,
+    ];
+    let result = adb
+        .run(Some(serial), &args, Duration::from_secs(45), Some(cancel))
+        .await?;
+    ensure_adb_success(&result)?;
+    Ok(())
+}
+
 async fn start_with(
     adb: &impl AdbRunner,
     serial: &str,
@@ -2062,7 +2257,29 @@ pub async fn stop(
     metadata_path: &Path,
     cancel: &CancellationToken,
 ) -> Result<ReceiverStatus, String> {
-    stop_with(&SystemAdb(adb), serial, apk, metadata_path, cancel).await
+    stop_with(&SystemAdb(adb), serial, apk, metadata_path, cancel, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stop_if_owner(
+    adb: &Path,
+    serial: &str,
+    apk: &Path,
+    metadata_path: &Path,
+    owner_id: &str,
+    generation: u64,
+    socket_name: &str,
+    cancel: &CancellationToken,
+) -> Result<ReceiverStatus, String> {
+    stop_with(
+        &SystemAdb(adb),
+        serial,
+        apk,
+        metadata_path,
+        cancel,
+        Some((owner_id, generation, socket_name)),
+    )
+    .await
 }
 
 async fn stop_with(
@@ -2071,6 +2288,7 @@ async fn stop_with(
     apk: &Path,
     metadata_path: &Path,
     cancel: &CancellationToken,
+    expected_owner: Option<(&str, u64, &str)>,
 ) -> Result<ReceiverStatus, String> {
     ensure_adb_device(adb, serial, cancel).await?;
     let user = current_android_user(adb, serial, cancel).await?;
@@ -2089,24 +2307,45 @@ async fn stop_with(
         // Nothing is running, so there is no session to clean up and no activity needs to launch.
         return Ok(status_from_health(before));
     }
+    if let Some((owner_id, generation, _socket_name)) = expected_owner {
+        if before.operation_owner_id.as_deref() != Some(owner_id)
+            || before.operation_generation != Some(generation)
+        {
+            return Err("Receiver owner changed; refusing to stop a different session.".into());
+        }
+    }
+    let owner_id_arg = expected_owner.map(|(owner_id, _, _)| owner_id);
+    let generation_arg = expected_owner.map(|(_, generation, _)| generation.to_string());
+    let socket_name_arg = expected_owner.map(|(_, _, socket_name)| socket_name);
+    let mut args = vec![
+        "shell",
+        "am",
+        "start",
+        "--user",
+        &user,
+        "-W",
+        "-n",
+        "app.anpod.receiver/.BootstrapActivity",
+        "-a",
+        "app.anpod.receiver.action.STOP",
+    ];
+    if let (Some(owner_id), Some(generation), Some(socket_name)) =
+        (owner_id_arg, generation_arg.as_deref(), socket_name_arg)
+    {
+        args.extend([
+            "--es",
+            "uiOwnerId",
+            owner_id,
+            "--el",
+            "uiGeneration",
+            generation,
+            "--es",
+            "socketName",
+            socket_name,
+        ]);
+    }
     let result = adb
-        .run(
-            Some(serial),
-            &[
-                "shell",
-                "am",
-                "start",
-                "--user",
-                &user,
-                "-W",
-                "-n",
-                "app.anpod.receiver/.BootstrapActivity",
-                "-a",
-                "app.anpod.receiver.action.STOP",
-            ],
-            Duration::from_secs(15),
-            Some(cancel),
-        )
+        .run(Some(serial), &args, Duration::from_secs(15), Some(cancel))
         .await?;
     ensure_adb_success(&result)?;
 
@@ -2120,6 +2359,16 @@ async fn stop_with(
         ensure_version(&health, &installed)?;
         if !health.service_active {
             return Ok(status_from_health(health));
+        }
+        if let Some((owner_id, generation, _socket_name)) = expected_owner {
+            if health.operation_owner_id.as_deref() != Some(owner_id)
+                || health.operation_generation != Some(generation)
+            {
+                return Err(
+                    "Receiver owner changed before stop completed; the other session was left running."
+                        .into(),
+                );
+            }
         }
         if Instant::now() >= deadline {
             return Err("Receiver 服务在停止请求后仍处于活动状态。".into());

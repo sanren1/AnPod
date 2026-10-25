@@ -65,6 +65,8 @@ pub(crate) const CAP_TERMINAL_CAUSE: u32 = 0x0000_0100;
 pub(crate) const CAP_AOA_SESSION_RESTART: u32 = 0x0000_0200;
 pub(crate) const CAP_AUDIO_FLOAT32: u32 = 0x0000_0400;
 pub(crate) const CAP_PROGRESS_EXT: u32 = 0x0000_0800;
+pub(crate) const CAP_AUDIO_ADB_STREAM: u32 = 0x0000_1000;
+pub(crate) const CAP_BUFFER_METRICS: u32 = 0x0000_2000;
 const IMPLEMENTED_CAPABILITIES: u32 =
     CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
@@ -75,6 +77,27 @@ const AUTH_UNTIL_REVOKED: u8 = 3;
 const AUTH_DENIED: u8 = 4;
 const AUTH_EXPIRED: u8 = 5;
 const AUTH_CANCELLED: u8 = 6;
+
+pub(crate) fn requested_progress_schema(capabilities: u32) -> u8 {
+    if capabilities & CAP_BUFFER_METRICS != 0 {
+        3
+    } else if capabilities & CAP_PROGRESS_EXT != 0 {
+        2
+    } else {
+        0
+    }
+}
+
+fn progress_schema_for_request(kind: u8, payload: &[u8]) -> u8 {
+    if kind != PLAYBACK_PROGRESS_QUERY {
+        return 0;
+    }
+    match payload {
+        [2] => 2,
+        [3] => 3,
+        _ => 0,
+    }
+}
 const AUTHORIZATION_WAIT: Duration = Duration::from_secs(30);
 const AUTHORIZATION_POLL: Duration = Duration::from_millis(500);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1241,14 +1264,14 @@ impl HostSession {
         {
             return Ok(None);
         }
-        let extended = self
+        let schema = self
             .capabilities
             .as_ref()
-            .is_some_and(|info| info.capability_bits & CAP_PROGRESS_EXT != 0);
-        let request = [2u8];
+            .map_or(0, |info| requested_progress_schema(info.capability_bits));
+        let request = [schema];
         let ack = self.command(
             PLAYBACK_PROGRESS_QUERY,
-            if extended { &request } else { &[] },
+            if schema != 0 { &request } else { &[] },
         )?;
         if ack.result != RESULT_OK {
             return Err("P5-C playback progress query was rejected.".into());
@@ -1359,13 +1382,13 @@ impl HostSession {
             self.session_id,
             &self.cancellation,
         )?;
-        let ack = decode_ack_with_format_ext(
+        let ack = decode_ack_with_format_schema(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
-            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
+            progress_schema_for_request(kind, payload),
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -1423,13 +1446,13 @@ impl HostSession {
         if Instant::now() >= deadline {
             return Err("P5-C approval deadline expired.".into());
         }
-        let ack = decode_ack_with_format_ext(
+        let ack = decode_ack_with_format_schema(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
-            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
+            progress_schema_for_request(kind, payload),
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -1507,13 +1530,13 @@ impl HostSession {
             request_cancellation,
             deadline,
         )?;
-        let ack = decode_ack_with_format_ext(
+        let ack = decode_ack_with_format_schema(
             &ack_frame,
             self.ack_sequence,
             kind,
             sequence,
             self.format_v2.is_some(),
-            kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
+            progress_schema_for_request(kind, payload),
         )?;
         self.record_terminal_cause(&ack)?;
         if ack
@@ -3714,15 +3737,38 @@ pub(crate) fn decode_ack_with_format_ext(
     v2_audio: bool,
     progress_extension: bool,
 ) -> Result<Ack, String> {
+    decode_ack_with_format_schema(
+        frame,
+        expected_sequence,
+        command,
+        command_sequence,
+        v2_audio,
+        if progress_extension { 2 } else { 0 },
+    )
+}
+
+pub(crate) fn decode_ack_with_format_schema(
+    frame: &[u8],
+    expected_sequence: u64,
+    command: u8,
+    command_sequence: u64,
+    v2_audio: bool,
+    progress_schema: u8,
+) -> Result<Ack, String> {
     let payload_len = u16::from_be_bytes([frame[28], frame[29]]) as usize;
     let terminal_ack = payload_len == 13 && frame[CONTROL_HEADER_BYTES + 9] == RESULT_USER_STOPPED;
+    let progress_extension_bytes = match progress_schema {
+        0 => 0,
+        2 => 126,
+        3 => 143,
+        _ => return Err("P5-C playback progress schema was unsupported.".into()),
+    };
     if frame[5] != ACK
         || u64::from_be_bytes(frame[20..28].try_into().unwrap()) != expected_sequence
         || (!terminal_ack
             && match command {
                 PLAYBACK_PROGRESS_QUERY => {
-                    payload_len
-                        != if v2_audio { 91 } else { 83 } + if progress_extension { 126 } else { 0 }
+                    payload_len != (if v2_audio { 91 } else { 83 }) + progress_extension_bytes
                 }
                 BACKGROUND_START_REQUEST | BACKGROUND_START_STATUS | BACKGROUND_START_CANCEL => {
                     payload_len != 30
@@ -3754,7 +3800,7 @@ pub(crate) fn decode_ack_with_format_ext(
         Some(decode_playback_progress_with_format(
             &payload[13..],
             v2_audio,
-            progress_extension,
+            progress_schema,
         )?)
     } else {
         None
@@ -3825,16 +3871,22 @@ fn background_trust_management_state(state: ReceiverState) -> bool {
 }
 
 fn decode_playback_progress(data: &[u8]) -> Result<PlaybackDiagnostics, String> {
-    decode_playback_progress_with_format(data, false, false)
+    decode_playback_progress_with_format(data, false, 0)
 }
 
 fn decode_playback_progress_with_format(
     data: &[u8],
     v2_audio: bool,
-    progress_extension: bool,
+    progress_schema: u8,
 ) -> Result<PlaybackDiagnostics, String> {
     let base_len = if v2_audio { 78 } else { 70 };
-    if data.len() != base_len + if progress_extension { 126 } else { 0 } {
+    let extension_len = match progress_schema {
+        0 => 0,
+        2 => 126,
+        3 => 143,
+        _ => return Err("Receiver playback progress schema was unsupported.".into()),
+    };
+    if data.len() != base_len + extension_len {
         return Err("Receiver playback progress payload length was invalid.".into());
     }
     let advancing = match data[45] {
@@ -3883,9 +3935,9 @@ fn decode_playback_progress_with_format(
         diagnostics.opened_track_channels = (data[72] != 0).then_some(data[72]);
         diagnostics.output_sample_rate = (output_sample_rate != 0).then_some(output_sample_rate);
     }
-    if progress_extension {
+    if progress_schema != 0 {
         let extension = &data[base_len..];
-        if extension[0] != 2 || extension[21] > 2 {
+        if extension[0] != progress_schema || extension[21] > 2 {
             return Err("Receiver extended playback progress schema or engine was invalid.".into());
         }
         let u32_at_ext =
@@ -3900,7 +3952,7 @@ fn decode_playback_progress_with_format(
             let value = u64_at_ext(offset);
             (value != u64::MAX).then_some(value)
         };
-        diagnostics.progress_schema = Some(2);
+        diagnostics.progress_schema = Some(progress_schema);
         diagnostics.progress_monotonic_nanos = metric_u64(1);
         diagnostics.receiver_generation = metric_u64(9);
         diagnostics.output_epoch = metric_u32(17);
@@ -3919,6 +3971,17 @@ fn decode_playback_progress_with_format(
         diagnostics.oboe_zero_filled_frames = metric_u64(110);
         diagnostics.ring_pending_frames = metric_u32(118);
         diagnostics.stream_pending_frames = metric_u32(122);
+        if progress_schema == 3 {
+            let metric_i32 = |offset| {
+                let value = i32::from_be_bytes(extension[offset..offset + 4].try_into().unwrap());
+                (value != i32::MIN).then_some(value)
+            };
+            diagnostics.drift_target_frames = metric_u32(126);
+            diagnostics.drift_observed_frames = metric_u32(130);
+            diagnostics.drift_error_frames = metric_i32(134);
+            diagnostics.drift_correction_ppm = metric_i32(138);
+            diagnostics.drift_reset_reason = (extension[142] != 0).then_some(extension[142]);
+        }
     }
     Ok(diagnostics)
 }

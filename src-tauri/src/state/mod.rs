@@ -25,8 +25,10 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     env, fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -383,6 +385,11 @@ pub struct DiagnosticsTimelineSample {
     pub android_output_format: Option<AndroidOutputFormat>,
     pub pc_queued_frames: Option<u64>,
     pub pc_dropped_frames: Option<u64>,
+    pub drift_target_frames: Option<u32>,
+    pub drift_observed_frames: Option<u32>,
+    pub drift_error_frames: Option<i32>,
+    pub drift_correction_ppm: Option<i32>,
+    pub drift_reset_reason: Option<u8>,
     pub playback: Option<PlaybackDiagnostics>,
 }
 
@@ -585,10 +592,217 @@ pub(crate) struct Session {
     output_tail: Arc<Mutex<VecDeque<String>>>,
     network_owner: Option<SessionOwner>,
     aoa_owner: Option<AoaOwner>,
+    adb_stream_owner: Option<AoaOwner>,
     aoa_target_id: Option<String>,
     network_sink_queue: Option<SessionAudioQueue>,
     network_binding_ref: Option<String>,
     windows_mix_format: Option<WindowsMixFormat>,
+}
+
+#[derive(Clone)]
+struct PendingAdbCleanup {
+    serial: String,
+    transport: String,
+    socket_name: String,
+    installed_receiver: bool,
+    receiver_owner_id: Option<String>,
+    receiver_generation: Option<u64>,
+    receiver_stopped: bool,
+    receiver_user_stopped: bool,
+    reverse_removed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AdbCleanupOutcome {
+    #[default]
+    Complete,
+    ReceiverUserStopped,
+}
+
+enum AdbRecoveryAttempt {
+    Cancelled,
+    Offline,
+    ReceiverUserStopped,
+    CleanupFailed(String),
+    Connected,
+    Failed,
+}
+
+trait AdbRecoveryAttemptOps {
+    fn find_device<'a>(
+        &'a self,
+        serial: &'a str,
+        transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Vec<Device>> + Send + 'a>>;
+    fn cleanup_pending<'a>(
+        &'a self,
+        serial: &'a str,
+        transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<AdbCleanupOutcome, String>> + Send + 'a>>;
+    fn bootstrap<'a>(
+        &'a self,
+        device: Device,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+async fn run_adb_recovery_attempt(
+    ops: &impl AdbRecoveryAttemptOps,
+    serial: &str,
+    transport: &str,
+    cancel: &CancellationToken,
+) -> AdbRecoveryAttempt {
+    if cancel.is_cancelled() {
+        return AdbRecoveryAttempt::Cancelled;
+    }
+    let device = ops
+        .find_device(serial, transport, cancel)
+        .await
+        .into_iter()
+        .find(|device| {
+            device.serial == serial && device.transport == transport && device.connectable
+        });
+    let Some(device) = device else {
+        return if cancel.is_cancelled() {
+            AdbRecoveryAttempt::Cancelled
+        } else {
+            AdbRecoveryAttempt::Offline
+        };
+    };
+    if cancel.is_cancelled() {
+        return AdbRecoveryAttempt::Cancelled;
+    }
+    match ops.cleanup_pending(serial, transport, cancel).await {
+        Ok(AdbCleanupOutcome::ReceiverUserStopped) => {
+            return AdbRecoveryAttempt::ReceiverUserStopped;
+        }
+        Err(error) => return AdbRecoveryAttempt::CleanupFailed(error),
+        Ok(AdbCleanupOutcome::Complete) => {}
+    }
+    if cancel.is_cancelled() {
+        return AdbRecoveryAttempt::Cancelled;
+    }
+    if ops.bootstrap(device, cancel).await {
+        AdbRecoveryAttempt::Connected
+    } else if cancel.is_cancelled() {
+        AdbRecoveryAttempt::Cancelled
+    } else {
+        AdbRecoveryAttempt::Failed
+    }
+}
+
+struct AppStateAdbRecoveryAttemptOps<'a> {
+    state: &'a AppState,
+    app: &'a AppHandle,
+    operation_generation: u64,
+    was_playing: bool,
+}
+
+impl AdbRecoveryAttemptOps for AppStateAdbRecoveryAttemptOps<'_> {
+    fn find_device<'a>(
+        &'a self,
+        serial: &'a str,
+        transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Vec<Device>> + Send + 'a>> {
+        Box::pin(async move {
+            if transport == "wifi" && serial.contains(':') {
+                let _ = checked_adb(
+                    &self.state.adb_path,
+                    None,
+                    &["connect", serial],
+                    Duration::from_secs(8),
+                    Some(cancel),
+                )
+                .await;
+            }
+            if cancel.is_cancelled() {
+                return Vec::new();
+            }
+            if self.state.refresh_devices().await.is_err() {
+                return Vec::new();
+            }
+            self.state.snapshot().devices
+        })
+    }
+
+    fn cleanup_pending<'a>(
+        &'a self,
+        serial: &'a str,
+        transport: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<AdbCleanupOutcome, String>> + Send + 'a>> {
+        Box::pin(
+            self.state
+                .cleanup_pending_adb_for_target(serial, transport, cancel),
+        )
+    }
+
+    fn bootstrap<'a>(
+        &'a self,
+        device: Device,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .state
+                .connect_locked(
+                    self.app,
+                    &device.serial,
+                    self.operation_generation,
+                    cancel,
+                    self.was_playing,
+                )
+                .await
+            {
+                Ok(result) if result.success => {
+                    if !self.was_playing {
+                        let _ = self
+                            .state
+                            .set_output_locked(self.app, "computer", cancel)
+                            .await;
+                        self.state.emit(self.app);
+                    }
+                    true
+                }
+                _ => {
+                    let _ = self.state.teardown(Some(self.app)).await;
+                    false
+                }
+            }
+        })
+    }
+}
+
+fn record_adb_cleanup_attempt(
+    cleanup: &mut PendingAdbCleanup,
+    stop: Result<(), String>,
+    receiver_user_stopped: bool,
+    reverse: Result<(), String>,
+) -> Result<AdbCleanupOutcome, String> {
+    let mut errors = Vec::new();
+    if receiver_user_stopped {
+        cleanup.receiver_user_stopped = true;
+    }
+    match stop {
+        Ok(()) => cleanup.receiver_stopped = true,
+        Err(error) => errors.push(error),
+    }
+    match reverse {
+        Ok(()) => cleanup.reverse_removed = true,
+        Err(error) => errors.push(error),
+    }
+    if errors.is_empty() {
+        Ok(if cleanup.receiver_user_stopped {
+            AdbCleanupOutcome::ReceiverUserStopped
+        } else {
+            AdbCleanupOutcome::Complete
+        })
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub(crate) struct ActiveOperation {
@@ -635,6 +849,7 @@ pub struct AppState {
     usb_direct_configuration_id: AtomicU64,
     usb_direct_configuration_sequence: AtomicU64,
     recovering: AtomicBool,
+    pending_adb_cleanup: Mutex<Vec<PendingAdbCleanup>>,
     qr_operation: Mutex<Option<ActiveQrOperation>>,
     qr_generation: AtomicU64,
     last_pairing_endpoint: Mutex<Option<String>>,
@@ -756,6 +971,7 @@ impl AppState {
             usb_direct_configuration_id: AtomicU64::new(0),
             usb_direct_configuration_sequence: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
+            pending_adb_cleanup: Mutex::new(Vec::new()),
             qr_operation: Mutex::new(None),
             qr_generation: AtomicU64::new(0),
             last_pairing_endpoint: Mutex::new(None),
@@ -1016,6 +1232,7 @@ impl AppState {
                 receiver_owner_id: None, receiver_generation: None,
                 network_owner: Some(owner), network_sink_queue: queue, network_binding_ref: Some(binding_ref.clone()),
                 aoa_owner: None,
+                adb_stream_owner: None,
                 aoa_target_id: None,
                 windows_mix_format: mix_format.clone(),
             });
@@ -1330,6 +1547,8 @@ impl AppState {
             owner.pcm_payload_bytes_sent()
         } else if let Some(owner) = active.aoa_owner.as_ref() {
             owner.snapshot().pcm_payload_bytes_sent
+        } else if let Some(owner) = active.adb_stream_owner.as_ref() {
+            owner.snapshot().pcm_payload_bytes_sent
         } else if let Ok(bytes) = self.audio.sent_pcm_bytes() {
             bytes
         } else {
@@ -1370,6 +1589,12 @@ impl AppState {
                     (
                         owner.playback_progress,
                         active.aoa_owner.as_ref().map(AoaOwner::audio_queue),
+                    )
+                } else if let Some(owner) = active.adb_stream_owner.as_ref() {
+                    let owner = owner.snapshot();
+                    (
+                        owner.playback_progress,
+                        active.adb_stream_owner.as_ref().map(AoaOwner::audio_queue),
                     )
                 } else if let Some(owner) = active.network_owner.as_ref() {
                     let owner_snapshot = owner.snapshot();
@@ -1417,6 +1642,11 @@ impl AppState {
                 .or_else(|| playback.as_ref().and_then(|p| p.pc_queued_frames)),
             pc_dropped_frames: dropped_frames
                 .or_else(|| playback.as_ref().and_then(|p| p.pc_dropped_frames)),
+            drift_target_frames: playback.as_ref().and_then(|p| p.drift_target_frames),
+            drift_observed_frames: playback.as_ref().and_then(|p| p.drift_observed_frames),
+            drift_error_frames: playback.as_ref().and_then(|p| p.drift_error_frames),
+            drift_correction_ppm: playback.as_ref().and_then(|p| p.drift_correction_ppm),
+            drift_reset_reason: playback.as_ref().and_then(|p| p.drift_reset_reason),
             playback,
         };
         let mut timeline = self
@@ -1474,6 +1704,7 @@ impl AppState {
                 && active.serial == serial
                 && active.network_owner.is_none()
                 && active.aoa_owner.is_none()
+                && active.adb_stream_owner.is_none()
                 && active.output == "phone"
         }) else {
             return false;
@@ -1606,13 +1837,9 @@ impl AppState {
         if self.usb_direct_configuration_active() {
             return Ok(self.snapshot());
         }
-        if self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|session| session.aoa_owner.is_some())
-        {
+        if self.session.lock().await.as_ref().is_some_and(|session| {
+            session.aoa_owner.is_some() || session.adb_stream_owner.is_some()
+        }) {
             return Ok(self.snapshot());
         }
         self.refresh_devices_with_cancel(None).await
@@ -1892,6 +2119,7 @@ impl AppState {
                 output_tail: Arc::new(Mutex::new(VecDeque::new())),
                 network_owner: None,
                 aoa_owner: Some(owner),
+                adb_stream_owner: None,
                 aoa_target_id: Some(target_id.to_owned()),
                 network_sink_queue: None,
                 network_binding_ref: Some(binding_reference.to_owned()),
@@ -2737,14 +2965,16 @@ impl AppState {
         let mut session = self.session.lock().await;
         let Some(active) = session
             .as_mut()
-            .filter(|session| session.aoa_owner.is_some())
+            .filter(|session| session.aoa_owner.is_some() || session.adb_stream_owner.is_some())
         else {
             return false;
         };
+        let adb_stream = active.adb_stream_owner.is_some();
         let snapshot = active
             .aoa_owner
             .as_ref()
-            .expect("AOA session owner")
+            .or(active.adb_stream_owner.as_ref())
+            .expect("record stream owner")
             .snapshot();
         let failure = self.audio.take_last_error().ok().flatten().or_else(|| {
             (snapshot.state == crate::p5c::ReceiverState::Stopped).then(|| {
@@ -2778,12 +3008,26 @@ impl AppState {
                 let binding = active.network_binding_ref.clone();
                 let format = snapshot.format;
                 let output = active.output.clone();
+                let serial = active.serial.clone();
+                let transport = active.transport.clone();
+                let session_key = active.reverse.clone();
                 let reason = snapshot
                     .last_error
                     .clone()
                     .unwrap_or_else(|| "USB Direct 连接已中断".into());
                 drop(session);
-                if let (Some(target_id), Some(binding)) = (target_id, binding) {
+                if adb_stream {
+                    self.recover_session_locked(
+                        app,
+                        generation,
+                        serial,
+                        transport,
+                        output == "phone",
+                        session_key,
+                        reason,
+                    )
+                    .await;
+                } else if let (Some(target_id), Some(binding)) = (target_id, binding) {
                     self.recover_aoa_session_locked(
                         app, generation, target_id, binding, format, output, reason,
                     )
@@ -2801,9 +3045,25 @@ impl AppState {
             _ => {}
         }
         if let Some(error) = failure {
+            if adb_stream {
+                drop(session);
+                let cleanup = self.teardown(Some(app)).await;
+                let detail = cleanup.map_or_else(
+                    |cleanup_error| format!("{error}；清理连接失败：{cleanup_error}"),
+                    |_| error.clone(),
+                );
+                self.set_state(app, "error", &detail, self.snapshot().device_name);
+                self.emit(app);
+                *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+                return true;
+            }
             let _ = self.audio.stop_and_cleanup();
             let _ = self.audio.restore_muted();
-            if let Some(owner) = active.aoa_owner.take() {
+            if let Some(owner) = active
+                .aoa_owner
+                .take()
+                .or_else(|| active.adb_stream_owner.take())
+            {
                 let _ = owner.stop();
             }
             *session = None;
@@ -2819,7 +3079,12 @@ impl AppState {
             view.windows_mix_format = None;
             view.output = "computer".into();
             view.state = "error".into();
-            view.message = "USB Direct 音频会话已停止".into();
+            view.message = if adb_stream {
+                "ADB 音频会话已停止"
+            } else {
+                "USB Direct 音频会话已停止"
+            }
+            .into();
             view.status_detail = format!("本机采集已清理；{error}");
             view.audio_bitrate_bps = None;
             drop(view);
@@ -2839,15 +3104,19 @@ impl AppState {
             let changed =
                 view.state != next_state || view.playback_diagnostics != snapshot.playback_progress;
             view.state = next_state.into();
+            let transport_label = if adb_stream { "ADB" } else { "USB Direct" };
             view.message = match next_state {
+                "streaming" if adb_stream => "正在通过 ADB 播放".into(),
+                "paused" if adb_stream => "ADB 播放已暂停".into(),
                 "streaming" => "正在通过 USB Direct 播放".into(),
                 "paused" => "USB Direct 播放已暂停".into(),
+                _ if adb_stream => "ADB Receiver 已就绪".into(),
                 _ => "USB Direct Receiver 已就绪".into(),
             };
             view.status_detail = snapshot
                 .last_error
                 .clone()
-                .unwrap_or_else(|| "USB Direct 已认证；音频通过 ANPD v2 流传输。".into());
+                .unwrap_or_else(|| format!("{transport_label} 已认证；音频通过 ANPD v2 流传输。"));
             view.session_capabilities = Some(snapshot.capabilities.clone());
             view.playback_diagnostics = snapshot.playback_progress.clone();
             view.negotiated_audio_format = Some(negotiated_v2_audio_format(snapshot.format));
@@ -2873,6 +3142,24 @@ impl AppState {
         {
             return;
         }
+        if session
+            .as_ref()
+            .is_some_and(|active| active.adb_stream_owner.is_some())
+        {
+            drop(session);
+            let cleanup = self.teardown(Some(app)).await;
+            self.set_state(
+                app,
+                if cleanup.is_ok() { "ready" } else { "error" },
+                message,
+                None,
+            );
+            if let Err(error) = cleanup {
+                self.view.lock().expect("app view lock").status_detail = error;
+            }
+            self.emit(app);
+            return;
+        }
         let mut cleanup = Vec::new();
         if let Err(error) = self.audio.stop_and_cleanup() {
             cleanup.push(error);
@@ -2880,7 +3167,12 @@ impl AppState {
         if let Err(error) = self.audio.restore_muted() {
             cleanup.push(error);
         }
-        if let Some(owner) = session.as_mut().and_then(|active| active.aoa_owner.take()) {
+        if let Some(owner) = session.as_mut().and_then(|active| {
+            active
+                .aoa_owner
+                .take()
+                .or_else(|| active.adb_stream_owner.take())
+        }) {
             if let Err(error) = owner.stop() {
                 cleanup.push(error);
             }
@@ -3105,37 +3397,65 @@ impl AppState {
             self.recovering.store(false, Ordering::Release);
             return;
         };
-        let same_session = self.session.lock().await.as_ref().is_some_and(|session| {
-            session.generation == session_generation
-                && session.serial == serial
-                && session.reverse == session_key
-        });
+        let (same_session, adb_stream) = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| {
+                (
+                    session.generation == session_generation
+                        && session.serial == serial
+                        && session.reverse == session_key,
+                    session.adb_stream_owner.is_some(),
+                )
+            })
+            .unwrap_or((false, false));
         if !same_session {
             self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
         }
-        // monitor_once holds gate and already confirmed session loss. A socket
-        // still reporting connected must not override a missing ADB device.
+        // monitor_once holds gate and already confirmed session loss. Keep the
+        // old remote owner pending until the retry loop has freshly confirmed
+        // this same target and transport online.
         let device_name = self.snapshot().device_name;
-        if let Err(error) = self.teardown(Some(app)).await {
-            if !token.is_cancelled() {
-                self.set_state(
-                    app,
-                    "error",
-                    format!("{reason}；清理连接失败：{error}"),
-                    device_name,
-                );
+        let teardown_result = if adb_stream {
+            self.teardown_adb_for_recovery(app, session_generation, &session_key)
+                .await
+        } else {
+            self.teardown(Some(app))
+                .await
+                .map(|()| AdbCleanupOutcome::Complete)
+        };
+        let cleanup_outcome = match teardown_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if !token.is_cancelled() {
+                    self.set_state(
+                        app,
+                        "error",
+                        format!("{reason}；清理连接失败：{error}"),
+                        device_name,
+                    );
+                }
+                self.finish_operation(generation);
+                self.recovering.store(false, Ordering::Release);
+                return;
             }
-            self.finish_operation(generation);
-            self.recovering.store(false, Ordering::Release);
-            return;
-        }
+        };
         if token.is_cancelled() {
             self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
         }
+        if cleanup_outcome == AdbCleanupOutcome::ReceiverUserStopped {
+            self.finish_operation(generation);
+            self.set_state(app, "ready", "手机已主动停止音频会话", None);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        let mut last_cleanup_error = None;
         for attempt in 0..3 {
             if token.is_cancelled() {
                 break;
@@ -3147,51 +3467,84 @@ impl AppState {
                 device_name.clone(),
             );
             tokio::select! { _ = token.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis([1000, 2000, 5000][attempt])) => {} }
-            if transport == "wifi" && serial.contains(':') {
-                let _ = checked_adb(
-                    &self.adb_path,
-                    None,
-                    &["connect", &serial],
-                    Duration::from_secs(8),
-                    Some(&token),
-                )
-                .await;
-            }
-            if token.is_cancelled() {
-                break;
-            }
-            let _ = self.refresh_devices().await;
-            if let Some(device) = self
-                .snapshot()
-                .devices
-                .iter()
-                .find(|device| {
-                    device.serial == serial && device.transport == transport && device.connectable
-                })
-                .cloned()
-            {
-                if let Ok(result) = self
-                    .connect_locked(app, &device.serial, generation, &token, was_playing)
-                    .await
-                {
-                    if result.success {
-                        if !was_playing {
-                            let _ = self.set_output_locked(app, "computer", &token).await;
-                            self.emit(app);
-                        }
+            if adb_stream {
+                let ops = AppStateAdbRecoveryAttemptOps {
+                    state: self,
+                    app,
+                    operation_generation: generation,
+                    was_playing,
+                };
+                match run_adb_recovery_attempt(&ops, &serial, &transport, &token).await {
+                    AdbRecoveryAttempt::Cancelled => break,
+                    AdbRecoveryAttempt::Offline | AdbRecoveryAttempt::Failed => {}
+                    AdbRecoveryAttempt::ReceiverUserStopped => {
+                        self.finish_operation(generation);
+                        self.set_state(app, "ready", "手机已主动停止音频会话", None);
+                        self.recovering.store(false, Ordering::Release);
+                        return;
+                    }
+                    AdbRecoveryAttempt::CleanupFailed(error) => {
+                        last_cleanup_error = Some(error);
+                    }
+                    AdbRecoveryAttempt::Connected => {
                         self.finish_operation(generation);
                         self.recovering.store(false, Ordering::Release);
                         return;
                     }
                 }
-                let _ = self.teardown(Some(app)).await;
+            } else {
+                if transport == "wifi" && serial.contains(':') {
+                    let _ = checked_adb(
+                        &self.adb_path,
+                        None,
+                        &["connect", &serial],
+                        Duration::from_secs(8),
+                        Some(&token),
+                    )
+                    .await;
+                }
+                if token.is_cancelled() {
+                    break;
+                }
+                let _ = self.refresh_devices().await;
+                if let Some(device) = self
+                    .snapshot()
+                    .devices
+                    .iter()
+                    .find(|device| {
+                        device.serial == serial
+                            && device.transport == transport
+                            && device.connectable
+                    })
+                    .cloned()
+                {
+                    if let Ok(result) = self
+                        .connect_locked(app, &device.serial, generation, &token, was_playing)
+                        .await
+                    {
+                        if result.success {
+                            if !was_playing {
+                                let _ = self.set_output_locked(app, "computer", &token).await;
+                                self.emit(app);
+                            }
+                            self.finish_operation(generation);
+                            self.recovering.store(false, Ordering::Release);
+                            return;
+                        }
+                    }
+                    let _ = self.teardown(Some(app)).await;
+                }
             }
         }
         self.finish_operation(generation);
         if !token.is_cancelled()
             && operation_generation_matches(&self.operation_generation, generation)
         {
-            self.set_state(app, "error", "重连失败，请手动连接。", device_name);
+            let message = last_cleanup_error.map_or_else(
+                || "重连失败，请手动连接。".to_string(),
+                |error| format!("ADB 旧会话清理失败，未启动新流：{error}"),
+            );
+            self.set_state(app, "error", message, device_name);
         }
         self.recovering.store(false, Ordering::Release);
     }
@@ -3228,7 +3581,9 @@ impl AppState {
                 });
             }
             if self.session.lock().await.as_ref().is_some_and(|session| {
-                session.network_owner.is_some() || session.aoa_owner.is_some()
+                session.network_owner.is_some()
+                    || session.aoa_owner.is_some()
+                    || session.adb_stream_owner.is_some()
             }) {
                 return Err("当前是直接连接会话；请先断开后再切换手机。".into());
             }
@@ -3385,7 +3740,7 @@ impl AppState {
             }
             let quality = settings.audio_quality;
             validate_audio_quality(&quality)?;
-            if quality != "standard" {
+            if settings.audio_backend == "legacy" && quality != "standard" {
                 return Err("ADB连接仅支持标准音质。".into());
             }
         }
@@ -3455,6 +3810,284 @@ impl AppState {
         }
     }
 
+    async fn connect_adb_stream_inner(
+        &self,
+        app: &AppHandle,
+        device: &Device,
+        token: &CancellationToken,
+        play_on_phone: bool,
+        settings: AppSettings,
+    ) -> Result<String, String> {
+        use crate::aoa_owner::AoaOwner;
+        use crate::protocol::AudioFormatV2;
+
+        let serial = device.serial.as_str();
+        token_check(token)?;
+        self.audio.initialize()?;
+        self.audio.set_streaming(false)?;
+        let quality = settings.audio_quality.as_str();
+        let profile = audio_quality_profile(quality)
+            .filter(|profile| *profile >= 4)
+            .ok_or_else(|| "ADB Float32 audio requires HiFi or Hi-Res quality.".to_string())?;
+        let mode = if settings.playback_mode.eq_ignore_ascii_case("lowlatency") {
+            1
+        } else {
+            0
+        };
+        let format = AudioFormatV2::for_profile(profile, mode)
+            .map_err(|_| "Unable to construct the authenticated Float32 format.".to_string())?;
+        let native = self.audio.probe_float_format()?;
+        crate::audio::validate_float_format_for_session(&native, format)?;
+        let queue = Arc::new(FloatPcmQueue::new(mode == 1));
+        queue.set_expected_format(format.sample_rate, 4096)?;
+        let source = SessionAudioQueue::Float32(queue, format);
+        let (binding_reference, material) = receiver::adb_binding_material(
+            &self.adb_path,
+            serial,
+            if device.transport == "wifi" {
+                "wifi"
+            } else {
+                "usb"
+            },
+            &self.data_dir,
+            &self.receiver_apk_path,
+            &self.receiver_metadata_path,
+            token,
+        )
+        .await?;
+        let host_id = material
+            .host_id()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let socket_name = format!("anpod_adb_{}", uuid_token()?);
+        checked_adb(
+            &self.adb_path,
+            Some(serial),
+            &[
+                "reverse",
+                &format!("localabstract:{socket_name}"),
+                &format!("tcp:{port}"),
+            ],
+            Duration::from_secs(5),
+            Some(token),
+        )
+        .await?;
+
+        let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        *self.session.lock().await = Some(Session {
+            generation,
+            serial: serial.into(),
+            transport: device.transport.clone(),
+            reverse: socket_name.clone(),
+            child: None,
+            installed_receiver: true,
+            receiver_owner_id: None,
+            receiver_generation: None,
+            output: "computer".into(),
+            output_tail: Arc::new(Mutex::new(VecDeque::new())),
+            network_owner: None,
+            aoa_owner: None,
+            adb_stream_owner: None,
+            aoa_target_id: None,
+            network_sink_queue: Some(source.clone()),
+            network_binding_ref: Some(binding_reference.clone()),
+            windows_mix_format: Some(windows_mix_format(native)),
+        });
+        {
+            let mut view = self.view.lock().expect("app view lock");
+            view.session_generation = Some(generation);
+            view.session_active = true;
+            view.session_serial = Some(serial.into());
+            view.session_receiver_binding = Some(binding_reference.clone());
+            view.session_transport = Some(device.transport.clone());
+            view.session_capabilities = None;
+            view.playback_diagnostics = None;
+            view.negotiated_audio_format = None;
+            view.windows_mix_format = None;
+            view.network_recovery_seconds_remaining = None;
+            view.session_android_version =
+                (!device.android_version.is_empty()).then(|| device.android_version.clone());
+            view.audio_bitrate_bps = Some(0);
+        }
+        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+
+        let accept_cancel = token.child_token();
+        let mut accepted = tokio::task::spawn_blocking({
+            let token = accept_cancel.clone();
+            move || loop {
+                if token.is_cancelled() {
+                    return Err("ADB audio connection was cancelled.".to_string());
+                }
+                match listener.accept() {
+                    Ok((stream, _peer)) => return Ok(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        });
+        let dispatch = receiver::start_adb_stream_audio(
+            &self.adb_path,
+            serial,
+            &self.receiver_apk_path,
+            &self.receiver_metadata_path,
+            &socket_name,
+            &host_id,
+            if device.transport == "wifi" {
+                "wifi"
+            } else {
+                "usb"
+            },
+            token,
+        )
+        .await;
+        if let Err(error) = dispatch {
+            accept_cancel.cancel();
+            let _ = accepted.await;
+            return Err(error);
+        }
+        let stream = tokio::select! {
+            result = &mut accepted => result.map_err(|error| format!("ADB accept worker failed: {error}"))??,
+            _ = token.cancelled() => {
+                accept_cancel.cancel();
+                let _ = accepted.await;
+                return Err("ADB audio connection was cancelled.".into());
+            },
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                accept_cancel.cancel();
+                let _ = accepted.await;
+                return Err("Receiver did not connect its ADB audio stream within 30 seconds.".into());
+            },
+        };
+        token_check(token)?;
+        let owner_queue = source.clone();
+        let owner = tokio::task::spawn_blocking(move || {
+            AoaOwner::connect_adb_stream(stream, material, format, owner_queue)
+        })
+        .await
+        .map_err(|error| format!("ADB record owner failed: {error}"))??;
+        token_check(token)?;
+        let receiver_status = receiver::status(
+            &self.adb_path,
+            serial,
+            &self.receiver_apk_path,
+            &self.receiver_metadata_path,
+            token,
+        )
+        .await?;
+        let receiver_owner_id = receiver_status
+            .operation_owner_id
+            .clone()
+            .filter(|owner_id| !owner_id.is_empty())
+            .ok_or_else(|| "ADB Receiver did not report its operation owner.".to_string())?;
+        let receiver_generation = receiver_status
+            .operation_generation
+            .ok_or_else(|| "ADB Receiver did not report its operation generation.".to_string())?;
+        if !receiver_status.service_active || !receiver_status.healthy {
+            let _ = owner.stop();
+            return Err(receiver_status
+                .monitoring_error()
+                .unwrap_or_else(|| "ADB Receiver is not healthy after P5-C startup.".into()));
+        }
+        let mut mix_format = Some(windows_mix_format(native));
+        if play_on_phone {
+            mix_format = self.start_session_audio_sink(&source)?;
+            self.audio.mute_active()?;
+        } else {
+            owner.pause()?;
+        }
+        let session = self.session.lock().await;
+        let active = session.as_ref().ok_or("ADB audio session was cancelled.")?;
+        if active.generation != generation {
+            let _ = owner.stop();
+            return Err("ADB audio session generation changed during startup.".into());
+        }
+        drop(session);
+        if let Some(active) = self.session.lock().await.as_mut() {
+            active.adb_stream_owner = Some(owner);
+            active.receiver_owner_id = Some(receiver_owner_id);
+            active.receiver_generation = Some(receiver_generation);
+            active.output = if play_on_phone { "phone" } else { "computer" }.into();
+            active.windows_mix_format = mix_format.clone();
+        }
+        {
+            let mut view = self.view.lock().expect("app view lock");
+            view.output = if play_on_phone { "phone" } else { "computer" }.into();
+            view.settings.last_device_id = Some(serial.into());
+            view.busy = false;
+            view.settings.last_wireless_endpoint = if device.transport == "wifi" {
+                Some(serial.into())
+            } else {
+                view.settings.last_wireless_endpoint.clone()
+            };
+            let settings = view.settings.clone();
+            drop(view);
+            let _ = self.save_settings(&settings);
+        }
+        let snapshot = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|session| session.adb_stream_owner.as_ref())
+            .map(AoaOwner::snapshot)
+            .ok_or("ADB stream owner was not installed.")?;
+        let mut view = self.view.lock().expect("app view lock");
+        view.session_capabilities = Some(snapshot.capabilities);
+        view.playback_diagnostics = snapshot.playback_progress;
+        view.negotiated_audio_format = Some(negotiated_v2_audio_format(format));
+        view.windows_mix_format = if play_on_phone { mix_format } else { None };
+        view.state = if play_on_phone {
+            "phoneReady"
+        } else {
+            "connected"
+        }
+        .into();
+        view.message = if play_on_phone {
+            "手机接收已就绪"
+        } else {
+            "已连接 · 电脑播放"
+        }
+        .into();
+        view.status_detail = if play_on_phone {
+            "Receiver 已认证并开始等待音频播放。".into()
+        } else {
+            "Receiver 已认证；手机输出保持暂停。".into()
+        };
+        drop(view);
+        self.set_state(
+            app,
+            if play_on_phone {
+                "phoneReady"
+            } else {
+                "connected"
+            },
+            if play_on_phone {
+                "手机接收已就绪"
+            } else {
+                "已连接 · 电脑播放"
+            },
+            Some(device.display_name.clone()),
+        );
+        Ok(if play_on_phone {
+            "手机接收端已就绪，等待音频数据。"
+        } else {
+            "已连接，声音继续从电脑播放。"
+        }
+        .into())
+    }
+
     async fn connect_inner(
         &self,
         app: &AppHandle,
@@ -3464,6 +4097,14 @@ impl AppState {
     ) -> Result<String, String> {
         let serial = device.serial.as_str();
         token_check(token)?;
+        self.cleanup_pending_adb_for_target(serial, &device.transport, token)
+            .await?;
+        let settings = self.view.lock().expect("app view lock").settings.clone();
+        if settings.audio_backend == "receiver" && settings.audio_quality != "standard" {
+            return self
+                .connect_adb_stream_inner(app, device, token, play_on_phone, settings)
+                .await;
+        }
         let installed_receiver =
             self.view.lock().expect("view lock").settings.audio_backend == "receiver";
         self.audio.initialize()?;
@@ -3501,6 +4142,7 @@ impl AppState {
             output_tail: Arc::new(Mutex::new(VecDeque::new())),
             network_owner: None,
             aoa_owner: None,
+            adb_stream_owner: None,
             aoa_target_id: None,
             network_sink_queue: None,
             network_binding_ref: None,
@@ -3837,6 +4479,41 @@ impl AppState {
                 ))
             })
         };
+        let adb_stream_session = {
+            let session = self.session.lock().await;
+            session.as_ref().and_then(|active| {
+                active.adb_stream_owner.as_ref().map(|owner| {
+                    (
+                        active.serial.clone(),
+                        active.output.clone(),
+                        owner.snapshot().format,
+                    )
+                })
+            })
+        };
+        if let Some((serial, output, current_format)) = adb_stream_session {
+            if kind == "playback" {
+                let mode = match value {
+                    "balanced" => 0,
+                    "lowLatency" => 1,
+                    _ => return Err("未知的播放模式。".into()),
+                };
+                AudioFormatV2::for_profile(current_format.profile, mode).map_err(|_| {
+                    "ADB audio format does not support the selected playback mode.".to_string()
+                })?;
+                self.update_mode_setting(kind, value)?;
+                self.teardown(Some(app)).await?;
+                let generation = self.operation_generation.load(Ordering::Acquire);
+                let result = self
+                    .connect_locked(app, &serial, generation, token, output == "phone")
+                    .await?;
+                if !result.success {
+                    return Err(result.message);
+                }
+                self.emit(app);
+                return Ok(self.snapshot());
+            }
+        }
         if let Some((target_id, binding, current_format, output, capabilities)) = aoa_session {
             if kind != "playback" {
                 return Err("USB Direct 会话连接方式和音质已锁定；请先断开。".into());
@@ -4148,6 +4825,262 @@ impl AppState {
         Ok(path.to_string_lossy().into_owned())
     }
 
+    fn remember_pending_adb_cleanup(&self, cleanup: PendingAdbCleanup) {
+        let mut pending = self
+            .pending_adb_cleanup
+            .lock()
+            .expect("pending ADB cleanup lock");
+        if let Some(existing) = pending.iter_mut().find(|item| {
+            item.serial == cleanup.serial
+                && item.transport == cleanup.transport
+                && item.socket_name == cleanup.socket_name
+        }) {
+            existing.installed_receiver |= cleanup.installed_receiver;
+            existing.receiver_stopped |= cleanup.receiver_stopped;
+            existing.receiver_user_stopped |= cleanup.receiver_user_stopped;
+            existing.reverse_removed |= cleanup.reverse_removed;
+            if existing.receiver_owner_id.is_none() {
+                existing.receiver_owner_id = cleanup.receiver_owner_id;
+            }
+            if existing.receiver_generation.is_none() {
+                existing.receiver_generation = cleanup.receiver_generation;
+            }
+        } else {
+            pending.push(cleanup);
+        }
+    }
+
+    async fn cleanup_pending_adb_for_target(
+        &self,
+        serial: &str,
+        transport: &str,
+        cancel: &CancellationToken,
+    ) -> Result<AdbCleanupOutcome, String> {
+        let mut pending = self
+            .pending_adb_cleanup
+            .lock()
+            .expect("pending ADB cleanup lock")
+            .clone();
+        let mut outcome = AdbCleanupOutcome::Complete;
+        for cleanup in pending
+            .iter_mut()
+            .filter(|item| item.serial == serial && item.transport == transport)
+        {
+            if cleanup.receiver_user_stopped {
+                outcome = AdbCleanupOutcome::ReceiverUserStopped;
+            }
+            let result = self.cleanup_adb_remote(cleanup, cancel).await;
+            if let Some(stored) = self
+                .pending_adb_cleanup
+                .lock()
+                .expect("pending ADB cleanup lock")
+                .iter_mut()
+                .find(|item| {
+                    item.serial == cleanup.serial
+                        && item.transport == cleanup.transport
+                        && item.socket_name == cleanup.socket_name
+                })
+            {
+                stored.receiver_stopped = cleanup.receiver_stopped;
+                stored.receiver_user_stopped = cleanup.receiver_user_stopped;
+                stored.reverse_removed = cleanup.reverse_removed;
+            }
+            if result? == AdbCleanupOutcome::ReceiverUserStopped {
+                outcome = AdbCleanupOutcome::ReceiverUserStopped;
+            }
+        }
+        let completed: Vec<_> = pending
+            .iter()
+            .filter(|item| {
+                item.serial == serial
+                    && item.transport == transport
+                    && (!item.installed_receiver || item.receiver_stopped)
+                    && item.reverse_removed
+            })
+            .map(|item| {
+                (
+                    item.serial.clone(),
+                    item.transport.clone(),
+                    item.socket_name.clone(),
+                )
+            })
+            .collect();
+        if !completed.is_empty() {
+            self.pending_adb_cleanup
+                .lock()
+                .expect("pending ADB cleanup lock")
+                .retain(|item| {
+                    !completed.contains(&(
+                        item.serial.clone(),
+                        item.transport.clone(),
+                        item.socket_name.clone(),
+                    ))
+                });
+        }
+        Ok(outcome)
+    }
+
+    async fn cleanup_adb_remote(
+        &self,
+        cleanup: &mut PendingAdbCleanup,
+        cancel: &CancellationToken,
+    ) -> Result<AdbCleanupOutcome, String> {
+        let (stop, receiver_user_stopped) = if cleanup.installed_receiver
+            && !cleanup.receiver_stopped
+        {
+            if let (Some(owner_id), Some(generation)) = (
+                cleanup.receiver_owner_id.as_deref(),
+                cleanup.receiver_generation,
+            ) {
+                match receiver::status(
+                    &self.adb_path,
+                    &cleanup.serial,
+                    &self.receiver_apk_path,
+                    &self.receiver_metadata_path,
+                    cancel,
+                )
+                .await
+                {
+                    Ok(status)
+                        if status.was_stopped_by_user_for(Some(owner_id), Some(generation)) =>
+                    {
+                        (Ok(()), true)
+                    }
+                    Ok(status) if !status.service_active => (Ok(()), false),
+                    Ok(status)
+                        if status.operation_owner_id.as_deref() != Some(owner_id)
+                            || status.operation_generation != Some(generation) =>
+                    {
+                        (
+                            Err(
+                                "Receiver owner changed; refusing to stop a different session."
+                                    .into(),
+                            ),
+                            false,
+                        )
+                    }
+                    Ok(_) => match receiver::stop_if_owner(
+                        &self.adb_path,
+                        &cleanup.serial,
+                        &self.receiver_apk_path,
+                        &self.receiver_metadata_path,
+                        owner_id,
+                        generation,
+                        &cleanup.socket_name,
+                        cancel,
+                    )
+                    .await
+                    {
+                        Ok(status)
+                            if status.was_stopped_by_user_for(Some(owner_id), Some(generation)) =>
+                        {
+                            (Ok(()), true)
+                        }
+                        Ok(_) => (Ok(()), false),
+                        Err(error) => (Err(error), false),
+                    },
+                    Err(error) => (Err(error), false),
+                }
+            } else {
+                match receiver::status(
+                    &self.adb_path,
+                    &cleanup.serial,
+                    &self.receiver_apk_path,
+                    &self.receiver_metadata_path,
+                    cancel,
+                )
+                .await
+                {
+                    Ok(status) if !status.service_active => (Ok(()), false),
+                    Ok(_) => (
+                        Err(
+                            "ADB Receiver owner is unknown; refusing to stop an unowned session."
+                                .into(),
+                        ),
+                        false,
+                    ),
+                    Err(error) => (Err(error), false),
+                }
+            }
+        } else {
+            (Ok(()), false)
+        };
+        let reverse = if !cleanup.reverse_removed {
+            adb_run(
+                &self.adb_path,
+                Some(&cleanup.serial),
+                &[
+                    "reverse",
+                    "--remove",
+                    &format!("localabstract:{}", cleanup.socket_name),
+                ],
+                Duration::from_secs(5),
+                Some(cancel),
+            )
+            .await
+            .and_then(|result| {
+                if result.success {
+                    Ok(())
+                } else {
+                    Err("Unable to remove the ADB audio reverse mapping.".into())
+                }
+            })
+        } else {
+            Ok(())
+        };
+        record_adb_cleanup_attempt(cleanup, stop, receiver_user_stopped, reverse)
+    }
+
+    async fn teardown_adb_for_recovery(
+        &self,
+        app: &AppHandle,
+        session_generation: u64,
+        session_key: &str,
+    ) -> Result<AdbCleanupOutcome, String> {
+        let (cleanup, owner) = {
+            let mut session = self.session.lock().await;
+            let active = session
+                .as_mut()
+                .filter(|active| {
+                    active.generation == session_generation
+                        && active.reverse == session_key
+                        && active.adb_stream_owner.is_some()
+                })
+                .ok_or_else(|| "ADB recovery target changed before local cleanup.".to_string())?;
+            let cleanup = PendingAdbCleanup {
+                serial: active.serial.clone(),
+                transport: active.transport.clone(),
+                socket_name: active.reverse.clone(),
+                installed_receiver: active.installed_receiver,
+                receiver_owner_id: active.receiver_owner_id.clone(),
+                receiver_generation: active.receiver_generation,
+                receiver_stopped: !active.installed_receiver,
+                receiver_user_stopped: false,
+                reverse_removed: active.reverse.is_empty(),
+            };
+            active.reverse.clear();
+            active.installed_receiver = false;
+            (cleanup, active.adb_stream_owner.take())
+        };
+        self.remember_pending_adb_cleanup(cleanup);
+        let owner_error = owner.and_then(|owner| {
+            if owner.snapshot().terminal_cause == Some(TerminalCause::TransportFailure) {
+                owner.cancel_after_transport_failure().err()
+            } else {
+                owner.stop().err()
+            }
+        });
+        let local_result = self.teardown(Some(app)).await;
+        match (owner_error, local_result) {
+            (None, Ok(())) => Ok(AdbCleanupOutcome::Complete),
+            (Some(error), Ok(())) => Err(format!("ADB record owner cleanup failed: {error}")),
+            (None, Err(error)) => Err(error),
+            (Some(owner_error), Err(local_error)) => Err(format!(
+                "ADB record owner cleanup failed: {owner_error}; {local_error}"
+            )),
+        }
+    }
+
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
         self.host_offer_listener
             .lock()
@@ -4155,7 +5088,8 @@ impl AppState {
             .take();
         let mut errors = Vec::new();
         if let Some(mut session) = self.session.lock().await.take() {
-            let legacy_adb_session = session.network_owner.is_none() && session.aoa_owner.is_none();
+            let adb_stream =
+                session.adb_stream_owner.is_some() || session.reverse.starts_with("anpod_adb_");
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = false;
@@ -4179,13 +5113,37 @@ impl AppState {
                     errors.push(format!("USB Direct 会话停止失败：{error}"));
                 }
             }
+            if let Some(owner) = session.adb_stream_owner.take() {
+                if let Err(error) = owner.stop() {
+                    errors.push(format!("ADB audio stream stop failed: {error}"));
+                }
+            }
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
             if let Err(error) = self.audio.restore_muted() {
                 errors.push(format!("电脑声音恢复失败：{error}"));
             }
-            if session.installed_receiver {
+            if adb_stream {
+                let mut cleanup = PendingAdbCleanup {
+                    serial: session.serial.clone(),
+                    transport: session.transport.clone(),
+                    socket_name: session.reverse.clone(),
+                    installed_receiver: session.installed_receiver,
+                    receiver_owner_id: session.receiver_owner_id.clone(),
+                    receiver_generation: session.receiver_generation,
+                    receiver_stopped: !session.installed_receiver,
+                    receiver_user_stopped: false,
+                    reverse_removed: session.reverse.is_empty(),
+                };
+                if let Err(error) = self
+                    .cleanup_adb_remote(&mut cleanup, &CancellationToken::new())
+                    .await
+                {
+                    errors.push(format!("ADB remote cleanup failed: {error}"));
+                    self.remember_pending_adb_cleanup(cleanup);
+                }
+            } else if session.installed_receiver {
                 if let Err(error) = receiver::stop(
                     &self.adb_path,
                     &session.serial,
@@ -4216,7 +5174,7 @@ impl AppState {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
-            if legacy_adb_session {
+            if !adb_stream && !session.reverse.is_empty() {
                 if let Err(error) = adb_run(
                     &self.adb_path,
                     Some(&session.serial),
@@ -4316,6 +5274,25 @@ impl AppState {
         output: &str,
         token: &CancellationToken,
     ) -> Result<(), String> {
+        let adb_stream_serial = {
+            let session = self.session.lock().await;
+            session.as_ref().and_then(|active| {
+                (active.adb_stream_owner.is_some() && active.output != output)
+                    .then(|| active.serial.clone())
+            })
+        };
+        if let Some(serial) = adb_stream_serial {
+            token_check(token)?;
+            self.teardown(Some(app)).await?;
+            let generation = self.operation_generation.load(Ordering::Acquire);
+            let result = self
+                .connect_locked(app, &serial, generation, token, output == "phone")
+                .await?;
+            if result.success {
+                return Ok(());
+            }
+            return Err(result.message);
+        }
         if output == "phone" {
             let restart = {
                 let session = self.session.lock().await;
@@ -4820,7 +5797,10 @@ impl AppState {
                     .as_str()
                     .ok_or("无效音质设置 / Invalid audio quality")?;
                 validate_audio_quality(quality)?;
-                if adb_transport_enabled(&settings) && quality != "standard" {
+                if adb_transport_enabled(&settings)
+                    && settings.audio_backend == "legacy"
+                    && quality != "standard"
+                {
                     return Err("ADB连接仅支持标准音质。".into());
                 }
                 settings.audio_quality = quality.into();
@@ -4835,7 +5815,7 @@ impl AppState {
             }
             _ => return Err("未知设置项。".into()),
         }
-        if adb_transport_enabled(&settings) {
+        if adb_transport_enabled(&settings) && settings.audio_backend == "legacy" {
             settings.audio_quality = "standard".into();
         }
         let settings = normalize_settings(settings);

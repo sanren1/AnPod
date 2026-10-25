@@ -481,3 +481,21 @@ fn aoa_binding_derivation_matches_fixed_vector_and_rejects_lan_proof() {
     assert_eq!(host_session.format, receiver_session.format);
     assert_eq!(host_session.session_id, receiver_session.session_id);
 }
+
+#[test]
+fn adb_binding_derivation_matches_independent_fixed_vector_and_is_domain_separated() {
+    let material = BindingMaterial {
+        host_id: [0x01; 16],
+        receiver_id: [0x02; 16],
+        secret: [0x03; 32],
+    };
+    let adb = material.derive_adb_stream();
+    assert_eq!(adb.host_id, material.host_id);
+    assert_eq!(adb.receiver_id, material.receiver_id);
+    assert_eq!(
+        hex(&adb.secret),
+        "cb76cb157e4c5446d03232534f61486a750cb61ff29ccf8882b09c3ffe1d0c37"
+    );
+    assert_ne!(adb.secret, material.derive_aoa_transport().secret);
+    assert_ne!(adb.secret, material.secret);
+}

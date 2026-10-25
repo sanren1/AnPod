@@ -826,10 +826,10 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     } else {
         normalize_wireless_protocol(&settings.wireless_protocol).into()
     };
-    if adb_transport_enabled(&settings) {
+    settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
+    if adb_transport_enabled(&settings) && settings.audio_backend == "legacy" {
         settings.audio_quality = "standard".into();
     }
-    settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() {
         "lowlatency" | "low_latency" => "LowLatency".into(),
         _ => "Balanced".into(),

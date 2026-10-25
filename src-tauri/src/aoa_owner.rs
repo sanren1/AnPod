@@ -5,9 +5,9 @@ use crate::{
     p5c::{
         self, Ack, ReceiverCapabilities, ReceiverState, SessionAudioQueue, TerminalCause,
         AUDIO_PROTOCOL_MAJOR, BIND, CAPABILITIES_QUERY, CAP_AUDIO_FLOAT32, CAP_AUDIO_V2,
-        CAP_PLAYBACK_PROGRESS, CAP_PROGRESS_EXT, HEARTBEAT, HOST_TO_RECEIVER_CONTROL,
-        MANAGEMENT_CONTROL_MAJOR, PAUSE, PLAYBACK_PROGRESS_QUERY, RECEIVER_TO_HOST_CONTROL,
-        RESULT_OK, RESULT_USER_STOPPED, RESUME, SELECT_MODE, START, STOP,
+        CAP_BUFFER_METRICS, CAP_PLAYBACK_PROGRESS, CAP_PROGRESS_EXT, HEARTBEAT,
+        HOST_TO_RECEIVER_CONTROL, MANAGEMENT_CONTROL_MAJOR, PAUSE, PLAYBACK_PROGRESS_QUERY,
+        RECEIVER_TO_HOST_CONTROL, RESULT_OK, RESULT_USER_STOPPED, RESUME, SELECT_MODE, START, STOP,
     },
     protocol::{
         AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
@@ -18,7 +18,8 @@ use crate::{
 
 use crate::p5c::{CAP_AOA_SESSION_RESTART, CAP_TERMINAL_CAUSE};
 use std::{
-    io,
+    io::{self, Read, Write},
+    net::TcpStream,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -28,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const REQUIRED_AOA_CAPABILITIES: u32 = 0x82;
+const REQUIRED_RECORD_CAPABILITIES: u32 = 0x82;
 const RECORD_DEADLINE: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_POLL: Duration = Duration::from_millis(20);
@@ -61,6 +62,104 @@ impl CancelIo for AoaCancel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecordTransport {
+    Aoa,
+    AdbStream,
+}
+
+struct TcpCancel(TcpStream);
+impl CancelIo for TcpCancel {
+    fn cancel_io(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+struct TcpRecordReader(TcpStream);
+impl RecordReader for TcpRecordReader {
+    fn read_record(&mut self) -> io::Result<Record> {
+        let deadline = Instant::now() + RECORD_DEADLINE;
+        let mut header = [0; 8];
+        tcp_read_exact_until(&mut self.0, &mut header, deadline)?;
+        let length = u16::from_be_bytes([header[6], header[7]]) as usize;
+        if &header[..4] != b"ANPU" || header[4] != 1 || !(1..=1200).contains(&length) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid ANPU header",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(8 + length);
+        bytes.extend_from_slice(&header);
+        bytes.resize(8 + length, 0);
+        tcp_read_exact_until(&mut self.0, &mut bytes[8..], deadline)?;
+        crate::aoa::decode_record(&bytes)
+    }
+}
+
+struct TcpRecordWriter(TcpStream);
+impl RecordWriter for TcpRecordWriter {
+    fn write_record(&mut self, record: &Record) -> io::Result<()> {
+        let bytes = crate::aoa::encode_record(record)?;
+        tcp_write_all_until(&mut self.0, &bytes, Instant::now() + RECORD_DEADLINE)
+    }
+}
+
+fn tcp_read_exact_until(
+    stream: &mut TcpStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "record deadline expired",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream closed",
+                ))
+            }
+            Ok(count) => {
+                let (_, rest) = std::mem::take(&mut bytes).split_at_mut(count);
+                bytes = rest;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn tcp_write_all_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "record deadline expired",
+            ));
+        }
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "stream closed")),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 enum OwnerCommand {
     Pause(SyncSender<Result<(), String>>),
     Resume(SyncSender<Result<(), String>>),
@@ -77,6 +176,7 @@ pub(crate) struct AoaOwner {
     worker: Option<JoinHandle<Result<(), String>>>,
     audio_queue: SessionAudioQueue,
     snapshot: Arc<Mutex<AoaSnapshot>>,
+    transport: RecordTransport,
 }
 
 #[derive(Clone, Debug)]
@@ -108,13 +208,61 @@ impl AoaOwner {
         )
     }
 
+    pub(crate) fn connect_adb_stream(
+        stream: TcpStream,
+        material: BindingMaterial,
+        format: AudioFormatV2,
+        queue: SessionAudioQueue,
+    ) -> Result<Self, String> {
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("Unable to configure the ADB record socket: {error}"))?;
+        let cancel = TcpCancel(stream.try_clone().map_err(|e| e.to_string())?);
+        let reader = TcpRecordReader(stream.try_clone().map_err(|e| e.to_string())?);
+        let writer = TcpRecordWriter(stream);
+        Self::connect_io_with_transport(
+            reader,
+            writer,
+            cancel,
+            material,
+            format,
+            queue,
+            RecordTransport::AdbStream,
+        )
+    }
+
     fn connect_io<R, W, C>(
+        reader: R,
+        writer: W,
+        cancel: C,
+        material: BindingMaterial,
+        format: AudioFormatV2,
+        queue: SessionAudioQueue,
+    ) -> Result<Self, String>
+    where
+        R: RecordReader + 'static,
+        W: RecordWriter + 'static,
+        C: CancelIo + 'static,
+    {
+        Self::connect_io_with_transport(
+            reader,
+            writer,
+            cancel,
+            material,
+            format,
+            queue,
+            RecordTransport::Aoa,
+        )
+    }
+
+    fn connect_io_with_transport<R, W, C>(
         reader: R,
         mut writer: W,
         cancel: C,
         material: BindingMaterial,
         format: AudioFormatV2,
         queue: SessionAudioQueue,
+        transport: RecordTransport,
     ) -> Result<Self, String>
     where
         R: RecordReader + 'static,
@@ -134,9 +282,12 @@ impl AoaOwner {
             .map_err(|e| e.to_string())?;
 
         let setup = (|| {
-            let (handshake, hello) =
-                HostHandshakeV2::start(material.derive_aoa_transport(), format)
-                    .map_err(|e| format!("AOA P5-A handshake could not start: {e}"))?;
+            let transport_material = match transport {
+                RecordTransport::Aoa => material.derive_aoa_transport(),
+                RecordTransport::AdbStream => material.derive_adb_stream(),
+            };
+            let (handshake, hello) = HostHandshakeV2::start(transport_material, format)
+                .map_err(|e| format!("Authenticated record P5-A handshake could not start: {e}"))?;
             write_record(&mut writer, RecordType::Handshake, hello)?;
             let challenge = receive_record(&records_rx, cancel.as_ref(), RECORD_DEADLINE)?;
             require_record_type(&challenge, RecordType::Handshake)?;
@@ -157,10 +308,25 @@ impl AoaOwner {
                 cancel.as_ref(),
                 &keys,
                 session_id,
+                REQUIRED_RECORD_CAPABILITIES
+                    | if transport == RecordTransport::AdbStream {
+                        p5c::CAP_AUDIO_ADB_STREAM
+                            | CAP_AUDIO_V2
+                            | CAP_AUDIO_FLOAT32
+                            | CAP_TERMINAL_CAUSE
+                    } else {
+                        0
+                    },
             )?;
             let required_audio_capabilities = CAP_AUDIO_V2
                 | if format.profile >= 4 {
                     CAP_AUDIO_FLOAT32
+                } else {
+                    0
+                };
+            let required_audio_capabilities = required_audio_capabilities
+                | if transport == RecordTransport::AdbStream && format.profile >= 4 {
+                    p5c::CAP_AUDIO_ADB_STREAM
                 } else {
                     0
                 };
@@ -169,7 +335,7 @@ impl AoaOwner {
                     != required_audio_capabilities
             {
                 return Err(if format.profile >= 4 {
-                    "RECEIVER_UPDATE_REQUIRED: AOA Receiver does not advertise authenticated Float32 audio."
+                    "RECEIVER_UPDATE_REQUIRED: Receiver does not advertise authenticated Float32 audio for this transport."
                 } else {
                     "AOA Receiver does not support authenticated ANPD v2 audio."
                 }.into());
@@ -312,6 +478,7 @@ impl AoaOwner {
             worker: Some(worker),
             audio_queue: queue,
             snapshot,
+            transport,
         })
     }
 
@@ -340,7 +507,30 @@ impl AoaOwner {
         }
         self.join_worker().and(result)
     }
+    pub(crate) fn cancel_after_transport_failure(mut self) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        if snapshot.state != ReceiverState::Stopped
+            || snapshot.terminal_cause != Some(TerminalCause::TransportFailure)
+        {
+            return Err("ADB record owner has no confirmed transport failure.".into());
+        }
+        stop_queue(&self.audio_queue);
+        self.cancel.cancel_io();
+        match self
+            .worker
+            .take()
+            .ok_or_else(|| "ADB record owner worker was already joined.".to_string())?
+            .join()
+        {
+            Err(_) => Err("ADB record owner worker panicked.".into()),
+            Ok(Err(error)) if error == "AOA reader worker panicked." => Err(error),
+            Ok(_) => Ok(()),
+        }
+    }
     pub(crate) fn stop_for_restart(mut self) -> Result<(), String> {
+        if self.transport != RecordTransport::Aoa {
+            return Err("Session restart is only available for AOA Direct.".into());
+        }
         let result = self.request(|reply| OwnerCommand::Stop {
             restart: true,
             reply,
@@ -504,11 +694,12 @@ fn exchange_capabilities<W: RecordWriter>(
     cancel: &dyn CancelIo,
     keys: &SessionKeys,
     session_id: u64,
+    required_capabilities: u32,
 ) -> Result<ReceiverCapabilities, String> {
     let payload = p5c::encode_capabilities_query(
         MANAGEMENT_CONTROL_MAJOR,
         AUDIO_PROTOCOL_MAJOR,
-        REQUIRED_AOA_CAPABILITIES,
+        required_capabilities,
     );
     let query = p5c::encode_control(
         &keys.host_to_receiver_control,
@@ -560,13 +751,22 @@ fn exchange_command<W: RecordWriter>(
         RECEIVER_TO_HOST_CONTROL,
         session_id,
     )?;
-    let ack = p5c::decode_ack_with_format_ext(
+    let progress_schema = if kind == PLAYBACK_PROGRESS_QUERY {
+        payload
+            .first()
+            .copied()
+            .filter(|schema| matches!(schema, 2 | 3))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let ack = p5c::decode_ack_with_format_schema(
         &record.body,
         *ack_sequence,
         kind,
         command,
         true,
-        kind == PLAYBACK_PROGRESS_QUERY && payload == [2],
+        progress_schema,
     )?;
     *command_sequence = command
         .checked_add(1)
@@ -642,7 +842,11 @@ fn run_owner_worker<W: RecordWriter>(
         .join()
         .map_err(|_| "AOA reader worker panicked.".to_string());
     drop(keys);
-    result.and(joined)
+    match (result, joined) {
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -738,13 +942,18 @@ fn run_owner_loop<W: RecordWriter>(
             & CAP_PLAYBACK_PROGRESS
             != 0;
         if supports_progress && Instant::now() >= next_progress {
-            let supports_extended_progress = snapshot
+            let capability_bits = snapshot
                 .lock()
                 .map_err(|_| "AOA snapshot poisoned.")?
                 .capabilities
-                .capability_bits
-                & CAP_PROGRESS_EXT
-                != 0;
+                .capability_bits;
+            let progress_schema = if capability_bits & CAP_BUFFER_METRICS != 0 {
+                3
+            } else if capability_bits & CAP_PROGRESS_EXT != 0 {
+                2
+            } else {
+                0
+            };
             let ack = exchange_command(
                 writer,
                 records,
@@ -754,10 +963,12 @@ fn run_owner_loop<W: RecordWriter>(
                 &mut command_sequence,
                 &mut ack_sequence,
                 PLAYBACK_PROGRESS_QUERY,
-                if supports_extended_progress {
+                if progress_schema == 0 {
+                    &[]
+                } else if progress_schema == 2 {
                     &[2]
                 } else {
-                    &[]
+                    &[3]
                 },
             )?;
             if ack.result == RESULT_USER_STOPPED {

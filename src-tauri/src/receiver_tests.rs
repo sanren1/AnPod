@@ -416,6 +416,21 @@ impl AdbRunner for FakeAdb {
                 }
                 values
                     if values.windows(2).any(|pair| {
+                        pair[0] == "-a"
+                            && pair[1] == "app.anpod.receiver.action.START_ADB_STREAM_AUDIO"
+                    }) =>
+                {
+                    state.active = true;
+                    state.foreground = true;
+                    state.healthy = true;
+                    AdbResult {
+                        success: true,
+                        stdout: "Status: ok".into(),
+                        stderr: String::new(),
+                    }
+                }
+                values
+                    if values.windows(2).any(|pair| {
                         pair[0] == "-a" && pair[1] == "app.anpod.receiver.action.STOP"
                     }) =>
                 {
@@ -533,6 +548,10 @@ struct ArtifactFiles {
 
 impl ArtifactFiles {
     fn new() -> Self {
+        Self::with_version(1)
+    }
+
+    fn with_version(version_code: u32) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::current_dir()
@@ -555,7 +574,7 @@ impl ArtifactFiles {
         fs::write(
             &metadata,
             serde_json::json!({
-                "applicationId": PACKAGE, "versionCode": 1, "versionName": "0.1.0-p1",
+                "applicationId": PACKAGE, "versionCode": version_code, "versionName": "0.1.0-p1",
                 "sha256": digest, "signerSha256": "a".repeat(64)
             })
             .to_string(),
@@ -701,7 +720,8 @@ async fn binding_reset_requires_capability_identity_current_commitments_and_idle
         &CancellationToken::new(),
     )
     .await
-    .unwrap_err();
+    .err()
+    .expect("unknown Receiver owner must be rejected");
     assert!(unsupported.contains("不支持条件绑定重置"));
     assert!(adb.0.lock().unwrap().binding_commitment.is_some());
     assert!(binding_path.exists());
@@ -1159,7 +1179,7 @@ async fn fake_adb_normal_install_health_start_stop_flow_checks_installed_apk_eac
             .healthy
     );
     assert!(
-        !stop_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel)
+        !stop_with(&adb, SERIAL, &files.apk, &files.metadata, &cancel, None)
             .await
             .unwrap()
             .service_active
@@ -1213,6 +1233,33 @@ async fn fake_adb_normal_install_health_start_stop_flow_checks_installed_apk_eac
         "--user".into(),
         TEST_USER.into()
     ])));
+}
+
+#[tokio::test]
+async fn fake_adb_guarded_stop_refuses_unknown_or_changed_receiver_owner() {
+    let files = ArtifactFiles::new();
+    let adb = FakeAdb::new(true, files.digest.clone());
+    {
+        let mut state = adb.0.lock().unwrap();
+        state.active = true;
+        state.foreground = true;
+        state.healthy = true;
+    }
+    let error = stop_with(
+        &adb,
+        SERIAL,
+        &files.apk,
+        &files.metadata,
+        &CancellationToken::new(),
+        Some(("old-owner", 7, "anpod_adb_unique")),
+    )
+    .await
+    .err()
+    .expect("unknown Receiver owner must be rejected");
+    assert!(error.contains("owner changed"));
+    assert!(!adb.calls().iter().any(|call| call
+        .iter()
+        .any(|arg| arg == "app.anpod.receiver.action.STOP")));
 }
 
 #[tokio::test]
@@ -1555,6 +1602,173 @@ async fn fake_adb_audio_start_sends_session_handshake_and_playback_mode() {
     assert!(!audio_start
         .iter()
         .any(|arg| arg == "start-foreground-service" || arg == "startservice"));
+}
+
+#[tokio::test]
+async fn fake_adb_float_bootstrap_uses_only_public_binding_and_no_health_wait() {
+    let files = ArtifactFiles::with_version(46);
+    for (serial, transport) in [(SERIAL, "usb"), ("192.0.2.20:5555", "wifi")] {
+        let adb = FakeAdb::with_serial(true, files.digest.clone(), serial);
+        start_adb_stream_audio_with(
+            &adb,
+            serial,
+            &files.apk,
+            &files.metadata,
+            "anpod_adb_test_1",
+            "0123456789abcdef0123456789abcdef",
+            transport,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let calls = adb.calls();
+        let action = calls
+            .iter()
+            .find(|call| {
+                call.iter()
+                    .any(|arg| arg == "app.anpod.receiver.action.START_ADB_STREAM_AUDIO")
+            })
+            .unwrap();
+        assert!(action
+            .iter()
+            .any(|arg| arg == "app.anpod.receiver/.BootstrapActivity"));
+        for expected in [
+            "socketName",
+            "anpod_adb_test_1",
+            "hostId",
+            "0123456789abcdef0123456789abcdef",
+            "connectionTransport",
+            transport,
+        ] {
+            assert!(
+                action.iter().any(|arg| arg == expected),
+                "missing {expected}: {action:?}"
+            );
+        }
+        assert!(!action
+            .iter()
+            .any(|arg| arg == "connectCode" || arg == "secret" || arg == "token"));
+        assert!(!calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == HEALTH_URI)));
+    }
+}
+
+#[tokio::test]
+async fn fake_adb_float_bootstrap_requires_receiver_46_before_dispatch() {
+    let files = ArtifactFiles::with_version(45);
+    let adb = FakeAdb::new(true, files.digest.clone());
+    let error = start_adb_stream_audio_with(
+        &adb,
+        SERIAL,
+        &files.apk,
+        &files.metadata,
+        "anpod_adb_0123456789abcdef0123456789abcdef",
+        "0123456789abcdef0123456789abcdef",
+        "usb",
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("RECEIVER_UPDATE_REQUIRED"));
+    assert!(!adb.calls().iter().any(|call| {
+        call.iter()
+            .any(|arg| arg == "app.anpod.receiver.action.START_ADB_STREAM_AUDIO")
+    }));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn wireless_adb_resolves_the_unique_paired_usb_binding_across_ip_changes() {
+    use crate::security::{test_binding_material, write_test_binding_file};
+
+    let files = ArtifactFiles::new();
+    let data_dir = files.dir.join("profile");
+    let binding_dir = data_dir.join("receiver-bindings");
+    fs::create_dir_all(&binding_dir).unwrap();
+    let reference = binding_reference_for("USB-PAIRED", TEST_USER);
+    let material = test_binding_material();
+    write_test_binding_file(&binding_dir.join(format!("{reference}.dat")), &material).unwrap();
+    let usb = FakeAdb::with_serial(true, files.digest.clone(), "USB-PAIRED");
+    usb.0.lock().unwrap().binding_commitment = Some(hex_digest(&material.commitment()));
+    let (usb_reference, usb_material) = adb_binding_material_with(
+        &usb,
+        "USB-PAIRED",
+        "usb",
+        &data_dir,
+        &files.apk,
+        &files.metadata,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(usb_reference, reference);
+    assert_eq!(usb_material.commitment(), material.commitment());
+
+    for endpoint in ["192.0.2.20:5555", "192.0.2.21:5555"] {
+        let adb = FakeAdb::with_serial(true, files.digest.clone(), endpoint);
+        adb.0.lock().unwrap().binding_commitment = Some(hex_digest(&material.commitment()));
+        let (matched_reference, matched_material) = adb_binding_material_with(
+            &adb,
+            endpoint,
+            "wifi",
+            &data_dir,
+            &files.apk,
+            &files.metadata,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched_reference, reference);
+        assert_eq!(matched_material.commitment(), material.commitment());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn wireless_adb_rejects_wrong_or_ambiguous_binding_commitments() {
+    use crate::security::{test_binding_material, write_test_binding_file};
+
+    let files = ArtifactFiles::new();
+    let data_dir = files.dir.join("profile");
+    let binding_dir = data_dir.join("receiver-bindings");
+    fs::create_dir_all(&binding_dir).unwrap();
+    let material = test_binding_material();
+    let reference = binding_reference_for("USB-PAIRED", TEST_USER);
+    write_test_binding_file(&binding_dir.join(format!("{reference}.dat")), &material).unwrap();
+    let adb = FakeAdb::with_serial(true, files.digest.clone(), "192.0.2.20:5555");
+    adb.0.lock().unwrap().binding_commitment = Some("ff".repeat(32));
+    assert!(adb_binding_material_with(
+        &adb,
+        "192.0.2.20:5555",
+        "wifi",
+        &data_dir,
+        &files.apk,
+        &files.metadata,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .unwrap()
+    .contains("没有唯一匹配"));
+
+    let duplicate = binding_reference_for("USB-OTHER", TEST_USER);
+    write_test_binding_file(&binding_dir.join(format!("{duplicate}.dat")), &material).unwrap();
+    adb.0.lock().unwrap().binding_commitment = Some(hex_digest(&material.commitment()));
+    assert!(adb_binding_material_with(
+        &adb,
+        "192.0.2.20:5555",
+        "wifi",
+        &data_dir,
+        &files.apk,
+        &files.metadata,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .unwrap()
+    .contains("匹配多个"));
 }
 
 #[tokio::test]

@@ -26,6 +26,197 @@ fn aoa_vectors() -> std::collections::HashMap<String, Vec<u8>> {
     .collect()
 }
 
+/// Explicit opt-in cross-process check of the PC production record owner and the
+/// Android production ADB coordinator. Ordinary Rust and Android test runs do
+/// not start an external process or require a listening endpoint.
+#[cfg(windows)]
+#[test]
+#[ignore = "explicit offline Rust↔Android production ADB loopback integration"]
+fn adb_record_stream_production_coordinator_loopback() {
+    use crate::{
+        aoa_owner::AoaOwner, network::FloatPcmQueue, p5c::SessionAudioQueue,
+        protocol::AudioFormatV2, security::test_adb_binding_material,
+    };
+    use std::{
+        net::{Ipv4Addr, TcpListener},
+        process::{Command, Stdio},
+    };
+
+    const FLOAT_BITS: [u32; 8] = [
+        0x3f80_0000,
+        0xbf00_0000,
+        0x0000_0001,
+        0x8000_0000,
+        0x7f7f_ffff,
+        0x8000_0001,
+        0x3eaa_aaab,
+        0x0080_0000,
+    ];
+    const PACKETS: usize = 14;
+    const FRAMES_PER_PACKET: usize = 143;
+    const CYCLES: [u8; 4] = [4, 5, 4, 5];
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let gradle = repo.join("src/AnPod.Receiver/gradlew.bat");
+    assert!(gradle.is_file(), "Receiver Gradle wrapper is missing");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut child = ChildGuard::new(
+        Command::new("cmd.exe")
+            .arg("/d")
+            .arg("/c")
+            .arg(gradle)
+            .arg("--offline")
+            .arg("--no-daemon")
+            .arg(":app:testDebugUnitTest")
+            .arg("--tests")
+            .arg("app.anpod.receiver.AdbRecordStreamInteropTest")
+            .current_dir(repo.join("src/AnPod.Receiver"))
+            .env("ANPOD_ADB_LOOPBACK_PORT", port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn offline Receiver JVM loopback test"),
+    );
+
+    for (cycle, profile) in CYCLES.into_iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let stream = loop {
+            if let Some(status) = child.child_mut().try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "Receiver Gradle/JUnit exited before cycle {cycle}: {status}"
+                );
+                panic!("Receiver Gradle/JUnit exited before cycle {cycle}");
+            }
+            match listener.accept() {
+                Ok((stream, _peer)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for Android ADB loopback cycle {cycle}"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept Android ADB loopback cycle {cycle}: {error}"),
+            }
+        };
+        stream
+            .set_nodelay(true)
+            .expect("enable low-latency loopback writes");
+        let format = AudioFormatV2::for_profile(profile, 1).unwrap();
+        let queue = Arc::new(FloatPcmQueue::new(true));
+        queue.set_expected_format(format.sample_rate, 4096).unwrap();
+        let owner = AoaOwner::connect_adb_stream(
+            stream,
+            test_adb_binding_material(),
+            format,
+            SessionAudioQueue::Float32(queue.clone(), format),
+        )
+        .unwrap_or_else(|error| panic!("production ADB owner cycle {cycle}: {error}"));
+        let snapshot = owner.snapshot();
+        assert!(
+            snapshot.capabilities.compatible,
+            "ADB capabilities incompatible in cycle {cycle}"
+        );
+        assert_eq!(snapshot.capabilities.capability_bits & 0x1582, 0x1582);
+        assert_ne!(snapshot.capabilities.capability_bits & 0x2000, 0);
+        assert_eq!(snapshot.format, format);
+
+        let block: Vec<f32> = (0..FRAMES_PER_PACKET * 2)
+            .map(|sample| f32::from_bits(FLOAT_BITS[sample % FLOAT_BITS.len()]))
+            .collect();
+        for packet in 0..PACKETS {
+            let frame_index = (packet * FRAMES_PER_PACKET) as u64;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if queue.push_raw(
+                    block.as_ptr(),
+                    FRAMES_PER_PACKET as u32,
+                    format.sample_rate,
+                    2,
+                    frame_index,
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Float32 capture queue did not accept packet {packet} in cycle {cycle}"
+                );
+                thread::yield_now();
+            }
+            let expected_bytes = ((packet + 1) * FRAMES_PER_PACKET * 8) as u64;
+            let send_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let snapshot = owner.snapshot();
+                if snapshot.pcm_payload_bytes_sent >= expected_bytes {
+                    break;
+                }
+                if snapshot.state == crate::p5c::ReceiverState::Stopped {
+                    let error = format!(
+                        "ADB owner stopped before packet {packet} reached receiver in cycle {cycle}: sent={} expected={expected_bytes}, error={:?}",
+                        snapshot.pcm_payload_bytes_sent,
+                        snapshot.last_error
+                    );
+                    drop(owner);
+                    let status = child.wait_until_exit(Duration::from_secs(90));
+                    panic!("{error}; Receiver Gradle exit status: {status}");
+                }
+                if Instant::now() >= send_deadline {
+                    let error = format!(
+                        "ADB owner sent {} of {expected_bytes} raw Float32 bytes through packet {packet} in cycle {cycle}; progress={:?}, error={:?}",
+                        snapshot.pcm_payload_bytes_sent,
+                        snapshot.playback_progress,
+                        snapshot.last_error
+                    );
+                    drop(owner);
+                    let status = child.wait_until_exit(Duration::from_secs(90));
+                    panic!("{error}; Receiver Gradle exit status: {status}");
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let progress_deadline = Instant::now() + Duration::from_secs(10);
+        while !owner
+            .snapshot()
+            .playback_progress
+            .as_ref()
+            .is_some_and(|progress| progress.progress_schema == Some(3))
+        {
+            assert!(
+                Instant::now() < progress_deadline,
+                "ADB owner did not parse schema3 progress in cycle {cycle}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        owner
+            .pause()
+            .unwrap_or_else(|error| panic!("P5-C PAUSE cycle {cycle}: {error}"));
+        owner
+            .resume()
+            .unwrap_or_else(|error| panic!("P5-C RESUME cycle {cycle}: {error}"));
+        owner
+            .stop()
+            .unwrap_or_else(|error| panic!("P5-C STOP cycle {cycle}: {error}"));
+        queue.stop_and_clear();
+    }
+
+    let status_deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(status) = child.child_mut().try_wait().unwrap() {
+            assert!(status.success(), "Receiver Gradle/JUnit failed: {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < status_deadline,
+            "Receiver Gradle/JUnit did not finish"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn aoa_p5c_control_vectors_match_existing_encoder_for_all_profiles() {
     let vectors = aoa_vectors();
@@ -507,7 +698,7 @@ fn playback_progress_extension_schema_two_decodes_metrics_and_unknowns() {
     extension[22..30].copy_from_slice(&480_000u64.to_be_bytes());
     extension[30..38].copy_from_slice(&7u64.to_be_bytes());
     extension[118..122].copy_from_slice(&12u32.to_be_bytes());
-    let progress = decode_playback_progress_with_format(&payload, true, true).unwrap();
+    let progress = decode_playback_progress_with_format(&payload, true, 2).unwrap();
     assert_eq!(progress.progress_schema, Some(2));
     assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
     assert_eq!(progress.receiver_generation, Some(9));
@@ -520,10 +711,45 @@ fn playback_progress_extension_schema_two_decodes_metrics_and_unknowns() {
     assert_eq!(progress.stream_pending_frames, None);
 
     payload[78] = 1;
-    assert!(decode_playback_progress_with_format(&payload, true, true).is_err());
+    assert!(decode_playback_progress_with_format(&payload, true, 2).is_err());
     payload[78] = 2;
     payload[78 + 21] = 3;
-    assert!(decode_playback_progress_with_format(&payload, true, true).is_err());
+    assert!(decode_playback_progress_with_format(&payload, true, 2).is_err());
+}
+
+#[test]
+fn playback_progress_extension_schema_three_preserves_signed_drift_and_unknowns() {
+    let mut payload = vec![0xff; 78 + 143];
+    payload[45] = 1;
+    payload[70] = 1;
+    payload[71] = 3;
+    payload[72] = 2;
+    payload[73] = 0;
+    payload[74..78].copy_from_slice(&48_000u32.to_be_bytes());
+    payload[78] = 3;
+    payload[78 + 21] = 0;
+    payload[78 + 126..78 + 130].copy_from_slice(&1_920u32.to_be_bytes());
+    payload[78 + 130..78 + 134].copy_from_slice(&2_000u32.to_be_bytes());
+    payload[78 + 134..78 + 138].copy_from_slice(&(-80i32).to_be_bytes());
+    payload[78 + 138..78 + 142].copy_from_slice(&(-250i32).to_be_bytes());
+    payload[78 + 142] = 8;
+
+    let progress = decode_playback_progress_with_format(&payload, true, 3).unwrap();
+    assert_eq!(progress.progress_schema, Some(3));
+    assert_eq!(progress.drift_target_frames, Some(1_920));
+    assert_eq!(progress.drift_observed_frames, Some(2_000));
+    assert_eq!(progress.drift_error_frames, Some(-80));
+    assert_eq!(progress.drift_correction_ppm, Some(-250));
+    assert_eq!(progress.drift_reset_reason, Some(8));
+
+    payload[78 + 134..78 + 138].copy_from_slice(&i32::MIN.to_be_bytes());
+    payload[78 + 138..78 + 142].copy_from_slice(&i32::MIN.to_be_bytes());
+    payload[78 + 142] = 0;
+    let unknown = decode_playback_progress_with_format(&payload, true, 3).unwrap();
+    assert_eq!(unknown.drift_error_frames, None);
+    assert_eq!(unknown.drift_correction_ppm, None);
+    assert_eq!(unknown.drift_reset_reason, None);
+    assert!(decode_playback_progress_with_format(&payload[..payload.len() - 1], true, 3).is_err());
 }
 use crate::security::{
     test_binding_material, test_binding_material_with_wrong_identity,
@@ -573,6 +799,21 @@ impl ChildGuard {
     }
     fn finish(mut self, stdout: BufReader<std::process::ChildStdout>) -> String {
         finish_endpoint(self.0.take().expect("guarded child"), stdout)
+    }
+    fn wait_until_exit(mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let child = self.0.as_mut().expect("guarded child");
+            if let Some(status) = child.try_wait().expect("poll guarded child") {
+                self.0.take();
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "guarded child did not exit after failure"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1270,6 +1511,7 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
     );
 
     let (child, stdout, advertised_peer) = spawn_discoverable_endpoint(&classes);
+    let child = ChildGuard::new(child);
     let malformed_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     malformed_sender
         .send_to(
@@ -1314,7 +1556,7 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
     assert_eq!(capabilities.audio_major, 1);
     assert_eq!(
         capabilities.capability_bits,
-        3 | CAP_PLAYBACK_PROGRESS | CAP_PROGRESS_EXT | CAP_TERMINAL_CAUSE
+        3 | CAP_PLAYBACK_PROGRESS | CAP_PROGRESS_EXT | CAP_TERMINAL_CAUSE | CAP_BUFFER_METRICS
     );
     assert_eq!(
         capabilities.version_code, 0,
@@ -1332,11 +1574,16 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
         "fixture reports unknown instead of inventing metrics"
     );
     assert_eq!(progress.playback_advancing, None);
-    assert_eq!(progress.progress_schema, Some(2));
+    assert_eq!(progress.progress_schema, Some(3));
     assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
     assert_eq!(progress.receiver_generation, Some(77));
     assert_eq!(progress.ingress_audio_frames, Some(480_000));
     assert_eq!(progress.queue_dropped_frames, Some(7));
+    assert_eq!(progress.drift_target_frames, Some(1_920));
+    assert_eq!(progress.drift_observed_frames, Some(2_000));
+    assert_eq!(progress.drift_error_frames, Some(-80));
+    assert_eq!(progress.drift_correction_ppm, Some(-250));
+    assert_eq!(progress.drift_reset_reason, Some(8));
     host.resend_last_for_test().unwrap();
     host.send_old_audio_for_test().unwrap();
     thread::sleep(Duration::from_millis(100));
@@ -1376,7 +1623,7 @@ fn java_receiver_and_rust_sender_share_authenticated_session_and_cleanup() {
     );
     assert_eq!(host.state(), ReceiverState::Stopped);
     drop(host);
-    let result = finish_endpoint(child, stdout);
+    let result = child.finish(stdout);
     let fields: Vec<_> = result.split(',').collect();
     assert_eq!(fields.len(), 8, "unexpected merged P5-C result: {result}");
     assert_eq!(fields[0], "");
@@ -3566,13 +3813,18 @@ fn float32_profiles_authenticate_udp_and_preserve_sample_bits() {
         session.select_mode().unwrap();
         session.start().unwrap();
         let progress = session.playback_progress().unwrap().unwrap();
-        assert_eq!(progress.progress_schema, Some(2));
+        assert_eq!(progress.progress_schema, Some(3));
         assert_eq!(progress.progress_monotonic_nanos, Some(1_234));
         assert_eq!(progress.receiver_generation, Some(77));
         assert_eq!(progress.output_epoch, Some(4));
         assert_eq!(progress.output_engine, Some(2));
         assert_eq!(progress.ingress_audio_frames, Some(480_000));
         assert_eq!(progress.queue_dropped_frames, Some(7));
+        assert_eq!(progress.drift_target_frames, Some(1_920));
+        assert_eq!(progress.drift_observed_frames, Some(2_000));
+        assert_eq!(progress.drift_error_frames, Some(-80));
+        assert_eq!(progress.drift_correction_ppm, Some(-250));
+        assert_eq!(progress.drift_reset_reason, Some(8));
 
         let samples = [
             1.0 / 8_388_608.0,
