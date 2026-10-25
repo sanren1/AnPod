@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn authenticated_quality_profiles_and_snapshot_format_precedence() {
+    assert_eq!(audio_quality_profile("standard"), Some(1));
+    assert_eq!(audio_quality_profile("hifi"), Some(4));
+    assert_eq!(audio_quality_profile("hires"), Some(5));
+
+    let diagnostics = PlaybackDiagnostics {
+        sample_rate: Some(48_000),
+        channels: Some(2),
+        ..Default::default()
+    };
+    let float = NegotiatedAudioFormat {
+        codec_version: 2,
+        sample_format: "float32le".into(),
+        sample_rate_hz: 48_000,
+        channels: 2,
+        valid_bits_per_sample: 32,
+        bytes_per_sample: 4,
+        frame_bytes: 8,
+    };
+    let standard_v2 = NegotiatedAudioFormat {
+        codec_version: 2,
+        sample_format: "pcm16le".into(),
+        sample_rate_hz: 48_000,
+        channels: 2,
+        valid_bits_per_sample: 16,
+        bytes_per_sample: 2,
+        frame_bytes: 4,
+    };
+    let selected =
+        snapshot_negotiated_audio_format(true, "phone", Some(&diagnostics), Some(&standard_v2))
+            .unwrap();
+    assert_eq!(selected.codec_version, 2);
+    assert_eq!(selected.sample_format, "pcm16le");
+    let selected =
+        snapshot_negotiated_audio_format(true, "phone", Some(&diagnostics), Some(&float)).unwrap();
+    assert_eq!(selected.sample_format, "float32le");
+    assert_eq!(selected.codec_version, 2);
+    let pcm24 = NegotiatedAudioFormat {
+        codec_version: 2,
+        sample_format: "pcm24le".into(),
+        valid_bits_per_sample: 24,
+        bytes_per_sample: 3,
+        frame_bytes: 6,
+        ..float.clone()
+    };
+    let selected =
+        snapshot_negotiated_audio_format(true, "phone", Some(&diagnostics), Some(&pcm24)).unwrap();
+    assert_eq!(selected.sample_format, "pcm24le");
+    assert_eq!(selected.valid_bits_per_sample, 24);
+    let fallback = snapshot_negotiated_audio_format(true, "phone", Some(&diagnostics), None)
+        .expect("legacy 48 kHz stereo should infer PCM16");
+    assert_eq!(fallback.sample_format, "pcm16le");
+    assert!(
+        snapshot_negotiated_audio_format(true, "computer", Some(&diagnostics), Some(&float))
+            .is_none()
+    );
+
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.session_active = true;
+        view.output = "phone".into();
+        view.playback_diagnostics = Some(diagnostics);
+        view.negotiated_audio_format = Some(standard_v2);
+    }
+    let actual = state.snapshot().negotiated_audio_format.unwrap();
+    assert_eq!(actual.codec_version, 2);
+    assert_eq!(actual.sample_format, "pcm16le");
+}
+
+#[test]
 fn diagnostics_sample_requires_matching_session_generation() {
     assert!(diagnostics_generation_is_consistent(Some(4), Some(4)));
     assert!(!diagnostics_generation_is_consistent(Some(4), Some(5)));

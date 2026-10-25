@@ -799,6 +799,15 @@ pub(crate) fn validate_audio_quality(value: &str) -> Result<(), String> {
     }
 }
 
+pub(crate) fn audio_quality_profile(value: &str) -> Option<u8> {
+    match value {
+        "standard" => Some(1),
+        "hifi" => Some(4),
+        "hires" => Some(5),
+        _ => None,
+    }
+}
+
 pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.schema_version = 1;
     settings.preferred_transport = match settings.preferred_transport.to_ascii_lowercase().as_str()

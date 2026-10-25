@@ -276,6 +276,20 @@ fn negotiated_audio_format(
         })
 }
 
+fn snapshot_negotiated_audio_format(
+    session_active: bool,
+    output: &str,
+    diagnostics: Option<&PlaybackDiagnostics>,
+    negotiated: Option<&NegotiatedAudioFormat>,
+) -> Option<NegotiatedAudioFormat> {
+    if !session_active || output != "phone" {
+        return None;
+    }
+    negotiated
+        .cloned()
+        .or_else(|| negotiated_audio_format(true, output, diagnostics))
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
@@ -851,7 +865,8 @@ impl AppState {
             self.audio.initialize()?;
             let playback_mode = if self.view.lock().expect("view lock").settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 };
             let (capture_format, profile, initial_float_queue, mut mix_format) = if audio_quality != "standard" {
-                let profile_id = if audio_quality == "hifi" { 4 } else { 5 };
+                let profile_id = audio_quality_profile(&audio_quality)
+                    .ok_or_else(|| "Invalid audio quality; select Standard, HiFi, or Hi-Res.".to_string())?;
                 let format = AudioFormatV2::for_profile(profile_id, playback_mode)
                     .map_err(|_| "Unable to construct the authenticated Float32 format.".to_string())?;
                 let native = self.audio.probe_float_format()?;
@@ -1272,16 +1287,12 @@ impl AppState {
                 .map(str::to_owned),
             session_capabilities: view.session_capabilities.clone(),
             playback_diagnostics: view.playback_diagnostics.clone(),
-            negotiated_audio_format: (view.session_active && view.output == "phone")
-                .then(|| {
-                    negotiated_audio_format(
-                        view.session_active,
-                        &view.output,
-                        view.playback_diagnostics.as_ref(),
-                    )
-                    .or_else(|| view.negotiated_audio_format.clone())
-                })
-                .flatten(),
+            negotiated_audio_format: snapshot_negotiated_audio_format(
+                view.session_active,
+                &view.output,
+                view.playback_diagnostics.as_ref(),
+                view.negotiated_audio_format.as_ref(),
+            ),
             windows_mix_format: (view.session_active && view.output == "phone")
                 .then(|| view.windows_mix_format.clone())
                 .flatten(),
@@ -1832,12 +1843,8 @@ impl AppState {
             } else {
                 0
             };
-            let profile = match settings.audio_quality.as_str() {
-                "standard" => 1,
-                "hifi" => 2,
-                "hires" => 3,
-                _ => return Err("所选音质不可用。".into()),
-            };
+            let profile = audio_quality_profile(&settings.audio_quality)
+                .ok_or_else(|| "所选音质不可用。".to_string())?;
             let format = AudioFormatV2::for_profile(profile, mode)
                 .map_err(|_| "无法建立所选 USB Direct 音频格式。".to_string())?;
             let (owner, queue, mix_format) = self
@@ -4355,12 +4362,8 @@ impl AppState {
                         .settings
                         .audio_quality
                         .clone();
-                    let expected_profile = match quality.as_str() {
-                        "standard" => 1,
-                        "hifi" => 2,
-                        "hires" => 3,
-                        _ => return Err("所选音质不可用。".into()),
-                    };
+                    let expected_profile = audio_quality_profile(&quality)
+                        .ok_or_else(|| "所选音质不可用。".to_string())?;
                     if snapshot.format.profile != expected_profile {
                         return Err(
                             "USB Direct 会话格式与当前音质设置不符；请断开后重新连接。".into()
