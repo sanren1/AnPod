@@ -11,6 +11,8 @@ import static org.junit.Assert.assertTrue;
 import android.content.Intent;
 import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
 import android.os.Looper;
 import android.media.AudioManager;
 import android.media.AudioFormat;
@@ -64,6 +66,77 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     private static final AtomicBoolean MISMATCH_TRACK_RELEASED = new AtomicBoolean();
+    private static final AtomicReference<String> ADB_BOOTSTRAP_SOCKET = new AtomicReference<>();
+
+    @Implements(LocalSocket.class)
+    public static final class AdbBootstrapSocketShadow {
+        @Implementation
+        protected void connect(LocalSocketAddress address) throws IOException {
+            ADB_BOOTSTRAP_SOCKET.set(address.getName());
+            throw new IOException("AdbBootstrapReachedSocket");
+        }
+    }
+
+    @Test
+    @Config(sdk = 34, shadows = {FloatWriteShadow.class, AdbBootstrapSocketShadow.class})
+    public void adbStreamServiceBootstrapAcceptsSavedHighBitHostId() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        byte[] hostId = hexBytes("007f80ff102030405060708090a0b0c0");
+        byte[] receiverId = new byte[16];
+        byte[] secret = new byte[32];
+        java.util.Arrays.fill(receiverId, (byte) 2);
+        java.util.Arrays.fill(secret, (byte) 3);
+        PairingProtocol.BindingMaterial binding = new PairingProtocol.BindingMaterial(hostId, receiverId, secret);
+        byte[] expectedRecord = binding.encodedRecord();
+        java.io.File isolatedFiles = new java.io.File(service.getCacheDir(),
+                "adb-bootstrap-binding-test-" + java.util.UUID.randomUUID());
+        assertTrue(isolatedFiles.mkdirs());
+        android.content.Context base = org.robolectric.util.ReflectionHelpers.getField(service, "mBase");
+        org.robolectric.util.ReflectionHelpers.setField(service, "mBase",
+                new android.content.ContextWrapper(base) {
+                    @Override public java.io.File getFilesDir() { return isolatedFiles; }
+                });
+        BindingStore store = new BindingStore(isolatedFiles);
+        ADB_BOOTSTRAP_SOCKET.set(null);
+        try {
+            try (java.io.FileOutputStream output = new java.io.FileOutputStream(
+                    new java.io.File(isolatedFiles, "anpod-binding-v1.bin"))) {
+                output.write(expectedRecord);
+            }
+            assertEquals("saved", store.status().state);
+            Intent start = new Intent(service, ReceiverService.class)
+                    .setAction(BootstrapActivity.ACTION_START_ADB_STREAM_AUDIO)
+                    .putExtra("socketName", "anpod_adb_missing_test_listener")
+                    .putExtra("hostId", "007f80ff102030405060708090a0b0c0")
+                    .putExtra("connectionTransport", "usb");
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(start, 0, 1));
+            Thread bootstrap = org.robolectric.util.ReflectionHelpers.getField(service, "adbStreamBootstrapThread");
+            assertNotNull(bootstrap);
+            bootstrap.join(5_000);
+            assertFalse("bootstrap should leave the authentication guard and reach LocalSocket connect",
+                    bootstrap.isAlive());
+            Shadows.shadowOf(Looper.getMainLooper()).idle();
+            assertFalse("matching saved host ID must not fail the production bootstrap guard",
+                    "AdbHostBindingMismatch".equals(service.uiOperation.error()));
+            assertTrue("unexpected bootstrap result: " + service.uiOperation.error(),
+                    service.uiOperation.error().contains("AdbBootstrapReachedSocket"));
+            assertEquals("anpod_adb_missing_test_listener", ADB_BOOTSTRAP_SOCKET.get());
+            try (PairingProtocol.BindingMaterial stored = store.load()) {
+                byte[] actualRecord = stored.encodedRecord();
+                try { assertArrayEquals(expectedRecord, actualRecord); }
+                finally { java.util.Arrays.fill(actualRecord, (byte) 0); }
+            }
+        } finally {
+            service.onDestroy();
+            binding.close();
+            java.util.Arrays.fill(expectedRecord, (byte) 0);
+            java.util.Arrays.fill(hostId, (byte) 0);
+            java.util.Arrays.fill(receiverId, (byte) 0);
+            java.util.Arrays.fill(secret, (byte) 0);
+            deleteTree(isolatedFiles);
+            ADB_BOOTSTRAP_SOCKET.set(null);
+        }
+    }
 
     private static final class FakeOboeCalls implements OboeNativeBridge.NativeCalls {
         int openCalls, startCalls, closeCalls, closeFailures;
@@ -1703,6 +1776,22 @@ public final class ReceiverServiceRobolectricTest {
 
     private static UiSnapshot invokeSnapshot(ReceiverService service) {
         return service.uiState.snapshot();
+    }
+
+    private static byte[] hexBytes(String value) {
+        byte[] bytes = new byte[value.length() / 2];
+        for (int index = 0; index < bytes.length; index++)
+            bytes[index] = (byte) Integer.parseInt(value.substring(index * 2, index * 2 + 2), 16);
+        return bytes;
+    }
+
+    private static void deleteTree(java.io.File directory) {
+        java.io.File[] children = directory.listFiles();
+        if (children != null) for (java.io.File child : children) {
+            if (child.isDirectory()) deleteTree(child);
+            else assertTrue(child.delete());
+        }
+        assertTrue(directory.delete());
     }
 
     private static void resetWaveformForTest() throws Exception {

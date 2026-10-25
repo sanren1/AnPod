@@ -85,6 +85,32 @@ public class AoaReceiverCoordinatorTest {
         }
     }
 
+    @Test public void adbBootstrapHostIdMatchesSavedBytesAcrossSignedByteRange() throws Exception {
+        byte[] hostId = new byte[16];
+        byte[] receiverId = filled(16, 2);
+        byte[] secret = filled(32, 3);
+        try {
+            for (int value = 0; value <= 0xff; value++) {
+                Arrays.fill(hostId, (byte) value);
+                String candidate = encodeHex(hostId);
+                try (PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(
+                        hostId, receiverId, secret)) {
+                    assertTrue(String.format("byte 0x%02x must match its saved representation", value),
+                            saved.hostIdMatchesHex(candidate));
+                    assertFalse(saved.hostIdMatchesHex(candidate.substring(0, candidate.length() - 2)
+                            + String.format(java.util.Locale.ROOT, "%02x", value ^ 1)));
+                    assertFalse(saved.hostIdMatchesHex(candidate.substring(0, candidate.length() - 2) + "0A"));
+                    assertFalse(saved.hostIdMatchesHex(candidate.substring(2)));
+                    assertFalse(saved.hostIdMatchesHex(null));
+                }
+            }
+        } finally {
+            Arrays.fill(hostId, (byte) 0);
+            Arrays.fill(receiverId, (byte) 0);
+            Arrays.fill(secret, (byte) 0);
+        }
+    }
+
     @Test public void noHelloTimesOutAndReleasesTheSingleConnectionOwner() throws Exception {
         PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(
                 sequence(0x10, 16), sequence(0x20, 16), sequence(0, 32));
@@ -314,6 +340,16 @@ public class AoaReceiverCoordinatorTest {
         for (int index = 0; index < output.length; index++)
             output[index] = (byte) Integer.parseInt(value.substring(index * 2, index * 2 + 2), 16);
         return output;
+    }
+
+    private static String encodeHex(byte[] value) {
+        char[] digits = "0123456789abcdef".toCharArray();
+        char[] output = new char[value.length * 2];
+        for (int index = 0; index < value.length; index++) {
+            output[index * 2] = digits[(value[index] >>> 4) & 0x0f];
+            output[index * 2 + 1] = digits[value[index] & 0x0f];
+        }
+        return new String(output);
     }
 
     private static final class Endpoint implements AoaReceiverCoordinator.PlaybackEndpoint {

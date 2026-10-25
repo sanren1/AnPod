@@ -58,7 +58,7 @@ final class PairingProtocol {
                 int high = lowerHex(candidate.charAt(index * 2));
                 int low = lowerHex(candidate.charAt(index * 2 + 1));
                 if (high < 0 || low < 0) return false;
-                difference |= hostId[index] ^ ((high << 4) | low);
+                difference |= (hostId[index] & 0xff) ^ ((high << 4) | low);
             }
             return difference == 0;
         }

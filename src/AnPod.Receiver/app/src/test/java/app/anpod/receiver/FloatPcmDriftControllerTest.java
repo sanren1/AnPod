@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.anpod.server.FloatPcmDriftController;
@@ -71,6 +72,22 @@ public final class FloatPcmDriftControllerTest {
         assertEquals(10, queue.readFrames(new float[40], 0, 20));
         assertEquals(5, queue.concealedFrames());
         assertEquals(20, queue.initialTargetFrames());
+    }
+
+    @Test public void initialPlaybackTrimsOnlyTheOldestFramesToEachModeTarget() throws Exception {
+        assertStartupTrim(false, 140);
+        assertStartupTrim(true, 55);
+
+        FloatPcmFrameQueue queue = new FloatPcmFrameQueue(1_000, false, 40);
+        assertTrue(queue.offer(0, indexedStereoFrames(0, 20), 20));
+        assertTrue(queue.offer(40, indexedStereoFrames(40, 40), 40));
+        float[] firstRead = new float[80];
+        assertEquals(40, queue.readFrames(firstRead, 0, 40));
+        assertEquals(20, queue.droppedFrames());
+        assertEquals(0, queue.concealedFrames());
+        assertEquals(80, queue.playoutFrame());
+        assertEquals(43f, firstRead[FloatPcmFrameQueue.FADE_MS * 2], 0f);
+        queue.stop();
     }
 
     @Test public void sustainedPositiveAndNegativeWaterlineErrorsCorrectInTheRightDirection() {
@@ -179,6 +196,48 @@ public final class FloatPcmDriftControllerTest {
         thread.setDaemon(true);
         thread.start();
         return read;
+    }
+
+    private static void assertStartupTrim(boolean lowLatency, int queuedFrames) throws Exception {
+        FloatPcmFrameQueue queue = new FloatPcmFrameQueue(1_000, lowLatency, queuedFrames);
+        int targetFrames = queue.initialTargetFrames();
+        float[] source = indexedStereoFrames(0, queuedFrames);
+        assertTrue(queue.offer(0, source, queuedFrames));
+
+        float[] firstRead = new float[targetFrames * 2];
+        assertEquals(targetFrames, queue.readFrames(firstRead, 0, targetFrames));
+        assertEquals(queuedFrames - targetFrames, queue.droppedFrames());
+        assertEquals(0, queue.expiredFrames());
+        assertEquals(0, queue.queuedFrames());
+        assertEquals(queuedFrames, queue.playoutFrame());
+        assertEquals(0f, firstRead[0], 0f);
+        int firstUnfadedFrame = FloatPcmFrameQueue.FADE_MS;
+        assertEquals(queuedFrames - targetFrames + firstUnfadedFrame,
+                firstRead[firstUnfadedFrame * 2], 0f);
+        assertEquals(-(queuedFrames - targetFrames + firstUnfadedFrame),
+                firstRead[firstUnfadedFrame * 2 + 1], 0f);
+        assertFalse(queue.offer(0, indexedStereoFrames(0, 1), 1));
+        queue.stop();
+    }
+
+    private static float[] indexedStereoFrames(int firstFrame, int frameCount) {
+        float[] samples = new float[frameCount * 2];
+        for (int frame = 0; frame < frameCount; frame++) {
+            samples[frame * 2] = firstFrame + frame;
+            samples[frame * 2 + 1] = -(firstFrame + frame);
+        }
+        return samples;
+    }
+
+    @Test public void startupTrimDoesNotRunOnAnAlreadyStartedQueue() throws Exception {
+        FloatPcmFrameQueue queue = new FloatPcmFrameQueue(1_000, false, 100);
+        assertTrue(queue.offer(0, indexedStereoFrames(0, 40), 40));
+        assertEquals(40, queue.readFrames(new float[80], 0, 40));
+        assertTrue(queue.offer(40, indexedStereoFrames(40, 55), 55));
+        assertEquals(5, queue.readFrames(new float[10], 0, 5));
+        assertEquals(0, queue.droppedFrames());
+        assertEquals(50, queue.queuedFrames());
+        queue.stop();
     }
 
     private static float[] stereoFrames(int frames) { return new float[frames * 2]; }

@@ -1,5 +1,7 @@
 package app.anpod.receiver;
 
+import com.anpod.server.FloatPcmFrameQueue;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -109,11 +111,25 @@ public final class AdbRecordStreamInteropTest {
             context.set(next);
             Thread verifier = new Thread(() -> {
                 try {
-                    float[] decoded = new float[20];
-                    int frames = next.floatQueue.readFrames(decoded, 0, 10);
-                    assertEquals(10, frames);
-                    for (int sample = 0; sample < decoded.length; sample++)
-                        assertEquals(FLOAT_BITS[sample % FLOAT_BITS.length], Float.floatToRawIntBits(decoded[sample]));
+                    int fadeFrames = Math.max(1,
+                            next.formatV2.sampleRate * FloatPcmFrameQueue.FADE_MS / 1000);
+                    int framesToRead = fadeFrames + 10;
+                    float[] decoded = new float[framesToRead * 2];
+                    int framesRead = 0;
+                    while (framesRead < framesToRead) {
+                        framesRead += next.floatQueue.readFrames(
+                                decoded, framesRead, framesToRead - framesRead);
+                    }
+                    long droppedFrames = next.floatQueue.droppedFrames();
+                    int firstVerifiedFrame = (int) ((droppedFrames + fadeFrames) % FRAMES_PER_PACKET);
+                    for (int frame = 0; frame < 10; frame++) {
+                        int packetSample = (firstVerifiedFrame + frame) * 2;
+                        for (int channel = 0; channel < 2; channel++) {
+                            int sample = fadeFrames * 2 + frame * 2 + channel;
+                            assertEquals(FLOAT_BITS[(packetSample + channel) % FLOAT_BITS.length],
+                                    Float.floatToRawIntBits(decoded[sample]));
+                        }
+                    }
                 } catch (Throwable failure) {
                     verificationFailure.set(failure);
                 } finally {

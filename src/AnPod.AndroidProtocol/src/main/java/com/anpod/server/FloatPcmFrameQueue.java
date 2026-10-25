@@ -163,6 +163,7 @@ public final class FloatPcmFrameQueue {
                 wait();
                 continue;
             }
+            if (!started && queuedFrames > initialTargetFrames) trimStartupExcess();
             int frames = poll(destination, destinationFrameOffset, maxFrames);
             if (frames > 0) {
                 started = true;
@@ -366,6 +367,27 @@ public final class FloatPcmFrameQueue {
             queuedFrames -= packet.frameCount - packet.offsetFrames;
             droppedFrames += packet.frameCount - packet.offsetFrames;
         }
+    }
+
+    private void trimStartupExcess() {
+        int excessFrames = queuedFrames - initialTargetFrames;
+        while (excessFrames > 0) {
+            Packet packet = packets.get(0);
+            int remainingFrames = packet.frameCount - packet.offsetFrames;
+            int discardedFrames = Math.min(excessFrames, remainingFrames);
+            packet.offsetFrames += discardedFrames;
+            queuedFrames -= discardedFrames;
+            droppedFrames += discardedFrames;
+            excessFrames -= discardedFrames;
+            if (packet.offsetFrames == packet.frameCount) packets.remove(0);
+        }
+        Packet first = packets.get(0);
+        playoutFrame = first.frameIndex + first.offsetFrames;
+        hasAdvanced = true;
+        fadeNext = true;
+        fadeInProgressFrames = 0;
+        hasLastFrame = false;
+        plcFrames = 0;
     }
 
     private void expireStalePackets(long nowNanos) {
