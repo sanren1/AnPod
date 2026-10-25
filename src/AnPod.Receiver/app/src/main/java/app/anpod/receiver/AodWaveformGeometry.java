@@ -15,6 +15,18 @@ final class AodWaveformGeometry {
 
     private AodWaveformGeometry() {}
 
+    static float clockBottom(float screenHeight, float baseClockHeight, float footerTop,
+                             float maximumDrift, float clearance, float waveformReserveCap) {
+        float waveformReserve = Math.min(screenHeight * 0.32f, waveformReserveCap);
+        float defaultBottom = screenHeight * 0.10f + baseClockHeight;
+        float latestBottom = footerTop - 2f * (maximumDrift + clearance) - waveformReserve;
+        return Math.min(defaultBottom, latestBottom);
+    }
+
+    static float clockOffsetY(float clockBottom, float clockTopPadding, float clockHeight) {
+        return clockBottom - clockTopPadding - clockHeight;
+    }
+
     static Layout layout(float clockBottom, float footerTop,
                          float maximumDrift, float clearance) {
         float center = (clockBottom + footerTop) / 2f;

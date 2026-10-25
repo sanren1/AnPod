@@ -1,6 +1,7 @@
 package app.anpod.receiver
 
 import android.content.SharedPreferences
+import androidx.compose.ui.unit.IntSize
 
 internal data class AodDisplaySettings(
     val clockScale: Int = DEFAULT_CLOCK_SCALE,
@@ -33,22 +34,28 @@ internal data class AodDisplaySettings(
         private const val KEY_UNDERRUNS = "aod_show_underruns"
         private const val KEY_OUTPUT_ENGINE = "aod_show_output_engine"
 
-        fun clockSizeSp(
-            baseSizeSp: Float,
-            naturalWidthAtBasePx: Float,
-            naturalHeightAtBasePx: Float,
-            availableWidthPx: Float,
-            availableHeightPx: Float,
-            scalePercent: Int
+        fun fitClockSizeSp(
+            requestedSizeSp: Float,
+            availableWidthPx: Int,
+            availableHeightPx: Int,
+            measure: (Float) -> IntSize
         ): Float {
-            val scale = scalePercent / 100f
-            val widthScale = if (naturalWidthAtBasePx <= 0f)
-                1f
-                else minOf(1f, availableWidthPx / (naturalWidthAtBasePx * scale))
-            val heightScale = if (naturalHeightAtBasePx <= 0f)
-                1f
-                else minOf(1f, availableHeightPx / (naturalHeightAtBasePx * scale))
-            return baseSizeSp * scale * minOf(widthScale, heightScale)
+            if (measure(requestedSizeSp).let {
+                    it.width <= availableWidthPx && it.height <= availableHeightPx
+                }) return requestedSizeSp
+
+            var lower = 0f
+            var upper = requestedSizeSp
+            repeat(10) {
+                val candidate = (lower + upper) / 2f
+                val size = measure(candidate)
+                if (size.width <= availableWidthPx && size.height <= availableHeightPx) {
+                    lower = candidate
+                } else {
+                    upper = candidate
+                }
+            }
+            return lower
         }
 
         fun read(preferences: SharedPreferences) = AodDisplaySettings(

@@ -131,6 +131,26 @@ public final class PcmWaveformTapTest {
     }
 
     @Test
+    public void waveformReserveKeepsShortScreenLayoutUsable() {
+        for (float screenHeight : new float[] {240f, 320f, 400f}) {
+            float footerTop = screenHeight * 0.88f;
+            float baseClockHeight = Math.max(96f, Math.min(184f, screenHeight * 0.40f));
+            float clockBottom = AodWaveformGeometry.clockBottom(
+                    screenHeight, baseClockHeight, footerTop, 9f, 4f, 64f);
+            AodWaveformGeometry.Layout layout = AodWaveformGeometry.layout(clockBottom, footerTop, 9f, 4f);
+            assertTrue("screen height " + screenHeight, layout.regionHeight > 0f);
+        }
+
+        float screenHeight = 200f;
+        float footerTop = screenHeight * 0.88f;
+        float clockBottom = AodWaveformGeometry.clockBottom(screenHeight, 96f, footerTop, 9f, 4f, 64f);
+        AodWaveformGeometry.Layout bold = AodWaveformGeometry.layout(clockBottom, footerTop, 9f, 4f);
+        float boldPeakPlusGlowAndClearance = bold.maximumAmplitude +
+                AodWaveformGeometry.GLOW_STROKE_WIDTH + 4f;
+        assertTrue(boldPeakPlusGlowAndClearance <= bold.regionHeight / 2f);
+    }
+
+    @Test
     public void carrierDriftStaysSlowEnoughPerFrame() {
         float[] history = new float[PcmWaveformTap.POINTS];
         java.util.Arrays.fill(history, 0.5f);

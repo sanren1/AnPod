@@ -85,6 +85,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -247,55 +248,74 @@ private fun AodVisualLayout(
     ) {
         val baseClockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
         val density = LocalDensity.current
-        val clockMeasurement = rememberTextMeasurer().measure(
-            AnnotatedString(clockText),
-            style = TextStyle(fontFamily = RubikClock, fontWeight = FontWeight.Black,
-                fontSize = baseClockSize.sp, letterSpacing = (-5).sp),
-            maxLines = 1,
-            softWrap = false
-        )
+        val textMeasurer = rememberTextMeasurer()
+        val clockBaseStyle = TextStyle(fontFamily = RubikClock, fontWeight = FontWeight.Black,
+            fontSize = baseClockSize.sp, letterSpacing = (-5).sp)
         val screenHeightPx = with(density) { maxHeight.toPx() }
         val clearancePx = with(density) { 4.dp.toPx() }
-        var clockTopPx by remember { mutableStateOf(Float.NaN) }
-        var clockBottomPx by remember { mutableStateOf(Float.NaN) }
         var footerTopPx by remember { mutableStateOf(Float.NaN) }
-        val clockTop = if (clockTopPx.isFinite()) clockTopPx else screenHeightPx * 0.10f
         val footerTop = if (footerTopPx.isFinite()) footerTopPx else screenHeightPx * 0.88f
-        val clockSize = AodDisplaySettings.clockSizeSp(
-            baseClockSize,
-            clockMeasurement.size.width.toFloat(),
-            clockMeasurement.size.height.toFloat(),
-            with(density) { (maxWidth * 0.92f).toPx() },
-            (footerTop - clockTop - clearancePx).coerceAtLeast(0f),
-            settings.clockScale
-        )
+        val maximumDriftY = with(density) { AodDrift.MAX_Y_DP.dp.toPx() }
+        val clockTopPaddingPx = screenHeightPx * 0.10f
+        val (clockBottomPx, clockSize, clockHeightPx) = remember(
+            textMeasurer, clockBaseStyle, density.density, density.fontScale, maxWidth, maxHeight,
+            footerTop, settings.clockScale
+        ) {
+            val text = AnnotatedString("04:44")
+            fun measureClock(size: Float, measureDensity: Density) = textMeasurer.measure(
+                text,
+                style = clockBaseStyle.copy(fontSize = size.sp),
+                density = measureDensity,
+                maxLines = 1,
+                softWrap = false
+            )
+
+            val referenceMeasurement = measureClock(baseClockSize, Density(density.density, fontScale = 1f))
+            val clockBottom = AodWaveformGeometry.clockBottom(
+                screenHeightPx,
+                referenceMeasurement.size.height.toFloat(),
+                footerTop,
+                maximumDriftY,
+                clearancePx,
+                with(density) { 64.dp.toPx() }
+            )
+            val maximumWidth = (with(density) { (maxWidth * 0.92f).toPx() } -
+                with(density) { (2 * AodDrift.MAX_X_DP).dp.toPx() }).coerceAtLeast(0f)
+            val maximumHeight = (clockBottom - with(density) { (16 + AodDrift.MAX_Y_DP).dp.toPx() })
+                .coerceAtLeast(0f)
+            val requestedSize = baseClockSize * settings.clockScale / 100f
+            val size = AodDisplaySettings.fitClockSizeSp(
+                requestedSize,
+                maximumWidth.toInt(),
+                maximumHeight.toInt()
+            ) { measureClock(it, density).size }
+            val rendered = measureClock(size, density)
+            Triple(clockBottom, size, rendered.size.height.toFloat())
+        }
         val driftYPx = with(density) { driftY.dp.toPx() }
         val waveformLayout = AodWaveformGeometry.layout(
-            if (clockBottomPx.isFinite()) clockBottomPx else screenHeightPx * 0.54f,
+            clockBottomPx,
             footerTop,
-            with(density) { AodDrift.MAX_Y_DP.dp.toPx() },
+            maximumDriftY,
             clearancePx
         )
         val waveformHeight = with(density) { waveformLayout.regionHeight.toDp() }
         val waveformTop = with(density) { (waveformLayout.centerY - waveformLayout.regionHeight / 2f).toDp() }
         Text(
             text = clockText,
-            fontFamily = RubikClock,
-            fontWeight = FontWeight.Black,
-            fontSize = clockSize.sp,
-            letterSpacing = (-5).sp,
+            style = clockBaseStyle.copy(fontSize = clockSize.sp),
             maxLines = 1,
             softWrap = false,
             color = Color(0xFFF7F7F7),
             modifier = Modifier.align(Alignment.TopCenter)
                 .padding(top = (maxHeight.value * 0.10f).dp)
-                .offset(x = driftX.dp, y = driftY.dp)
-                .onGloballyPositioned { coordinates ->
-                    val top = coordinates.positionInParent().y - driftYPx
-                    val bottom = coordinates.positionInParent().y + coordinates.size.height - driftYPx
-                    if (clockTopPx.isNaN() || kotlin.math.abs(clockTopPx - top) > 0.5f) clockTopPx = top
-                    if (clockBottomPx.isNaN() || kotlin.math.abs(clockBottomPx - bottom) > 0.5f) clockBottomPx = bottom
-                }
+                .offset(x = driftX.dp, y = driftY.dp + with(density) {
+                    AodWaveformGeometry.clockOffsetY(
+                        clockBottomPx,
+                        clockTopPaddingPx,
+                        clockHeightPx
+                    ).toDp()
+                })
         )
         WaveformCanvas(
             waveform,

@@ -2,11 +2,13 @@ package app.anpod.receiver
 
 import androidx.test.core.app.ApplicationProvider
 import android.content.Context
+import androidx.compose.ui.unit.IntSize
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import kotlin.math.roundToInt
 
 @RunWith(RobolectricTestRunner::class)
 class AodDisplaySettingsTest {
@@ -58,12 +60,55 @@ class AodDisplaySettingsTest {
     }
 
     @Test
-    fun clockScaleChangesSizeUntilAvailableWidthIsReached() {
-        assertEquals(80f, AodDisplaySettings.clockSizeSp(100f, 240f, 120f, 400f, 300f, 80), 0.01f)
-        assertEquals(100f, AodDisplaySettings.clockSizeSp(100f, 240f, 120f, 400f, 300f, 100), 0.01f)
-        assertEquals(120f, AodDisplaySettings.clockSizeSp(100f, 240f, 120f, 400f, 300f, 120), 0.01f)
-        assertEquals(100f, AodDisplaySettings.clockSizeSp(100f, 240f, 120f, 240f, 300f, 120), 0.01f)
-        assertEquals(100f, AodDisplaySettings.clockSizeSp(100f, 240f, 200f, 400f, 200f, 120), 0.01f)
+    fun requestedClockScaleAndLargeFontScaleKeepClockInsideItsFixedBand() {
+        val screenHeight = 300f
+        val footerTop = screenHeight * 0.88f
+        val topPadding = screenHeight * 0.10f
+        val topSafe = 25f
+        val maxDrift = 9f
+        val clearance = 4f
+        val baseSizeSp = 120f
+        val referenceHeight = 96f
+        val bottom = AodWaveformGeometry.clockBottom(
+            screenHeight, referenceHeight, footerTop, maxDrift, clearance, 64f)
+        val baselineWaveform = AodWaveformGeometry.layout(bottom, footerTop, maxDrift, clearance)
+
+        for (fontScale in listOf(1f, 1.3f, 2f)) {
+            val measuredHeight = referenceHeight * fontScale
+            for (clockScale in listOf(80, 100, 120)) {
+                val requestedSize = baseSizeSp * clockScale / 100f
+                fun measure(size: Float) = IntSize(
+                    (150f * fontScale * size / baseSizeSp - 20f * fontScale).roundToInt(),
+                    (measuredHeight * size / baseSizeSp).roundToInt()
+                )
+                val fittedSize = AodDisplaySettings.fitClockSizeSp(
+                    requestedSize, 180, (bottom - topSafe).toInt(), ::measure)
+                val renderedHeight = measure(fittedSize).height.toFloat()
+                val offset = AodWaveformGeometry.clockOffsetY(bottom, topPadding, renderedHeight)
+                val renderedTop = topPadding + offset
+                val renderedBottom = renderedTop + renderedHeight
+                val waveform = AodWaveformGeometry.layout(bottom, footerTop, maxDrift, clearance)
+
+                assertTrue("fontScale=$fontScale scale=$clockScale", renderedTop >= topSafe - 0.01f)
+                assertEquals(bottom, renderedBottom, 0.01f)
+                assertTrue(waveform.regionHeight > 0f)
+                assertEquals(baselineWaveform.regionHeight, waveform.regionHeight, 0f)
+                assertEquals(baselineWaveform.maximumAmplitude, waveform.maximumAmplitude, 0f)
+            }
+        }
+    }
+
+    @Test
+    fun measuredClockFitHonorsWidthAndHeightBounds() {
+        val measure: (Float) -> IntSize = { size ->
+            IntSize((size * 1.4f + 20f).roundToInt(), (size * 1.1f + 12f).roundToInt())
+        }
+        val fitted = AodDisplaySettings.fitClockSizeSp(120f, 180, 100, measure)
+        val result = measure(fitted)
+
+        assertTrue(fitted < 120f)
+        assertTrue(result.width <= 180)
+        assertTrue(result.height <= 100)
     }
 
     @Test
