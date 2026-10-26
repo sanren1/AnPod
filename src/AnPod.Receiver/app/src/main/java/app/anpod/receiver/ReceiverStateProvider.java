@@ -298,7 +298,9 @@ public final class ReceiverStateProvider extends ContentProvider {
                 if (ReceiverService.audioActive || !"stopped".equals(ReceiverService.networkAudioState))
                     throw new IllegalStateException("receiver_busy; stop receiving on the phone before resetting the binding");
                 ReceiverService.resetAuthorizationForBinding(bindingStore, expectedCommitment);
-                return bindingStore.removeIfMatches(expectedCommitment) == BindingStore.ResetResult.REMOVED ? 1 : 0;
+                int removed = bindingStore.removeIfMatches(expectedCommitment) == BindingStore.ResetResult.REMOVED ? 1 : 0;
+                BackgroundStandbyRecovery.clear(getContext());
+                return removed;
             } catch (BindingStore.ConflictException error) {
                 throw new IllegalStateException("binding_conflict", error);
             } catch (IOException | PairingProtocol.Failure error) {

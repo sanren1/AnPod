@@ -911,6 +911,12 @@ public final class ReceiverService extends Service {
 
     String startFromUi(String address, int prefixLength, String requestId,
             boolean backgroundStandby, boolean keepReceiveIntent) {
+        return startFromUi(address, prefixLength, requestId, backgroundStandby, keepReceiveIntent, null, null);
+    }
+
+    String startFromUi(String address, int prefixLength, String requestId,
+            boolean backgroundStandby, boolean keepReceiveIntent,
+            String expectedRecoveryBinding, String expectedRecoveryOperation) {
         if (requestId == null || requestId.isEmpty()) return "启动请求无效，请重试。";
         if (keepReceiveIntent && !applicationIsVisible()) return "请在 AnPod 界面中点击“连接电脑”。";
         if (backgroundStandby && !applicationIsVisible()) return "请在 Receiver 前台界面中启用后台待机。";
@@ -924,20 +930,31 @@ public final class ReceiverService extends Service {
             String ownerId = UUID.randomUUID().toString();
             long generation;
             synchronized (networkCoordinatorLock) {
-                if (!uiOperation.canBegin() || currentAudio != null || pendingAudio != null
-                        || networkCoordinator != null || !uiOperation.begin(ownerId))
-                    return "已有接收会话正在运行。";
-                generation = networkBootstrapGeneration.incrementAndGet();
-                currentOperationGeneration = generation;
-                beginHealthOperation(ownerId, generation);
-                backgroundStandbyEnabled = backgroundStandby;
-                receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
-                pendingUiStartRequestId = requestId;
-                pendingUiStandbyStart = backgroundStandby;
-                pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
-                networkAudioState = "starting";
-                networkAudioFailure = "";
-                startFailure = "";
+                synchronized (BindingStore.storageLock()) {
+                    if (expectedRecoveryBinding != null || expectedRecoveryOperation != null) {
+                        if (!backgroundStandby || expectedRecoveryBinding == null || expectedRecoveryOperation == null)
+                            return getString(R.string.background_standby_recovery_expired);
+                        BindingStore.Status currentBinding = new BindingStore(getFilesDir()).status();
+                        if (!"saved".equals(currentBinding.state)
+                                || !BackgroundStandbyRecovery.matches(this, expectedRecoveryBinding,
+                                        expectedRecoveryOperation, currentBinding.commitment))
+                            return getString(R.string.background_standby_recovery_expired);
+                    }
+                    if (!uiOperation.canBegin() || currentAudio != null || pendingAudio != null
+                            || networkCoordinator != null || !uiOperation.begin(ownerId))
+                        return "已有接收会话正在运行。";
+                    generation = networkBootstrapGeneration.incrementAndGet();
+                    currentOperationGeneration = generation;
+                    beginHealthOperation(ownerId, generation);
+                    backgroundStandbyEnabled = backgroundStandby;
+                    receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
+                    pendingUiStartRequestId = requestId;
+                    pendingUiStandbyStart = backgroundStandby;
+                    pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
+                    networkAudioState = "starting";
+                    networkAudioFailure = "";
+                    startFailure = "";
+                }
             }
             Intent intent = new Intent(this, ReceiverService.class).setAction(ACTION_UI_START_NETWORK_AUDIO)
                     .putExtra("networkAddress", address).putExtra("networkPrefixLength", prefixLength)
@@ -1163,10 +1180,17 @@ public final class ReceiverService extends Service {
         terminalGeneration = -1;
     }
 
-    private static synchronized void recordManualStop(String ownerId, long generation) {
-        terminalCause = "USER_STOP";
-        terminalOwnerId = ownerId;
-        terminalGeneration = generation;
+    private void recordManualStop(String ownerId, long generation) {
+        synchronized (networkCoordinatorLock) {
+            synchronized (BindingStore.storageLock()) {
+                synchronized (ReceiverService.class) {
+                    terminalCause = "USER_STOP";
+                    terminalOwnerId = ownerId;
+                    terminalGeneration = generation;
+                }
+                BackgroundStandbyRecovery.clear(this);
+            }
+        }
     }
 
     private static synchronized boolean isManualStop(String ownerId, long generation) {
@@ -1933,8 +1957,28 @@ public final class ReceiverService extends Service {
             coordinator.startDiscovery(selectedNetwork::bindSocket, discoverySecret);
             if (discoverySecret != null) java.util.Arrays.fill(discoverySecret, (byte) 0);
             if (keepReceiveIntent) coordinator.startAutomaticSearch();
-            uiOperation.running(ownerId);
-            networkAudioState = "prepared";
+            boolean started = false;
+            synchronized (networkCoordinatorLock) {
+                if (isCurrentOperation(ownerId, generation) && !isManualStop(ownerId, generation)
+                        && uiOperation.running(ownerId)) {
+                    networkAudioState = "prepared";
+                    started = true;
+                    if (backgroundStandby && backgroundStandbyEnabled) {
+                        synchronized (BindingStore.storageLock()) {
+                            if (backgroundStandbyEnabled && isCurrentOperation(ownerId, generation)
+                                    && !isManualStop(ownerId, generation)) {
+                                BindingStore.Status status = new BindingStore(getFilesDir()).status();
+                                if (!"saved".equals(status.state)) throw new IOException("AnPod binding is unavailable");
+                                if (!BackgroundStandbyRecovery.save(this, status.commitment, ownerId))
+                                    android.util.Log.e("AnPodReceiver", "Could not save boot standby recovery intent");
+                            } else if (!isCurrentOperation(ownerId, generation) || isManualStop(ownerId, generation)) {
+                                started = false;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!started) { coordinator.close(); return; }
             if (keepReceiveIntent && timeout != null) {
                 handler.removeCallbacks(timeout);
                 timeout = null;

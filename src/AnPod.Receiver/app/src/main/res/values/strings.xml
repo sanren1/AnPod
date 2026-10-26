@@ -27,6 +27,9 @@
     <string name="background_standby_requires_binding">请先通过 USB 与电脑配对，再允许电脑连接。</string>
     <string name="background_standby_requires_idle_receiver">请先停止当前接收，再允许电脑连接。</string>
     <string name="background_standby_primary_action">停止等待连接</string>
+    <string name="background_standby_recovery_title">恢复后台待机</string>
+    <string name="background_standby_recovery_text">点按即可继续等待电脑连接。</string>
+    <string name="background_standby_recovery_expired">待机恢复请求已失效，请在 Receiver 中重新启用后台待机。</string>
     <string name="background_standby_status_disabled">已关闭电脑连接许可。</string>
     <string name="background_standby_status_enabled">已允许电脑连接。</string>
     <string name="background_standby_status_listening">正在等待这台电脑连接。</string>

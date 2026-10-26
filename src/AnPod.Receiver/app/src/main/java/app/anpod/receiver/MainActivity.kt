@@ -116,7 +116,9 @@ internal fun primaryActionFor(
     else -> PrimaryAction.CONNECT_WIFI
 }
 
-class MainActivity : ComponentActivity() {
+open class MainActivity : ComponentActivity() {
+    private var recoveryClickPending = false
+    private var recoveryClickConsumed = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var receiver by mutableStateOf<ReceiverUiBinder?>(null)
     private var snapshot by mutableStateOf<UiSnapshot?>(null)
@@ -131,6 +133,8 @@ class MainActivity : ComponentActivity() {
         val generation: Long,
         val previousOperationId: String,
         val backgroundStandby: Boolean,
+        val recoveryBindingCommitment: String? = null,
+        val recoveryOperationId: String? = null,
         val operationId: String? = null
     )
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
@@ -198,6 +202,7 @@ class MainActivity : ComponentActivity() {
         advancePendingConnection(snapshot)
         refreshUsbAccessory()
         maybeEnterAod()
+        maybeStartBootRecovery()
     }
 
     private fun refreshUsbAccessory() {
@@ -268,7 +273,16 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (this is RecoveryActivity) {
+            recoveryClickPending = true
+            recoveryClickConsumed = false
+        }
         refresh()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("bootStandbyRecoveryConsumed", recoveryClickConsumed)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onStop() {
@@ -296,6 +310,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (this is RecoveryActivity) {
+            recoveryClickConsumed = savedInstanceState?.getBoolean("bootStandbyRecoveryConsumed") == true
+            recoveryClickPending = !recoveryClickConsumed
+        }
         val preferences = getSharedPreferences("anpod_receiver", MODE_PRIVATE)
         aodEnabled = preferences.getBoolean("aod_enabled", false)
         aodDisplaySettings = AodDisplaySettings.read(preferences)
@@ -508,9 +526,27 @@ class MainActivity : ComponentActivity() {
         try { unregisterReceiver(receiver) } catch (_: IllegalArgumentException) { }
     }
 
-    private fun startBackgroundStandby() = beginReceive(backgroundStandby = true)
+    private fun startBackgroundStandby(recoveryBindingCommitment: String? = null,
+        recoveryOperationId: String? = null) = beginReceive(backgroundStandby = true,
+        recoveryBindingCommitment = recoveryBindingCommitment, recoveryOperationId = recoveryOperationId)
 
-    private fun beginReceive(backgroundStandby: Boolean) {
+    private fun maybeStartBootRecovery() {
+        if (!recoveryClickPending || recoveryClickConsumed || !activityStarted || !bound || receiver == null) return
+        val current = snapshot ?: return
+        val expectedCommitment = intent.getStringExtra(RecoveryActivity.EXTRA_BINDING_COMMITMENT).orEmpty()
+        val expectedOperationId = intent.getStringExtra(RecoveryActivity.EXTRA_OPERATION_ID).orEmpty()
+        if (!BackgroundStandbyRecovery.matches(this, expectedCommitment, expectedOperationId, current.bindingFingerprint)) {
+            recoveryClickPending = false
+            recoveryClickConsumed = true
+            return
+        }
+        recoveryClickPending = false
+        recoveryClickConsumed = true
+        startBackgroundStandby(expectedCommitment, expectedOperationId)
+    }
+
+    private fun beginReceive(backgroundStandby: Boolean, recoveryBindingCommitment: String? = null,
+        recoveryOperationId: String? = null) {
         val current = snapshot
         val service = receiver
         if (current == null || service == null) { localMessage = getString(R.string.receiver_service_not_ready_retry); return }
@@ -522,7 +558,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         val generation = discoveryGeneration.incrementAndGet()
-        pendingConnection = PendingConnection(generation, current.operationId, backgroundStandby)
+        pendingConnection = PendingConnection(generation, current.operationId, backgroundStandby,
+            recoveryBindingCommitment, recoveryOperationId)
         localMessage = ""
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -558,7 +595,11 @@ class MainActivity : ComponentActivity() {
         }
         if (pendingUsbPermission != null) cancelUsbPermission()
         localMessage = ""
-        localMessage = if (pending.backgroundStandby)
+        localMessage = if (pending.backgroundStandby && pending.recoveryBindingCommitment != null
+            && pending.recoveryOperationId != null)
+            service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString(),
+                pending.recoveryBindingCommitment, pending.recoveryOperationId)
+        else if (pending.backgroundStandby)
             service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
         else service.startReceiving(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
         if (localMessage.isNotEmpty()) pendingConnection = null

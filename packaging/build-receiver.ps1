@@ -119,12 +119,18 @@ if (-not $application) { throw 'Merged manifest is missing application.' }
 $components = @($application.ChildNodes | Where-Object { $_.LocalName -in @('activity', 'service', 'provider', 'receiver') })
 $exports = @($components | Where-Object { $_.GetAttribute('exported', $androidNs) -eq 'true' })
 $mainActivity = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.MainActivity' }
+$recoveryActivity = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.RecoveryActivity' }
 $bootstrap = $components | Where-Object { $_.LocalName -eq 'activity' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.BootstrapActivity' }
 $service = $components | Where-Object { $_.LocalName -eq 'service' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.ReceiverService' }
 $provider = $components | Where-Object { $_.LocalName -eq 'provider' -and $_.GetAttribute('authorities', $androidNs) -eq 'app.anpod.receiver.state' }
 $profileInstaller = $components | Where-Object { $_.LocalName -eq 'receiver' -and $_.GetAttribute('name', $androidNs) -eq 'androidx.profileinstaller.ProfileInstallReceiver' }
+$bootReceiver = $components | Where-Object { $_.LocalName -eq 'receiver' -and $_.GetAttribute('name', $androidNs) -eq 'app.anpod.receiver.BootCompletedReceiver' }
 if (-not $bootstrap -or $bootstrap.GetAttribute('exported', $androidNs) -ne 'true' -or $bootstrap.GetAttribute('permission', $androidNs) -ne 'android.permission.DUMP') { throw 'Bootstrap must be explicitly exported and protected by android.permission.DUMP.' }
 if (-not $mainActivity -or $mainActivity.GetAttribute('exported', $androidNs) -ne 'true' -or $mainActivity.GetAttribute('permission', $androidNs)) { throw 'MainActivity must be the unpermissioned exported Launcher entry.' }
+if (-not $recoveryActivity -or $recoveryActivity.GetAttribute('exported', $androidNs) -ne 'false' -or $recoveryActivity.GetAttribute('permission', $androidNs)) { throw 'RecoveryActivity must remain a private notification entry.' }
+if (-not $bootReceiver -or $bootReceiver.GetAttribute('exported', $androidNs) -ne 'false' -or $bootReceiver.GetAttribute('permission', $androidNs)) { throw 'BootCompletedReceiver must remain private.' }
+$bootActions = @($bootReceiver.SelectNodes('intent-filter/action', $ns) | ForEach-Object { $_.GetAttribute('name', $androidNs) })
+if ($bootActions.Count -ne 1 -or $bootActions[0] -ne 'android.intent.action.BOOT_COMPLETED') { throw 'BootCompletedReceiver may handle only BOOT_COMPLETED.' }
 if (-not $service -or $service.GetAttribute('exported', $androidNs) -ne 'false' -or
         ((@($service.GetAttribute('foregroundServiceType', $androidNs).Split('|') | Sort-Object) -join '|') -ne 'connectedDevice|mediaPlayback|shortService')) {
     throw 'Receiver service must remain private and declare exactly connectedDevice, mediaPlayback and shortService foreground types.'
@@ -135,7 +141,7 @@ if (@($exports | Where-Object { $_ -ne $bootstrap -and $_ -ne $provider -and $_ 
 $launcherComponents = @($components | Where-Object { $_.SelectNodes('intent-filter[action[@android:name="android.intent.action.MAIN"] and category[@android:name="android.intent.category.LAUNCHER"]]', $ns).Count -gt 0 })
 if ($launcherComponents.Count -ne 1 -or $launcherComponents[0] -ne $mainActivity) { throw 'MainActivity must be the only MAIN/LAUNCHER component.' }
 $permissions = @($manifest.SelectNodes('/manifest/uses-permission', $ns) | ForEach-Object { $_.GetAttribute('name', $androidNs) })
-foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.ACCESS_WIFI_STATE', 'android.permission.WAKE_LOCK', 'android.permission.CHANGE_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE', 'android.permission.POST_NOTIFICATIONS')) {
+foreach ($required in @('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.ACCESS_WIFI_STATE', 'android.permission.WAKE_LOCK', 'android.permission.CHANGE_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE', 'android.permission.POST_NOTIFICATIONS', 'android.permission.RECEIVE_BOOT_COMPLETED')) {
     if ($required -notin $permissions) { throw "Merged manifest is missing $required." }
 }
 foreach ($retired in @('android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.REQUEST_INSTALL_PACKAGES')) {

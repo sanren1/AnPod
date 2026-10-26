@@ -288,6 +288,106 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void successfulStandbyBootstrapPersistsItsBindingAndOwnerAndManualStopClearsIt() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        NetworkFixture fixture = addSelectableNetwork();
+        PairingProtocol.BindingMaterial binding = PairingProtocol.BindingMaterial.generate();
+        String owner = java.util.UUID.randomUUID().toString();
+        long generation = 87;
+        String commitment;
+        try {
+            BindingStore store = new BindingStore(service.getFilesDir());
+            store.createOrConfirm(binding);
+            commitment = store.status().commitment;
+            Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(
+                    android.Manifest.permission.POST_NOTIFICATIONS);
+            assertTrue(service.uiOperation.begin(owner));
+            service.currentOperationGeneration = generation;
+            ((java.util.concurrent.atomic.AtomicLong) getInstanceField(service, "networkBootstrapGeneration")).set(generation);
+            service.backgroundStandbyEnabled = true;
+            Method beginHealth = ReceiverService.class.getDeclaredMethod("beginHealthOperation", String.class, long.class);
+            beginHealth.setAccessible(true);
+            beginHealth.invoke(service, owner, generation);
+
+            Method bootstrap = ReceiverService.class.getDeclaredMethod("startNetworkBootstrap",
+                    String.class, int.class, long.class, String.class, boolean.class, boolean.class);
+            bootstrap.setAccessible(true);
+            bootstrap.invoke(service, fixture.address.getHostAddress(), fixture.prefixLength,
+                    generation, owner, true, true);
+
+            assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+            assertEquals(commitment, BackgroundStandbyRecovery.bindingCommitment(service));
+            assertEquals(owner, BackgroundStandbyRecovery.operationId(service));
+            service.backgroundAuthorization.trustUntilRevoked(owner, generation);
+            service.backgroundAuthorization.revoke(owner, generation);
+            assertEquals("grant revocation must not clear independent recovery intent", owner,
+                    BackgroundStandbyRecovery.operationId(service));
+            assertTrue(service.stopFromUi(owner, generation));
+            assertEquals("", BackgroundStandbyRecovery.bindingCommitment(service));
+            assertEquals("", BackgroundStandbyRecovery.operationId(service));
+        } finally {
+            binding.close();
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(fixture.network);
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void remoteNetworkTerminationDoesNotClearStandbyRecoveryIntent() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = java.util.UUID.randomUUID().toString();
+        long generation = 88;
+        String commitment = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assertTrue(BackgroundStandbyRecovery.save(service, commitment, owner));
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        ((java.util.concurrent.atomic.AtomicLong) getInstanceField(service, "networkBootstrapGeneration")).set(generation);
+        service.backgroundStandbyEnabled = true;
+        try {
+            service.requestTermination(owner, generation, false, "NetworkSessionStopped");
+
+            assertEquals(commitment, BackgroundStandbyRecovery.bindingCommitment(service));
+            assertEquals(owner, BackgroundStandbyRecovery.operationId(service));
+        } finally {
+            service.onDestroy();
+        }
+    }
+
+    @Test
+    public void recoveryStartRejectsBindingChangedAfterNotificationWasCreated() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        NetworkFixture fixture = addSelectableNetwork();
+        PairingProtocol.BindingMaterial original = PairingProtocol.BindingMaterial.generate();
+        PairingProtocol.BindingMaterial replacement = PairingProtocol.BindingMaterial.generate();
+        org.robolectric.android.controller.ActivityController<MainActivity> activity = null;
+        try {
+            BindingStore store = new BindingStore(service.getFilesDir());
+            store.createOrConfirm(original);
+            String oldCommitment = store.status().commitment;
+            assertTrue(BackgroundStandbyRecovery.save(service, oldCommitment, "original-owner"));
+            store.removeIfMatches(oldCommitment);
+            store.createOrConfirm(replacement);
+            Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(
+                    android.Manifest.permission.POST_NOTIFICATIONS);
+            activity = Robolectric.buildActivity(MainActivity.class).create().start().resume();
+
+            String result = service.startFromUi(fixture.address.getHostAddress(), fixture.prefixLength,
+                    "recovery-attempt", true, true, oldCommitment, "original-owner");
+
+            assertEquals(service.getString(R.string.background_standby_recovery_expired), result);
+            assertEquals(ReceiverUiOperation.IDLE, service.uiOperation.phase());
+            assertEquals("", BackgroundStandbyRecovery.bindingCommitment(service));
+        } finally {
+            if (activity != null) activity.destroy();
+            original.close();
+            replacement.close();
+            Shadows.shadowOf(service.getSystemService(ConnectivityManager.class)).removeNetwork(fixture.network);
+            service.onDestroy();
+        }
+    }
+
+    @Test
     public void preparedOwnerNetworkCheckRejectsTheOldNetworkAfterAReplacementIsListed() throws Exception {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
         NetworkFixture fixture = addSelectableNetwork();

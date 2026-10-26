@@ -57,6 +57,17 @@ final class ReceiverNotifications {
         return builder.build();
     }
 
+    static Notification standbyRecovery(Context context, String channelId, PendingIntent content) {
+        Notification.Builder builder = builder(context, channelId);
+        builder.setSmallIcon(android.R.drawable.stat_sys_headset)
+                .setContentTitle(context.getString(R.string.background_standby_recovery_title))
+                .setContentText(context.getString(R.string.background_standby_recovery_text))
+                .setContentIntent(content)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true);
+        return builder.build();
+    }
+
     private static Notification.Builder builder(Context context, String channelId) {
         return Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(context, channelId) : new Notification.Builder(context);

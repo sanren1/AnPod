@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="false"
@@ -36,6 +37,11 @@
                 android:resource="@xml/accessory_filter" />
         </activity>
 
+        <activity
+            android:name=".RecoveryActivity"
+            android:exported="false"
+            android:launchMode="singleTop" />
+
         <!-- No launcher filter. The explicit USB bootstrap is restricted to adb shell. -->
         <activity
             android:name=".AodActivity"
@@ -58,6 +64,14 @@
             android:name=".ReceiverService"
             android:exported="false"
             android:foregroundServiceType="shortService|mediaPlayback|connectedDevice" />
+
+        <receiver
+            android:name=".BootCompletedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name=".ReceiverStateProvider"

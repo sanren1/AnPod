@@ -1,18 +1,108 @@
 package app.anpod.receiver
 
 import androidx.compose.runtime.MutableState
+import android.content.Intent
+import android.os.Bundle
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityStatusDecisionTest {
+    @Test
+    fun recoveryClickIsConsumedOnceWithoutReplacingAnActiveOwner() {
+        val app = RuntimeEnvironment.getApplication()
+        val preferences = app.getSharedPreferences("anpod_receiver", android.content.Context.MODE_PRIVATE)
+        preferences.edit().clear().commit()
+        val binding = PairingProtocol.BindingMaterial.generate()
+        val store = BindingStore(app.filesDir)
+        val service = Robolectric.buildService(ReceiverService::class.java).create().get()
+        var controller: org.robolectric.android.controller.ActivityController<RecoveryActivity>? = null
+        try {
+            store.createOrConfirm(binding)
+            val commitment = store.status().commitment
+            assertTrue(BackgroundStandbyRecovery.save(app, commitment, "standby-owner"))
+            Shadows.shadowOf(app).grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS)
+            assertTrue(service.uiOperation.begin("active-owner"))
+            ReflectionHelpers.setField(service, "networkAudioState", "starting")
+            val intent = Intent(app, RecoveryActivity::class.java)
+                .putExtra(RecoveryActivity.EXTRA_BINDING_COMMITMENT, commitment)
+                .putExtra(RecoveryActivity.EXTRA_OPERATION_ID, "standby-owner")
+            controller = Robolectric.buildActivity(RecoveryActivity::class.java, intent).create()
+            val activity = controller.get()
+            val binder = ReceiverUiBinder(service)
+            ReflectionHelpers.getField<MutableState<ReceiverUiBinder?>>(activity,
+                "receiver${'$'}delegate").value = binder
+            ReflectionHelpers.getField<MutableState<UiSnapshot?>>(activity,
+                "snapshot${'$'}delegate").value = binder.snapshot()
+            ReflectionHelpers.setField(activity, "bound", true)
+            ReflectionHelpers.setField(activity, "activityStarted", true)
+            assertNotNull(ReflectionHelpers.getField<MutableState<ReceiverUiBinder?>>(activity,
+                "receiver${'$'}delegate").value)
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "maybeStartBootRecovery")
+
+            assertTrue(ReflectionHelpers.getField<Boolean>(activity, "recoveryClickConsumed"))
+            assertEquals("active-owner", service.uiOperation.ownerId())
+            assertEquals(ReceiverUiOperation.STARTING, service.uiOperation.phase())
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "maybeStartBootRecovery")
+            assertEquals("active-owner", service.uiOperation.ownerId())
+        } finally {
+            if (controller != null) {
+                ReflectionHelpers.setField(controller.get(), "bound", false)
+                ReflectionHelpers.setField(controller.get(), "activityStarted", false)
+            }
+            controller?.destroy()
+            BackgroundStandbyRecovery.clear(app)
+            try { store.removeIfMatches(store.status().commitment) } catch (_: Exception) { }
+            binding.close()
+            service.onDestroy()
+            preferences.edit().clear().commit()
+        }
+    }
+
+    @Test
+    fun publicMainActivityIgnoresForgedRecoveryIntentAndPrivateActivityKeepsConsumedClickAcrossRotation() {
+        val forged = Intent(RuntimeEnvironment.getApplication(), MainActivity::class.java)
+            .setAction("app.anpod.receiver.action.RECOVER_STANDBY")
+            .putExtra(RecoveryActivity.EXTRA_BINDING_COMMITMENT, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .putExtra(RecoveryActivity.EXTRA_OPERATION_ID, "forged-owner")
+        val publicController = Robolectric.buildActivity(MainActivity::class.java, forged).create()
+        try {
+            assertFalse(ReflectionHelpers.getField(publicController.get(), "recoveryClickPending"))
+        } finally {
+            publicController.destroy()
+        }
+
+        val trustedIntent = Intent(RuntimeEnvironment.getApplication(), RecoveryActivity::class.java)
+            .putExtra(RecoveryActivity.EXTRA_BINDING_COMMITMENT, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .putExtra(RecoveryActivity.EXTRA_OPERATION_ID, "trusted-owner")
+        val firstController = Robolectric.buildActivity(RecoveryActivity::class.java, trustedIntent).create()
+        val state = Bundle()
+        try {
+            ReflectionHelpers.setField(firstController.get(), "recoveryClickConsumed", true)
+            firstController.saveInstanceState(state)
+        } finally {
+            firstController.destroy()
+        }
+        val recreated = Robolectric.buildActivity(RecoveryActivity::class.java, trustedIntent).create(state)
+        try {
+            assertTrue(ReflectionHelpers.getField(recreated.get(), "recoveryClickConsumed"))
+            assertFalse(ReflectionHelpers.getField(recreated.get(), "recoveryClickPending"))
+        } finally {
+            recreated.destroy()
+        }
+    }
+
     @Test
     fun primaryActionDispatchesByChoiceAndActualOperation() {
         assertEquals(PrimaryAction.CONNECT_USB_DIRECT, primaryActionFor(ConnectionChoice.USB_DIRECT))

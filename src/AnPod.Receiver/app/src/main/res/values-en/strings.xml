@@ -27,6 +27,9 @@
     <string name="background_standby_requires_binding">Connect to the computer with a cable once to pair before allowing computer connections.</string>
     <string name="background_standby_requires_idle_receiver">Stop the current connection before allowing computer connections.</string>
     <string name="background_standby_primary_action">Stop waiting for a connection</string>
+    <string name="background_standby_recovery_title">Resume standby</string>
+    <string name="background_standby_recovery_text">Tap to wait for your computer again.</string>
+    <string name="background_standby_recovery_expired">This standby request has expired. Enable standby again in Receiver.</string>
     <string name="background_standby_status_disabled">Computer connections are not allowed.</string>
     <string name="background_standby_status_enabled">Computer connections are allowed.</string>
     <string name="background_standby_status_listening">Waiting for this computer to connect.</string>

@@ -27,6 +27,11 @@ import java.util.List;
         public String startBackgroundStandby(String address, int prefixLength, String requestId) {
             return service.startFromUi(address, prefixLength, requestId, true, true);
         }
+        public String startBackgroundStandby(String address, int prefixLength, String requestId,
+                String expectedBindingCommitment, String expectedOperationId) {
+            return service.startFromUi(address, prefixLength, requestId, true, true,
+                    expectedBindingCommitment, expectedOperationId);
+        }
         public String startAoaAccessory(UsbAccessory accessory, String requestId) {
             return service.startAoaFromUi(accessory, requestId);
         }
