@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone } from "lucide-react";
+import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
 import { strings } from "./strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, OperationResult } from "./appTypes";
-import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, endpointFitsInterface, CAP_AOA_SESSION_RESTART, CAP_AUDIO_V2 } from "./appRuntime";
+import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, endpointFitsInterface, CAP_AOA_SESSION_RESTART } from "./appRuntime";
 import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
 import { DeviceDialog } from "./components/DeviceDialog";
-import { AudioSettingsDialog } from "./components/AudioSettingsDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairDialog } from "./components/PairDialog";
 import { HelpDialog } from "./components/HelpDialog";
@@ -14,10 +13,11 @@ import { DiagnosticsDialog } from "./components/DiagnosticsDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { AoaDialog } from "./components/AoaDialog";
 import { ErrorDetails } from "./components/Modal";
+import { FluidSegmentedControl } from "./components/ui/FluidSegmentedControl";
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [panel, setPanel] = useState<"device" | "settings" | "audio" | "pair" | "network" | "receiver" | "setup" | "aoa" | "help" | "diagnostics" | null>(null);
+  const [panel, setPanel] = useState<"device" | "settings" | "pair" | "network" | "receiver" | "setup" | "aoa" | "help" | "diagnostics" | null>(null);
   const [confirm, setConfirm] = useState<{ kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "wiredMode" | "device" | "network" | "receiverUsb" | "aoa"; value: string } | null>(null);
   const pendingSettingsConfirmation = useRef<{ kind: "wirelessProtocol" | "audioBackend"; value: string; resolve: () => void; reject: (error: unknown) => void } | null>(null);
   const [pendingNetworkStart, setPendingNetworkStart] = useState<NetworkStartRequest | null>(null);
@@ -30,7 +30,6 @@ function App() {
   const receiverConfirmationStarted = useRef(false);
   const helpButtonRef = useRef<HTMLButtonElement>(null);
   const diagnosticsButtonRef = useRef<HTMLButtonElement>(null);
-  const audioSettingsButtonRef = useRef<HTMLButtonElement>(null);
   const appMounted = useRef(true);
   const receiverOperationUnlisten = useRef<(() => void) | null>(null);
   const aoaConfigurationActive = useRef<number | null>(null);
@@ -157,6 +156,8 @@ function App() {
   const receiverUpdateNeeded = snapshot?.state === "error" && needsReceiverUpdate(`${snapshot.message} ${snapshot.statusDetail}`)
     || snapshot?.state === "managementOnly" && snapshot.sessionCapabilities?.audioCompatible === false;
   const controlsDisabled = working || cancelPending || snapshot?.busy === true || cleanupPending || receiverOperationBusy;
+  const aoaPlaybackRestartUnavailable = aoaSession && !controlsDisabled && snapshot.sessionCapabilities !== null
+    && (snapshot.sessionCapabilities.capabilityBits & CAP_AOA_SESSION_RESTART) === 0;
   const activeDevice = snapshot?.sessionTransport === "aoa" ? undefined
     : snapshot?.devices.find(device => device.serial === snapshot.sessionSerial);
   const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
@@ -189,6 +190,7 @@ function App() {
     setNetworkDialogError("");
     setPanel("network");
   };
+  const openConnectionFlow = () => openNetworkDialog(true, { localAddress: "", bindingReference: "" }, !!snapshot?.wirelessConnectionOffers.active);
   useEffect(() => {
     const offers = snapshot?.wirelessConnectionOffers;
     if (!offers?.active || !offers.offers.length) return;
@@ -360,7 +362,12 @@ function App() {
     if (value === current) return;
     if (active && kind === "playback" && (lanSession || snapshot.canChangePlaybackMode)) {
       setWorking(true);
-      try { apply(await invokeApp<Snapshot>("reconfigure_session", { kind, value })); }
+      try {
+        apply(await invokeApp<Snapshot>("apply_audio_settings", {
+          audioQuality: snapshot.settings.audioQuality,
+          playbackMode: value === "lowLatency" ? "LowLatency" : "Balanced",
+        }));
+      }
       catch (error) {
         let message = String(error);
         try { apply(await invokeApp<Snapshot>("get_snapshot")); }
@@ -376,11 +383,17 @@ function App() {
         return new Promise<void>((resolve, reject) => { pendingSettingsConfirmation.current = { kind, value, resolve, reject }; });
       return;
     }
+    if (kind === "playback") {
+      setWorking(true);
+      void invokeApp<Snapshot>("apply_audio_settings", {
+        audioQuality: snapshot.settings.audioQuality,
+        playbackMode: value === "lowLatency" ? "LowLatency" : "Balanced",
+      }).then(apply).catch(error => notify(String(error))).finally(() => setWorking(false));
+      return;
+    }
     setWorking(true);
     try {
-      const key = kind === "playback" ? "playbackMode" : kind;
-      const savedValue = kind === "playback" ? value === "lowLatency" ? "LowLatency" : "Balanced" : value;
-      let next = await invokeApp<Snapshot>("update_setting", { key, value: savedValue });
+      let next = await invokeApp<Snapshot>("update_setting", { key: kind, value });
       apply(next);
       let refreshFailure = "";
       if (kind === "transport" || kind === "wirelessProtocol") {
@@ -402,6 +415,17 @@ function App() {
 
   const saveSetting = async (key: keyof Snapshot["settings"], value: unknown) => {
     if (!snapshot || snapshot.settings[key] === value) return;
+    if (key === "audioQuality") {
+      try {
+        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: value, playbackMode: snapshot.settings.playbackMode }));
+      } catch (error) {
+        try { apply(await invokeApp<Snapshot>("get_snapshot")); }
+        catch (refreshError) { notify(`${String(error)}${strings.app.refreshFailureSuffix(String(refreshError))}`); throw error; }
+        notify(String(error));
+        throw error;
+      }
+      return;
+    }
     try {
       const next = await invokeApp<Snapshot>("update_setting", { key, value });
       apply(next);
@@ -410,18 +434,6 @@ function App() {
       notify(String(error));
       throw error;
     }
-  };
-
-  const applyAudioSettings = async (audioQuality: Snapshot["settings"]["audioQuality"], playbackMode: Snapshot["settings"]["playbackMode"]) => {
-    if (!snapshot) return;
-    setWorking(true);
-    try {
-      apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality, playbackMode }));
-    } catch (error) {
-      try { apply(await invokeApp<Snapshot>("get_snapshot")); }
-      catch (refreshError) { throw new Error(`${strings.app.audioSettingsApplyFailed} ${String(error)}；${String(refreshError)}`); }
-      throw new Error(`${strings.app.audioSettingsApplyFailed} ${String(error)}`);
-    } finally { setWorking(false); }
   };
 
   const performReceiverUsbOperation = async (operation: ReceiverUsbOperation) => {
@@ -553,6 +565,10 @@ function App() {
         const result = await invokeApp<OperationResult>("switch_device", { serial: confirm.value });
         apply(result.snapshot);
         if (!result.success) notify(result.message);
+      } else if (confirm.kind === "playback") {
+        if (!snapshot) throw new Error(strings.app.desktopOnly);
+        const playbackMode = confirm.value === "lowLatency" ? "LowLatency" : "Balanced";
+        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: snapshot.settings.audioQuality, playbackMode }));
       } else {
         const next = await invokeApp<Snapshot>("reconfigure_session", { kind: confirm.kind, value: confirm.value });
         apply(next);
@@ -886,12 +902,8 @@ function App() {
       mainListenerGeneration.current++;
       setMainListenerPending(false);
       void stopOfferListener();
-    } else if (cleanupPending || (active && snapshot.state === "managementOnly")) {
+    } else if (cleanupPending || (active && (snapshot.state === "managementOnly" || snapshot.output === "phone"))) {
       void disconnect();
-    } else if (active && snapshot.state === "paused") {
-      void setOutput("phone");
-    } else if (active && snapshot.output === "phone") {
-      void setOutput("computer");
     } else if (!active && snapshot.connectionTransport === "usb" && wiredMode === "aoa") {
       void openAoaDialog();
     } else if (receiverUpdateNeeded && !active) {
@@ -959,12 +971,12 @@ function App() {
         : !active && snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? working || snapshot.busy ? strings.app.processing : strings.app.connectUsbDirect
         : receiverUpdateNeeded && !active ? strings.app.upgradePhone
         : active && snapshot.state === "managementOnly" ? strings.app.disconnectManagement
-          : active && snapshot.state === "paused" ? strings.app.resumeOnPhone
-            : active && snapshot.output === "phone" ? strings.app.pauseOnPhone
+          : active && snapshot.output === "phone" ? strings.app.disconnect
+            : active && snapshot.state === "paused" && snapshot.output === "computer" ? strings.app.resumeOnPhone
               : active ? strings.app.startStreaming
-              : !active && wirelessUdpMode ? working || snapshot.busy ? strings.app.processing : strings.app.connectPhone
-              : active || selected?.connectable ? working || snapshot.busy ? strings.app.processing : strings.app.connectAndPlay
-              : snapshot.connectionTransport === "usb" ? strings.app.connectUsbPhone : strings.app.addWirelessPhone;
+                : !active && wirelessUdpMode ? working || snapshot.busy ? strings.app.processing : strings.app.connectPhone
+                  : selected?.connectable ? working || snapshot.busy ? strings.app.processing : strings.app.connectAndPlay
+                    : snapshot.connectionTransport === "usb" ? strings.app.connectUsbPhone : strings.app.addWirelessPhone;
   const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
   const failureSummary = cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired
     : failureDetail.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(failureDetail)) : strings.app.operationNotCompleted;
@@ -979,7 +991,7 @@ function App() {
       <section className="device-section" aria-label={strings.app.targetPhone}>
         <div className="section-title"><h1>{strings.app.targetPhone}</h1></div>
         <div className="device-card">
-          <button className="device-select" onClick={() => setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup" || panel === "aoa"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.connectUsbDirect : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
+          <button className="device-select" onClick={() => snapshot.connectionTransport === "usb" && wiredMode === "aoa" && !active ? void openAoaDialog() : wirelessUdpMode ? openConnectionFlow() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup" || panel === "aoa"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.connectUsbDirect : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
               <strong>{active ? lanSession ? strings.app.connectedPhone : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.chooseUsbDirectPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
@@ -990,14 +1002,36 @@ function App() {
           </button>
           <div className="device-actions">
             {!active && !cleanupPending && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => { setBackgroundStartMode(false); setPanel("setup"); }}>{strings.app.firstSetup}</button>}
-            {active && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void disconnect()}>{strings.app.disconnect}</button>}
+            {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{strings.app.switchToComputer}</button>}
           </div>
         </div>
 
-        <button ref={audioSettingsButtonRef} className="audio-settings-summary" type="button" disabled={controlsDisabled} onClick={() => setPanel("audio")}>
-          <span>{strings.app.audioSummary(snapshot.settings.playbackMode === "LowLatency" ? strings.app.lowLatency : strings.app.balanced, strings.app.audioQualityShortLabels[snapshot.settings.audioQuality])}</span>
-          <span>{strings.app.editAudioSettings}</span>
-        </button>
+      <section className="connection-section" aria-label={strings.app.connectionMode}>
+        <div className="section-title"><h2>{strings.app.connectionMode}</h2></div>
+        <FluidSegmentedControl
+          className="transport-switch"
+          label={strings.app.connectionMode}
+          value={snapshot.connectionTransport}
+          options={[
+            { value: "usb", label: <><Usb size={16} aria-hidden="true" />{strings.app.usb}</>, disabled: controlsDisabled || snapshot.wirelessConnectionOffers.active },
+            { value: "wireless", label: <><Wifi size={16} aria-hidden="true" />{strings.app.wireless}</>, disabled: controlsDisabled || snapshot.wirelessConnectionOffers.active },
+          ]}
+          onValueChange={value => void setOption("transport", value)}
+        />
+        {snapshot.connectionTransport === "usb" && <div className="wired-mode-section">
+          <div className="mode-row"><h3>{strings.app.wiredMode}</h3><FluidSegmentedControl
+            className="transport-switch"
+            label={strings.app.wiredMode}
+            value={wiredMode}
+            options={[
+              { value: "adb", label: strings.app.wiredModeAdb, disabled: controlsDisabled },
+              { value: "aoa", label: strings.app.wiredModeDirect, disabled: controlsDisabled },
+            ]}
+            onValueChange={setWiredMode}
+          /></div>
+          <p className="connection-hint">{strings.app.wiredModeHint}</p>
+        </div>}
+      </section>
 
       <div className="device-status-actions status-hero">
         <div className={`status-line state-${snapshot.state}`}>
@@ -1017,21 +1051,45 @@ function App() {
       </div>
       </section>
 
+      <section className="mode-section home-choice-section" aria-labelledby="home-playback-mode-title">
+          <h2 id="home-playback-mode-title">{strings.app.playbackMode}</h2>
+          <FluidSegmentedControl
+            className="mode-switch"
+            label={strings.app.playbackMode}
+            value={snapshot.settings.playbackMode}
+            options={[
+              { value: "Balanced", label: strings.app.balanced, disabled: controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes) },
+              { value: "LowLatency", label: strings.app.lowLatency, disabled: controlsDisabled || (active ? !snapshot.canChangePlaybackMode : !snapshot.canChangeModes) },
+            ]}
+            onValueChange={value => void setOption("playback", value === "Balanced" ? "balanced" : "lowLatency")}
+          />
+          {aoaPlaybackRestartUnavailable && <p className="dialog-footnote">{strings.app.aoaPlaybackModeUpdate}</p>}
+      </section>
+      <section className="mode-section home-choice-section home-quality-section" aria-labelledby="home-audio-quality-title">
+        <h2 id="home-audio-quality-title">{strings.app.audioQualityTitle}</h2>
+        <FluidSegmentedControl
+          className="quality-switch"
+          label={strings.app.audioQualityTitle}
+          value={snapshot.settings.audioQuality}
+          options={(["standard", "hifi", "hires"] as const).map(quality => ({
+            value: quality,
+            label: strings.app.audioQualityShortLabels[quality],
+            disabled: controlsDisabled || !canSetAudioQuality(snapshot, quality),
+          }))}
+          onValueChange={quality => {
+            if (quality === snapshot.settings.audioQuality) return;
+            setWorking(true);
+            void saveSetting("audioQuality", quality).catch(() => {}).finally(() => setWorking(false));
+          }}
+        />
+      </section>
     </main>
 
     <footer className="footer"><button ref={helpButtonRef} onClick={() => setPanel("help")}><CircleHelp size={15} />{strings.app.help}</button><span>v{snapshot.version}</span><button ref={diagnosticsButtonRef} onClick={() => setPanel("diagnostics")}><Activity size={15} />{strings.app.diagnostics}</button></footer>
     {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{strings.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
-    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} active={active} activeSerial={snapshot.sessionTransport === "aoa" ? null : snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} connectionTransport={snapshot.connectionTransport} wiredMode={wiredMode} wirelessProtocol={snapshot.settings.wirelessProtocol} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={null} onOpenDirect={() => { setPanel(null); void openAoaDialog(); }} onOpenUdp={() => openNetworkDialog(false, { localAddress: "", bindingReference: "" }, true)} onSetOption={(kind, value) => { if (active) setPanel(null); void setOption(kind, value); }} onSetWiredMode={mode => { if (active) setPanel(null); setWiredMode(mode); }} onClose={() => setPanel(null)} />}
-    {panel === "audio" && <AudioSettingsDialog snapshot={snapshot} busy={working || snapshot.busy} canChangeMode={active ? snapshot.canChangePlaybackMode : snapshot.canChangeModes} canChangeQuality={quality => {
-      if (!active) return canSetAudioQuality(snapshot, quality);
-      if (lanSession) return quality === "standard" || quality === snapshot.settings.audioQuality
-        || (((snapshot.sessionCapabilities?.capabilityBits ?? 0) & CAP_AUDIO_V2) !== 0);
-      if (aoaSession) return quality === snapshot.settings.audioQuality || (((snapshot.sessionCapabilities?.capabilityBits ?? 0) & CAP_AOA_SESSION_RESTART) !== 0);
-      const adbQualityOnly = snapshot.settings.audioBackend === "legacy" && (snapshot.sessionConnectionTransport === "usb" && snapshot.settings.wiredMode !== "aoa" || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb");
-      return !adbQualityOnly || quality === "standard";
-    }} qualityHint={lanSession ? strings.app.p5cAudioQualityHint : aoaSession && (((snapshot.sessionCapabilities?.capabilityBits ?? 0) & CAP_AOA_SESSION_RESTART) === 0) ? strings.app.aoaAudioSettingsHint : undefined} onApply={applyAudioSettings} onClose={() => setPanel(current => current === "audio" ? null : current)} returnFocusTarget={() => audioSettingsButtonRef.current} />}
-    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} onSetOption={(kind, value) => setOption(kind, value, true)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onOpenAudioSettings={() => setPanel("audio")} onSave={saveSetting} onClose={() => setPanel(null)} />}
+    {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionTransport === "aoa" ? null : snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={null} onClose={() => setPanel(null)} />}
+    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} onSetOption={(kind, value) => setOption(kind, value, true)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onSave={saveSetting} onClose={() => setPanel(null)} />}
     {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}:${networkRecoveryMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} networkRecoveryMode={networkRecoveryMode} onNetworkRecoveryChange={setNetworkRecoveryMode} onConnect={startBackgroundConnection} preferredBindingReference={lastOfferListenerChoice.current?.bindingReference ?? snapshot.wirelessConnectionOffers.automaticBinding ?? ""} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || cancelPending || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} receiverOperationProgress={receiverOperationProgress} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { if (networkStartPendingRef.current) void cancelNetworkStart(); if (panel === "network") retainOfferListenerOnClose.current = true; setBackgroundStartMode(false); if (!receiverOperationBusy) { setReceiverOperationResult(null); setReceiverOperationProgress(null); } setPanel(null); }} />}
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} returnFocusTarget={() => helpButtonRef.current} />}
