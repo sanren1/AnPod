@@ -54,8 +54,8 @@
     <string name="connection_wifi">Wi-Fi</string>
     <string name="connection_adb_description">Start the connection from the computer with USB ADB. The phone will not start the receiver.</string>
     <string name="connection_wifi_description">Use a network the phone and computer can reach.</string>
-    <string name="adb_waiting_guidance">On the computer, connect this phone with USB ADB and start AnPod. This guide does not start the receiver.</string>
-    <string name="close_connection_guide">Close connection guide</string>
+    <string name="waiting_for_computer_connection">Waiting for the computer to connect</string>
+    <string name="connection_wifi_adb">Wi-Fi ADB</string>
     <string name="actual_connection">Actual connection: %1$s</string>
     <string name="actual_connection_unknown">Transport unknown</string>
     <string name="dialog_cancel">Cancel</string>
@@ -151,8 +151,9 @@
     <string name="aod_not_running">Connect to the computer before opening the always-on screen.</string>
     <string name="state_not_connected">Not connected</string>
     <string name="state_waiting_for_computer">Waiting for computer</string>
-    <string name="state_waiting_for_pc_action">Waiting for computer action</string>
-    <string name="state_receiving">Receiving</string>
+    <string name="state_connected_waiting_for_audio">Connected, waiting for audio</string>
+    <string name="state_receiving">Streaming</string>
+    <string name="state_playing_computer_audio">Playing computer audio</string>
     <string name="state_connecting">Connecting</string>
     <string name="state_needs_attention">Needs attention</string>
     <string name="next_step_reading_status">Checking status. Please wait.</string>

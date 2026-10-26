@@ -61,6 +61,7 @@ export const readableStatus = (snapshot: Snapshot, cleanupPending: boolean) => {
 };
 export const CAP_PLAYBACK_PROGRESS = 1 << 3;
 export const CAP_AOA_SESSION_RESTART = 1 << 9;
+export const CAP_AUDIO_V2 = 1 << 7;
 export const needsReceiverUpdate = (message: string) => message.includes("RECEIVER_UPDATE_REQUIRED:");
 export const windowsRateMismatchHz = (message: string) => {
   const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];

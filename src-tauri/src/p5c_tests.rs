@@ -114,6 +114,8 @@ fn adb_record_stream_production_coordinator_loopback() {
             test_adb_binding_material(),
             format,
             SessionAudioQueue::Float32(queue.clone(), format),
+            "adb",
+            None,
         )
         .unwrap_or_else(|error| panic!("production ADB owner cycle {cycle}: {error}"));
         let snapshot = owner.snapshot();
@@ -1257,6 +1259,38 @@ fn spawn_audio_v2_upgrade_fixture_with_profiles(
     )
 }
 
+fn spawn_audio_configuration_sequence_fixture(
+    classes: &Path,
+    sequence: &str,
+) -> (Child, BufReader<std::process::ChildStdout>, SocketAddr) {
+    let (_, java) = java_paths();
+    let mut child = Command::new(java)
+        .arg("-cp")
+        .arg(classes)
+        .arg("app.anpod.receiver.P5cLoopbackEndpoint")
+        .arg("--audio-v2-upgrade")
+        .arg(format!("--audio-config-sequence={sequence}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let port = line
+        .trim()
+        .strip_prefix("PORT=")
+        .expect("Java audio configuration fixture port")
+        .parse::<u16>()
+        .unwrap();
+    (
+        child,
+        stdout,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+    )
+}
+
 fn finish_endpoint(mut child: Child, mut stdout: BufReader<std::process::ChildStdout>) -> String {
     let mut result = String::new();
     stdout.read_line(&mut result).unwrap();
@@ -2170,6 +2204,7 @@ fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
             &cancellation,
             &enabled,
             &mut endpoint,
+            &mut profile,
             &mut parameters,
             &mut paused,
         ),
@@ -2188,6 +2223,7 @@ fn mode_changes_during_reconnect_and_pending_handshake_sync_pcm24_profile() {
         apply_pending_commands(
             &receiver,
             &mut endpoint,
+            &mut profile,
             &mut parameters,
             &mut paused,
             &enabled,
@@ -3689,7 +3725,7 @@ fn pcm24_upgrade_probe_fresh_v2_auth_and_control_use_one_receiver_intent() {
     drop(child.stdin.take());
     let result = finish_endpoint(child, stdout);
     let fields: Vec<_> = result.split(',').collect();
-    assert_eq!(fields.len(), 7, "unexpected PCM24 upgrade result: {result}");
+    assert_eq!(fields.len(), 9, "unexpected PCM24 upgrade result: {result}");
     assert_eq!(
         fields[0], "",
         "probe/fresh V2 session unexpectedly failed: {result}"
@@ -3761,7 +3797,7 @@ fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
     drop(child.stdin.take());
     let result = finish_endpoint(child, stdout);
     let fields: Vec<_> = result.split(',').collect();
-    assert_eq!(fields.len(), 7, "unexpected PCM24/96 result: {result}");
+    assert_eq!(fields.len(), 9, "unexpected PCM24/96 result: {result}");
     assert_eq!(fields[0], "", "96 kHz v2 session failed: {result}");
     assert_eq!(fields[1..5], ["1", "1", "0", "1"]);
     assert_eq!(fields[5], "true");
@@ -3847,7 +3883,7 @@ fn float32_profiles_authenticate_udp_and_preserve_sample_bits() {
         let fields: Vec<_> = result.split(',').collect();
         assert_eq!(
             fields.len(),
-            7,
+            9,
             "unexpected Float32 profile {profile} result: {result}"
         );
         assert_eq!(fields[0], "", "Float32 profile {profile} failed: {result}");
@@ -3959,6 +3995,7 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
         Some(initial_queue.clone()),
         CancellationToken::new(),
         timing,
+        None,
     )
     .unwrap();
 
@@ -4059,13 +4096,114 @@ fn pcm24_owner_pause_and_mode_restart_use_a_fresh_float_queue() {
     drop(child.stdin.take());
     let result = finish_endpoint(child, stdout);
     let fields: Vec<_> = result.split(',').collect();
-    assert_eq!(fields.len(), 7, "unexpected PCM24 owner result: {result}");
+    assert_eq!(fields.len(), 9, "unexpected PCM24 owner result: {result}");
     assert_eq!(fields[0], "", "V2 owner restart failed: {result}");
     assert_eq!(fields[1..5], ["2", "3", "1", "2"]);
     assert_eq!(fields[5], "true", "UDP receiver was not closed: {result}");
     assert_eq!(
         fields[6], "true",
         "Java PCM24 decoder lost Q23 samples: {result}"
+    );
+    let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn owner_reconfigures_standard_float4_float5_standard_in_one_paused_receive_intent() {
+    let classes = compile_java_endpoint();
+    let sequence = "standard:0,4:1,5:0,standard:1";
+    let (mut child, stdout, peer) = spawn_audio_configuration_sequence_fixture(&classes, sequence);
+    let mut endpoint = SessionEndpoint::loopback(peer);
+    endpoint.connection_intent = Some(([0x5a; 16], true));
+    let timing = SessionTiming {
+        heartbeat_interval: Duration::from_millis(20),
+        reconnect_delays: [Duration::from_millis(20); 4],
+        recovery_window: Duration::from_secs(5),
+    };
+    let mut owner = SessionOwner::start_with_endpoint(
+        endpoint,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+        timing,
+    )
+    .unwrap();
+    let mut current = wait_for_owner(&owner, |snapshot| {
+        snapshot.state == SessionLifecycleState::ReceiverRunning
+            && snapshot.session_id.is_some()
+            && snapshot.negotiated_format.is_none()
+    });
+    owner.set_paused(true).unwrap();
+    current = wait_for_owner(&owner, |snapshot| {
+        snapshot.generation == current.generation && snapshot.state == SessionLifecycleState::Paused
+    });
+    assert!(current.paused);
+
+    for (profile_id, mode) in [(Some(4), 1), (Some(5), 0), (None, 1)] {
+        let expected_format =
+            profile_id.map(|profile| AudioFormatV2::for_profile(profile, mode).unwrap());
+        let parameters = AudioParameters {
+            sample_rate: expected_format.map_or(48_000, |format| format.sample_rate),
+            channels: 2,
+            mode,
+        };
+        let profile = expected_format
+            .map(HostAudioProfile::AudioV2)
+            .unwrap_or(HostAudioProfile::Standard);
+        let old_session_id = current.session_id;
+        let old_generation = current.generation;
+        let old_float_queue = match owner.audio_queue().unwrap() {
+            SessionAudioQueue::Float32(queue, _) => Some(queue),
+            SessionAudioQueue::Pcm16(_) => None,
+        };
+        owner.reconfigure_audio(profile, parameters, true).unwrap();
+        current = wait_for_owner(&owner, |snapshot| {
+            snapshot.generation > old_generation
+                && snapshot.session_id.is_some()
+                && snapshot.session_id != old_session_id
+                && snapshot.state == SessionLifecycleState::Paused
+                && snapshot.paused
+                && snapshot.negotiated_format == expected_format
+        });
+        if let Some(queue) = old_float_queue {
+            assert!(
+                queue.is_stopped(),
+                "old Float32 queue survived reconfiguration"
+            );
+        }
+        match (expected_format, owner.audio_queue().unwrap()) {
+            (None, SessionAudioQueue::Pcm16(_)) => {}
+            (Some(expected), SessionAudioQueue::Float32(queue, actual)) => {
+                assert_eq!(actual, expected);
+                assert!(!queue.is_stopped());
+            }
+            _ => panic!("owner published a queue inconsistent with its descriptor"),
+        }
+    }
+    owner.stop();
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let result = finish_endpoint(child, stdout);
+    let fields: Vec<_> = result.split(',').collect();
+    assert_eq!(
+        fields.len(),
+        9,
+        "unexpected audio configuration result: {result}"
+    );
+    assert_eq!(
+        fields[0], "",
+        "audio configuration sequence failed: {result}"
+    );
+    assert_eq!(
+        fields[7], "0",
+        "Receiver rejected requested sequence: {result}"
+    );
+    assert_eq!(
+        fields[8], "2",
+        "sequence did not use two Float sessions: {result}"
     );
     let _ = fs::remove_dir_all(classes);
 }
@@ -4201,7 +4339,6 @@ fn mode_change_uses_a_fresh_session_and_preserves_pause() {
     let before = wait_for_owner(&owner, |status| {
         status.state == SessionLifecycleState::ReceiverRunning
     });
-
     // Two 10 ms synthetic capture blocks follow each other at the production
     // callback cadence; each block is split into two 5 ms UDP packets.
     let old_queue = owner.pcm_queue().unwrap();
@@ -4327,6 +4464,126 @@ fn mode_change_uses_a_fresh_session_and_preserves_pause() {
             "initial, mode-change, and recovered frame-zero PCM payloads must reach the fake sink exactly once: {result}");
     assert_eq!(fields[4], "3", "each active session, including mode and recovery rebuilds, must receive one STOP: {result}");
     let _ = fs::remove_dir_all(classes);
+}
+
+#[test]
+fn owner_keeps_progress_queries_with_startup_diagnostics_disabled() {
+    let classes = compile_java_endpoint();
+    let (child, stdout, peer) =
+        spawn_endpoint_mode(&classes, false, false, false, false, false, false, true);
+    let mut owner = SessionOwner::start(
+        peer,
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let progress = wait_for_owner(&owner, |status| status.playback_diagnostics.is_some());
+    assert_eq!(
+        progress.playback_diagnostics.unwrap().progress_schema,
+        Some(3),
+        "diagnostics-disabled owner must keep its normal progress query"
+    );
+    owner.stop();
+    let result = finish_endpoint(child, stdout);
+    assert!(
+        result.starts_with(",1,"),
+        "unexpected endpoint result: {result}"
+    );
+}
+
+#[test]
+fn startup_diagnostics_sample_schema3_owner_and_resume_without_mixing_epochs() {
+    let classes = compile_java_endpoint();
+    let (mut child, stdout, peer) =
+        spawn_endpoint_mode(&classes, false, false, false, false, false, false, true);
+    let capture = StartupDiagnosticsCapture::new();
+    let mut owner = SessionOwner::start_with_endpoint_and_profile(
+        SessionEndpoint::loopback(peer),
+        test_binding_material(),
+        AudioParameters {
+            sample_rate: 48_000,
+            channels: 2,
+            mode: 0,
+        },
+        HostAudioProfile::Standard,
+        None,
+        CancellationToken::new(),
+        DEFAULT_SESSION_TIMING,
+        Some(capture.clone()),
+    )
+    .unwrap();
+    let active = wait_for_owner(&owner, |status| {
+        status
+            .playback_diagnostics
+            .as_ref()
+            .is_some_and(|progress| progress.progress_schema == Some(3))
+    });
+    assert_eq!(active.state, SessionLifecycleState::ReceiverRunning);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while capture
+        .export()
+        .windows
+        .first()
+        .is_none_or(|window| window.samples.len() < 2)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "schema3 owner did not produce fast samples"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let initial = capture.export();
+    assert_eq!(initial.windows.len(), 1);
+    assert!(initial.windows[0].samples.len() >= 2);
+    let initial_samples = initial.windows[0].samples.len();
+
+    owner.set_paused(true).unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Paused
+    });
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        capture.export().windows[0].samples.len(),
+        initial_samples,
+        "paused owner must not append dense startup samples"
+    );
+
+    owner.set_paused(false).unwrap();
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::ReceiverRunning
+    });
+    let resume_deadline = Instant::now() + Duration::from_millis(800);
+    while capture.export().windows[0].samples.len() == initial_samples {
+        assert!(
+            Instant::now() < resume_deadline,
+            "active schema3 window was not sampled after resume"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let resumed = capture.export();
+    assert_eq!(
+        resumed.windows.len(),
+        1,
+        "same receiver/output epoch must keep one window"
+    );
+    assert!(resumed.windows[0].samples.len() > initial_samples);
+
+    owner.stop();
+    child.stdin.as_mut().unwrap().write_all(b"close").unwrap();
+    let result = finish_endpoint(child, stdout);
+    assert!(
+        result.starts_with(",1,"),
+        "unexpected endpoint result: {result}"
+    );
+    assert!(
+        !capture.export().windows.is_empty(),
+        "STOP must not erase the export buffer"
+    );
 }
 
 fn wait_for_owner(

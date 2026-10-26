@@ -4,9 +4,8 @@ import type { Settings, Snapshot } from "../appTypes";
 import { Activity, CircleHelp, Smartphone } from "lucide-react";
 import { Modal } from "./Modal";
 import { SettingToggle } from "./SettingToggle";
-import { canSetAudioQuality } from "../appRuntime";
 
-export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onSave: (key: keyof Settings, value: unknown) => Promise<void>; onClose: () => void }) {
+export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onOpenAudioSettings, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onOpenAudioSettings: () => void; onSave: (key: keyof Settings, value: unknown) => Promise<void>; onClose: () => void }) {
   const [savingKeys, setSavingKeys] = useState<Set<keyof Settings>>(() => new Set());
   const [saveError, setSaveError] = useState(false);
   const settings = snapshot.settings;
@@ -58,6 +57,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     <section className="settings-audio-summary" aria-label={strings.app.settingsAudio}>
       <span>{strings.app.transportQuality}</span>
       <strong>{strings.app.audioQualityShortLabels[settings.audioQuality]}</strong>
+      <button type="button" disabled={busy} onClick={onOpenAudioSettings}>{strings.app.editAudioSettings}</button>
     </section>
     <section className="settings-group settings-connection-shortcut" aria-labelledby="settings-connection-shortcut-title">
       <h3 id="settings-connection-shortcut-title">{strings.app.settingsConnection}</h3>
@@ -69,23 +69,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <summary><span>{strings.app.advancedConnection}<small>{strings.app.advancedSettingsHint}</small></span></summary>
       <section className="settings-group settings-audio" aria-labelledby="settings-audio-title">
         <h3 id="settings-audio-title">{strings.app.settingsAudio}</h3>
-        <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
-          <legend>{strings.app.transportQuality}</legend>
-          <div className="audio-quality-options">
-            {(["standard", "hifi", "hires"] as const).map(quality => {
-              const fullLabel = strings.app.audioQualityLabels[quality];
-              const requestedSpec = fullLabel.split(" · ").slice(1).join(" · ").replace(/\s*(?:（实验）|\(experimental\))$/i, "");
-              return <label className="audio-quality-card" key={quality}>
-                <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || savingKeys.has("audioQuality") || !canSetAudioQuality(snapshot, quality)} onChange={() => void update("audioQuality", quality)} />
-                <span>
-                  <strong>{strings.app.audioQualityShortLabels[quality]}</strong>
-                  <small>{strings.app.requestedSpecification}: {requestedSpec}</small>
-                  {quality !== "standard" && <small>{strings.app.audioExperimental}</small>}
-                </span>
-              </label>;
-            })}
-          </div>
-          <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
+        <div className="audio-quality-settings">
           <details className="audio-format-disclosure">
             <summary>{strings.app.audioFormatDetails}</summary>
             <dl className="audio-quality-status">
@@ -95,7 +79,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
             </dl>
             <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
           </details>
-        </fieldset>
+        </div>
       </section>
       <section className="settings-group settings-connection" aria-labelledby="settings-connection-title">
         <h3 id="settings-connection-title">{strings.app.settingsConnection}</h3>

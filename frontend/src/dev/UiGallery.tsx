@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Activity, AudioLines, CircleHelp, Settings2, Smartphone, Usb, Wifi } from "lucide-react";
+import { Activity, AudioLines, CircleHelp, ChevronDown, Settings2, Smartphone } from "lucide-react";
 import { FluidSegmentedControl, type SegmentOption } from "../components/ui/FluidSegmentedControl";
 import "./ui-gallery.css";
 
@@ -25,9 +25,6 @@ function PreviewWindow({ theme, view }: { theme: Theme; view: "main" | "settings
   const t = (zh: string, en: string) => english ? en : zh;
   const [appearanceChoice, setAppearanceChoice] = useState<AppearanceChoice>(theme);
   const appearance = appearanceChoice === "system" ? theme : appearanceChoice;
-  const [transport, setTransport] = useState<"usb" | "wireless">("usb");
-  const [wiredMode, setWiredMode] = useState<"adb" | "aoa">("aoa");
-  const [playbackMode, setPlaybackMode] = useState<"balanced" | "lowLatency">("balanced");
   const [wirelessMethod, setWirelessMethod] = useState<"udp" | "adb">("udp");
   const themeOptions: SegmentOption<AppearanceChoice>[] = [
     { value: "system", label: t("跟随系统", "System") },
@@ -44,37 +41,25 @@ function PreviewWindow({ theme, view }: { theme: Theme; view: "main" | "settings
     </header>
 
     {view === "main" ? <main className="gallery-main">
-      <section className="gallery-device" aria-label={t("目标手机", "Target phone")}>
-        <span className="gallery-phone-icon"><Smartphone size={20} /></span>
-        <div><strong>{t("目标手机", "Target phone")}</strong><small>{t("USB Direct · 已连接", "USB Direct · Connected")}</small></div>
-        <span aria-hidden="true">›</span>
+      <section className="device-section" aria-label={t("目标手机", "Target phone")}>
+        <div className="section-title"><h1>{t("目标手机", "Target phone")}</h1></div>
+        <div className="device-card">
+          <button className="device-select" type="button" aria-haspopup="dialog" aria-label={t("选择手机和连接方式", "Choose phone and connection type")}>
+            <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
+            <span className="device-copy"><strong>{t("Pixel 8", "Pixel 8")}</strong><span>{t("USB Direct · 已连接", "USB Direct · Connected")}</span></span>
+            <ChevronDown size={18} aria-hidden="true" />
+          </button>
+          <div className="device-actions"><button className="text-button" type="button">{t("断开连接", "Disconnect")}</button></div>
+        </div>
+        <button className="audio-settings-summary" type="button">
+          <span>{t("均衡", "Balanced")} · {t("标准", "Standard")}</span>
+          <span>{t("音频设置", "Audio settings")}</span>
+        </button>
       </section>
-      <div className="gallery-field">
-        <strong>{t("连接方式", "Connection")}</strong>
-        <FluidSegmentedControl label={t("连接方式", "Connection")} value={transport} options={[
-          { value: "usb", label: <><Usb size={14} />{t("USB", "USB")}</> },
-          { value: "wireless", label: <><Wifi size={14} />{t("无线", "Wireless")}</> },
-        ]} onValueChange={setTransport} />
-      </div>
-      <div className="gallery-field">
-        <strong>{t("有线模式", "Wired mode")}</strong>
-        <FluidSegmentedControl label={t("有线模式", "Wired mode")} value={wiredMode} options={[
-          { value: "adb", label: "ADB" },
-          { value: "aoa", label: "USB Direct" },
-        ]} onValueChange={setWiredMode} />
-      </div>
-      <section className="gallery-status-card" aria-label={t("连接状态", "Connection status")}>
-        <div className="gallery-status-heading"><span className="gallery-status-dot" /><strong>{t("已连接，等待播放", "Connected · waiting to play")}</strong></div>
-        <p>{t("尚未确认收到音频数据", "Audio receipt is not confirmed")}</p>
-        <button className="gallery-primary" type="button">{t("播放到手机", "Play to phone")}</button>
+      <section className="device-status-actions status-hero" aria-label={t("连接状态", "Connection status")}>
+        <div className="status-line state-streaming"><span className="status-dot" /><span>{t("手机正在播放", "Playing on phone")}</span></div>
+        <button className="primary-button main-action" type="button">{t("暂停", "Pause")}</button>
       </section>
-      <div className="gallery-field gallery-playback">
-        <strong>{t("播放模式", "Playback mode")}</strong>
-        <FluidSegmentedControl label={t("播放模式", "Playback mode")} value={playbackMode} options={[
-          { value: "balanced", label: t("均衡", "Balanced") },
-          { value: "lowLatency", label: t("低延迟", "Low latency") },
-        ]} onValueChange={setPlaybackMode} />
-      </div>
       <footer className="gallery-footer"><span><CircleHelp size={14} />{t("帮助", "Help")}</span><span>v1.10.14</span><span><Activity size={14} />{t("诊断", "Diagnostics")}</span></footer>
     </main> : <main className="gallery-settings">
       <div className="gallery-settings-title"><h2>{t("设置", "Settings")}</h2><p>{t("管理连接、音频与界面偏好", "Manage connection, audio and appearance")}</p></div>

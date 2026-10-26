@@ -1,4 +1,84 @@
 use super::*;
+
+#[test]
+fn startup_diagnostics_are_schema3_bounded_and_epoch_scoped() {
+    let capture = StartupDiagnosticsCapture::new();
+    let recorder = capture.recorder("usb-direct", 4, 0);
+    let start = Instant::now();
+    let progress =
+        |receiver_generation, output_epoch, progress_schema, monotonic| PlaybackDiagnostics {
+            progress_schema: Some(progress_schema),
+            receiver_generation: Some(receiver_generation),
+            output_epoch: Some(output_epoch),
+            progress_monotonic_nanos: Some(monotonic),
+            ring_pending_frames: Some(4),
+            stream_pending_frames: Some(32),
+            ..PlaybackDiagnostics::default()
+        };
+
+    recorder.record(progress(7, 2, 2, 10), Some(20), Some(0), start);
+    assert!(!recorder.should_poll_fast(Some(7), Some(2), start));
+    recorder.record(progress(7, 2, 3, 20), Some(21), Some(0), start);
+    assert!(recorder.should_poll_fast(Some(7), Some(2), start));
+    for sample in 1..STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW {
+        recorder.record(
+            progress(7, 2, 3, 20 + sample as u64),
+            Some(21),
+            Some(0),
+            start + STARTUP_DIAGNOSTICS_INTERVAL * sample as u32,
+        );
+    }
+    assert!(!recorder.should_poll_fast(Some(7), Some(2), start + STARTUP_DIAGNOSTICS_WINDOW));
+    let export = capture.export();
+    assert_eq!(export.windows.len(), 1);
+    assert_eq!(
+        export.windows[0].samples.len(),
+        STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW
+    );
+    assert_eq!(
+        export.windows[0].first_observed_receiver_monotonic_nanos,
+        Some(20)
+    );
+    assert_eq!(export.windows[0].transport, "usb-direct");
+    assert_eq!(export.windows[0].audio_profile, 4);
+    assert_eq!(export.windows[0].playback_mode, 0);
+    assert_eq!(export.windows[0].samples[0].pc_queued_frames, Some(21));
+
+    let next_owner = capture.recorder("wifi-adb", 4, 1);
+    next_owner.record(progress(7, 2, 3, 30), None, None, start);
+    assert_eq!(capture.export().windows.len(), 2);
+    assert_ne!(
+        capture.export().windows[0].owner_generation,
+        capture.export().windows[1].owner_generation
+    );
+}
+
+#[test]
+fn startup_diagnostics_stop_at_the_process_window_cap() {
+    let capture = StartupDiagnosticsCapture::new();
+    let start = Instant::now();
+    for receiver_generation in 1..=STARTUP_DIAGNOSTICS_MAX_WINDOWS as u64 + 1 {
+        let recorder = capture.recorder("usb-adb", 1, 0);
+        recorder.record(
+            PlaybackDiagnostics {
+                progress_schema: Some(3),
+                receiver_generation: Some(receiver_generation),
+                output_epoch: Some(1),
+                ..PlaybackDiagnostics::default()
+            },
+            None,
+            None,
+            start,
+        );
+    }
+    let export = capture.export();
+    assert!(export.limit_reached);
+    assert_eq!(export.windows.len(), STARTUP_DIAGNOSTICS_MAX_WINDOWS);
+    assert!(export
+        .windows
+        .iter()
+        .all(|window| window.samples.len() == 1));
+}
 use std::{sync::Mutex, time::SystemTime};
 
 const SERIAL: &str = "FAKE123";

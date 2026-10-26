@@ -2,10 +2,12 @@ use crate::state::{adb_run, adb_run_with_stdin, parse_devices, AdbResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     fs::{self, File},
     future::Future,
     io::Read,
     path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -152,6 +154,214 @@ pub struct PlaybackDiagnostics {
     pub oboe_zero_filled_frames: Option<u64>,
     pub ring_pending_frames: Option<u32>,
     pub stream_pending_frames: Option<u32>,
+}
+
+pub(crate) const STARTUP_DIAGNOSTICS_INTERVAL: Duration = Duration::from_millis(250);
+const STARTUP_DIAGNOSTICS_WINDOW: Duration = Duration::from_secs(10);
+const STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW: usize = 40;
+const STARTUP_DIAGNOSTICS_MAX_WINDOWS: usize = 12;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartupDiagnosticsSample {
+    pub host_elapsed_ms: u64,
+    pub receiver_monotonic_nanos: Option<u64>,
+    pub pc_queued_frames: Option<u64>,
+    pub pc_dropped_frames: Option<u64>,
+    pub playback: PlaybackDiagnostics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartupDiagnosticsWindow {
+    pub owner_generation: u64,
+    pub receiver_generation: u64,
+    pub output_epoch: u32,
+    pub transport: String,
+    pub audio_profile: u8,
+    pub playback_mode: u8,
+    pub first_observed_host_elapsed_ms: u64,
+    pub first_observed_receiver_monotonic_nanos: Option<u64>,
+    pub samples: Vec<StartupDiagnosticsSample>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartupDiagnosticsExport {
+    pub enabled: bool,
+    pub sample_interval_ms: u64,
+    pub window_ms: u64,
+    pub max_samples_per_window: usize,
+    pub max_windows: usize,
+    pub limit_reached: bool,
+    pub windows: Vec<StartupDiagnosticsWindow>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupDiagnosticsCapture(Arc<Mutex<StartupDiagnosticsBuffer>>);
+
+struct StartupDiagnosticsBuffer {
+    started_at: Instant,
+    next_owner_generation: u64,
+    limit_reached: bool,
+    windows: VecDeque<StartupDiagnosticsWindow>,
+    last_sample_at: VecDeque<Option<Instant>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupDiagnosticsRecorder {
+    capture: StartupDiagnosticsCapture,
+    owner_generation: u64,
+    transport: String,
+    audio_profile: u8,
+    playback_mode: u8,
+}
+
+impl StartupDiagnosticsCapture {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(StartupDiagnosticsBuffer {
+            started_at: Instant::now(),
+            next_owner_generation: 0,
+            limit_reached: false,
+            windows: VecDeque::with_capacity(STARTUP_DIAGNOSTICS_MAX_WINDOWS),
+            last_sample_at: VecDeque::with_capacity(STARTUP_DIAGNOSTICS_MAX_WINDOWS),
+        })))
+    }
+
+    pub(crate) fn recorder(
+        &self,
+        transport: &str,
+        audio_profile: u8,
+        playback_mode: u8,
+    ) -> StartupDiagnosticsRecorder {
+        let mut buffer = self.0.lock().expect("startup diagnostics lock");
+        buffer.next_owner_generation = buffer.next_owner_generation.saturating_add(1);
+        StartupDiagnosticsRecorder {
+            capture: self.clone(),
+            owner_generation: buffer.next_owner_generation,
+            transport: transport.into(),
+            audio_profile,
+            playback_mode,
+        }
+    }
+
+    pub(crate) fn export(&self) -> StartupDiagnosticsExport {
+        let buffer = self.0.lock().expect("startup diagnostics lock");
+        StartupDiagnosticsExport {
+            enabled: true,
+            sample_interval_ms: STARTUP_DIAGNOSTICS_INTERVAL.as_millis() as u64,
+            window_ms: STARTUP_DIAGNOSTICS_WINDOW.as_millis() as u64,
+            max_samples_per_window: STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW,
+            max_windows: STARTUP_DIAGNOSTICS_MAX_WINDOWS,
+            limit_reached: buffer.limit_reached,
+            windows: buffer.windows.iter().cloned().collect(),
+        }
+    }
+}
+
+impl StartupDiagnosticsRecorder {
+    pub(crate) fn should_poll_fast(
+        &self,
+        receiver_generation: Option<u64>,
+        output_epoch: Option<u32>,
+        now: Instant,
+    ) -> bool {
+        let (Some(receiver_generation), Some(output_epoch)) = (receiver_generation, output_epoch)
+        else {
+            return false;
+        };
+        let buffer = self.capture.0.lock().expect("startup diagnostics lock");
+        buffer
+            .windows
+            .iter()
+            .zip(&buffer.last_sample_at)
+            .find(|(window, _)| {
+                window.owner_generation == self.owner_generation
+                    && window.receiver_generation == receiver_generation
+                    && window.output_epoch == output_epoch
+            })
+            .is_some_and(|(window, last)| {
+                window.samples.len() < STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW
+                    && now.saturating_duration_since(
+                        buffer.started_at
+                            + Duration::from_millis(window.first_observed_host_elapsed_ms),
+                    ) <= STARTUP_DIAGNOSTICS_WINDOW
+                    && last.is_some()
+            })
+    }
+
+    pub(crate) fn record(
+        &self,
+        playback: PlaybackDiagnostics,
+        pc_queued_frames: Option<u64>,
+        pc_dropped_frames: Option<u64>,
+        now: Instant,
+    ) {
+        let (Some(receiver_generation), Some(output_epoch)) =
+            (playback.receiver_generation, playback.output_epoch)
+        else {
+            return;
+        };
+        if playback.progress_schema != Some(3) {
+            return;
+        }
+        let mut buffer = self.capture.0.lock().expect("startup diagnostics lock");
+        if buffer.limit_reached {
+            return;
+        }
+        let index = if let Some(index) = buffer.windows.iter().position(|window| {
+            window.owner_generation == self.owner_generation
+                && window.receiver_generation == receiver_generation
+                && window.output_epoch == output_epoch
+        }) {
+            index
+        } else {
+            if buffer.windows.len() == STARTUP_DIAGNOSTICS_MAX_WINDOWS {
+                buffer.limit_reached = true;
+                return;
+            }
+            let host_elapsed_ms =
+                now.saturating_duration_since(buffer.started_at).as_millis() as u64;
+            buffer.windows.push_back(StartupDiagnosticsWindow {
+                owner_generation: self.owner_generation,
+                receiver_generation,
+                output_epoch,
+                transport: self.transport.clone(),
+                audio_profile: self.audio_profile,
+                playback_mode: self.playback_mode,
+                first_observed_host_elapsed_ms: host_elapsed_ms,
+                first_observed_receiver_monotonic_nanos: playback.progress_monotonic_nanos,
+                samples: Vec::with_capacity(STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW),
+            });
+            buffer.last_sample_at.push_back(None);
+            buffer.windows.len() - 1
+        };
+        let started_at = buffer.started_at;
+        let window_start = started_at
+            + Duration::from_millis(buffer.windows[index].first_observed_host_elapsed_ms);
+        let elapsed = now.saturating_duration_since(window_start);
+        if elapsed > STARTUP_DIAGNOSTICS_WINDOW
+            || buffer.windows[index].samples.len() >= STARTUP_DIAGNOSTICS_SAMPLES_PER_WINDOW
+        {
+            return;
+        }
+        if buffer.last_sample_at[index]
+            .is_some_and(|last| now.saturating_duration_since(last) < STARTUP_DIAGNOSTICS_INTERVAL)
+        {
+            return;
+        }
+        buffer.last_sample_at[index] = Some(now);
+        let host_elapsed_ms = now.saturating_duration_since(started_at).as_millis() as u64;
+        buffer.windows[index]
+            .samples
+            .push(StartupDiagnosticsSample {
+                host_elapsed_ms,
+                receiver_monotonic_nanos: playback.progress_monotonic_nanos,
+                pc_queued_frames,
+                pc_dropped_frames,
+                playback,
+            });
+    }
 }
 
 impl ReceiverStatus {

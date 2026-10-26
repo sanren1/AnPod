@@ -103,13 +103,18 @@ final class ReceiverUiState {
                 : service.isAdbStreamSession() ? "wifi".equals(service.adbConnectionTransport()) ? "wifi-adb" : "usb-adb"
                 : service.networkCoordinator != null || !ReceiverService.networkAudioAddress.isEmpty() ? "wireless-udp"
                 : ReceiverService.currentAudio != null ? "usb-or-local" : "unknown";
-        String state = ReceiverUiOperation.displayState(ReceiverService.networkAudioState, ReceiverService.currentAudio != null, ReceiverService.audioActive);
+        ReceiverService.AudioSession audio = ReceiverService.currentAudio;
+        boolean userPaused = audio != null && !audio.cancelled
+                && service.isCurrentOperation(audio.ownerId, audio.networkGeneration)
+                && audio.focusState.isUserPaused()
+                && !"failed".equals(ReceiverService.networkAudioState);
+        String state = userPaused ? "paused"
+                : ReceiverUiOperation.displayState(ReceiverService.networkAudioState, audio != null, ReceiverService.audioActive);
         String mode = ReceiverService.currentAudio == null ? "" : ReceiverService.actualMode;
         Boolean playbackAdvancing = ReceiverService.playbackMetricsSnapshot().advancing;
         String operationError = service.uiOperation.error();
         if (operationError.isEmpty()) operationError = ReceiverService.networkAudioFailure;
         boolean canRevokeBackgroundTrust = service.canRevokeBackgroundTrust(binding, fingerprint, grantKind);
-        ReceiverService.AudioSession audio = ReceiverService.currentAudio;
         String requestedEngine = audio == null ? service.requestedOutputEnginePreference()
                 : audio.requestedOutputEngine;
         String fallbackReason = audio == null

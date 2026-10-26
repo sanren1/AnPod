@@ -4,7 +4,7 @@ use crate::{
     network::{FloatPcmQueue, FloatUdpSender, PcmQueue, UdpSender, UdpSessionMaterial},
     network_interface::Ipv4Interface,
     protocol::{AudioFormatV2, PcmFormat},
-    receiver::PlaybackDiagnostics,
+    receiver::{PlaybackDiagnostics, StartupDiagnosticsCapture, STARTUP_DIAGNOSTICS_INTERVAL},
     security::{AudioParameters, BindingMaterial, HostHandshake, HostHandshakeV2},
 };
 use hmac::{Hmac, Mac};
@@ -1837,6 +1837,11 @@ enum OwnerCommand {
     SetPaused(bool),
     UpdateEndpoint(SessionEndpoint),
     SetMode(u8),
+    ReconfigureAudio {
+        profile: HostAudioProfile,
+        parameters: AudioParameters,
+        paused: bool,
+    },
     Reconnect,
     BackgroundTrustQuery {
         session_generation: u64,
@@ -1912,6 +1917,7 @@ impl SessionOwner {
         caller_cancel: CancellationToken,
         connection_intent: Option<([u8; 16], bool)>,
         background_authorization_required: bool,
+        diagnostics: Option<StartupDiagnosticsCapture>,
     ) -> Result<Self, String> {
         let mut endpoint = SessionEndpoint::on_interface(interface, peer);
         endpoint.connection_intent = connection_intent;
@@ -1924,6 +1930,7 @@ impl SessionOwner {
             initial_float_queue,
             caller_cancel,
             DEFAULT_SESSION_TIMING,
+            diagnostics,
         )
     }
 
@@ -1996,9 +2003,11 @@ impl SessionOwner {
             None,
             caller_cancel,
             timing,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_endpoint_and_profile(
         mut endpoint: SessionEndpoint,
         binding: BindingMaterial,
@@ -2007,6 +2016,7 @@ impl SessionOwner {
         initial_float_queue: Option<Arc<FloatPcmQueue>>,
         caller_cancel: CancellationToken,
         timing: SessionTiming,
+        diagnostics: Option<StartupDiagnosticsCapture>,
     ) -> Result<Self, String> {
         endpoint.validate()?;
         if endpoint.background_request_id.is_none() {
@@ -2056,6 +2066,7 @@ impl SessionOwner {
                     timing,
                     profile,
                     initial_float_queue,
+                    diagnostics,
                 )
             })
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
@@ -2209,6 +2220,30 @@ impl SessionOwner {
         }
         self.commands
             .send(OwnerCommand::SetMode(mode))
+            .map_err(|_| "P5-D session owner has stopped.".to_string())
+    }
+
+    pub(crate) fn reconfigure_audio(
+        &self,
+        profile: HostAudioProfile,
+        parameters: AudioParameters,
+        paused: bool,
+    ) -> Result<(), String> {
+        if parameters.mode > 1 || parameters.channels != 2 {
+            return Err("P5-D audio configuration is invalid.".into());
+        }
+        let profile = profile_for_mode(profile, parameters.mode)?;
+        if let HostAudioProfile::AudioV2(format) = profile {
+            if format.sample_rate != parameters.sample_rate {
+                return Err("P5-D audio profile does not match its sample rate.".into());
+            }
+        }
+        self.commands
+            .send(OwnerCommand::ReconfigureAudio {
+                profile,
+                parameters,
+                paused,
+            })
             .map_err(|_| "P5-D session owner has stopped.".to_string())
     }
 
@@ -2397,6 +2432,7 @@ fn run_session_owner(
     timing: SessionTiming,
     mut profile: HostAudioProfile,
     mut initial_float_queue: Option<Arc<FloatPcmQueue>>,
+    diagnostics_capture: Option<StartupDiagnosticsCapture>,
 ) {
     let mut endpoint = endpoint;
     let mut parameters = parameters;
@@ -2480,6 +2516,7 @@ fn run_session_owner(
                     &cancellation,
                     &enabled,
                     &mut endpoint,
+                    &mut profile,
                     &mut parameters,
                     &mut desired_paused,
                 ) {
@@ -2520,6 +2557,20 @@ fn run_session_owner(
         let terminal_cause_supported = capabilities
             .as_ref()
             .is_some_and(|info| info.capability_bits & CAP_TERMINAL_CAUSE != 0);
+        let startup_recorder = if capabilities
+            .as_ref()
+            .is_some_and(|info| info.capability_bits & CAP_BUFFER_METRICS != 0)
+        {
+            diagnostics_capture.as_ref().map(|capture| {
+                let (audio_profile, playback_mode) = match profile {
+                    HostAudioProfile::Standard => (1, parameters.mode),
+                    HostAudioProfile::AudioV2(format) => (format.profile, format.mode),
+                };
+                capture.recorder("wifi-udp", audio_profile, playback_mode)
+            })
+        } else {
+            None
+        };
         status
             .lock()
             .expect("P5-D session status lock poisoned")
@@ -2657,6 +2708,24 @@ fn run_session_owner(
                         restart = true;
                         break;
                     }
+                    Ok(OwnerCommand::ReconfigureAudio {
+                        profile: next_profile,
+                        parameters: next_parameters,
+                        paused: next_paused,
+                    }) => {
+                        profile = next_profile;
+                        parameters = next_parameters;
+                        desired_paused = next_paused;
+                        if recovery_started_at.is_none() {
+                            recovery_started_at = Some(Instant::now());
+                            status
+                                .lock()
+                                .expect("P5-D session status lock poisoned")
+                                .recovery_started_at = recovery_started_at;
+                        }
+                        restart = true;
+                        break;
+                    }
                     Ok(OwnerCommand::SetPaused(_)) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2706,6 +2775,7 @@ fn run_session_owner(
                         &cancellation,
                         &enabled,
                         &mut endpoint,
+                        &mut profile,
                         &mut parameters,
                         &mut desired_paused,
                     ) {
@@ -2762,6 +2832,7 @@ fn run_session_owner(
                 &cancellation,
                 &enabled,
                 &mut endpoint,
+                &mut profile,
                 &mut parameters,
                 &mut desired_paused,
             ) {
@@ -2783,6 +2854,7 @@ fn run_session_owner(
         match apply_pending_commands(
             &commands,
             &mut endpoint,
+            &mut profile,
             &mut parameters,
             &mut desired_paused,
             &enabled,
@@ -2794,6 +2866,11 @@ fn run_session_owner(
                 continue 'owner;
             }
             PendingCommands::ModeChanged => {
+                drop(session);
+                retry_index = 0;
+                continue 'owner;
+            }
+            PendingCommands::AudioConfigurationChanged => {
                 drop(session);
                 retry_index = 0;
                 continue 'owner;
@@ -2847,6 +2924,7 @@ fn run_session_owner(
                 &cancellation,
                 &enabled,
                 &mut endpoint,
+                &mut profile,
                 &mut parameters,
                 &mut desired_paused,
             ) {
@@ -2905,6 +2983,7 @@ fn run_session_owner(
         let mut endpoint_changed = false;
         let mut stop_owner = false;
         let mut next_heartbeat = Instant::now() + timing.heartbeat_interval;
+        let mut next_progress = next_heartbeat;
         loop {
             if !enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
                 stop_owner = true;
@@ -2937,50 +3016,6 @@ fn run_session_owner(
                         break;
                     }
                     Ok(state) => {
-                        match session.playback_progress() {
-                            Ok(Some(mut diagnostics)) => {
-                                let audio_queue = session.audio_queue();
-                                let previous = status
-                                    .lock()
-                                    .expect("P5-D session status lock poisoned")
-                                    .playback_diagnostics
-                                    .as_ref()
-                                    .and_then(|current| current.underrun_count);
-                                diagnostics.sample_rate = Some(session.parameters.sample_rate);
-                                diagnostics.channels = Some(session.parameters.channels);
-                                let (dropped_frames, queued_frames) = match audio_queue {
-                                    SessionAudioQueue::Pcm16(queue) => {
-                                        (queue.dropped_frames(), queue.queued_frames())
-                                    }
-                                    SessionAudioQueue::Float32(queue, _) => {
-                                        (queue.dropped_frames(), queue.queued_frames())
-                                    }
-                                };
-                                diagnostics.pc_dropped_frames = Some(dropped_frames);
-                                diagnostics.pc_queued_frames = Some(queued_frames);
-                                diagnostics.underrun_increment =
-                                    match (previous, diagnostics.underrun_count) {
-                                        (Some(previous), Some(current)) if current >= previous => {
-                                            Some((current - previous) as u64)
-                                        }
-                                        _ => None,
-                                    };
-                                status
-                                    .lock()
-                                    .expect("P5-D session status lock poisoned")
-                                    .playback_diagnostics = Some(diagnostics);
-                            }
-                            Ok(None) => {
-                                status
-                                    .lock()
-                                    .expect("P5-D session status lock poisoned")
-                                    .playback_diagnostics = None;
-                            }
-                            Err(error) => {
-                                last_error = Some(error);
-                                break;
-                            }
-                        }
                         publish_session(
                             &status,
                             lifecycle_from_receiver(state),
@@ -2997,15 +3032,96 @@ fn run_session_owner(
                     }
                 }
                 next_heartbeat = Instant::now() + timing.heartbeat_interval;
-                continue;
             }
-            let until_heartbeat = next_heartbeat.saturating_duration_since(Instant::now());
-            match commands.recv_timeout(until_heartbeat.min(SESSION_IO_POLL)) {
+            if Instant::now() >= next_progress {
+                match session.playback_progress() {
+                    Ok(Some(mut playback)) => {
+                        let audio_queue = session.audio_queue();
+                        let previous = status
+                            .lock()
+                            .expect("P5-D session status lock poisoned")
+                            .playback_diagnostics
+                            .as_ref()
+                            .and_then(|current| current.underrun_count);
+                        playback.sample_rate = Some(session.parameters.sample_rate);
+                        playback.channels = Some(session.parameters.channels);
+                        let (pc_dropped, pc_queued) = match audio_queue {
+                            SessionAudioQueue::Pcm16(queue) => {
+                                (Some(queue.dropped_frames()), Some(queue.queued_frames()))
+                            }
+                            SessionAudioQueue::Float32(queue, _) => {
+                                (Some(queue.dropped_frames()), Some(queue.queued_frames()))
+                            }
+                        };
+                        playback.pc_dropped_frames = pc_dropped;
+                        playback.pc_queued_frames = pc_queued;
+                        playback.underrun_increment = match (previous, playback.underrun_count) {
+                            (Some(previous), Some(current)) if current >= previous => {
+                                Some((current - previous) as u64)
+                            }
+                            _ => None,
+                        };
+                        let now = Instant::now();
+                        let fast = !paused
+                            && startup_recorder.as_ref().is_some_and(|recorder| {
+                                if playback.output_epoch.is_some() {
+                                    recorder.record(playback.clone(), pc_queued, pc_dropped, now);
+                                    recorder.should_poll_fast(
+                                        playback.receiver_generation,
+                                        playback.output_epoch,
+                                        now,
+                                    )
+                                } else {
+                                    false
+                                }
+                            });
+                        status
+                            .lock()
+                            .expect("P5-D session status lock poisoned")
+                            .playback_diagnostics = Some(playback);
+                        next_progress = now
+                            + if fast {
+                                STARTUP_DIAGNOSTICS_INTERVAL
+                            } else {
+                                timing.heartbeat_interval
+                            };
+                    }
+                    Ok(None) => {
+                        status
+                            .lock()
+                            .expect("P5-D session status lock poisoned")
+                            .playback_diagnostics = None;
+                        next_progress = Instant::now() + timing.heartbeat_interval;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let until_next = next_heartbeat
+                .min(next_progress)
+                .saturating_duration_since(Instant::now());
+            match commands.recv_timeout(until_next.min(SESSION_IO_POLL)) {
                 Ok(OwnerCommand::SetPaused(value)) => {
                     desired_paused = value;
                     if value == paused {
                         continue;
                     }
+                    let fast_resume = !value
+                        && startup_recorder.as_ref().is_some_and(|recorder| {
+                            let current = status.lock().expect("P5-D session status lock poisoned");
+                            current
+                                .playback_diagnostics
+                                .as_ref()
+                                .is_some_and(|progress| {
+                                    recorder.should_poll_fast(
+                                        progress.receiver_generation,
+                                        progress.output_epoch,
+                                        Instant::now(),
+                                    )
+                                })
+                        });
                     let result = if value {
                         session.pause()
                     } else {
@@ -3014,6 +3130,13 @@ fn run_session_owner(
                     match result {
                         Ok(()) => {
                             paused = value;
+                            next_progress = if value {
+                                Instant::now() + timing.heartbeat_interval
+                            } else if fast_resume {
+                                Instant::now()
+                            } else {
+                                next_progress
+                            };
                             let state = if paused {
                                 SessionLifecycleState::Paused
                             } else {
@@ -3059,6 +3182,36 @@ fn run_session_owner(
                         continue;
                     }
                     parameters.mode = mode;
+                    if let Err(error) = session.stop() {
+                        last_error = Some(error);
+                    }
+                    endpoint_changed = true;
+                    break;
+                }
+                Ok(OwnerCommand::ReconfigureAudio {
+                    profile: next_profile,
+                    parameters: next_parameters,
+                    paused: next_paused,
+                }) => {
+                    if next_profile == profile && next_parameters == parameters {
+                        desired_paused = next_paused;
+                        if next_paused != paused {
+                            let changed = if next_paused {
+                                session.pause()
+                            } else {
+                                session.resume()
+                            };
+                            if let Err(error) = changed {
+                                last_error = Some(error);
+                                break;
+                            }
+                            paused = next_paused;
+                        }
+                        continue;
+                    }
+                    profile = next_profile;
+                    parameters = next_parameters;
+                    desired_paused = next_paused;
                     if let Err(error) = session.stop() {
                         last_error = Some(error);
                     }
@@ -3178,6 +3331,7 @@ fn run_session_owner(
             &cancellation,
             &enabled,
             &mut endpoint,
+            &mut profile,
             &mut parameters,
             &mut desired_paused,
         ) {
@@ -3252,6 +3406,7 @@ fn publish_session(
     if state == SessionLifecycleState::Reconnecting && session_id.is_none() {
         current.capabilities = None;
         current.playback_diagnostics = None;
+        current.negotiated_format = None;
     }
     current.state = state;
     current.generation = generation;
@@ -3271,6 +3426,7 @@ enum PendingCommands {
     Stop,
     EndpointChanged,
     ModeChanged,
+    AudioConfigurationChanged,
     Reconnect,
     Applied,
 }
@@ -3278,12 +3434,14 @@ enum PendingCommands {
 fn apply_pending_commands(
     commands: &mpsc::Receiver<OwnerCommand>,
     endpoint: &mut SessionEndpoint,
+    profile: &mut HostAudioProfile,
     parameters: &mut AudioParameters,
     paused: &mut bool,
     enabled: &AtomicBool,
 ) -> PendingCommands {
     let mut endpoint_changed = false;
     let mut mode_changed = false;
+    let mut audio_configuration_changed = false;
     let mut reconnect = false;
     loop {
         match commands.try_recv() {
@@ -3309,6 +3467,17 @@ fn apply_pending_commands(
                 mode_changed |= parameters.mode != mode;
                 parameters.mode = mode;
             }
+            Ok(OwnerCommand::ReconfigureAudio {
+                profile: next_profile,
+                parameters: next_parameters,
+                paused: next_paused,
+            }) => {
+                audio_configuration_changed |=
+                    *profile != next_profile || *parameters != next_parameters;
+                *profile = next_profile;
+                *parameters = next_parameters;
+                *paused = next_paused;
+            }
             Ok(OwnerCommand::Reconnect) => reconnect = true,
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -3323,17 +3492,21 @@ fn apply_pending_commands(
         PendingCommands::EndpointChanged
     } else if mode_changed {
         PendingCommands::ModeChanged
+    } else if audio_configuration_changed {
+        PendingCommands::AudioConfigurationChanged
     } else {
         PendingCommands::Applied
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_reconnect(
     delay: Duration,
     commands: &mpsc::Receiver<OwnerCommand>,
     cancellation: &CancellationToken,
     enabled: &AtomicBool,
     endpoint: &mut SessionEndpoint,
+    profile: &mut HostAudioProfile,
     parameters: &mut AudioParameters,
     paused: &mut bool,
 ) -> RetryWait {
@@ -3369,6 +3542,19 @@ fn wait_for_reconnect(
             Ok(OwnerCommand::SetMode(mode)) => {
                 if parameters.mode != mode {
                     parameters.mode = mode;
+                    return RetryWait::ReconnectNow;
+                }
+            }
+            Ok(OwnerCommand::ReconfigureAudio {
+                profile: next_profile,
+                parameters: next_parameters,
+                paused: next_paused,
+            }) => {
+                let changed = *profile != next_profile || *parameters != next_parameters;
+                *profile = next_profile;
+                *parameters = next_parameters;
+                *paused = next_paused;
+                if changed {
                     return RetryWait::ReconnectNow;
                 }
             }

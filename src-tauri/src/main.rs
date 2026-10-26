@@ -28,7 +28,7 @@ mod protocol;
 mod security;
 
 use state::{AoaDeviceTarget, AppSnapshot, AppState, OperationResult, UsbDirectConfiguration};
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 fn get_snapshot(state: State<'_, AppState>) -> AppSnapshot {
@@ -373,6 +373,18 @@ async fn reconfigure_session(
 }
 
 #[tauri::command]
+async fn apply_audio_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    audio_quality: String,
+    playback_mode: String,
+) -> Result<AppSnapshot, String> {
+    state
+        .apply_audio_settings(&app, &audio_quality, &playback_mode)
+        .await
+}
+
+#[tauri::command]
 async fn begin_usb_direct_configuration(
     state: State<'_, AppState>,
     disconnect_current: bool,
@@ -515,6 +527,7 @@ fn main() {
             accept_wireless_connection_offer,
             cancel_qr_pairing,
             reconfigure_session,
+            apply_audio_settings,
             begin_usb_direct_configuration,
             end_usb_direct_configuration,
             show_main_window,

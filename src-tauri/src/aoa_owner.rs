@@ -12,7 +12,10 @@ use crate::{
     protocol::{
         AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
     },
-    receiver::PlaybackDiagnostics,
+    receiver::{
+        PlaybackDiagnostics, StartupDiagnosticsCapture, StartupDiagnosticsRecorder,
+        STARTUP_DIAGNOSTICS_INTERVAL,
+    },
     security::{BindingMaterial, HostHandshakeV2, SessionKeys},
 };
 
@@ -197,14 +200,18 @@ impl AoaOwner {
         material: BindingMaterial,
         format: AudioFormatV2,
         queue: SessionAudioQueue,
+        diagnostics: Option<StartupDiagnosticsCapture>,
     ) -> Result<Self, String> {
-        Self::connect_io(
+        Self::connect_io_with_transport(
             stream.reader,
             stream.writer,
             stream.cancel,
             material,
             format,
             queue,
+            RecordTransport::Aoa,
+            diagnostics,
+            "usb-direct",
         )
     }
 
@@ -213,6 +220,8 @@ impl AoaOwner {
         material: BindingMaterial,
         format: AudioFormatV2,
         queue: SessionAudioQueue,
+        diagnostic_transport: &str,
+        diagnostics: Option<StartupDiagnosticsCapture>,
     ) -> Result<Self, String> {
         stream
             .set_nonblocking(false)
@@ -228,6 +237,8 @@ impl AoaOwner {
             format,
             queue,
             RecordTransport::AdbStream,
+            diagnostics,
+            diagnostic_transport,
         )
     }
 
@@ -252,9 +263,12 @@ impl AoaOwner {
             format,
             queue,
             RecordTransport::Aoa,
+            None,
+            "usb-direct",
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect_io_with_transport<R, W, C>(
         reader: R,
         mut writer: W,
@@ -263,6 +277,8 @@ impl AoaOwner {
         format: AudioFormatV2,
         queue: SessionAudioQueue,
         transport: RecordTransport,
+        diagnostics: Option<StartupDiagnosticsCapture>,
+        diagnostic_transport: &str,
     ) -> Result<Self, String>
     where
         R: RecordReader + 'static,
@@ -412,6 +428,8 @@ impl AoaOwner {
                 return Err(error);
             }
         };
+        let diagnostics = diagnostics
+            .map(|capture| capture.recorder(diagnostic_transport, format.profile, format.mode));
         let (commands, commands_rx) = mpsc::sync_channel(OWNER_COMMAND_CAPACITY);
         let worker_cancel = cancel.clone();
         let worker_queue = queue.clone();
@@ -456,6 +474,7 @@ impl AoaOwner {
                     commands_rx,
                     worker_snapshot,
                     worker_bytes_for_thread,
+                    diagnostics,
                 )
             });
         let worker = match worker {
@@ -811,6 +830,7 @@ fn run_owner_worker<W: RecordWriter>(
     commands: Receiver<OwnerCommand>,
     snapshot: Arc<Mutex<AoaSnapshot>>,
     bytes_sent: Arc<AtomicU64>,
+    diagnostics: Option<StartupDiagnosticsRecorder>,
 ) -> Result<(), String> {
     let result = run_owner_loop(
         &mut writer,
@@ -826,6 +846,7 @@ fn run_owner_worker<W: RecordWriter>(
         &commands,
         &snapshot,
         &bytes_sent,
+        diagnostics,
     );
     if let Err(error) = &result {
         stop_queue(&queue);
@@ -864,6 +885,7 @@ fn run_owner_loop<W: RecordWriter>(
     commands: &Receiver<OwnerCommand>,
     snapshot: &Arc<Mutex<AoaSnapshot>>,
     bytes_sent: &AtomicU64,
+    diagnostics: Option<StartupDiagnosticsRecorder>,
 ) -> Result<(), String> {
     let mut state = ReceiverState::ReceiverRunning;
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
@@ -877,6 +899,7 @@ fn run_owner_loop<W: RecordWriter>(
                 return Err("AOA session was cancelled.".into())
             }
             Ok(command) => {
+                let resumed = matches!(&command, OwnerCommand::Resume(_));
                 if process_command(
                     command,
                     writer,
@@ -892,6 +915,9 @@ fn run_owner_loop<W: RecordWriter>(
                     snapshot,
                 )? {
                     return Ok(());
+                }
+                if resumed && startup_window_is_active(diagnostics.as_ref(), snapshot) {
+                    next_progress = Instant::now();
                 }
                 continue;
             }
@@ -994,10 +1020,41 @@ fn run_owner_loop<W: RecordWriter>(
             if ack.result != RESULT_OK {
                 return Err("AOA playback progress query was rejected.".into());
             }
+            let playback = ack.playback_progress;
+            let next_interval = if let (Some(recorder), Some(progress)) =
+                (diagnostics.as_ref(), playback.as_ref())
+            {
+                let active = ack.state != ReceiverState::Paused && progress.output_epoch.is_some();
+                if active {
+                    let (pc_queued, pc_dropped) = match queue {
+                        SessionAudioQueue::Pcm16(queue) => {
+                            (Some(queue.queued_frames()), Some(queue.dropped_frames()))
+                        }
+                        SessionAudioQueue::Float32(queue, _) => {
+                            (Some(queue.queued_frames()), Some(queue.dropped_frames()))
+                        }
+                    };
+                    let now = Instant::now();
+                    recorder.record(progress.clone(), pc_queued, pc_dropped, now);
+                    if recorder.should_poll_fast(
+                        progress.receiver_generation,
+                        progress.output_epoch,
+                        now,
+                    ) {
+                        STARTUP_DIAGNOSTICS_INTERVAL
+                    } else {
+                        Duration::from_secs(2)
+                    }
+                } else {
+                    Duration::from_secs(2)
+                }
+            } else {
+                Duration::from_secs(2)
+            };
             let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
             view.state = ack.state;
-            view.playback_progress = ack.playback_progress;
-            next_progress = Instant::now() + Duration::from_secs(2);
+            view.playback_progress = playback;
+            next_progress = Instant::now() + next_interval;
         }
 
         match records.try_recv() {
@@ -1017,6 +1074,7 @@ fn run_owner_loop<W: RecordWriter>(
         if state == ReceiverState::Paused {
             match commands.recv_timeout(CONTROL_POLL) {
                 Ok(command) => {
+                    let resumed = matches!(&command, OwnerCommand::Resume(_));
                     if process_command(
                         command,
                         writer,
@@ -1032,6 +1090,9 @@ fn run_owner_loop<W: RecordWriter>(
                         snapshot,
                     )? {
                         return Ok(());
+                    }
+                    if resumed && startup_window_is_active(diagnostics.as_ref(), snapshot) {
+                        next_progress = Instant::now();
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1132,6 +1193,21 @@ fn run_owner_loop<W: RecordWriter>(
             pending = None;
         }
     }
+}
+
+fn startup_window_is_active(
+    diagnostics: Option<&StartupDiagnosticsRecorder>,
+    snapshot: &Mutex<AoaSnapshot>,
+) -> bool {
+    diagnostics.is_some_and(|recorder| {
+        let snapshot = snapshot.lock().expect("AOA snapshot lock");
+        let progress = snapshot.playback_progress.as_ref();
+        recorder.should_poll_fast(
+            progress.and_then(|progress| progress.receiver_generation),
+            progress.and_then(|progress| progress.output_epoch),
+            Instant::now(),
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

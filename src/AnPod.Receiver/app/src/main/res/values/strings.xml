@@ -54,8 +54,8 @@
     <string name="connection_wifi">Wi-Fi</string>
     <string name="connection_adb_description">请在电脑端通过 USB ADB 发起连接；手机不会启动接收服务。</string>
     <string name="connection_wifi_description">需与电脑网络互通。</string>
-    <string name="adb_waiting_guidance">请在电脑端使用 USB ADB 连接这台手机并启动 AnPod。等待指引不会启动服务。</string>
-    <string name="close_connection_guide">关闭连接指引</string>
+    <string name="waiting_for_computer_connection">等待电脑发起连接</string>
+    <string name="connection_wifi_adb">Wi-Fi ADB</string>
     <string name="actual_connection">实际连接：%1$s</string>
     <string name="actual_connection_unknown">传输方式未知</string>
     <string name="dialog_cancel">取消</string>
@@ -151,8 +151,9 @@
     <string name="aod_not_running">请先连接电脑，再打开常显屏幕。</string>
     <string name="state_not_connected">未连接</string>
     <string name="state_waiting_for_computer">等待电脑</string>
-    <string name="state_waiting_for_pc_action">等待电脑操作</string>
-    <string name="state_receiving">正在接收</string>
+    <string name="state_connected_waiting_for_audio">已连接，等待投送</string>
+    <string name="state_receiving">正在投送</string>
+    <string name="state_playing_computer_audio">正在播放电脑音频</string>
     <string name="state_connecting">连接中</string>
     <string name="state_needs_attention">需要处理</string>
     <string name="next_step_reading_status">正在读取状态，请稍候。</string>

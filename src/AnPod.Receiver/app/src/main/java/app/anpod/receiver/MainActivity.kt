@@ -94,8 +94,8 @@ internal enum class ConnectionChoice(val preferenceValue: String) {
 }
 
 internal enum class PrimaryAction {
-    CONNECT_USB_DIRECT, SHOW_ADB_GUIDE, CONNECT_WIFI, CANCEL_USB_PERMISSION,
-    CLOSE_ADB_GUIDE, CANCEL_PENDING_CONNECTION, STOP_RECEIVER, STOP_BACKGROUND_STANDBY, DISABLED
+    CONNECT_USB_DIRECT, WAIT_ADB, CONNECT_WIFI, CANCEL_USB_PERMISSION,
+    CANCEL_PENDING_CONNECTION, STOP_RECEIVER, STOP_BACKGROUND_STANDBY, DISABLED
 }
 
 internal fun primaryActionFor(
@@ -104,7 +104,6 @@ internal fun primaryActionFor(
     operationStopping: Boolean = false,
     usbPermissionPending: Boolean = false,
     connectionPending: Boolean = false,
-    adbGuideVisible: Boolean = false,
     backgroundStandbyEnabled: Boolean = false
 ): PrimaryAction = when {
     operationStopping -> PrimaryAction.DISABLED
@@ -112,9 +111,8 @@ internal fun primaryActionFor(
     backgroundStandbyEnabled -> PrimaryAction.STOP_BACKGROUND_STANDBY
     usbPermissionPending -> PrimaryAction.CANCEL_USB_PERMISSION
     connectionPending -> PrimaryAction.CANCEL_PENDING_CONNECTION
-    choice == ConnectionChoice.USB_ADB && adbGuideVisible -> PrimaryAction.CLOSE_ADB_GUIDE
     choice == ConnectionChoice.USB_DIRECT -> PrimaryAction.CONNECT_USB_DIRECT
-    choice == ConnectionChoice.USB_ADB -> PrimaryAction.SHOW_ADB_GUIDE
+    choice == ConnectionChoice.USB_ADB -> PrimaryAction.WAIT_ADB
     else -> PrimaryAction.CONNECT_WIFI
 }
 
@@ -681,7 +679,6 @@ private fun ReceiverScreen(
     var trustConfirmationTarget by remember { mutableStateOf<BackgroundTrustTarget?>(null) }
     var otherSettingsExpanded by remember { mutableStateOf(false) }
     var aodSettingsOpen by remember { mutableStateOf(false) }
-    var adbGuideVisible by remember(connectionChoice) { mutableStateOf(false) }
     val currentTrustTarget = snapshot?.takeIf {
         serviceConnected && (it.backgroundStandbyEnabled || it.canRevokeBackgroundTrust)
             && it.bindingFingerprint.isNotEmpty()
@@ -713,20 +710,21 @@ private fun ReceiverScreen(
         (!backgroundStandbyEnabled && (snapshot?.operationState in setOf("starting", "running") ||
             snapshot?.serviceState in setOf("starting", "prepared")))
     val selectionLocked = running || connectionPending || usbPermissionPending
-    LaunchedEffect(receiverActive) { if (receiverActive) adbGuideVisible = false }
     val action = primaryActionFor(
         connectionChoice,
         receiverActive = receiverActive,
         operationStopping = snapshot?.operationState == "stopping",
         usbPermissionPending = usbPermissionPending,
         connectionPending = connectionPending,
-        adbGuideVisible = adbGuideVisible && !running,
         backgroundStandbyEnabled = backgroundStandbyEnabled
+    )
+    val displayedConnectionChoice = displayedConnectionChoice(
+        connectionChoice, snapshot?.connectionMethod, selectionLocked
     )
     val canPerformAction = action != PrimaryAction.DISABLED && when (action) {
         PrimaryAction.CONNECT_USB_DIRECT -> usbDirectSupported && usbAccessoryFeatureAvailable && serviceConnected
         PrimaryAction.CONNECT_WIFI -> serviceConnected
-        PrimaryAction.SHOW_ADB_GUIDE, PrimaryAction.CLOSE_ADB_GUIDE -> true
+        PrimaryAction.WAIT_ADB -> false
         PrimaryAction.CANCEL_USB_PERMISSION, PrimaryAction.CANCEL_PENDING_CONNECTION -> true
         PrimaryAction.STOP_RECEIVER, PrimaryAction.STOP_BACKGROUND_STANDBY -> serviceConnected
         PrimaryAction.DISABLED -> false
@@ -748,7 +746,7 @@ private fun ReceiverScreen(
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        stateLabel(snapshot, connectionPending, needsAttention, adbGuideVisible, usbPermissionPending),
+                        stateLabel(snapshot, connectionPending, needsAttention, usbPermissionPending),
                         style = MaterialTheme.typography.headlineSmall,
                         color = if (needsAttention) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
@@ -759,10 +757,8 @@ private fun ReceiverScreen(
                             style = MaterialTheme.typography.bodyMedium)
                     }
                     val statusHint = when {
-                        shouldShowAdbGuideAsStatusStep(
-                                connectionChoice, adbGuideVisible, snapshot != null, needsAttention,
-                                receiverActive, backgroundStandbyEnabled, connectionPending
-                            ) -> stringResource(R.string.adb_waiting_guidance)
+                        connectionChoice == ConnectionChoice.USB_ADB && !needsAttention && !receiverActive &&
+                                !backgroundStandbyEnabled && !connectionPending -> null
                         snapshot == null || needsAttention || receiverActive || backgroundStandbyEnabled || connectionPending ->
                             nextStep(snapshot, bound, connectionPending, diagnostic, interfaces.isEmpty(),
                                 networkChoiceNeeded, notificationPermissionDenied)
@@ -806,7 +802,7 @@ private fun ReceiverScreen(
                         ConnectionChoice.values().forEachIndexed { index, choice ->
                             val accessibleLabel = stringResource(choice.labelResource())
                             SegmentedButton(
-                                selected = connectionChoice == choice,
+                                selected = displayedConnectionChoice == choice,
                                 onClick = { onSelectConnectionChoice(choice) },
                                 enabled = !selectionLocked,
                                 shape = SegmentedButtonDefaults.itemShape(index, ConnectionChoice.values().size),
@@ -816,20 +812,17 @@ private fun ReceiverScreen(
                             ) { Text(stringResource(choice.shortLabelResource()), softWrap = true) }
                         }
                     }
-                    if (!(adbGuideVisible && connectionChoice == ConnectionChoice.USB_ADB)) {
-                        connectionChoice.descriptionResource()?.let {
-                            Text(stringResource(it), style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
+                    displayedConnectionChoice?.descriptionResource()?.let {
+                        Text(stringResource(it), style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Button(
                         onClick = {
                             when (action) {
                                 PrimaryAction.CONNECT_USB_DIRECT -> onConnectUsbDirect()
-                                PrimaryAction.SHOW_ADB_GUIDE -> adbGuideVisible = true
+                                PrimaryAction.WAIT_ADB -> Unit
                                 PrimaryAction.CONNECT_WIFI -> onConnectComputer()
                                 PrimaryAction.CANCEL_USB_PERMISSION -> onCancelUsbPermission()
-                                PrimaryAction.CLOSE_ADB_GUIDE -> adbGuideVisible = false
                                 PrimaryAction.CANCEL_PENDING_CONNECTION -> onCancelPendingConnection()
                                 PrimaryAction.STOP_RECEIVER -> onStop()
                                 PrimaryAction.STOP_BACKGROUND_STANDBY -> onStopBackgroundStandby()
@@ -841,7 +834,7 @@ private fun ReceiverScreen(
                     ) { Text(stringResource(action.labelResource())) }
                     if (localStatusMessage != null) Text(localStatusMessage,
                         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (connectionChoice == ConnectionChoice.USB_DIRECT) {
+                    if (shouldShowUsbDirectGuidance(displayedConnectionChoice, selectionLocked)) {
                         val directNote = when {
                             !usbDirectSupported -> R.string.usb_direct_requires_api24
                             !usbAccessoryFeatureAvailable -> R.string.usb_direct_not_supported
@@ -1162,12 +1155,11 @@ private fun stateLabel(
     snapshot: UiSnapshot?,
     connectionPending: Boolean,
     needsAttention: Boolean,
-    adbGuideVisible: Boolean,
     usbPermissionPending: Boolean
 ): String =
     stringResource(chooseMainStateLabel(
         snapshot?.serviceState, snapshot?.operationState, snapshot != null,
-        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention, adbGuideVisible,
+        snapshot?.backgroundStandbyEnabled == true, connectionPending, needsAttention, snapshot?.playbackAdvancing,
         usbPermissionPending
     ))
 
@@ -1178,7 +1170,7 @@ internal fun chooseMainStateLabel(
     backgroundStandbyEnabled: Boolean,
     connectionPending: Boolean,
     needsAttention: Boolean,
-    adbGuideVisible: Boolean = false,
+    playbackAdvancing: Boolean? = null,
     usbPermissionPending: Boolean = false
 ): Int = when {
     operationState == "stopping" -> R.string.stopping
@@ -1187,35 +1179,47 @@ internal fun chooseMainStateLabel(
     !snapshotAvailable || connectionPending || serviceState == "starting"
             || operationState == "starting" ->
         R.string.state_connecting
-    serviceState == "streaming" -> R.string.state_receiving
-    serviceState == "receiverRunning" -> R.string.aod_connected
+    serviceState == "streaming" -> if (playbackAdvancing == true) {
+        R.string.state_playing_computer_audio
+    } else R.string.state_receiving
+    serviceState == "receiverRunning" -> if (playbackAdvancing == true) {
+        R.string.state_playing_computer_audio
+    } else R.string.aod_connected
     serviceState == "paused" -> R.string.paused
-    serviceState == "authenticated" -> R.string.aod_connected
+    serviceState == "authenticated" -> R.string.state_connected_waiting_for_audio
     backgroundStandbyEnabled || serviceState == "prepared" -> R.string.state_waiting_for_computer
-    snapshotAvailable && !connectionPending && adbGuideVisible -> R.string.state_waiting_for_pc_action
     else -> R.string.state_not_connected
 }
 
 internal fun actualConnectionLabel(method: String?): Int = when (method) {
     "usb-aoa" -> R.string.connection_usb_direct
-    "usb-adb", "usb-or-local" -> R.string.connection_usb_adb_short
+    "usb-adb" -> R.string.connection_usb_adb_short
+    "usb-or-local" -> R.string.usb_or_local_connection
+    "wifi-adb" -> R.string.connection_wifi_adb
     "wireless-udp" -> R.string.connection_wifi
     else -> R.string.actual_connection_unknown
 }
 
+internal fun connectionChoiceForActualMethod(method: String?): ConnectionChoice? = when (method) {
+    "usb-aoa" -> ConnectionChoice.USB_DIRECT
+    "usb-adb" -> ConnectionChoice.USB_ADB
+    "wifi-adb", "wireless-udp" -> ConnectionChoice.WIFI
+    else -> null
+}
+
+internal fun displayedConnectionChoice(
+    preferredChoice: ConnectionChoice,
+    actualMethod: String?,
+    selectionLocked: Boolean
+): ConnectionChoice? = if (selectionLocked) connectionChoiceForActualMethod(actualMethod) else preferredChoice
+
+internal fun shouldShowUsbDirectGuidance(
+    displayedChoice: ConnectionChoice?,
+    selectionLocked: Boolean
+) = !selectionLocked && displayedChoice == ConnectionChoice.USB_DIRECT
+
 internal fun isInformationalUsbPermissionMessage(message: String, pending: String, cancelled: String) =
     message == pending || message == cancelled
-
-internal fun shouldShowAdbGuideAsStatusStep(
-    choice: ConnectionChoice,
-    adbGuideVisible: Boolean,
-    snapshotAvailable: Boolean,
-    needsAttention: Boolean,
-    receiverActive: Boolean,
-    backgroundStandbyEnabled: Boolean,
-    connectionPending: Boolean
-) = choice == ConnectionChoice.USB_ADB && adbGuideVisible && snapshotAvailable &&
-        !needsAttention && !receiverActive && !backgroundStandbyEnabled && !connectionPending
 
 private fun ConnectionChoice.labelResource(): Int = when (this) {
     ConnectionChoice.USB_DIRECT -> R.string.connection_usb_direct
@@ -1237,9 +1241,8 @@ private fun ConnectionChoice.descriptionResource(): Int? = when (this) {
 
 private fun PrimaryAction.labelResource(): Int = when (this) {
     PrimaryAction.CONNECT_USB_DIRECT, PrimaryAction.CONNECT_WIFI -> R.string.start_receiving
-    PrimaryAction.SHOW_ADB_GUIDE -> R.string.start_receiving
+    PrimaryAction.WAIT_ADB -> R.string.waiting_for_computer_connection
     PrimaryAction.CANCEL_USB_PERMISSION -> R.string.usb_direct_cancel
-    PrimaryAction.CLOSE_ADB_GUIDE -> R.string.close_connection_guide
     PrimaryAction.CANCEL_PENDING_CONNECTION -> R.string.cancel_connection
     PrimaryAction.STOP_RECEIVER -> R.string.stop_receiving
     PrimaryAction.STOP_BACKGROUND_STANDBY -> R.string.background_standby_primary_action

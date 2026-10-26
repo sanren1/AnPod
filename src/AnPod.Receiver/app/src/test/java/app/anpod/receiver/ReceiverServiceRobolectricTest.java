@@ -1408,6 +1408,57 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void recordPauseProjectsPausedThroughTheServiceSnapshot() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "record-pause-snapshot";
+        long generation = 604;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration", new java.util.concurrent.atomic.AtomicLong(generation));
+        ReceiverService.networkAudioState = "streaming";
+        ReceiverService.audioActive = true;
+        try {
+            for (AodTelemetrySnapshot.Transport transport : new AodTelemetrySnapshot.Transport[] {
+                    AodTelemetrySnapshot.Transport.USB_DIRECT,
+                    AodTelemetrySnapshot.Transport.USB_ADB
+            }) {
+                long sessionId = transport == AodTelemetrySnapshot.Transport.USB_DIRECT ? 604 : 605;
+                AoaSessionContext context = new AoaSessionContext(sessionId, new byte[32],
+                        UdpPacketDecoder.AudioFormatV2.forProfile(4, 0), transport);
+                ReceiverService.AudioSession session = new ReceiverService.AudioSession(sessionId,
+                        ReceiverService.AudioRequest.aoa(context), owner, generation);
+                ReceiverService.currentAudio = session;
+                service.aoaOwnerId = transport == AodTelemetrySnapshot.Transport.USB_DIRECT ? owner : "";
+                setInstanceField(service, "adbOwnerId",
+                        transport == AodTelemetrySnapshot.Transport.USB_ADB ? owner : "");
+                setInstanceField(service, "adbConnectionTransport", "usb");
+
+                AoaReceiverCoordinator.PlaybackEndpoint endpoint = service.recordPlaybackEndpoint(owner, generation);
+                org.robolectric.util.ReflectionHelpers.setField(endpoint, "ownedSession", session);
+                endpoint.pause();
+
+                assertTrue(session.focusState.isUserPaused());
+                UiSnapshot snapshot = invokeSnapshot(service);
+                assertEquals("paused", snapshot.serviceState);
+                assertEquals(transport == AodTelemetrySnapshot.Transport.USB_DIRECT ? "usb-aoa" : "usb-adb",
+                        snapshot.connectionMethod);
+                assertEquals("record pause must not rewrite the transport state", "streaming",
+                        ReceiverService.networkAudioState);
+
+                ReceiverService.currentAudio = null;
+                context.destroy();
+            }
+        } finally {
+            ReceiverService.currentAudio = null;
+            service.aoaOwnerId = "";
+            setInstanceField(service, "adbOwnerId", "");
+            ReceiverService.audioActive = false;
+            service.onDestroy();
+        }
+    }
+
+    @Test
     public void manualStopRoutesToAuthenticatedAdbOwnerBeforeServiceCleanup() throws Exception {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
         String owner = "adb-manual-stop-owner";

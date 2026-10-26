@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn audio_settings_batch_validates_without_silent_legacy_downgrade() {
+    let current = AppSettings::default();
+    let next = prepare_audio_settings(&current, "hifi", "LowLatency").unwrap();
+    assert_eq!(next.audio_quality, "hifi");
+    assert_eq!(next.playback_mode, "LowLatency");
+
+    let mut legacy_adb = current;
+    legacy_adb.preferred_transport = "Usb".into();
+    legacy_adb.wired_mode = "adb".into();
+    legacy_adb.audio_backend = "legacy".into();
+    assert!(prepare_audio_settings(&legacy_adb, "hifi", "Balanced").is_err());
+    assert!(prepare_audio_settings(&legacy_adb, "standard", "unknown").is_err());
+}
+
+#[test]
+fn audio_preferences_commit_preserves_other_settings_and_is_write_atomic() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        ".tmp-audio-settings-commit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let old = AppSettings {
+        preferred_transport: "Wifi".into(),
+        wireless_protocol: "udp".into(),
+        last_device_id: Some("remembered-device".into()),
+        appearance_theme: "Dark".into(),
+        ..AppSettings::default()
+    };
+    let candidate = prepare_audio_settings(&old, "hifi", "LowLatency").unwrap();
+    let mut state = AppState::new();
+    state.data_dir = root.clone();
+    state.view.lock().unwrap().settings = old.clone();
+    state.save_audio_preferences(&candidate).unwrap();
+    let current = state.snapshot().settings;
+    assert_eq!(current.audio_quality, "hifi");
+    assert_eq!(current.playback_mode, "LowLatency");
+    assert_eq!(current.preferred_transport, "Wifi");
+    assert_eq!(current.wireless_protocol, "udp");
+    assert_eq!(current.last_device_id.as_deref(), Some("remembered-device"));
+    assert_eq!(current.appearance_theme, "Dark");
+    let persisted: AppSettings =
+        serde_json::from_slice(&fs::read(root.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(persisted).unwrap(),
+        serde_json::to_value(&current).unwrap()
+    );
+    fs::remove_dir_all(&root).unwrap();
+
+    let failed_root = root.with_extension("failed");
+    fs::create_dir_all(failed_root.join("settings.json")).unwrap();
+    let disk_sentinel = serde_json::to_vec(&old).unwrap();
+    fs::write(failed_root.join("settings.json/old.json"), &disk_sentinel).unwrap();
+    let mut failing_state = AppState::new();
+    failing_state.data_dir = failed_root.clone();
+    failing_state.view.lock().unwrap().settings = old.clone();
+    assert!(failing_state.save_audio_preferences(&candidate).is_err());
+    assert_eq!(
+        serde_json::to_value(failing_state.snapshot().settings).unwrap(),
+        serde_json::to_value(&old).unwrap()
+    );
+    assert_eq!(
+        fs::read(failed_root.join("settings.json/old.json")).unwrap(),
+        disk_sentinel
+    );
+    fs::remove_dir_all(failed_root).unwrap();
+}
+
+#[test]
 fn authenticated_quality_profiles_and_snapshot_format_precedence() {
     assert_eq!(audio_quality_profile("standard"), Some(1));
     assert_eq!(audio_quality_profile("hifi"), Some(4));
