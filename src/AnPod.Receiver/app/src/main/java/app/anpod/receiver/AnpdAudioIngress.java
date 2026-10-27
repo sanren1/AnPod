@@ -10,13 +10,14 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** Shared authenticated ANPD decoder and bounded queue ingress for UDP and AOA transports. */
 final class AnpdAudioIngress implements AutoCloseable {
-    enum Result { FORMAT, AUDIO, IDENTITY, AUTHENTICATION, REPLAY, FORMAT_REJECTED, HEADER_REJECTED }
+    enum Result { FORMAT, AUDIO, LOSS_LEDGER, IDENTITY, AUTHENTICATION, REPLAY, FORMAT_REJECTED, HEADER_REJECTED }
 
     private final UdpPacketDecoder decoder;
     private final UdpPacketDecoder.AudioFormatV2 formatV2;
     private final UdpPcmQueue pcmQueue;
     private final FloatPcmFrameQueue floatQueue;
     private final boolean requireFormatBeforeAudio;
+    private final AnpdLossLedger.Store lossLedger = new AnpdLossLedger.Store();
     private boolean formatSeen;
     private volatile boolean hasAuthenticatedAudio;
     private volatile long lastAuthenticatedAudioAtNanos;
@@ -60,8 +61,15 @@ final class AnpdAudioIngress implements AutoCloseable {
     Result accept(byte[] bytes, int length) {
         try {
             UdpPacketDecoder.Packet packet = decoder.open(bytes, length);
-            if (requireFormatBeforeAudio && packet.type == UdpPacketDecoder.AUDIO && !formatSeen)
+            if (requireFormatBeforeAudio && packet.type != UdpPacketDecoder.FORMAT && !formatSeen)
                 throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
+            if (packet.type == UdpPacketDecoder.LOSS_LEDGER && formatV2 == null && !formatSeen)
+                throw new UdpPacketDecoder.ProtocolException(UdpPacketDecoder.ProtocolException.FORMAT);
+            if (packet.type == UdpPacketDecoder.LOSS_LEDGER) {
+                lossLedger.apply(AnpdLossLedger.decode(packet.payload));
+                decoder.commit(packet.sequence);
+                return Result.LOSS_LEDGER;
+            }
             if (formatV2 == null) {
                 pcmQueue.accept(packet, decoder);
             } else if (pcmQueue != null) {
@@ -86,6 +94,27 @@ final class AnpdAudioIngress implements AutoCloseable {
     long droppedFrames() { return pcmQueue == null ? droppedFloatFrames : pcmQueue.droppedFrames(); }
     long authenticatedAudioPayloadBytes() { return authenticatedAudioPayloadBytes.get(); }
     long authenticatedAudioFrames() { return authenticatedAudioFrames.get(); }
+    void resetReceiverDropTrackingForPeriod() {
+        if (pcmQueue != null) pcmQueue.resetReceiverDropTrackingForPeriod();
+        if (floatQueue != null) floatQueue.resetReceiverDropTrackingForPeriod();
+    }
+    long lossLedgerPeriodEpoch() { return lossLedger.periodEpoch(); }
+    long appliedLossLedgerRevision() { return lossLedger.appliedRevision(); }
+    long lossCaptureTail() { return lossLedger.captureTail(); }
+    long lossSettledThrough() { return lossLedger.settledThrough(); }
+    long lossSourceSegmentGeneration() { return lossLedger.sourceSegmentGeneration(); }
+    long lossSourceSegmentStart() { return lossLedger.sourceSegmentStart(); }
+    boolean lossLedgerComplete() { return lossLedger.complete(); }
+    AnpdLossLedger.Interval[] lossLedgerIntervals() { return lossLedger.intervals(); }
+    com.anpod.server.SourceFrameRanges.Range[] receiverDropRanges() {
+        return pcmQueue != null ? pcmQueue.receiverDropRanges() : floatQueue.receiverDropRanges();
+    }
+    long receiverDropRevision() {
+        return pcmQueue != null ? pcmQueue.receiverDropRevision() : floatQueue.receiverDropRevision();
+    }
+    boolean receiverDropTrackingComplete() {
+        return pcmQueue != null ? pcmQueue.receiverDropTrackingComplete() : floatQueue.receiverDropTrackingComplete();
+    }
 
     void fail(IOException error) {
         if (pcmQueue != null) pcmQueue.fail(error); else floatQueue.fail(error);

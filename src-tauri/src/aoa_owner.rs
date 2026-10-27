@@ -1,11 +1,13 @@
 use crate::{
     aoa::{Record, RecordType},
     aoa_winusb::{AoaCancel, AoaReader, AoaStream, AoaWriter},
-    network::{float32_to_le_bytes, float_to_pcm24},
+    network::{
+        float32_to_le_bytes, float_to_pcm24, prepare_loss_ledger_payload, LossLedgerTxState,
+    },
     p5c::{
         self, Ack, ReceiverCapabilities, ReceiverState, SessionAudioQueue, TerminalCause,
         AUDIO_PROTOCOL_MAJOR, BIND, CAPABILITIES_QUERY, CAP_AUDIO_FLOAT32, CAP_AUDIO_V2,
-        CAP_BUFFER_METRICS, CAP_PLAYBACK_PROGRESS, CAP_PROGRESS_EXT, HEARTBEAT,
+        CAP_PLAYBACK_PROGRESS, CAP_SOURCE_FRAME_LOSS, CAP_SOURCE_SEGMENT_START, HEARTBEAT,
         HOST_TO_RECEIVER_CONTROL, MANAGEMENT_CONTROL_MAJOR, PAUSE, PLAYBACK_PROGRESS_QUERY,
         RECEIVER_TO_HOST_CONTROL, RESULT_OK, RESULT_USER_STOPPED, RESUME, SELECT_MODE, START, STOP,
     },
@@ -362,10 +364,7 @@ impl AoaOwner {
                 &mut writer,
                 &records_rx,
                 cancel.as_ref(),
-                &keys,
-                session_id,
-                &mut command_sequence,
-                &mut ack_sequence,
+                (&keys, session_id, &mut command_sequence, &mut ack_sequence),
                 BIND,
                 &[0, 0],
             )?;
@@ -377,10 +376,7 @@ impl AoaOwner {
                 &mut writer,
                 &records_rx,
                 cancel.as_ref(),
-                &keys,
-                session_id,
-                &mut command_sequence,
-                &mut ack_sequence,
+                (&keys, session_id, &mut command_sequence, &mut ack_sequence),
                 SELECT_MODE,
                 &[format.mode],
             )?;
@@ -389,10 +385,7 @@ impl AoaOwner {
                 &mut writer,
                 &records_rx,
                 cancel.as_ref(),
-                &keys,
-                session_id,
-                &mut command_sequence,
-                &mut ack_sequence,
+                (&keys, session_id, &mut command_sequence, &mut ack_sequence),
                 START,
                 &[],
             )?;
@@ -741,17 +734,26 @@ fn exchange_capabilities<W: RecordWriter>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn progress_schema_request_payload(schema: u8) -> &'static [u8] {
+    match schema {
+        0 => &[],
+        2 => &[2],
+        3 => &[3],
+        4 => &[4],
+        5 => &[5],
+        6 => &[6],
+        _ => &[],
+    }
+}
 fn exchange_command<W: RecordWriter>(
     writer: &mut W,
     records: &Receiver<Result<Record, String>>,
     cancel: &dyn CancelIo,
-    keys: &SessionKeys,
-    session_id: u64,
-    command_sequence: &mut u64,
-    ack_sequence: &mut u64,
+    context: (&SessionKeys, u64, &mut u64, &mut u64),
     kind: u8,
     payload: &[u8],
 ) -> Result<Ack, String> {
+    let (keys, session_id, command_sequence, ack_sequence) = context;
     let command = *command_sequence;
     let frame = p5c::encode_control(
         &keys.host_to_receiver_control,
@@ -774,7 +776,7 @@ fn exchange_command<W: RecordWriter>(
         payload
             .first()
             .copied()
-            .filter(|schema| matches!(schema, 2 | 3))
+            .filter(|schema| matches!(schema, 2..=6))
             .unwrap_or(0)
     } else {
         0
@@ -892,6 +894,14 @@ fn run_owner_loop<W: RecordWriter>(
     let mut next_progress = Instant::now();
     let mut pcm16 = Vec::new();
     let mut float32 = Vec::new();
+    let send_loss_ledger = snapshot
+        .lock()
+        .map_err(|_| "AOA snapshot poisoned.")?
+        .capabilities
+        .capability_bits
+        & (CAP_SOURCE_FRAME_LOSS | CAP_SOURCE_SEGMENT_START)
+        == (CAP_SOURCE_FRAME_LOSS | CAP_SOURCE_SEGMENT_START);
+    let mut loss_ledger_tx = LossLedgerTxState::default();
     let mut pending: Option<PendingBlock> = None;
     loop {
         match commands.try_recv() {
@@ -929,10 +939,7 @@ fn run_owner_loop<W: RecordWriter>(
                 writer,
                 records,
                 cancel,
-                keys,
-                session_id,
-                &mut command_sequence,
-                &mut ack_sequence,
+                (keys, session_id, &mut command_sequence, &mut ack_sequence),
                 HEARTBEAT,
                 &[],
             )?;
@@ -973,29 +980,14 @@ fn run_owner_loop<W: RecordWriter>(
                 .map_err(|_| "AOA snapshot poisoned.")?
                 .capabilities
                 .capability_bits;
-            let progress_schema = if capability_bits & CAP_BUFFER_METRICS != 0 {
-                3
-            } else if capability_bits & CAP_PROGRESS_EXT != 0 {
-                2
-            } else {
-                0
-            };
+            let progress_schema = p5c::requested_progress_schema(capability_bits);
             let ack = exchange_command(
                 writer,
                 records,
                 cancel,
-                keys,
-                session_id,
-                &mut command_sequence,
-                &mut ack_sequence,
+                (keys, session_id, &mut command_sequence, &mut ack_sequence),
                 PLAYBACK_PROGRESS_QUERY,
-                if progress_schema == 0 {
-                    &[]
-                } else if progress_schema == 2 {
-                    &[2]
-                } else {
-                    &[3]
-                },
+                progress_schema_request_payload(progress_schema),
             )?;
             if ack.result == RESULT_USER_STOPPED {
                 if ack.state != ReceiverState::Stopped
@@ -1021,6 +1013,12 @@ fn run_owner_loop<W: RecordWriter>(
                 return Err("AOA playback progress query was rejected.".into());
             }
             let playback = ack.playback_progress;
+            if let Some(revision) = playback
+                .as_ref()
+                .and_then(|p| p.applied_loss_ledger_revision)
+            {
+                acknowledge_source_revision(queue, revision);
+            }
             let next_interval = if let (Some(recorder), Some(progress)) =
                 (diagnostics.as_ref(), playback.as_ref())
             {
@@ -1135,10 +1133,17 @@ fn run_owner_loop<W: RecordWriter>(
             return Err("AOA audio queue stopped while the session was active.".into());
         }
         let Some(block) = pending.as_mut() else {
+            if send_loss_ledger {
+                maybe_send_aoa_loss_ledger(writer, queue, encoder, &mut loss_ledger_tx)?;
+            }
             continue;
         };
         if block.enqueued_at.elapsed() > block.age_budget {
-            record_dropped_frames(queue, (block.frame_count as usize - block.offset) as u64);
+            record_dropped_frames(
+                queue,
+                block.frame_index.checked_add(block.offset as u64),
+                (block.frame_count as usize - block.offset) as u64,
+            );
             pending = None;
             continue;
         }
@@ -1179,10 +1184,18 @@ fn run_owner_loop<W: RecordWriter>(
             }
             _ => return Err("AOA queue type does not match the authenticated profile.".into()),
         }
+        let segment_generation = source_segment_generation(queue);
+        if send_loss_ledger {
+            maybe_send_aoa_loss_ledger(writer, queue, encoder, &mut loss_ledger_tx)?;
+        }
         let packet = encoder
             .encode_next(PacketType::Audio, frame_index, &payload)
             .map_err(|e| e.to_string())?;
         write_record(writer, RecordType::Audio, packet)?;
+        note_audio_sent(queue, segment_generation, frame_index, frames as u64);
+        if send_loss_ledger {
+            maybe_send_aoa_loss_ledger(writer, queue, encoder, &mut loss_ledger_tx)?;
+        }
         bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
         snapshot
             .lock()
@@ -1192,6 +1205,52 @@ fn run_owner_loop<W: RecordWriter>(
         if block.offset == block.frame_count as usize {
             pending = None;
         }
+    }
+}
+
+fn maybe_send_aoa_loss_ledger<W: RecordWriter>(
+    writer: &mut W,
+    queue: &SessionAudioQueue,
+    encoder: &mut PacketEncoder,
+    tx: &mut LossLedgerTxState,
+) -> Result<(), String> {
+    let (snapshot, acknowledged) = match queue {
+        SessionAudioQueue::Pcm16(queue) => (
+            queue.source_frame_snapshot(),
+            queue.acknowledged_source_revision(),
+        ),
+        SessionAudioQueue::Float32(queue, _) => (
+            queue.source_frame_snapshot(),
+            queue.acknowledged_source_revision(),
+        ),
+    };
+    let Some(payload) = prepare_loss_ledger_payload(snapshot, acknowledged, tx)? else {
+        return Ok(());
+    };
+    let packet = encoder
+        .encode_next(PacketType::LossLedger, 0, &payload)
+        .map_err(|error| error.to_string())?;
+    write_record(writer, RecordType::Audio, packet)
+}
+
+fn source_segment_generation(queue: &SessionAudioQueue) -> u64 {
+    match queue {
+        SessionAudioQueue::Pcm16(queue) => queue.source_segment_generation(),
+        SessionAudioQueue::Float32(queue, _) => queue.source_segment_generation(),
+    }
+}
+
+fn note_audio_sent(queue: &SessionAudioQueue, generation: u64, start: u64, frames: u64) {
+    match queue {
+        SessionAudioQueue::Pcm16(queue) => queue.note_audio_sent(generation, start, frames),
+        SessionAudioQueue::Float32(queue, _) => queue.note_audio_sent(generation, start, frames),
+    }
+}
+
+fn acknowledge_source_revision(queue: &SessionAudioQueue, revision: u64) {
+    match queue {
+        SessionAudioQueue::Pcm16(queue) => queue.acknowledge_source_revision(revision),
+        SessionAudioQueue::Float32(queue, _) => queue.acknowledge_source_revision(revision),
     }
 }
 
@@ -1232,7 +1291,7 @@ fn process_command<W: RecordWriter>(
                 let _ = tx.send(Err("A stopped AOA queue requires a fresh session.".into()));
                 return Ok(false);
             }
-            clear_queue(queue);
+
             (RESUME, ReceiverState::ReceiverRunning, Some(tx), false)
         }
         OwnerCommand::Stop { restart, reply } => {
@@ -1266,19 +1325,12 @@ fn process_command<W: RecordWriter>(
         }
         return Ok(false);
     }
-    if kind == PAUSE {
-        *pending = None;
-        clear_queue(queue);
-    }
     let mut terminal_stop = false;
     let result = exchange_command(
         writer,
         records,
         cancel,
-        keys,
-        session_id,
-        command_sequence,
-        ack_sequence,
+        (keys, session_id, command_sequence, ack_sequence),
         kind,
         if restart { &[1] } else { &[] },
     )
@@ -1314,6 +1366,15 @@ fn process_command<W: RecordWriter>(
             },
         )?;
         *state = ack.state;
+        if kind == PAUSE {
+            *pending = None;
+            clear_queue(queue);
+            set_source_segment_active(queue, false);
+        } else if kind == RESUME {
+            *pending = None;
+            clear_queue(queue);
+            set_source_segment_active(queue, true);
+        }
         let mut view = snapshot.lock().map_err(|_| "AOA snapshot poisoned.")?;
         view.state = ack.state;
         if kind == STOP {
@@ -1355,10 +1416,19 @@ fn clear_queue(queue: &SessionAudioQueue) {
     }
 }
 
-fn record_dropped_frames(queue: &SessionAudioQueue, frames: u64) {
+fn set_source_segment_active(queue: &SessionAudioQueue, active: bool) {
+    match (queue, active) {
+        (SessionAudioQueue::Pcm16(queue), true) => queue.begin_source_segment(),
+        (SessionAudioQueue::Pcm16(queue), false) => queue.end_source_segment(),
+        (SessionAudioQueue::Float32(queue, _), true) => queue.begin_source_segment(),
+        (SessionAudioQueue::Float32(queue, _), false) => queue.end_source_segment(),
+    }
+}
+
+fn record_dropped_frames(queue: &SessionAudioQueue, frame_index: Option<u64>, frames: u64) {
     match queue {
-        SessionAudioQueue::Pcm16(q) => q.record_dropped_frames(frames),
-        SessionAudioQueue::Float32(q, _) => q.record_dropped_frames(frames),
+        SessionAudioQueue::Pcm16(q) => q.record_dropped_frames(frame_index, frames),
+        SessionAudioQueue::Float32(q, _) => q.record_dropped_frames(frame_index, frames),
     }
 }
 

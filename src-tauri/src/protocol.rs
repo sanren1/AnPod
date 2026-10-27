@@ -16,6 +16,7 @@ pub const RECEIVER_TO_HOST: u32 = 0x414e_5052; // ANPR
 pub enum PacketType {
     Format = 1,
     Audio = 2,
+    LossLedger = 3,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -25,11 +26,127 @@ impl TryFrom<u8> for PacketType {
         match value {
             1 => Ok(Self::Format),
             2 => Ok(Self::Audio),
+            3 => Ok(Self::LossLedger),
             _ => Err(ProtocolError::UnsupportedType),
         }
     }
 }
 
+const LOSS_LEDGER_VERSION: u8 = 2;
+pub const MAX_LOSS_INTERVALS: usize = 64;
+const LOSS_LEDGER_V2_HEADER_BYTES: usize = 36;
+const LOSS_LEDGER_V3_HEADER_BYTES: usize = 52;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LossInterval {
+    pub start: u64,
+    pub frame_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LossLedger {
+    pub period_epoch: u64,
+    pub revision: u64,
+    pub capture_tail: u64,
+    pub settled_through: u64,
+    pub source_segment_generation: u64,
+    pub source_segment_start: Option<u64>,
+    pub complete: bool,
+    pub intervals: Vec<LossInterval>,
+}
+
+impl LossLedger {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let mut payload = vec![0; LOSS_LEDGER_V3_HEADER_BYTES + self.intervals.len() * 16];
+        payload[0] = 3;
+        payload[1] = u8::from(self.complete);
+        payload[2] = self.intervals.len() as u8;
+        payload[4..12].copy_from_slice(&self.period_epoch.to_be_bytes());
+        payload[12..20].copy_from_slice(&self.revision.to_be_bytes());
+        payload[20..28].copy_from_slice(&self.capture_tail.to_be_bytes());
+        payload[28..36].copy_from_slice(&self.settled_through.to_be_bytes());
+        payload[36..44].copy_from_slice(&self.source_segment_generation.to_be_bytes());
+        payload[44..52].copy_from_slice(
+            &self
+                .source_segment_start
+                .ok_or(ProtocolError::InvalidFormat)?
+                .to_be_bytes(),
+        );
+        for (index, interval) in self.intervals.iter().enumerate() {
+            let offset = LOSS_LEDGER_V3_HEADER_BYTES + index * 16;
+            payload[offset..offset + 8].copy_from_slice(&interval.start.to_be_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&interval.frame_count.to_be_bytes());
+        }
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < LOSS_LEDGER_V2_HEADER_BYTES
+            || !matches!(payload[0], LOSS_LEDGER_VERSION | 3)
+            || payload[1] & !1 != 0
+            || payload[2] as usize > MAX_LOSS_INTERVALS
+            || payload[3] != 0
+        {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let header_bytes = if payload[0] == 3 {
+            LOSS_LEDGER_V3_HEADER_BYTES
+        } else {
+            LOSS_LEDGER_V2_HEADER_BYTES
+        };
+        if payload.len() != header_bytes + payload[2] as usize * 16 {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let read_u64 = |offset| u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+        let mut intervals = Vec::with_capacity(payload[2] as usize);
+        for index in 0..payload[2] as usize {
+            let offset = header_bytes + index * 16;
+            intervals.push(LossInterval {
+                start: read_u64(offset),
+                frame_count: read_u64(offset + 8),
+            });
+        }
+        let ledger = Self {
+            period_epoch: read_u64(4),
+            revision: read_u64(12),
+            capture_tail: read_u64(20),
+            settled_through: read_u64(28),
+            source_segment_generation: if payload[0] == 3 { read_u64(36) } else { 0 },
+            source_segment_start: (payload[0] == 3).then(|| read_u64(44)),
+            complete: payload[1] & 1 != 0,
+            intervals,
+        };
+        ledger.validate()?;
+        Ok(ledger)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.intervals.len() > MAX_LOSS_INTERVALS || self.settled_through > self.capture_tail {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        if self
+            .source_segment_start
+            .is_some_and(|start| start > self.settled_through || start > self.capture_tail)
+        {
+            return Err(ProtocolError::InvalidFormat);
+        }
+        let mut previous_end = None;
+        for interval in &self.intervals {
+            let Some(end) = interval.start.checked_add(interval.frame_count) else {
+                return Err(ProtocolError::InvalidFormat);
+            };
+            if interval.frame_count == 0
+                || end > self.capture_tail
+                || previous_end.is_some_and(|previous| interval.start <= previous)
+            {
+                return Err(ProtocolError::InvalidFormat);
+            }
+            previous_end = Some(end);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header {
     pub packet_type: PacketType,
@@ -193,6 +310,7 @@ impl AudioFormatV2 {
             {
                 Ok(())
             }
+            PacketType::LossLedger if index == 0 => LossLedger::decode(payload).map(|_| ()),
             _ => Err(ProtocolError::InvalidFormat),
         }
     }
@@ -293,7 +411,12 @@ impl PacketEncoder {
         if payload.len() > MAX_PAYLOAD_LEN || payload.len() > u16::MAX as usize {
             return Err(ProtocolError::Oversize);
         }
-        if let Some(format) = self.format_v2 {
+        if packet_type == PacketType::LossLedger {
+            if sample_frame_index != 0 {
+                return Err(ProtocolError::InvalidFormat);
+            }
+            LossLedger::decode(payload)?;
+        } else if let Some(format) = self.format_v2 {
             format.validate_packet(packet_type, sample_frame_index, payload)?;
         }
         let header = Header {
@@ -382,7 +505,12 @@ impl PacketDecoder {
                 },
             )
             .map_err(|_| ProtocolError::Authentication)?;
-        if let Some(format) = self.format_v2 {
+        if header.packet_type == PacketType::LossLedger {
+            if header.sample_frame_index != 0 {
+                return Err(ProtocolError::InvalidFormat);
+            }
+            LossLedger::decode(&payload)?;
+        } else if let Some(format) = self.format_v2 {
             format.validate_packet(header.packet_type, header.sample_frame_index, &payload)?;
         }
         Ok(DecodedPacket { header, payload })

@@ -28,6 +28,58 @@ public final class P5cProgressExtensionTest {
                 101, 202, 3, 2, counters, 17, 23).length);
     }
 
+    @Test public void schema4AddsAppliedLossLedgerRevisionAfterSchema3Tail() {
+        long[] counters = new long[12];
+        byte[] schema2 = P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],
+                101, 202, 3, 2, counters, 17, 23);
+        byte[] schema3 = P5cControlProtocol.playbackProgressPayloadSchema3(schema2,
+                1920, 1955, 35, 420, 4);
+        byte[] schema4 = P5cControlProtocol.playbackProgressPayloadSchema4(schema3, 42);
+        assertEquals(229, schema4.length);
+        assertEquals(4, schema4[78] & 0xff);
+        assertEquals(42, ByteBuffer.wrap(schema4).order(ByteOrder.BIG_ENDIAN).getLong(221));
+    }
+    @Test public void schema5AddsTenSecondSixtySecondAndCumulativeLossPairs() {
+        long[] counters = new long[12];
+        byte[] schema2 = P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],
+                101, 202, 3, 2, counters, 17, 23);
+        byte[] schema3 = P5cControlProtocol.playbackProgressPayloadSchema3(schema2,
+                1920, 1955, 35, 420, 4);
+        byte[] schema4 = P5cControlProtocol.playbackProgressPayloadSchema4(schema3, 42);
+        byte[] schema5 = P5cControlProtocol.playbackProgressPayloadSchema5(schema4,
+                new AodMetricsSampler.LossWindow(10, 100),
+                new AodMetricsSampler.LossWindow(20, 200),
+                new AodMetricsSampler.LossWindow(30, 300));
+        assertEquals(277, schema5.length);
+        assertEquals(5, schema5[78] & 0xff);
+        ByteBuffer fields = ByteBuffer.wrap(schema5).order(ByteOrder.BIG_ENDIAN);
+        assertEquals(42, fields.getLong(221));
+        assertEquals(10, fields.getLong(229));
+        assertEquals(100, fields.getLong(237));
+        assertEquals(20, fields.getLong(245));
+        assertEquals(200, fields.getLong(253));
+        assertEquals(30, fields.getLong(261));
+        assertEquals(300, fields.getLong(269));
+
+        byte[] unknown = P5cControlProtocol.playbackProgressPayloadSchema5(schema4, null, null, null);
+        ByteBuffer unknownFields = ByteBuffer.wrap(unknown).order(ByteOrder.BIG_ENDIAN);
+        for (int offset = 229; offset < 277; offset += 8) assertEquals(-1L, unknownFields.getLong(offset));
+    }
+    @Test public void schema6AddsLossBreakdownAndRecoveryTotals() {
+        long[] counters = new long[12];
+        byte[] schema2 = P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],
+                101, 202, 3, 2, counters, 17, 23);
+        byte[] schema3 = P5cControlProtocol.playbackProgressPayloadSchema3(schema2,
+                1920, 1955, 35, 420, 4);
+        byte[] schema4 = P5cControlProtocol.playbackProgressPayloadSchema4(schema3, 42);
+        byte[] schema5 = P5cControlProtocol.playbackProgressPayloadSchema5(schema4, null, null, null);
+        byte[] schema6 = P5cControlProtocol.playbackProgressPayloadSchema6(schema5, 1, 2, 3, 4, 5, 6);
+        assertEquals(325, schema6.length);
+        assertEquals(6, schema6[78] & 0xff);
+        ByteBuffer fields = ByteBuffer.wrap(schema6).order(ByteOrder.BIG_ENDIAN);
+        for (int index = 0; index < 6; index++) assertEquals(index + 1, fields.getLong(277 + index * 8));
+    }
+
     @Test public void schema3AddsFixed17ByteBufferMetricsTail() {
         long[] counters = new long[12];
         byte[] schema2 = P5cControlProtocol.playbackProgressPayloadExtended(new byte[78],

@@ -18,7 +18,7 @@ final class ReceiverUiState {
     }
 
     AodTelemetrySnapshot aodSnapshot() {
-        long now = System.nanoTime();
+        long now = android.os.SystemClock.elapsedRealtimeNanos();
         ReceiverService.AudioSession session = ReceiverService.currentAudio;
         if (session == null) {
             aodSessionId = -1;
@@ -41,12 +41,26 @@ final class ReceiverUiState {
         Long bitsPerSecond = aodSampler.bitsPerSecond(now);
         Float bufferMs = AodMetricsSampler.bufferMs(udp || record != null ? metrics.queuedFrames : 0,
                 metrics.pendingFrames, metrics.sampleRate);
-        Float lossPercent = null;
-        if (udp && session.udpQueue != null) {
-            aodSampler.updateFrameTotals(session.udpQueue.acceptedAudioFrames(),
-                    session.udpQueue.concealedFrames());
-            lossPercent = aodSampler.lossPercent();
-        }
+        ReceiverService.accountSettledPcDropGaps(session);
+        SourceFrameOutputMap lossMap = session.sourceFrameOutputMap;
+        int sourceRate = session.request.sourceSampleRate();
+        if (lossMap.hasCurrentSegmentSettlement())
+            session.lossSampler.recordSourceLossSnapshot(lossMap.sourceSegmentId(),
+                    lossMap.sourceSegmentLogicalStart(), lossMap.sourceSegmentOrigin(),
+                    lossMap.settledEligibleSourceThrough(), sourceRate, lossMap.settledLossRanges(),
+                    lossMap.rollingComplete(), lossMap.settledUnknownRanges());
+        if (lossMap.sourceSegmentUnknownStart() != -1L)
+            session.lossSampler.recordUnknownSourceRange(lossMap.sourceSegmentUnknownStart(),
+                    lossMap.sourceSegmentUnknownEnd(), sourceRate);
+        AodMetricsSampler.LossWindow sixtySecondLoss =
+                session.lossSampler.recentSourceLossWindow(60_000_000_000L, sourceRate);
+        AodMetricsSampler.LossWindow tenSecondLoss =
+                session.lossSampler.recentSourceLossWindow(10_000_000_000L, sourceRate);
+        Float lossPercent = sixtySecondLoss == null ? null
+                : 100.0f * sixtySecondLoss.lossFrames / sixtySecondLoss.eligibleFrames;
+        Float lossPercent10s = tenSecondLoss == null ? null
+                : 100.0f * tenSecondLoss.lossFrames / tenSecondLoss.eligibleFrames;
+        Float cumulativeLossPercent = session.sourceFrameOutputMap.lossPercent();
         boolean receivedRecently = aodSampler.receivedAudioRecently(now, 2_000_000_000L);
         AodTelemetrySnapshot.DisplayStatus status = receivedRecently
                 ? AodTelemetrySnapshot.DisplayStatus.RECEIVING
@@ -56,7 +70,8 @@ final class ReceiverUiState {
         AodTelemetrySnapshot.Transport transport = record != null ? record.transport
                 : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
-                lossPercent, metrics.sampleRate, metrics.channels, metrics.underrunCount,
+                lossPercent, lossPercent10s, cumulativeLossPercent,
+                metrics.sampleRate, metrics.channels, metrics.underrunCount,
                 session.actualOutputEngine, receivedRecently, now);
     }
 

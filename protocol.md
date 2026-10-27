@@ -999,3 +999,64 @@ is `INT32_MIN`; reset reason 0 is unknown, and bit flags 1/2/4/8 mean initial,
 not-playing or pause, source/output discontinuity, and observation/source gap.
 Positive ppm means delete frames; negative ppm means insert frames. Target and
 observed queue frames exclude platform output pending frames.
+
+# Source-frame Loss ledger and playback progress schemas 4–6
+
+Loss uses authenticated ANPD type `3` in the existing v2 session. It shares the
+session's AEAD, sequence, and replay protection with audio; it does not create a
+second session or counter domain. The Receiver accepts source-loss negotiation
+only when it implements the ledger and source-segment boundary. Capability bits
+are `source-frame-loss` (`0x00004000`), `source-loss-details` (`0x00008000`),
+`source-segment-start` (`0x00010000`), `progress-extension` (`0x00000800`),
+and `buffer-metrics` (`0x00002000`). The host sends type 3 when both
+`source-frame-loss` and `source-segment-start` are present. Progress queries
+carry the requested schema byte: schema 6 is selected when loss details,
+progress extension, and buffer metrics are all present; otherwise schema 5 is
+selected when source-frame loss, progress extension, and buffer metrics are
+present. Without those loss capabilities, existing schema 3/2 behavior remains.
+
+The type-3 payload uses unsigned big-endian fields. Version 2 has a 36-byte
+header; version 3 has a 52-byte header and adds the source-segment generation
+and start. Both append zero to 64 sorted, non-overlapping 16-byte intervals.
+Total payload size is `header size + 16 × interval count`.
+
+| Header offset | Width | Field |
+|---:|---:|---|
+| 0 | 1 | Ledger version: `2` or `3` |
+| 1 | 1 | Flags: bit 0 means the ledger is complete |
+| 2 | 1 | Interval count, at most 64 |
+| 3 | 1 | Reserved, zero |
+| 4 | 8 | Logical loss-period epoch |
+| 12 | 8 | Snapshot revision |
+| 20 | 8 | Native capture-tail upper bound |
+| 28 | 8 | PC sender settled-through watermark |
+| 36 (v3) | 8 | Source-segment generation |
+| 44 (v3) | 8 | First eligible source-frame index in this segment |
+
+Each interval is `(start: u64, frameCount: u64)`. The interval end must not
+exceed capture tail, and intervals must be ordered and non-overlapping. A
+watermark does not turn unresolved or in-flight frames into loss. Version 3's
+segment floor distinguishes a pause/recovery hole from post-resume transport
+loss. User pause excludes its duration and source-index hole while retaining
+the logical period; normal mode or quality changes start a new period. Old raw
+PCM without source indexes remains unmeasured.
+
+Playback progress ACK type 127 keeps its existing 13-byte ACK prefix and base
+diagnostics (70 bytes, or 78 with Audio V2), then appends the schema tail. The
+schema byte at the start of the tail matches the query. Schema 4 adds the
+Receiver's applied ledger revision; schemas 5 and 6 retain it and append the
+fields below. Unknown unsigned 64-bit values are `0xffffffffffffffff`.
+
+| Schema | Tail bytes | ACK payload bytes (70-byte base / 78-byte Audio V2 base) | Appended fields |
+|---:|---:|---:|---|
+| 4 | 151 | 234 / 242 | Schema 3's 143-byte tail, with byte 0 set to 4; applied ledger revision (`u64`) at tail offset 143 |
+| 5 | 199 | 282 / 290 | Schema 4 plus `(lossFrames, eligibleFrames)` `u64` pairs for 10 seconds, 60 seconds, and cumulative totals, in that order |
+| 6 | 247 | 330 / 338 | Schema 5 plus `u64` PC-drop, Receiver-drop, transport-missing, output-drop frame counts, recovery count, and recovery duration in milliseconds |
+
+For schema 5, an unavailable or incomplete window reports both pair values as
+unknown. Loss rates are exposed only when the corresponding source coverage is
+known. The 60-second value is the trailing source-frame loss rate used by the
+Receiver display; schema 6 adds the four mutually exclusive settled categories
+and recovery diagnostics. Oboe/AudioTrack playback positions remain system
+estimates and do not prove acoustic output. Real-device output mapping and audio
+quality remain unverified by offline protocol checks.

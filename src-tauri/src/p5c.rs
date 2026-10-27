@@ -67,6 +67,9 @@ pub(crate) const CAP_AUDIO_FLOAT32: u32 = 0x0000_0400;
 pub(crate) const CAP_PROGRESS_EXT: u32 = 0x0000_0800;
 pub(crate) const CAP_AUDIO_ADB_STREAM: u32 = 0x0000_1000;
 pub(crate) const CAP_BUFFER_METRICS: u32 = 0x0000_2000;
+pub(crate) const CAP_SOURCE_FRAME_LOSS: u32 = 0x0000_4000;
+pub(crate) const CAP_SOURCE_LOSS_DETAILS: u32 = 0x0000_8000;
+pub(crate) const CAP_SOURCE_SEGMENT_START: u32 = 0x0001_0000;
 const IMPLEMENTED_CAPABILITIES: u32 =
     CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS | CAP_PLAYBACK_PROGRESS | CAP_TERMINAL_CAUSE;
 const REQUIRED_CAPABILITIES: u32 = CAP_AUTHENTICATED_STATUS;
@@ -79,7 +82,17 @@ const AUTH_EXPIRED: u8 = 5;
 const AUTH_CANCELLED: u8 = 6;
 
 pub(crate) fn requested_progress_schema(capabilities: u32) -> u8 {
-    if capabilities & CAP_BUFFER_METRICS != 0 {
+    if capabilities & CAP_SOURCE_LOSS_DETAILS != 0
+        && capabilities & CAP_PROGRESS_EXT != 0
+        && capabilities & CAP_BUFFER_METRICS != 0
+    {
+        6
+    } else if capabilities & CAP_SOURCE_FRAME_LOSS != 0
+        && capabilities & CAP_PROGRESS_EXT != 0
+        && capabilities & CAP_BUFFER_METRICS != 0
+    {
+        5
+    } else if capabilities & CAP_BUFFER_METRICS != 0 {
         3
     } else if capabilities & CAP_PROGRESS_EXT != 0 {
         2
@@ -95,6 +108,9 @@ fn progress_schema_for_request(kind: u8, payload: &[u8]) -> u8 {
     match payload {
         [2] => 2,
         [3] => 3,
+        [4] => 4,
+        [5] => 5,
+        [6] => 6,
         _ => 0,
     }
 }
@@ -1135,6 +1151,10 @@ impl HostSession {
             let remote = self.remote_udp.ok_or("P5-C UDP peer was not confirmed.")?;
             let material =
                 UdpSessionMaterial::from_authenticated(self.session_id, &self.keys.audio);
+            let send_loss_ledger = self.capabilities.as_ref().is_some_and(|info| {
+                info.capability_bits & (CAP_SOURCE_FRAME_LOSS | CAP_SOURCE_SEGMENT_START)
+                    == (CAP_SOURCE_FRAME_LOSS | CAP_SOURCE_SEGMENT_START)
+            });
             if let (Some(queue), Some(format)) = (&self.float_queue, self.format_v2) {
                 self.float_sender = Some(FloatUdpSender::spawn_authenticated(
                     remote,
@@ -1143,6 +1163,7 @@ impl HostSession {
                     material,
                     format,
                     self.pcm_payload_bytes_sent.clone(),
+                    send_loss_ledger,
                 )?);
             } else {
                 self.sender = Some(UdpSender::spawn_authenticated(
@@ -1152,6 +1173,7 @@ impl HostSession {
                     material,
                     self.parameters,
                     self.pcm_payload_bytes_sent.clone(),
+                    send_loss_ledger,
                 )?);
             }
             Ok(())
@@ -1210,6 +1232,12 @@ impl HostSession {
         if ack.result != RESULT_OK || ack.state != ReceiverState::Paused {
             return Err("P5-C PAUSE was rejected.".into());
         }
+        self.queue.end_source_segment();
+        self.queue.clear_queued();
+        if let Some(queue) = &self.float_queue {
+            queue.end_source_segment();
+            queue.clear_queued();
+        }
         self.state = ack.state;
         if let Some(sender) = &self.float_sender {
             sender.expect_queue_stop();
@@ -1227,6 +1255,12 @@ impl HostSession {
         }
         if let Some(sender) = &self.float_sender {
             sender.resume_after_ack()?;
+        }
+        self.queue.clear_queued();
+        self.queue.begin_source_segment();
+        if let Some(queue) = &self.float_queue {
+            queue.clear_queued();
+            queue.begin_source_segment();
         }
         self.state = ack.state;
         Ok(())
@@ -1276,9 +1310,16 @@ impl HostSession {
         if ack.result != RESULT_OK {
             return Err("P5-C playback progress query was rejected.".into());
         }
-        ack.playback_progress
-            .ok_or_else(|| "Receiver playback progress response was missing.".to_string())
-            .map(Some)
+        let playback = ack
+            .playback_progress
+            .ok_or_else(|| "Receiver playback progress response was missing.".to_string())?;
+        if let Some(revision) = playback.applied_loss_ledger_revision {
+            match self.audio_queue() {
+                SessionAudioQueue::Pcm16(queue) => queue.acknowledge_source_revision(revision),
+                SessionAudioQueue::Float32(queue, _) => queue.acknowledge_source_revision(revision),
+            }
+        }
+        Ok(Some(playback))
     }
 
     pub(crate) fn check_liveness_at(&mut self, now: Instant) -> Result<(), String> {
@@ -3947,6 +3988,9 @@ pub(crate) fn decode_ack_with_format_schema(
         0 => 0,
         2 => 126,
         3 => 143,
+        4 => 151,
+        5 => 199,
+        6 => 247,
         _ => return Err("P5-C playback progress schema was unsupported.".into()),
     };
     if frame[5] != ACK
@@ -4070,6 +4114,9 @@ fn decode_playback_progress_with_format(
         0 => 0,
         2 => 126,
         3 => 143,
+        4 => 151,
+        5 => 199,
+        6 => 247,
         _ => return Err("Receiver playback progress schema was unsupported.".into()),
     };
     if data.len() != base_len + extension_len {
@@ -4157,7 +4204,7 @@ fn decode_playback_progress_with_format(
         diagnostics.oboe_zero_filled_frames = metric_u64(110);
         diagnostics.ring_pending_frames = metric_u32(118);
         diagnostics.stream_pending_frames = metric_u32(122);
-        if progress_schema == 3 {
+        if progress_schema >= 3 {
             let metric_i32 = |offset| {
                 let value = i32::from_be_bytes(extension[offset..offset + 4].try_into().unwrap());
                 (value != i32::MIN).then_some(value)
@@ -4167,6 +4214,40 @@ fn decode_playback_progress_with_format(
             diagnostics.drift_error_frames = metric_i32(134);
             diagnostics.drift_correction_ppm = metric_i32(138);
             diagnostics.drift_reset_reason = (extension[142] != 0).then_some(extension[142]);
+            if progress_schema >= 4 {
+                diagnostics.applied_loss_ledger_revision = metric_u64(143);
+            }
+            if progress_schema >= 5 {
+                diagnostics.applied_loss_ledger_revision = metric_u64(143);
+                diagnostics.loss_10s_frames = metric_u64(151);
+                diagnostics.eligible_10s_frames = metric_u64(159);
+                diagnostics.loss_60s_frames = metric_u64(167);
+                diagnostics.eligible_60s_frames = metric_u64(175);
+                diagnostics.cumulative_loss_frames = metric_u64(183);
+                diagnostics.cumulative_eligible_frames = metric_u64(191);
+                for (loss, eligible) in [
+                    (diagnostics.loss_10s_frames, diagnostics.eligible_10s_frames),
+                    (diagnostics.loss_60s_frames, diagnostics.eligible_60s_frames),
+                    (
+                        diagnostics.cumulative_loss_frames,
+                        diagnostics.cumulative_eligible_frames,
+                    ),
+                ] {
+                    if loss.is_some() != eligible.is_some()
+                        || loss.zip(eligible).is_some_and(|(lost, total)| lost > total)
+                    {
+                        return Err("Receiver loss diagnostics fields were invalid.".into());
+                    }
+                }
+            }
+            if progress_schema == 6 {
+                diagnostics.pc_drop_frames = metric_u64(199);
+                diagnostics.receiver_drop_frames = metric_u64(207);
+                diagnostics.transport_missing_frames = metric_u64(215);
+                diagnostics.output_drop_frames = metric_u64(223);
+                diagnostics.recovery_count = metric_u64(231);
+                diagnostics.recovery_duration_ms = metric_u64(239);
+            }
         }
     }
     Ok(diagnostics)

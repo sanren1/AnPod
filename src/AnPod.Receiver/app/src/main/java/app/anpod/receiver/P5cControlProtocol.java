@@ -51,6 +51,9 @@ final class P5cControlProtocol {
     static final int CAP_PROGRESS_EXT = 0x00000800;
     static final int CAP_AUDIO_ADB_STREAM = 0x00001000;
     static final int CAP_BUFFER_METRICS = 0x00002000;
+    static final int CAP_SOURCE_FRAME_LOSS = 0x00004000;
+    static final int CAP_SOURCE_LOSS_DETAILS = 0x00008000;
+    static final int CAP_SOURCE_SEGMENT_START = 0x00010000;
     static final int IMPLEMENTED_CAPABILITIES = CAP_RECEIVER_UI | CAP_AUTHENTICATED_STATUS
             | CAP_TERMINAL_CAUSE;
     static final int AUTH_PENDING = 0;
@@ -284,6 +287,57 @@ final class P5cControlProtocol {
         return payload;
     }
 
+    static byte[] playbackProgressPayloadSchema4(byte[] schema3Payload, long appliedLedgerRevision) {
+        if (schema3Payload == null || (schema3Payload.length != 213 && schema3Payload.length != 221))
+            throw new IllegalArgumentException("invalid schema4 playback progress fields");
+        int extensionStart = schema3Payload.length - 143;
+        if ((schema3Payload[extensionStart] & 0xff) != 3)
+            throw new IllegalArgumentException("schema3 playback progress required");
+        byte[] payload = Arrays.copyOf(schema3Payload, schema3Payload.length + 8);
+        payload[extensionStart] = 4;
+        putLong(payload, schema3Payload.length, appliedLedgerRevision);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadSchema5(byte[] schema4Payload,
+            AodMetricsSampler.LossWindow tenSeconds, AodMetricsSampler.LossWindow sixtySeconds,
+            AodMetricsSampler.LossWindow cumulative) {
+        if (schema4Payload == null || (schema4Payload.length != 221 && schema4Payload.length != 229))
+            throw new IllegalArgumentException("invalid schema5 playback progress fields");
+        int extensionStart = schema4Payload.length - 151;
+        if ((schema4Payload[extensionStart] & 0xff) != 4)
+            throw new IllegalArgumentException("schema4 playback progress required");
+        byte[] payload = Arrays.copyOf(schema4Payload, schema4Payload.length + 48);
+        payload[extensionStart] = 5;
+        putLossWindow(payload, schema4Payload.length, tenSeconds);
+        putLossWindow(payload, schema4Payload.length + 16, sixtySeconds);
+        putLossWindow(payload, schema4Payload.length + 32, cumulative);
+        return payload;
+    }
+
+    static byte[] playbackProgressPayloadSchema6(byte[] schema5Payload, long pcDropFrames,
+            long receiverDropFrames, long transportMissingFrames, long outputDropFrames,
+            long recoveryCount, long recoveryDurationMs) {
+        if (schema5Payload == null || (schema5Payload.length != 269 && schema5Payload.length != 277))
+            throw new IllegalArgumentException("invalid schema6 playback progress fields");
+        int extensionStart = schema5Payload.length - 199;
+        if ((schema5Payload[extensionStart] & 0xff) != 5)
+            throw new IllegalArgumentException("schema5 playback progress required");
+        byte[] payload = Arrays.copyOf(schema5Payload, schema5Payload.length + 48);
+        payload[extensionStart] = 6;
+        putLong(payload, schema5Payload.length, pcDropFrames);
+        putLong(payload, schema5Payload.length + 8, receiverDropFrames);
+        putLong(payload, schema5Payload.length + 16, transportMissingFrames);
+        putLong(payload, schema5Payload.length + 24, outputDropFrames);
+        putLong(payload, schema5Payload.length + 32, recoveryCount);
+        putLong(payload, schema5Payload.length + 40, recoveryDurationMs);
+        return payload;
+    }
+
+    private static void putLossWindow(byte[] payload, int offset, AodMetricsSampler.LossWindow window) {
+        putLong(payload, offset, window == null ? -1L : window.lossFrames);
+        putLong(payload, offset + 8, window == null ? -1L : window.eligibleFrames);
+    }
     static byte[] capabilitiesQueryPayload(int controlMajor, int audioMajor, int requiredCapabilities) {
         byte[] payload = new byte[8];
         payload[0] = (byte) (controlMajor >>> 8); payload[1] = (byte) controlMajor;

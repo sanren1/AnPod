@@ -610,6 +610,15 @@ fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
     let mut snapshot = sample_snapshot();
     snapshot.settings.last_usb_direct_target_id = Some("usb-target-private".into());
     snapshot.settings.last_usb_direct_binding_reference = Some("binding-private".into());
+    snapshot.playback_diagnostics = Some(PlaybackDiagnostics {
+        loss_10s_frames: Some(10),
+        eligible_10s_frames: Some(100),
+        loss_60s_frames: Some(20),
+        eligible_60s_frames: Some(200),
+        cumulative_loss_frames: Some(30),
+        cumulative_eligible_frames: Some(300),
+        ..PlaybackDiagnostics::default()
+    });
     let json = serde_json::to_string(&diagnostics_export(
         &snapshot,
         DiagnosticsTimelineBuffer::new().export(),
@@ -629,6 +638,10 @@ fn diagnostics_export_keeps_metrics_but_drops_identifiers() {
     assert!(json.contains("\"state\":\"connected\""));
     assert!(json.contains("\"playbackMode\":\"Balanced\""));
     assert!(json.contains("\"audioBitrateBps\":1536000"));
+    assert!(json.contains("\"loss10sFrames\":10"));
+    assert!(json.contains("\"eligible60sFrames\":200"));
+    assert!(json.contains("\"cumulativeLossFrames\":30"));
+    assert!(json.contains("\"cumulativeEligibleFrames\":300"));
 }
 
 #[test]

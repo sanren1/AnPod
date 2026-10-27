@@ -17,6 +17,12 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn aoa_progress_request_carries_schema_five_selector() {
+    assert_eq!(progress_schema_request_payload(4), &[4]);
+    assert_eq!(progress_schema_request_payload(5), &[5]);
+    assert!(progress_schema_request_payload(0).is_empty());
+}
 struct FakeReader {
     rx: ChannelReceiver<Record>,
     cancelled: Arc<AtomicBool>,
@@ -699,11 +705,11 @@ fn production_owner_handshakes_controls_and_sends_v2_media_for_all_profiles() {
         match &queue {
             SessionAudioQueue::Pcm16(q) => {
                 let old = [100i16, -100];
-                assert!(q.push_raw(old.as_ptr(), 1, 48_000, 2, 0));
+                assert!(!q.push_raw(old.as_ptr(), 1, 48_000, 2, 0));
             }
             SessionAudioQueue::Float32(q, _) => {
                 let old = [0.25f32, -0.25];
-                assert!(q.push_raw(old.as_ptr(), 1, format.sample_rate, 2, 0));
+                assert!(!q.push_raw(old.as_ptr(), 1, format.sample_rate, 2, 0));
             }
         }
         owner.resume().unwrap();

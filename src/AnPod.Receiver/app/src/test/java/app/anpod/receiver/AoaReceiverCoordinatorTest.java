@@ -11,6 +11,7 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
@@ -188,7 +189,8 @@ public class AoaReceiverCoordinatorTest {
                 int requiredCapabilities = P5cControlProtocol.CAP_AUDIO_V2
                         | (format.sampleFormat == 3 ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
                         | (transport.isAdbStream() ? P5cControlProtocol.CAP_AUDIO_ADB_STREAM : 0)
-                        | P5cControlProtocol.CAP_PROGRESS_EXT;
+                        | P5cControlProtocol.CAP_PROGRESS_EXT
+                        | P5cControlProtocol.CAP_SOURCE_FRAME_LOSS;
                 sendControl(io, keys, hostSession.sessionId, 0, P5cControlProtocol.CAPABILITIES_QUERY,
                         P5cControlProtocol.capabilitiesQueryPayload(3, 1, requiredCapabilities));
                 P5cControlProtocol.Frame caps = receiveControl(io, keys, hostSession.sessionId,
@@ -200,6 +202,8 @@ public class AoaReceiverCoordinatorTest {
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_AUDIO_FLOAT32);
                 assertEquals(P5cControlProtocol.CAP_PROGRESS_EXT,
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_PROGRESS_EXT);
+                assertEquals(P5cControlProtocol.CAP_SOURCE_FRAME_LOSS,
+                        P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_SOURCE_FRAME_LOSS);
                 assertEquals(P5cControlProtocol.CAP_BUFFER_METRICS,
                         P5cControlProtocol.getUnsignedInt(caps.payload, 12) & P5cControlProtocol.CAP_BUFFER_METRICS);
                 assertEquals(transport.isAdbStream() ? P5cControlProtocol.CAP_AUDIO_ADB_STREAM : 0,
@@ -234,6 +238,8 @@ public class AoaReceiverCoordinatorTest {
                 sendControl(io, keys, hostSession.sessionId, 4, P5cControlProtocol.PAUSE, new byte[0]);
                 assertAck(io, keys, hostSession.sessionId, 4, P5cControlProtocol.PAUSE,
                         P5cReceiverCoordinator.STATE_PAUSED);
+                assertTrue("PAUSE ACK callback must complete", endpoint.userPauseAcknowledged.await(2, TimeUnit.SECONDS));
+                assertEquals(1, endpoint.userPauseAcknowledgedCalls);
                 sendControl(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME, new byte[0]);
                 assertAck(io, keys, hostSession.sessionId, 5, P5cControlProtocol.RESUME,
                         P5cReceiverCoordinator.STATE_RECEIVER_RUNNING);
@@ -355,14 +361,18 @@ public class AoaReceiverCoordinatorTest {
     private static final class Endpoint implements AoaReceiverCoordinator.PlaybackEndpoint {
         volatile AoaSessionContext context;
         volatile boolean stopped;
+        volatile int userPauseAcknowledgedCalls;
+        final CountDownLatch userPauseAcknowledged = new CountDownLatch(1);
         @Override public boolean isCurrent(String ownerId, long generation) { return true; }
         @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return format.profile >= 1 && format.profile <= 5; }
         @Override public void start(AoaSessionContext context) { this.context = context; }
         @Override public void pause() { }
+        @Override public void userPauseAcknowledged() { userPauseAcknowledgedCalls++; userPauseAcknowledged.countDown(); }
         @Override public void resume() { }
         @Override public void stop() { stopped = true; }
         @Override public boolean streaming() { return false; }
         @Override public boolean supportsPlaybackProgressExtension() { return true; }
+        @Override public boolean supportsSourceFrameLoss() { return true; }
         @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
         @Override public byte[] playbackProgressPayloadExtendedV2() { return new byte[204]; }
         @Override public byte[] playbackProgressPayloadExtendedV2(int schema) {

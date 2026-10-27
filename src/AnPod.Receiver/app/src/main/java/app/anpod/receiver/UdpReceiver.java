@@ -89,6 +89,16 @@ final class UdpReceiver implements Runnable, AutoCloseable {
     long droppedFrames() { return ingress.droppedFrames(); }
     long authenticatedAudioPayloadBytes() { return ingress.authenticatedAudioPayloadBytes(); }
     long authenticatedAudioFrames() { return ingress.authenticatedAudioFrames(); }
+    long appliedLossLedgerRevision() { return ingress.appliedLossLedgerRevision(); }
+    AnpdLossLedger.Interval[] lossLedgerIntervals() { return ingress.lossLedgerIntervals(); }
+    long lossCaptureTail() { return ingress.lossCaptureTail(); }
+    long lossSettledThrough() { return ingress.lossSettledThrough(); }
+    long lossSourceSegmentGeneration() { return ingress.lossSourceSegmentGeneration(); }
+    long lossSourceSegmentStart() { return ingress.lossSourceSegmentStart(); }
+    boolean lossLedgerComplete() { return ingress.lossLedgerComplete(); }
+    com.anpod.server.SourceFrameRanges.Range[] receiverDropRanges() { return ingress.receiverDropRanges(); }
+    long receiverDropRevision() { return ingress.receiverDropRevision(); }
+    boolean receiverDropTrackingComplete() { return ingress.receiverDropTrackingComplete(); }
 
     @Override
     public void close() {
@@ -111,6 +121,7 @@ final class UdpReceiver implements Runnable, AutoCloseable {
         switch (result) {
             case FORMAT: return ProcessResult.FORMAT;
             case AUDIO: return ProcessResult.AUDIO;
+            case LOSS_LEDGER: return ProcessResult.LOSS_LEDGER;
             case IDENTITY: return ProcessResult.IDENTITY;
             case AUTHENTICATION: return ProcessResult.AUTHENTICATION;
             case REPLAY: return ProcessResult.REPLAY;
@@ -120,6 +131,6 @@ final class UdpReceiver implements Runnable, AutoCloseable {
     }
 
     enum ProcessResult {
-        FORMAT, AUDIO, WRONG_PEER, IDENTITY, AUTHENTICATION, REPLAY, FORMAT_REJECTED, HEADER_REJECTED
+        FORMAT, AUDIO, LOSS_LEDGER, WRONG_PEER, IDENTITY, AUTHENTICATION, REPLAY, FORMAT_REJECTED, HEADER_REJECTED
     }
 }

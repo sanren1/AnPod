@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "anpod-tauri"
-version = "1.16.0"
+version = "1.17.0"
 dependencies = [
  "aes-gcm",
  "getrandom 0.3.4",

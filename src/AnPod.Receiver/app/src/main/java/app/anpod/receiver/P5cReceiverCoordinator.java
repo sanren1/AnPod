@@ -59,6 +59,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         boolean start(UdpSessionContext context, StartPermission permission) throws IOException;
         void pause() throws IOException;
         void resume() throws IOException;
+        default void userPauseAcknowledged() {}
         void stop();
         boolean streaming() throws IOException;
         void shutdown();
@@ -73,6 +74,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         default int openedTrackSampleRateV2() { return 0; }
         default boolean supportsPlaybackProgress() { return false; }
         default boolean supportsPlaybackProgressExtension() { return false; }
+        default boolean supportsSourceFrameLoss() { return false; }
         default byte[] playbackProgressPayload() {
             return P5cControlProtocol.playbackProgressPayload(-1, -1, -1,
                     -1, -1, -1, -1, -1, null, -1, -1, -1, -1, -1, -1);
@@ -675,6 +677,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 int responsePort = 0;
                 byte[] responseExtra = new byte[0];
                 boolean stopAfterAck = false;
+                boolean resetLossPeriodAfterAck = false;
                 try {
                     if (userStopRequested) {
                         if (playbackStarted) playback.stop();
@@ -721,7 +724,11 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                             ? P5cControlProtocol.CAP_AUDIO_FLOAT32 : 0)
                                     | (playback.supportsPlaybackProgressExtension()
                                             ? P5cControlProtocol.CAP_PROGRESS_EXT
-                                                    | P5cControlProtocol.CAP_BUFFER_METRICS : 0);
+                                                    | P5cControlProtocol.CAP_BUFFER_METRICS : 0)
+                                    | (playback.supportsSourceFrameLoss() && playback.supportsPlaybackProgressExtension()
+                                             ? P5cControlProtocol.CAP_SOURCE_FRAME_LOSS
+                                                     | P5cControlProtocol.CAP_SOURCE_LOSS_DETAILS
+                                                     | P5cControlProtocol.CAP_SOURCE_SEGMENT_START : 0);
                             if ("incompatible".equals(capabilityTestMode)) audioMajor++;
                             if ("missing-capability".equals(capabilityTestMode))
                                 implemented &= ~P5cControlProtocol.CAP_AUTHENTICATED_STATUS;
@@ -937,7 +944,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                             if (command.payload.length != 0)
                                 result = RESULT_REJECTED;
                             else if (state == STATE_RECEIVER_RUNNING || state == STATE_STREAMING) {
-                                playback.pause(); state = STATE_PAUSED;
+                                playback.pause(); state = STATE_PAUSED; resetLossPeriodAfterAck = true;
                             } else if (state != STATE_PAUSED) result = RESULT_REJECTED;
                             break;
                         case P5cControlProtocol.RESUME:
@@ -976,6 +983,22 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                                     && (negotiatedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
                                     && (negotiatedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0) {
                                 responseExtra = playback.playbackProgressPayloadExtended(formatV2 != null, 3);
+                                if (responseExtra == null) result = RESULT_FAILED;
+                            } else if (command.payload.length == 1 && command.payload[0] == 4
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_SOURCE_FRAME_LOSS) != 0) {
+                                responseExtra = playback.playbackProgressPayloadExtended(formatV2 != null, 4);
+                                if (responseExtra == null) result = RESULT_FAILED;
+                            } else if (command.payload.length == 1 && command.payload[0] == 5
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_SOURCE_FRAME_LOSS) != 0) {
+                                responseExtra = playback.playbackProgressPayloadExtended(formatV2 != null, 5);
+                                if (responseExtra == null) result = RESULT_FAILED;
+                            } else if (command.payload.length == 1 && command.payload[0] == 6
+                                    && (negotiatedCapabilities & P5cControlProtocol.CAP_SOURCE_LOSS_DETAILS) != 0) {
+                                responseExtra = playback.playbackProgressPayloadExtended(formatV2 != null, 6);
                                 if (responseExtra == null) result = RESULT_FAILED;
                             } else result = RESULT_REJECTED;
                             break;
@@ -1026,6 +1049,7 @@ final class P5cReceiverCoordinator implements AutoCloseable {
                 if (dropStopAckForTest && command.type == P5cControlProtocol.STOP && result == RESULT_OK)
                     throw new IOException("test dropped the authenticated STOP ACK");
                 P5cControlProtocol.write(output, ack);
+                if (resetLossPeriodAfterAck && result == RESULT_OK) playback.userPauseAcknowledged();
                 lastCommand = command.raw;
                 lastAck = ack;
                 expectedCommandSequence++;

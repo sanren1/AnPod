@@ -720,6 +720,235 @@ fn playback_progress_extension_schema_two_decodes_metrics_and_unknowns() {
 }
 
 #[test]
+fn playback_progress_schema_five_reports_loss_windows_and_acknowledges_for_pcm_and_float() {
+    use std::net::TcpListener;
+
+    fn exercise(float: bool, revision: u64) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = listener.local_addr().unwrap();
+        let session_id = 0x0102_0304_0506_0708;
+        let control_tx = [0x31; 32];
+        let control_rx = [0x42; 32];
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let request = read_frame(
+                &mut tcp,
+                &control_tx,
+                HOST_TO_RECEIVER_CONTROL,
+                session_id,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(request[5], PLAYBACK_PROGRESS_QUERY);
+            assert_eq!(request[30], 5);
+            let base_len = if float { 78 } else { 70 };
+            let mut payload = vec![0xff; 13 + base_len + 199];
+            payload[0] = PLAYBACK_PROGRESS_QUERY;
+            payload[1..9].copy_from_slice(&request[20..28]);
+            payload[9] = RESULT_OK;
+            payload[10] = ReceiverState::ReceiverRunning.wire();
+            payload[11..13].copy_from_slice(&0u16.to_be_bytes());
+            payload[13 + 45] = 0xff;
+            payload[13 + 70] = 1;
+            payload[13 + 71] = 0;
+            payload[13 + 72] = 0;
+            payload[13 + 73] = 0;
+            payload[13 + 74..13 + 78].copy_from_slice(&0u32.to_be_bytes());
+            payload[13 + base_len] = 5;
+            payload[13 + base_len + 21] = 0;
+            payload[13 + base_len + 143..13 + base_len + 151]
+                .copy_from_slice(&revision.to_be_bytes());
+            for (offset, value) in [
+                (151, 10u64),
+                (159, 100),
+                (167, 20),
+                (175, 200),
+                (183, 30),
+                (191, 300),
+            ] {
+                payload[13 + base_len + offset..13 + base_len + offset + 8]
+                    .copy_from_slice(&value.to_be_bytes());
+            }
+            let ack = encode_control(
+                &control_rx,
+                RECEIVER_TO_HOST_CONTROL,
+                session_id,
+                0,
+                ACK,
+                &payload,
+            )
+            .unwrap();
+            write_frame(&mut tcp, &ack, &CancellationToken::new()).unwrap();
+        });
+        let stream = TcpStream::connect(peer).unwrap();
+        let format_v2 = float.then(|| AudioFormatV2::for_profile(2, 0).unwrap());
+        let pcm = Arc::new(PcmQueue::for_session(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            false,
+        ));
+        let float_queue = float.then(|| Arc::new(FloatPcmQueue::new(false)));
+        let mut host = HostSession {
+            tcp: Some(stream),
+            udp_socket: None,
+            sender: None,
+            float_sender: None,
+            pcm_payload_bytes_sent: Arc::new(AtomicU64::new(0)),
+            queue: pcm.clone(),
+            float_queue: float_queue.clone(),
+            keys: SessionKeys {
+                audio: [0; 32],
+                control_tx,
+                control_rx,
+            },
+            parameters: AudioParameters {
+                sample_rate: 48_000,
+                channels: 2,
+                mode: 0,
+            },
+            format_v2,
+            session_id,
+            binding_commitment: [0; 32],
+            remote_udp: None,
+            command_sequence: 0,
+            ack_sequence: 0,
+            last_command: None,
+            last_ack: None,
+            last_heartbeat: Instant::now(),
+            state: ReceiverState::ReceiverRunning,
+            capabilities: Some(ReceiverCapabilities {
+                control_major: 3,
+                audio_major: 1,
+                management_compatible: true,
+                audio_compatible: true,
+                compatible: true,
+                capability_bits: CAP_PLAYBACK_PROGRESS
+                    | CAP_PROGRESS_EXT
+                    | CAP_BUFFER_METRICS
+                    | CAP_SOURCE_FRAME_LOSS,
+                version_code: 1,
+            }),
+            terminal_cause: None,
+            connection_intent: None,
+            background_request_id: None,
+            background_authorization_required: false,
+            background_authorized: false,
+            cancellation: CancellationToken::new(),
+        };
+        let progress = host.playback_progress().unwrap().unwrap();
+        assert_eq!(progress.applied_loss_ledger_revision, Some(revision));
+        assert_eq!(progress.loss_10s_frames, Some(10));
+        assert_eq!(progress.eligible_10s_frames, Some(100));
+        assert_eq!(progress.loss_60s_frames, Some(20));
+        assert_eq!(progress.eligible_60s_frames, Some(200));
+        assert_eq!(progress.cumulative_loss_frames, Some(30));
+        assert_eq!(progress.cumulative_eligible_frames, Some(300));
+        if let Some(queue) = float_queue {
+            assert_eq!(queue.acknowledged_source_revision(), Some(revision));
+        } else {
+            assert_eq!(pcm.acknowledged_source_revision(), Some(revision));
+        }
+        server.join().unwrap();
+    }
+
+    exercise(false, 42);
+    exercise(true, 43);
+}
+
+#[test]
+fn progress_schema_five_requires_complete_capabilities_and_decodes_loss_pairs() {
+    assert_eq!(
+        requested_progress_schema(CAP_PROGRESS_EXT | CAP_BUFFER_METRICS | CAP_SOURCE_FRAME_LOSS),
+        5
+    );
+    assert_eq!(
+        requested_progress_schema(CAP_PROGRESS_EXT | CAP_BUFFER_METRICS),
+        3
+    );
+    assert_eq!(
+        requested_progress_schema(CAP_PROGRESS_EXT | CAP_SOURCE_FRAME_LOSS),
+        2
+    );
+
+    let mut payload = vec![0xff; 78 + 199];
+    payload[45] = 1;
+    payload[70] = 1;
+    payload[71] = 3;
+    payload[72] = 2;
+    payload[73] = 0;
+    payload[74..78].copy_from_slice(&48_000u32.to_be_bytes());
+    payload[78] = 5;
+    payload[78 + 21] = 0;
+    payload[78 + 143..78 + 151].copy_from_slice(&42u64.to_be_bytes());
+    for (offset, value) in [
+        (151, 10u64),
+        (159, 100),
+        (167, 20),
+        (175, 200),
+        (183, 30),
+        (191, 300),
+    ] {
+        payload[78 + offset..78 + offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    let progress = decode_playback_progress_with_format(&payload, true, 5).unwrap();
+    assert_eq!(progress.progress_schema, Some(5));
+    assert_eq!(progress.applied_loss_ledger_revision, Some(42));
+    assert_eq!(progress.loss_10s_frames, Some(10));
+    assert_eq!(progress.eligible_10s_frames, Some(100));
+    assert_eq!(progress.loss_60s_frames, Some(20));
+    assert_eq!(progress.eligible_60s_frames, Some(200));
+    assert_eq!(progress.cumulative_loss_frames, Some(30));
+    assert_eq!(progress.cumulative_eligible_frames, Some(300));
+
+    let mut pending = payload.clone();
+    for offset in [151, 159, 167, 175, 183, 191] {
+        pending[78 + offset..78 + offset + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    }
+    let unknown = decode_playback_progress_with_format(&pending, true, 5).unwrap();
+    assert_eq!(unknown.loss_10s_frames, None);
+    assert_eq!(unknown.eligible_10s_frames, None);
+    assert_eq!(unknown.loss_60s_frames, None);
+    assert_eq!(unknown.eligible_60s_frames, None);
+    assert_eq!(unknown.cumulative_loss_frames, None);
+    assert_eq!(unknown.cumulative_eligible_frames, None);
+    payload[78 + 159..78 + 167].copy_from_slice(&9u64.to_be_bytes());
+    assert!(decode_playback_progress_with_format(&payload, true, 5).is_err());
+    assert!(decode_playback_progress_with_format(&payload[..payload.len() - 1], true, 5).is_err());
+}
+
+#[test]
+fn progress_schema_six_decodes_loss_breakdown_and_recovery_totals() {
+    assert_eq!(
+        requested_progress_schema(
+            CAP_PROGRESS_EXT | CAP_BUFFER_METRICS | CAP_SOURCE_FRAME_LOSS | CAP_SOURCE_LOSS_DETAILS
+        ),
+        6
+    );
+    let mut payload = vec![0xff; 78 + 247];
+    payload[45] = 1;
+    payload[70] = 1;
+    payload[71] = 3;
+    payload[72] = 2;
+    payload[73] = 0;
+    payload[74..78].copy_from_slice(&0u32.to_be_bytes());
+    payload[78] = 6;
+    payload[78 + 21] = 0;
+    for (index, value) in (1u64..=6).enumerate() {
+        let offset = 78 + 199 + index * 8;
+        payload[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    let diagnostics = decode_playback_progress_with_format(&payload, true, 6).unwrap();
+    assert_eq!(diagnostics.pc_drop_frames, Some(1));
+    assert_eq!(diagnostics.receiver_drop_frames, Some(2));
+    assert_eq!(diagnostics.transport_missing_frames, Some(3));
+    assert_eq!(diagnostics.output_drop_frames, Some(4));
+    assert_eq!(diagnostics.recovery_count, Some(5));
+    assert_eq!(diagnostics.recovery_duration_ms, Some(6));
+}
+
+#[test]
 fn playback_progress_extension_schema_three_preserves_signed_drift_and_unknowns() {
     let mut payload = vec![0xff; 78 + 143];
     payload[45] = 1;
@@ -752,6 +981,28 @@ fn playback_progress_extension_schema_three_preserves_signed_drift_and_unknowns(
     assert_eq!(unknown.drift_correction_ppm, None);
     assert_eq!(unknown.drift_reset_reason, None);
     assert!(decode_playback_progress_with_format(&payload[..payload.len() - 1], true, 3).is_err());
+    let mut schema4 = vec![0xff; 78 + 151];
+    schema4[45] = 1;
+    schema4[70] = 1;
+    schema4[71] = 3;
+    schema4[72] = 2;
+    schema4[73] = 0;
+    schema4[74..78].copy_from_slice(&48_000u32.to_be_bytes());
+    schema4[78] = 4;
+    schema4[78 + 21] = 0;
+    schema4[78 + 126..78 + 130].copy_from_slice(&1_920u32.to_be_bytes());
+    schema4[78 + 130..78 + 134].copy_from_slice(&2_000u32.to_be_bytes());
+    schema4[78 + 134..78 + 138].copy_from_slice(&(-80i32).to_be_bytes());
+    schema4[78 + 138..78 + 142].copy_from_slice(&(-250i32).to_be_bytes());
+    schema4[78 + 142] = 8;
+    schema4[78 + 143..78 + 151].copy_from_slice(&42u64.to_be_bytes());
+    let acknowledged = decode_playback_progress_with_format(&schema4, true, 4).unwrap();
+    assert_eq!(acknowledged.progress_schema, Some(4));
+    assert_eq!(acknowledged.applied_loss_ledger_revision, Some(42));
+    schema4[78 + 143..78 + 151].copy_from_slice(&u64::MAX.to_be_bytes());
+    let pending = decode_playback_progress_with_format(&schema4, true, 4).unwrap();
+    assert_eq!(pending.applied_loss_ledger_revision, None);
+    assert!(decode_playback_progress_with_format(&schema4[..schema4.len() - 1], true, 4).is_err());
 }
 use crate::security::{
     test_binding_material, test_binding_material_with_wrong_identity,
@@ -767,10 +1018,12 @@ use std::{
 };
 
 const JAVA_SOURCES: &[&str] = &[
+    "AodMetricsSampler.java",
     "PairingProtocol.java",
     "P5cControlProtocol.java",
     "UdpSessionContext.java",
     "UdpPacketDecoder.java",
+    "AnpdLossLedger.java",
     "UdpPcmQueue.java",
     "AnpdAudioIngress.java",
     "UdpReceiver.java",
@@ -869,6 +1122,11 @@ fn compile_java_endpoint() -> PathBuf {
     }
     command.arg(
         repo.join("src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/Pcm16FrameStream.java"),
+    );
+    command.arg(
+        repo.join(
+            "src/AnPod.AndroidProtocol/src/main/java/com/anpod/server/SourceFrameRanges.java",
+        ),
     );
     command.arg(
         repo.join(
@@ -2370,12 +2628,12 @@ fn session_owner_recovers_after_udp_sender_failure_while_playing_or_paused() {
         status.state == SessionLifecycleState::Streaming
     });
 
-    owner.set_paused(true).unwrap();
-    wait_for_owner(&owner, |status| {
-        status.state == SessionLifecycleState::Paused
-    });
     crate::network::fail_next_udp_send_for_test();
     assert!(second_queue.push_raw(audio.as_ptr(), 960, 48_000, 2, 960));
+    wait_for_owner(&owner, |status| {
+        status.state == SessionLifecycleState::Reconnecting
+    });
+    owner.set_paused(true).unwrap();
     let recovered_paused = wait_for_owner(&owner, |status| {
         status.generation > recovered.generation
             && status.session_id.is_some()

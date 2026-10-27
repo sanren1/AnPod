@@ -154,6 +154,19 @@ pub struct PlaybackDiagnostics {
     pub oboe_zero_filled_frames: Option<u64>,
     pub ring_pending_frames: Option<u32>,
     pub stream_pending_frames: Option<u32>,
+    pub applied_loss_ledger_revision: Option<u64>,
+    pub loss_10s_frames: Option<u64>,
+    pub eligible_10s_frames: Option<u64>,
+    pub loss_60s_frames: Option<u64>,
+    pub eligible_60s_frames: Option<u64>,
+    pub cumulative_loss_frames: Option<u64>,
+    pub cumulative_eligible_frames: Option<u64>,
+    pub pc_drop_frames: Option<u64>,
+    pub receiver_drop_frames: Option<u64>,
+    pub transport_missing_frames: Option<u64>,
+    pub output_drop_frames: Option<u64>,
+    pub recovery_count: Option<u64>,
+    pub recovery_duration_ms: Option<u64>,
 }
 
 pub(crate) const STARTUP_DIAGNOSTICS_INTERVAL: Duration = Duration::from_millis(250);

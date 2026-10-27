@@ -133,6 +133,10 @@ public final class ReceiverService extends Service {
     private int operationStartId;
     volatile boolean destroyed;
     private volatile long networkRecoveryDeadlineElapsedMs;
+    private volatile SourceFrameOutputMap recoverableSourceFrameMap;
+    private volatile AodMetricsSampler recoverableLossSampler;
+    private volatile boolean preserveLossPeriodOnNextStart;
+    private volatile long recoverableLossPauseStartedNanos = -1L;
     volatile P5cReceiverCoordinator networkCoordinator;
     final Object networkCoordinatorLock = new Object();
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
@@ -546,7 +550,8 @@ public final class ReceiverService extends Service {
                         ? error.getMessage() : error.getClass().getSimpleName();
                 if (isCurrentOperation(ownerId, generation)) {
                     if (aoaRecoveryDeadlineElapsedMs > 0) {
-                        scheduleAoaRecovery(ownerId, generation, describeAoaFailure(failure));
+                        scheduleAoaRecovery(ownerId, generation, describeAoaFailure(failure),
+                                preserveLossPeriodOnNextStart);
                     } else requestTermination(ownerId, generation, true, describeAoaFailure(failure));
                 }
             } finally {
@@ -657,7 +662,7 @@ public final class ReceiverService extends Service {
                             + AOA_RECOVERY_WINDOW_MS;
                     aoaRecoveryAttempt = 0;
                 }
-                scheduleAoaRecovery(ownerId, generation, failure);
+                scheduleAoaRecovery(ownerId, generation, failure, unexpectedFailure && !restartRequested);
                 return;
             }
             requestTermination(ownerId, generation, !failure.isEmpty(), failure);
@@ -665,13 +670,20 @@ public final class ReceiverService extends Service {
     }
 
     void scheduleAoaRecovery(String ownerId, long generation, String failure) {
+        scheduleAoaRecovery(ownerId, generation, failure, true);
+    }
+
+    private void scheduleAoaRecovery(String ownerId, long generation, String failure, boolean preserveLossPeriod) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> scheduleAoaRecovery(ownerId, generation, failure));
+            handler.post(() -> scheduleAoaRecovery(ownerId, generation, failure, preserveLossPeriod));
             return;
         }
         if (!isCurrentOperation(ownerId, generation) || !ownerId.equals(aoaOwnerId)
                 || aoaOwnerGeneration != generation) return;
         aoaRecoveryFailure = failure == null ? "" : failure;
+        preserveLossPeriodOnNextStart = preserveLossPeriod && recoverableSourceFrameMap != null;
+        recoverableLossPauseStartedNanos = preserveLossPeriodOnNextStart
+                ? android.os.SystemClock.elapsedRealtimeNanos() : -1L;
         long now = android.os.SystemClock.elapsedRealtime();
         long remaining = aoaRecoveryDeadlineElapsedMs - now;
         if (remaining <= 0) {
@@ -718,6 +730,8 @@ public final class ReceiverService extends Service {
         aoaRecoveryDeadlineElapsedMs = 0;
         aoaRecoveryAttempt = 0;
         aoaRecoveryFailure = "";
+        preserveLossPeriodOnNextStart = false;
+        recoverableLossPauseStartedNanos = -1L;
     }
 
     private boolean registerAoaDetachReceiver(UsbAccessory accessory, String ownerId, long generation) {
@@ -1489,8 +1503,31 @@ public final class ReceiverService extends Service {
             requestTermination(uiOperation.ownerId(), currentOperationGeneration, true, "InvalidAudioRequest");
             return null;
         }
+        SourceFrameOutputMap sourceFrameOutputMap = preserveLossPeriodOnNextStart
+                && recoverableSourceFrameMap != null
+                ? recoverableSourceFrameMap : new SourceFrameOutputMap();
+        AodMetricsSampler lossSampler = preserveLossPeriodOnNextStart && recoverableLossSampler != null
+                ? recoverableLossSampler : new AodMetricsSampler();
+        boolean continuingLossPeriod = sourceFrameOutputMap == recoverableSourceFrameMap && preserveLossPeriodOnNextStart;
+        if (continuingLossPeriod) {
+            long pausedAt = recoverableLossPauseStartedNanos;
+            if (pausedAt >= 0) {
+                long duration = Math.max(0, android.os.SystemClock.elapsedRealtimeNanos() - pausedAt);
+                lossSampler.excludeLossTime(duration);
+                sourceFrameOutputMap.recordRecovery(duration);
+            }
+            sourceFrameOutputMap.resetOutputEpoch(false);
+        }
+        preserveLossPeriodOnNextStart = false;
+        recoverableLossPauseStartedNanos = -1L;
+        recoverableSourceFrameMap = sourceFrameOutputMap;
+        recoverableLossSampler = lossSampler;
         AudioSession session = new AudioSession(NEXT_AUDIO_ID.incrementAndGet(), request,
-                ownerId, generation);
+                ownerId, generation, sourceFrameOutputMap, lossSampler);
+        if (continuingLossPeriod)
+            sourceFrameOutputMap.beginSourceSegment(sourceCaptureTail(session), sourceSettledThrough(session),
+                    session.request.sourceSampleRate());
+        else sourceFrameOutputMap.beginSourceSegment(0L);
         session.requestedOutputEngine = requestedOutputEnginePreference();
         session.actualOutputEngine = "unknown";
         currentAudio = session;
@@ -1648,6 +1685,10 @@ public final class ReceiverService extends Service {
                 runOnMainForOwner(ownerId, generation, () -> setUdpAudioPaused(ownedSession, false));
             }
 
+            @Override public void userPauseAcknowledged() {
+                resetUserLossPeriod(ownedSession, ownerId, generation);
+            }
+
             @Override public void stop() {
                 AudioSession session = ownedSession;
                 if (session == null) return;
@@ -1666,6 +1707,7 @@ public final class ReceiverService extends Service {
             }
 
             @Override public boolean supportsPlaybackProgressExtension() { return true; }
+            @Override public boolean supportsSourceFrameLoss() { return true; }
 
             @Override public byte[] playbackProgressPayloadExtendedV2() {
                 return ReceiverService.playbackProgressPayloadExtendedV2();
@@ -1713,6 +1755,7 @@ public final class ReceiverService extends Service {
 
                 @Override public boolean supportsPlaybackProgress() { return true; }
                 @Override public boolean supportsPlaybackProgressExtension() { return true; }
+                @Override public boolean supportsSourceFrameLoss() { return true; }
                 @Override public boolean supportsAudioV2() { return true; }
                 @Override public boolean supportsAudioFormatV2(UdpPacketDecoder.AudioFormatV2 format) {
                     return ReceiverService.supportsAudioFormatV2(format);
@@ -1801,6 +1844,9 @@ public final class ReceiverService extends Service {
                     }
                     if (keepForRecovery) networkRecoveryDeadlineElapsedMs = onceRecoveryDeadline(ownerId, generation);
                     else if (playbackHadStarted) networkRecoveryDeadlineElapsedMs = 0;
+                    preserveLossPeriodOnNextStart = keepForRecovery && recoverableSourceFrameMap != null;
+                    recoverableLossPauseStartedNanos = preserveLossPeriodOnNextStart
+                            ? android.os.SystemClock.elapsedRealtimeNanos() : -1L;
                 }
 
                 @Override public void cancelBackgroundStartAuthorization(byte[] requestId, long sessionId,
@@ -1819,6 +1865,8 @@ public final class ReceiverService extends Service {
                                 peer, bindingCommitment);
                     }
                     networkRecoveryDeadlineElapsedMs = 0;
+                    preserveLossPeriodOnNextStart = false;
+                    recoverableLossPauseStartedNanos = -1L;
                 }
 
                 @Override public byte[] playbackProgressPayload() {
@@ -1901,6 +1949,10 @@ public final class ReceiverService extends Service {
                         setUdpAudioPaused(ownedSession, false);
                         networkAudioState = "receiverRunning";
                     });
+                }
+
+                @Override public void userPauseAcknowledged() {
+                    resetUserLossPeriod(ownedSession, ownerId, generation);
                 }
 
                 @Override public void stop() {
@@ -2325,6 +2377,7 @@ public final class ReceiverService extends Service {
     }
 
     private void receiveFloatAudio(AudioSession session) {
+        UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.formatV2();
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         AudioTrack track = null;
         PlaybackOutput output = null;
@@ -2337,7 +2390,6 @@ public final class ReceiverService extends Service {
         WifiManager.WifiLock wifiLock = null;
         String failure = "";
         try {
-            UdpPacketDecoder.AudioFormatV2 sourceFormat = session.request.formatV2();
             if (!supportsAudioFormatV2(sourceFormat))
                 throw new IOException("Unsupported audio format for playback");
             ensureRunning(session);
@@ -2472,8 +2524,10 @@ public final class ReceiverService extends Service {
                     int count = readFloatFrames(queue, samples,
                             Math.min(chunkFrames, preRollFrames - preRoll.completedFrames()));
                     if (count < 0) throw new IOException("FloatAudioStreamEndedBeforePlayback");
-                    boolean complete = writeV2Frames(session, output, samples, count, packed,
-                            blockGeneration);
+                    boolean complete = writeV2Frames(session, output, samples, count,
+                            queue.lastReadFrames(), packed,
+                            blockGeneration, queue.lastReadFrameIndex(), queue.lastReadSynthetic(),
+                            queue.lastReadFrames() == count);
                     long currentGeneration = session.focusState.writeGeneration();
                     preRoll.recordWrite(blockGeneration, currentGeneration, count, complete);
                 }
@@ -2541,6 +2595,8 @@ public final class ReceiverService extends Service {
                 long playbackPosition = output.playbackHeadPosition();
                 long playedFrames = playbackPosition < 0 ? 0
                         : session.driftPlaybackHead.update((int) playbackPosition, nowNanos);
+                session.sourceFrameOutputMap.advancePlayed(playedFrames);
+                accountSettledPcDropGaps(session);
                 long concealedFrames = queue.concealedFrames();
                 long droppedFrames = queue.droppedFrames();
                 long expiredFrames = queue.expiredFrames();
@@ -2564,7 +2620,11 @@ public final class ReceiverService extends Service {
                     outputFrames = queue.adjustDrift(samples, count, chunkFrames + 1, adjustment);
                     drift.commit(adjustment);
                 }
-                writeV2Frames(session, output, samples, outputFrames, packed, blockGeneration);
+                boolean sourceMappingValid = adjustment == 0 && outputFrames == count
+                        && queue.lastReadFrames() == count;
+                if (!sourceMappingValid) session.sourceFrameOutputMap.markIncomplete();
+                writeV2Frames(session, output, samples, outputFrames, queue.lastReadFrames(), packed,
+                        blockGeneration, queue.lastReadFrameIndex(), queue.lastReadSynthetic(), sourceMappingValid);
                 observedDriftResetGeneration = session.driftResetGeneration;
                 observedConcealedFrames = concealedFrames;
                 observedDroppedFrames = droppedFrames;
@@ -2618,6 +2678,7 @@ public final class ReceiverService extends Service {
                 catch (RuntimeException error) { failure = appendFailure(failure, "WiFiLockRelease: " + describeFailure(error)); }
             }
             joinNetworkThread(networkThread);
+            recordSettledLossSnapshot(session);
             session.request.destroy();
             synchronized (STATUS_LOCK) {
                 if (statusAudioId == session.id) {
@@ -2878,8 +2939,10 @@ public final class ReceiverService extends Service {
     }
 
     boolean writeV2Frames(AudioSession session, PlaybackOutput output, float[] samples,
-            int frameCount, byte[] packed, long generation) throws IOException {
+            int frameCount, int sourceFrameCount, byte[] packed, long generation, long sourceFrameStart,
+            boolean sourceSynthetic, boolean sourceMappingValid) throws IOException {
         if (frameCount <= 0) return true;
+        accountSettledPcDropGaps(session);
         if (output instanceof OboePlaybackOutput) {
             int offset = 0;
             while (offset < frameCount) {
@@ -2897,6 +2960,13 @@ public final class ReceiverService extends Service {
                 synchronized (session) {
                     if (!session.focusState.acceptsWrite(generation)) return false;
                     ensureRunning(session);
+                    int sourceOffset = sourceFramesThroughOutput(sourceFrameCount, frameCount, offset);
+                    int sourceEnd = sourceFramesThroughOutput(sourceFrameCount, frameCount, offset + written);
+                    if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
+                            sourceFrameStart + offset, written, sourceSynthetic);
+                    else if (sourceEnd > sourceOffset) session.sourceFrameOutputMap.recordUnknownWrite(
+                            sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, written);
+                    else session.sourceFrameOutputMap.recordUnknownOutput(written);
                     session.trackWrittenFrames += written;
                     PCM_BYTES_WRITTEN.addAndGet(written * output.channels() * Float.BYTES);
                     session.playbackActivity.noteSuccessfulWrite(System.nanoTime());
@@ -2914,6 +2984,14 @@ public final class ReceiverService extends Service {
             synchronized (session) {
                 if (!session.focusState.acceptsWrite(generation)) return writtenFrames;
                 ensureRunning(session);
+                int sourceOffset = sourceFramesThroughOutput(sourceFrameCount, frameCount, offsetFrames);
+                int sourceEnd = sourceFramesThroughOutput(sourceFrameCount, frameCount,
+                        offsetFrames + writtenFrames);
+                if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
+                        sourceFrameStart + offsetFrames, writtenFrames, sourceSynthetic);
+                else if (sourceEnd > sourceOffset) session.sourceFrameOutputMap.recordUnknownWrite(
+                        sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, writtenFrames);
+                else session.sourceFrameOutputMap.recordUnknownOutput(writtenFrames);
                 session.trackWrittenFrames += writtenFrames;
                 PCM_BYTES_WRITTEN.addAndGet(writtenFrames * output.channels()
                         * (output.formatCode() == 2 ? 3 : Float.BYTES));
@@ -2923,6 +3001,11 @@ public final class ReceiverService extends Service {
                     output.channels(), System.nanoTime());
             return writtenFrames;
         });
+    }
+
+    private static int sourceFramesThroughOutput(int sourceFrameCount, int outputFrameCount,
+            int outputFramesThrough) {
+        return (int) ((long) sourceFrameCount * outputFramesThrough / outputFrameCount);
     }
 
     interface V2PartialFrameWriter {
@@ -3191,11 +3274,16 @@ public final class ReceiverService extends Service {
                 while (preRolled < preRollBytes) {
                     ensureRunning(session);
                     long blockGeneration = session.focusState.writeGeneration();
+                    if (udpPcmInput != null) udpPcmInput.beginSourceRangeBatch();
                     int count = pcm.readFrames(input, buffer, Math.min(buffer.length, preRollBytes - preRolled));
                     if (count < 0) throw new IOException("AudioStreamEndedBeforePlayback");
                     if (!session.focusState.acceptsWrite(blockGeneration)) { preRolled = 0; continue; }
                     publishTcpBacklogMetrics(session, udpQueue, pcm);
-                    if (writeFrames(session, output, pcm, buffer, count, frameBytes, blockGeneration))
+                    boolean sourceMappingValid = udpPcmInput != null
+                            && udpPcmInput.sourceRangeBatchComplete()
+                            && udpPcmInput.sourceRangeFramesTotal() == count / frameBytes;
+                    if (writeFrames(session, output, pcm, buffer, count, frameBytes, blockGeneration,
+                            udpPcmInput, sourceMappingValid))
                         preRolled += count;
                     else preRolled = 0;
                 }
@@ -3306,6 +3394,7 @@ public final class ReceiverService extends Service {
                     int sourceReadLimitBytes = driftReadLimitBytes
                             + sourceReadAdjustmentFrames * frameBytes;
                     long blockGeneration = session.focusState.writeGeneration();
+                    if (udpPcmInput != null) udpPcmInput.beginSourceRangeBatch();
                     int count = pcm.readFrames(input, buffer, sourceReadLimitBytes);
                     if (!session.focusState.acceptsWrite(blockGeneration)) continue;
                     if ((sourceReadAdjustmentFrames != 0 || udpQueue != null) && count >= 0) {
@@ -3335,6 +3424,10 @@ public final class ReceiverService extends Service {
                     boolean playbackAdvancing = playbackPosition >= 0
                             && session.driftPlaybackHead.isAdvancing(nowNanos);
                     boolean headAdvanced = playedFrames > driftObservedPlayedFrames;
+                    if (udpQueue != null) {
+                        session.sourceFrameOutputMap.advancePlayed(playedFrames);
+                        accountSettledPcDropGaps(session);
+                    }
                     if (headAdvanced) driftObservedPlayedFrames = playedFrames;
                     boolean underrunChanged = previousUnderruns >= 0 && underruns >= 0
                             && underruns != previousUnderruns;
@@ -3389,7 +3482,14 @@ public final class ReceiverService extends Service {
                     }
                     if (resumeAfterSynthetic) driftNeedsRealAudio = false;
                     session.driftLastOutputDiscontinuities = underruns;
-                    writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, blockGeneration);
+                    boolean sourceMappingValid = udpPcmInput != null && outputBytes == count
+                            && sourceReadAdjustmentFrames == 0
+                            && udpPcmInput.sourceRangeBatchComplete()
+                            && udpPcmInput.sourceRangeFramesTotal() == count / frameBytes;
+                    if (!sourceMappingValid && udpPcmInput != null)
+                        session.sourceFrameOutputMap.markIncomplete();
+                    writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, blockGeneration,
+                            udpPcmInput, sourceMappingValid);
                     if (trackUnderruns >= 0) {
                         int reportedUnderruns = output.underrunCount();
                         if (udpQueue != null) udpQueue.reportTrackUnderruns(reportedUnderruns);
@@ -3452,6 +3552,7 @@ public final class ReceiverService extends Service {
                 }
                 if (interrupted) Thread.currentThread().interrupt();
             }
+            recordSettledLossSnapshot(session);
             session.request.destroy();
             synchronized (STATUS_LOCK) {
                 if (statusAudioId == session.id) {
@@ -3471,7 +3572,9 @@ public final class ReceiverService extends Service {
     }
 
     private boolean writeFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
-            byte[] buffer, int count, int frameBytes, long writeGeneration) throws IOException {
+            byte[] buffer, int count, int frameBytes, long writeGeneration,
+            UdpPcmQueue.QueueInputStream sourceRanges, boolean sourceMappingValid) throws IOException {
+        accountSettledPcDropGaps(session);
         boolean[] completed = {true};
         pcm.writeFramesForChannels((data, offset, length) -> {
             ensureRunning(session);
@@ -3496,6 +3599,12 @@ public final class ReceiverService extends Service {
                 ensureRunning(session);
                 if (written <= 0) throw new IOException("Audio output write failed: " + written);
                 if (written % frameBytes != 0) throw new IOException("Audio output returned a partial PCM frame");
+                if (session.udpQueue != null) {
+                    if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
+                            sourceRanges, offset / frameBytes, written / frameBytes);
+                    else session.sourceFrameOutputMap.recordUnknownWrite(
+                            sourceRanges, written / frameBytes);
+                }
                 session.trackWrittenFrames += written / frameBytes;
                 if (session.request.usesPacketIngress()) {
                     PCM_BYTES_WRITTEN.addAndGet(written);
@@ -3576,6 +3685,34 @@ public final class ReceiverService extends Service {
         if (!failure.isEmpty()) cancelAudio(session, failure);
     }
 
+    private static long sourceCaptureTail(AudioSession session) {
+        if (session == null) return -1L;
+        if (session.request.aoaContext != null)
+            return session.request.aoaContext.ingress.lossCaptureTail();
+        if (session.udpReceiver != null) return session.udpReceiver.lossCaptureTail();
+        return session.sourcePcDropCaptureTail;
+    }
+
+    private static long sourceSettledThrough(AudioSession session) {
+        if (session == null) return -1L;
+        if (session.request.aoaContext != null)
+            return session.request.aoaContext.ingress.lossSettledThrough();
+        if (session.udpReceiver != null) return session.udpReceiver.lossSettledThrough();
+        return session.sourcePcDropSettledThrough;
+    }
+
+    private void resetUserLossPeriod(AudioSession session, String ownerId, long generation) {
+        if (session == null || currentAudio != session
+                || !isCurrentOperation(ownerId, generation)) return;
+        accountSettledPcDropGaps(session);
+        recordSettledLossSnapshot(session);
+        if (session.request.aoaContext != null) {
+            session.request.aoaContext.ingress.resetReceiverDropTrackingForPeriod();
+        } else {
+            if (session.udpQueue != null) session.udpQueue.resetReceiverDropTrackingForPeriod();
+            if (session.floatQueue != null) session.floatQueue.resetReceiverDropTrackingForPeriod();
+        }
+    }
     /** Called with the session control monitor held. */
     private String resumeFocusedOutput(AudioSession session, PlaybackOutput output) {
         if (!session.focusState.canPlay()) return "";
@@ -3587,6 +3724,9 @@ public final class ReceiverService extends Service {
             output.play();
             markOutputEpoch(session);
             resetPlaybackHeadEpoch(session, output.playbackHeadPosition());
+            recordSettledLossSnapshot(session);
+            session.sourceFrameOutputMap.beginSourceSegment(sourceCaptureTail(session), sourceSettledThrough(session),
+                    session.request.sourceSampleRate());
             session.trackPlaying = true;
             session.focusState.markTrackPlaying();
             session.driftResetGeneration++;
@@ -3668,6 +3808,8 @@ public final class ReceiverService extends Service {
             if (aoaRecoveryDeadlineElapsedMs != 0) return;
         }
         if (session.request.udpContext != null && "NetworkSessionStopped".equals(failure)) {
+            preserveLossPeriodOnNextStart = false;
+            recoverableLossPauseStartedNanos = -1L;
             networkAudioState = networkCoordinator != null ? "prepared" : "stopped";
             if (networkCoordinator != null) {
                 networkRecoveryDeadlineElapsedMs = receiveIntentEnabled
@@ -3679,6 +3821,9 @@ public final class ReceiverService extends Service {
             return;
         }
         if (session.request.udpContext != null && networkCoordinator != null) {
+            preserveLossPeriodOnNextStart = recoverableSourceFrameMap != null;
+            recoverableLossPauseStartedNanos = preserveLossPeriodOnNextStart
+                    ? android.os.SystemClock.elapsedRealtimeNanos() : -1L;
             recordNetworkFailure(failure.isEmpty() ? "NetworkAudioSessionEnded" : failure);
             uiOperation.reportError(session.ownerId, networkAudioFailure);
             networkRecoveryDeadlineElapsedMs = receiveIntentEnabled
@@ -3893,7 +4038,8 @@ public final class ReceiverService extends Service {
     }
 
     static byte[] playbackProgressPayloadExtended(boolean audioV2, int schema) {
-        if (schema != 2 && schema != 3) throw new IllegalArgumentException("unsupported progress schema");
+        if (schema < 2 || schema > 6)
+            throw new IllegalArgumentException("unsupported progress schema");
         AudioSession session = currentAudio;
         PlaybackMetrics metrics = playbackMetricsSnapshot();
         if (session != currentAudio) session = null;
@@ -3973,17 +4119,139 @@ public final class ReceiverService extends Service {
                 : (int) Math.max(Integer.MIN_VALUE + 1L, Math.min(Integer.MAX_VALUE, drift.errorFrames()));
         int correctionPpm = drift == null ? Integer.MIN_VALUE : drift.correctionPpm();
         int resetReason = drift == null ? 0 : drift.resetReason();
-        return P5cControlProtocol.playbackProgressPayloadSchema3(extended, targetFrames,
+        byte[] schema3 = P5cControlProtocol.playbackProgressPayloadSchema3(extended, targetFrames,
                 observedFrames, errorFrames, correctionPpm, resetReason);
+        if (schema == 3) return schema3;
+        long appliedRevision = session == null ? -1L : session.request.aoaContext != null
+                ? session.request.aoaContext.ingress.appliedLossLedgerRevision()
+                : session.udpReceiver == null ? -1L : session.udpReceiver.appliedLossLedgerRevision();
+        byte[] schema4 = P5cControlProtocol.playbackProgressPayloadSchema4(schema3, appliedRevision);
+        if (schema == 4) return schema4;
+        if (session == null) {
+            byte[] schema5 = P5cControlProtocol.playbackProgressPayloadSchema5(schema4, null, null, null);
+            return schema == 5 ? schema5 : P5cControlProtocol.playbackProgressPayloadSchema6(
+                    schema5, -1L, -1L, -1L, -1L, -1L, -1L);
+        }
+        recordSettledLossSnapshot(session);
+        SourceFrameOutputMap map = session.sourceFrameOutputMap;
+        AodMetricsSampler sampler = session.lossSampler;
+        int sourceRate = session.request.sourceSampleRate();
+        AodMetricsSampler.LossWindow tenSeconds = sampler.recentSourceLossWindow(
+                10_000_000_000L, sourceRate);
+        AodMetricsSampler.LossWindow sixtySeconds = sampler.recentSourceLossWindow(
+                60_000_000_000L, sourceRate);
+        Long cumulativeLoss = map.complete() ? map.settledLossFrames() : null;
+        Long cumulativeEligible = map.complete() ? map.settledEligibleSourceFrames() : null;
+        byte[] schema5 = P5cControlProtocol.playbackProgressPayloadSchema5(schema4,
+                tenSeconds, sixtySeconds, cumulativeLoss == null ? null
+                        : new AodMetricsSampler.LossWindow(cumulativeLoss, cumulativeEligible));
+        if (schema == 5) return schema5;
+        boolean complete = map.complete();
+        return P5cControlProtocol.playbackProgressPayloadSchema6(schema5,
+                complete ? map.settledPcDropFrames() : -1L,
+                complete ? map.settledReceiverDropFrames() : -1L,
+                complete ? map.settledTransportMissingFrames() : -1L,
+                complete ? map.settledOutputDropFrames() : -1L,
+                map.recoveryCount(), map.recoveryDurationMs());
     }
 
     static byte[] playbackProgressPayloadExtendedV2() {
         return playbackProgressPayloadExtended(true);
     }
 
+    static void accountSettledPcDropGaps(AudioSession session) {
+        boolean updated = false;
+        long revision;
+        if (session.request.aoaContext != null) {
+            AnpdAudioIngress ingress = session.request.aoaContext.ingress;
+            revision = ingress.appliedLossLedgerRevision();
+            if (revision != -1L && revision != session.sourcePcDropRevision) {
+                session.sourcePcDropIntervals = ingress.lossLedgerIntervals();
+                session.sourcePcDropCaptureTail = ingress.lossCaptureTail();
+                session.sourcePcDropSettledThrough = ingress.lossSettledThrough();
+                session.sourcePcDropLedgerComplete = ingress.lossLedgerComplete();
+                session.sourcePcDropSegmentGeneration = ingress.lossSourceSegmentGeneration();
+                session.sourcePcDropSegmentStart = ingress.lossSourceSegmentStart();
+                session.sourcePcDropRevision = revision;
+                updated = true;
+            }
+            long receiverRevision = ingress.receiverDropRevision();
+            if (receiverRevision != session.sourceReceiverDropRevision) {
+                session.sourceReceiverDropRanges = ingress.receiverDropRanges();
+                session.sourceReceiverDropTrackingComplete = ingress.receiverDropTrackingComplete();
+                session.sourceReceiverDropRevision = receiverRevision;
+                updated = true;
+            }
+        } else if (session.udpReceiver != null) {
+            revision = session.udpReceiver.appliedLossLedgerRevision();
+            if (revision != -1L && revision != session.sourcePcDropRevision) {
+                session.sourcePcDropIntervals = session.udpReceiver.lossLedgerIntervals();
+                session.sourcePcDropCaptureTail = session.udpReceiver.lossCaptureTail();
+                session.sourcePcDropSettledThrough = session.udpReceiver.lossSettledThrough();
+                session.sourcePcDropLedgerComplete = session.udpReceiver.lossLedgerComplete();
+                session.sourcePcDropSegmentGeneration = session.udpReceiver.lossSourceSegmentGeneration();
+                session.sourcePcDropSegmentStart = session.udpReceiver.lossSourceSegmentStart();
+                session.sourcePcDropRevision = revision;
+                updated = true;
+            }
+            long receiverRevision = session.udpReceiver.receiverDropRevision();
+            if (receiverRevision != session.sourceReceiverDropRevision) {
+                session.sourceReceiverDropRanges = session.udpReceiver.receiverDropRanges();
+                session.sourceReceiverDropTrackingComplete = session.udpReceiver.receiverDropTrackingComplete();
+                session.sourceReceiverDropRevision = receiverRevision;
+                updated = true;
+            }
+        } else {
+            return;
+        }
+        if (session.sourcePcDropSegmentStart != -1L
+                && session.sourcePcDropBoundaryAppliedGeneration != session.sourcePcDropSegmentGeneration) {
+            if (session.sourceFrameOutputMap.setSourceSegmentFloor(session.sourcePcDropSegmentStart)) {
+                session.sourcePcDropBoundaryAppliedGeneration = session.sourcePcDropSegmentGeneration;
+            } else {
+                session.sourcePcDropLedgerComplete = false;
+            }
+        }
+        FloatPcmFrameQueue floatQueue = session.floatQueue;
+        if (floatQueue != null) {
+            long outputRevision = floatQueue.startupOutputDropRevision();
+            if (outputRevision != session.sourceStartupOutputDropRevision) {
+                session.sourceStartupOutputDropRanges = floatQueue.startupOutputDropRanges();
+                session.sourceStartupOutputDropTrackingComplete =
+                        floatQueue.startupOutputDropTrackingComplete();
+                session.sourceStartupOutputDropRevision = outputRevision;
+                updated = true;
+            }
+        }
+        session.sourceFrameOutputMap.recordSourceCaptureTail(session.sourcePcDropCaptureTail);
+        int gapCount = session.sourceFrameOutputMap.sourceGapCount();
+        if (session.sourcePcDropRevision != -1L
+                && (updated || gapCount != session.sourcePcDropGapCount)) {
+            session.sourceFrameOutputMap.accountSourceGaps(session.sourcePcDropIntervals,
+                    session.sourceReceiverDropRanges, session.sourceStartupOutputDropRanges,
+                    session.sourcePcDropSettledThrough, session.sourcePcDropLedgerComplete,
+                    session.sourceReceiverDropTrackingComplete,
+                    session.sourceStartupOutputDropTrackingComplete);
+            session.sourcePcDropGapCount = gapCount;
+        }
+    }
+
+    private static void recordSettledLossSnapshot(AudioSession session) {
+        accountSettledPcDropGaps(session);
+        SourceFrameOutputMap map = session.sourceFrameOutputMap;
+        if (!map.hasCurrentSegmentSettlement()) return;
+        int sourceRate = session.request.sourceSampleRate();
+        session.lossSampler.recordSourceLossSnapshot(map.sourceSegmentId(), map.sourceSegmentLogicalStart(),
+                map.sourceSegmentOrigin(), map.settledEligibleSourceThrough(), sourceRate,
+                map.settledLossRanges(), map.rollingComplete(), map.settledUnknownRanges());
+        if (map.sourceSegmentUnknownStart() != -1L)
+            session.lossSampler.recordUnknownSourceRange(map.sourceSegmentUnknownStart(),
+                    map.sourceSegmentUnknownEnd(), sourceRate);
+    }
     private static void markOutputEpoch(AudioSession session) { session.outputEpoch++; }
 
     private static void resetPlaybackHeadEpoch(AudioSession session, long playbackPosition) {
+        session.sourceFrameOutputMap.resetOutputEpoch(playbackPosition >= 0);
         if (playbackPosition >= 0) {
             int head = (int) playbackPosition;
             session.playbackActivity.resetPlaybackHead(head);
@@ -4094,6 +4362,13 @@ public final class ReceiverService extends Service {
             return udpContext != null ? udpContext.formatV2 : aoaContext == null ? null : aoaContext.formatV2;
         }
 
+        int sourceSampleRate() {
+            UdpPacketDecoder.AudioFormatV2 format = formatV2();
+            if (format != null) return format.sampleRate;
+            return udpContext != null && udpContext.parameters != null
+                    ? udpContext.parameters.sampleRate : 0;
+        }
+
         boolean usesPacketIngress() { return udpContext != null || aoaContext != null; }
 
         boolean usesFloatV2Worker() {
@@ -4142,21 +4417,48 @@ public final class ReceiverService extends Service {
         volatile int openedTrackSampleRateV2;
         boolean trackReady;
         volatile long trackWrittenFrames;
+        final SourceFrameOutputMap sourceFrameOutputMap;
+        final AodMetricsSampler lossSampler;
+        long sourcePcDropRevision = -1L;
+        long sourcePcDropSegmentGeneration = -1L;
+        long sourcePcDropSegmentStart = -1L;
+        long sourcePcDropBoundaryAppliedGeneration = -1L;
+        int sourcePcDropGapCount = -1;
+        AnpdLossLedger.Interval[] sourcePcDropIntervals = new AnpdLossLedger.Interval[0];
+        com.anpod.server.SourceFrameRanges.Range[] sourceReceiverDropRanges =
+                new com.anpod.server.SourceFrameRanges.Range[0];
+        long sourceReceiverDropRevision = -1L;
+        boolean sourceReceiverDropTrackingComplete = true;
+        long sourceStartupOutputDropRevision = -1L;
+        com.anpod.server.SourceFrameRanges.Range[] sourceStartupOutputDropRanges =
+                new com.anpod.server.SourceFrameRanges.Range[0];
+        boolean sourceStartupOutputDropTrackingComplete = true;
+        long sourcePcDropSettledThrough = -1L;
+        long sourcePcDropCaptureTail = -1L;
+        boolean sourcePcDropLedgerComplete;
         volatile long inputPcmBytes;
         volatile boolean trackPlaying;
         final AudioFocusState focusState = new AudioFocusState();
         volatile boolean cancelled;
         volatile String stopReason = "";
 
-        AudioSession(long id, AudioRequest request, String ownerId, long networkGeneration) {
+        AudioSession(long id, AudioRequest request, String ownerId, long networkGeneration,
+                SourceFrameOutputMap sourceFrameOutputMap, AodMetricsSampler lossSampler) {
             this.id = id;
             this.request = request;
             this.ownerId = ownerId;
             this.networkGeneration = networkGeneration;
+            this.sourceFrameOutputMap = sourceFrameOutputMap;
+            this.lossSampler = lossSampler;
             if (request.aoaContext != null) {
                 udpQueue = request.aoaContext.pcmQueue;
                 floatQueue = request.aoaContext.floatQueue;
             }
+        }
+
+        AudioSession(long id, AudioRequest request, String ownerId, long networkGeneration) {
+            this(id, request, ownerId, networkGeneration, new SourceFrameOutputMap(),
+                    new AodMetricsSampler());
         }
 
         boolean isStreamingAt(long nowNanos) throws IOException {

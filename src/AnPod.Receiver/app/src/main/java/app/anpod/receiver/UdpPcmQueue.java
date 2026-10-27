@@ -1,6 +1,7 @@
 package app.anpod.receiver;
 
 import com.anpod.server.Pcm16FrameStream;
+import com.anpod.server.SourceFrameRanges;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,6 +39,7 @@ final class UdpPcmQueue {
     private long playoutFrame;
     private long payloadGeneration;
     private long droppedFrames;
+    private final SourceFrameRanges receiverDropRanges = new SourceFrameRanges();
     private long acceptedAudioFrames;
     private long audioPayloadBytes;
     private long expiredFrames;
@@ -193,6 +195,7 @@ final class UdpPcmQueue {
         if (hasPlayoutFrame && Long.compareUnsigned(packet.sampleFrameIndex, playoutFrame) < 0) {
             droppedFrames += frameCount;
             if (Long.compareUnsigned(frameEnd, playoutFrame) > 0) {
+                noteReceiverDrop(playoutFrame, (int) (frameEnd - playoutFrame));
                 advancePlayoutFrame(frameEnd);
                 markDiscontinuity();
             }
@@ -209,6 +212,10 @@ final class UdpPcmQueue {
         if (insertAt < packets.size()
                 && packets.get(insertAt).frameIndex == audio.frameIndex) {
             droppedFrames += frameCount;
+            AudioPacket existing = packets.get(insertAt);
+            long existingEnd = existing.frameIndex + existing.frameCount;
+            if (Long.compareUnsigned(frameEnd, existingEnd) > 0)
+                noteReceiverDropUncovered(existingEnd, frameEnd);
             return;
         }
         int evictions = 0;
@@ -220,6 +227,7 @@ final class UdpPcmQueue {
                 || queuedFrames + frameCount > maxQueuedFrames;
         if (needsEviction && insertAt == 0 && !packets.isEmpty()) {
             droppedFrames += frameCount;
+            noteReceiverDrop(packet.sampleFrameIndex, frameCount);
             expiredFrames += frameCount;
             return;
         }
@@ -238,6 +246,7 @@ final class UdpPcmQueue {
                 || (evictions > 0 && predictedWatermarkSet
                         && Long.compareUnsigned(audio.frameIndex, predictedWatermark) < 0)) {
             droppedFrames += frameCount;
+            noteReceiverDrop(packet.sampleFrameIndex, frameCount);
             expiredFrames += frameCount;
             return;
         }
@@ -249,6 +258,7 @@ final class UdpPcmQueue {
                 || (nextIndex < packets.size() && Long.compareUnsigned(audio.frameIndex + frameCount,
                         packets.get(nextIndex).frameIndex) > 0)) {
             droppedFrames += frameCount;
+            noteReceiverDropUncovered(audio.frameIndex, frameEnd);
             return;
         }
         for (int i = 0; i < evictions; i++) {
@@ -263,6 +273,7 @@ final class UdpPcmQueue {
         if ((hasPlayoutFrame && Long.compareUnsigned(audio.frameIndex, playoutFrame) < 0)
                 || queuedFrames + frameCount > maxQueuedFrames) {
             droppedFrames += frameCount;
+            noteReceiverDrop(packet.sampleFrameIndex, frameCount);
             expiredFrames += frameCount;
             long end = audio.frameIndex + frameCount;
             boolean future = !hasPlayoutFrame || Long.compareUnsigned(end, playoutFrame) > 0;
@@ -437,6 +448,7 @@ final class UdpPcmQueue {
             AudioPacket stale = packets.remove(0);
             queuedFrames -= stale.frameCount;
             droppedFrames += stale.frameCount;
+            noteReceiverDrop(stale.frameIndex, stale.frameCount);
             expiredFrames += stale.frameCount;
             long end = stale.frameIndex + stale.frameCount;
             if (Long.compareUnsigned(end, playoutFrame) > 0) {
@@ -448,6 +460,7 @@ final class UdpPcmQueue {
 
     private void dropQueuedPacket(AudioPacket packet, boolean expired) {
         droppedFrames += packet.frameCount;
+        noteReceiverDrop(packet.frameIndex, packet.frameCount);
         if (expired) expiredFrames += packet.frameCount;
         long end = packet.frameIndex + packet.frameCount;
         boolean future = !hasPlayoutFrame || Long.compareUnsigned(end, playoutFrame) > 0;
@@ -477,6 +490,9 @@ final class UdpPcmQueue {
                     clearPlcHistory();
                     int frameBytes = format.channels * 2;
                     droppedFrames += (stream.currentPayload.length - stream.payloadOffset) / frameBytes;
+                    if (stream.currentPayloadIsReal) noteReceiverDrop(
+                            stream.currentPayloadFrameIndex + stream.payloadOffset / frameBytes,
+                            (stream.currentPayload.length - stream.payloadOffset) / frameBytes);
                     stream.currentPayload = null;
                     stream.payloadOffset = 0;
                     stream.enqueuedAtNanos = 0;
@@ -496,12 +512,15 @@ final class UdpPcmQueue {
 
             long now = clock.nowNanos();
             decayTarget(now);
+            int frameBytes = format.channels * 2;
             if (stream.currentPayload != null) {
                 if (expireCurrentPayload(stream, now)) {
                     stream.payloadGeneration = payloadGeneration;
                     continue;
                 }
                 int count = Math.min(length, stream.currentPayload.length - stream.payloadOffset);
+                stream.recordSourceBytes(stream.currentPayloadFrameIndex, !stream.currentPayloadIsReal,
+                        stream.payloadOffset, count, frameBytes);
                 System.arraycopy(stream.currentPayload, stream.payloadOffset, target, offset, count);
                 stream.payloadOffset += count;
                 if (stream.currentPayloadIsReal) stream.sourceBytesDelivered += count;
@@ -562,7 +581,6 @@ final class UdpPcmQueue {
                     int boundedGapFrames = (int) gapFrames;
                     int repeatedFrames = lastRealPayload == null ? 0
                             : Math.min(boundedGapFrames, lastRealFrameCount);
-                    int frameBytes = format.channels * 2;
                     byte[] concealment = new byte[boundedGapFrames * frameBytes];
                     if (repeatedFrames > 0) {
                         System.arraycopy(lastRealPayload, 0, concealment, 0, repeatedFrames * frameBytes);
@@ -573,6 +591,7 @@ final class UdpPcmQueue {
                     plcSilentFrames += boundedGapFrames - repeatedFrames;
                     markDiscontinuity();
                     stream.currentPayload = concealment;
+                    stream.currentPayloadFrameIndex = playoutFrame;
                     stream.payloadOffset = 0;
                     stream.enqueuedAtNanos = now;
                     stream.currentPayloadIsReal = false;
@@ -600,6 +619,7 @@ final class UdpPcmQueue {
             discardBehindWatermark();
             gapWaitActive = false;
             stream.currentPayload = next.payload;
+            stream.currentPayloadFrameIndex = next.frameIndex;
             stream.payloadOffset = 0;
             stream.enqueuedAtNanos = next.enqueuedAtNanos;
             stream.currentPayloadIsReal = true;
@@ -613,6 +633,8 @@ final class UdpPcmQueue {
         int frameBytes = format.channels * 2;
         int remainingFrames = (stream.currentPayload.length - stream.payloadOffset) / frameBytes;
         droppedFrames += remainingFrames;
+        if (stream.currentPayloadIsReal) noteReceiverDrop(
+                stream.currentPayloadFrameIndex + stream.payloadOffset / frameBytes, remainingFrames);
         expiredFrames += remainingFrames;
         stream.currentPayload = null;
         stream.payloadOffset = 0;
@@ -684,6 +706,30 @@ final class UdpPcmQueue {
         notifyAll();
     }
 
+    private void noteReceiverDrop(long start, int frameCount) {
+        if (frameCount > 0) receiverDropRanges.add(start, frameCount);
+    }
+
+    private void noteReceiverDropUncovered(long start, long end) {
+        long cursor = start;
+        for (AudioPacket packet : packets) {
+            long packetEnd = packet.frameIndex + packet.frameCount;
+            if (Long.compareUnsigned(packetEnd, cursor) <= 0) continue;
+            if (Long.compareUnsigned(packet.frameIndex, end) >= 0) break;
+            if (Long.compareUnsigned(packet.frameIndex, cursor) > 0) {
+                long gapEnd = Long.compareUnsigned(packet.frameIndex, end) < 0 ? packet.frameIndex : end;
+                noteReceiverDrop(cursor, (int) (gapEnd - cursor));
+            }
+            if (Long.compareUnsigned(packetEnd, cursor) > 0) cursor = packetEnd;
+            if (Long.compareUnsigned(cursor, end) >= 0) return;
+        }
+        if (Long.compareUnsigned(cursor, end) < 0) noteReceiverDrop(cursor, (int) (end - cursor));
+    }
+
+    synchronized void resetReceiverDropTrackingForPeriod() { receiverDropRanges.clear(); }
+    synchronized SourceFrameRanges.Range[] receiverDropRanges() { return receiverDropRanges.snapshot(); }
+    synchronized long receiverDropRevision() { return receiverDropRanges.revision(); }
+    synchronized boolean receiverDropTrackingComplete() { return receiverDropRanges.complete(); }
     synchronized int size() { return packets.size(); }
     synchronized long droppedFrames() { return droppedFrames; }
     synchronized long expiredFrames() { return expiredFrames; }
@@ -767,8 +813,18 @@ final class UdpPcmQueue {
         private long payloadGeneration = -1;
         private long enqueuedAtNanos;
         private boolean currentPayloadIsReal;
+        private long currentPayloadFrameIndex;
         private long sourceBytesDelivered;
         private long syntheticBytesDelivered;
+        private static final int MAX_SOURCE_RANGES = 64;
+        private final long[] rangeStarts = new long[MAX_SOURCE_RANGES];
+        private final int[] rangeCounts = new int[MAX_SOURCE_RANGES];
+        private final boolean[] rangeSynthetic = new boolean[MAX_SOURCE_RANGES];
+        private int rangeCount;
+        private boolean rangeBatchComplete = true;
+        private int partialFrameBytes;
+        private long partialFrameIndex;
+        private boolean partialFrameSynthetic;
 
         QueueInputStream(UdpPcmQueue queue) { this.queue = queue; }
 
@@ -809,6 +865,79 @@ final class UdpPcmQueue {
             queue.stop();
         }
 
+        void beginSourceRangeBatch() {
+            synchronized (queue) {
+                rangeCount = 0;
+                rangeBatchComplete = true;
+            }
+        }
+
+        int sourceRangeCount() { synchronized (queue) { return rangeCount; } }
+        long sourceRangeFramesTotal() {
+            synchronized (queue) {
+                long total = 0;
+                for (int i = 0; i < rangeCount; i++) total += rangeCounts[i];
+                return total;
+            }
+        }
+        boolean sourceRangeBatchComplete() { synchronized (queue) { return rangeBatchComplete; } }
+        long sourceRangeStart(int index) { synchronized (queue) { return rangeStarts[index]; } }
+        int sourceRangeFrames(int index) { synchronized (queue) { return rangeCounts[index]; } }
+        boolean sourceRangeSynthetic(int index) { synchronized (queue) { return rangeSynthetic[index]; } }
+
+        private void recordSourceBytes(long payloadStartFrame, boolean isSynthetic, int byteOffset,
+                int byteCount, int frameBytes) {
+            int consumed = 0;
+            int byteInFrame = byteOffset % frameBytes;
+            long sourceFrame = payloadStartFrame + byteOffset / frameBytes;
+            if (partialFrameBytes != byteInFrame) {
+                rangeBatchComplete = false;
+                partialFrameBytes = byteInFrame;
+                partialFrameIndex = sourceFrame;
+                partialFrameSynthetic = isSynthetic;
+            }
+            if (partialFrameBytes > 0) {
+                int take = Math.min(byteCount, frameBytes - partialFrameBytes);
+                partialFrameBytes += take;
+                consumed += take;
+                if (partialFrameBytes == frameBytes) {
+                    appendSourceRange(partialFrameIndex, 1, partialFrameSynthetic);
+                    partialFrameBytes = 0;
+                }
+            }
+            int fullFrames = (byteCount - consumed) / frameBytes;
+            if (fullFrames > 0) {
+                appendSourceRange(payloadStartFrame + (byteOffset + consumed) / frameBytes,
+                        fullFrames, isSynthetic);
+                consumed += fullFrames * frameBytes;
+            }
+            if (consumed < byteCount) {
+                partialFrameBytes = byteCount - consumed;
+                partialFrameIndex = payloadStartFrame + (byteOffset + consumed) / frameBytes;
+                partialFrameSynthetic = isSynthetic;
+            }
+        }
+
+        private void appendSourceRange(long start, int frames, boolean isSynthetic) {
+            if (frames <= 0) return;
+            if (rangeCount > 0) {
+                int last = rangeCount - 1;
+                if (rangeStarts[last] + rangeCounts[last] == start
+                        && rangeSynthetic[last] == isSynthetic) {
+                    if (Integer.MAX_VALUE - rangeCounts[last] < frames) rangeBatchComplete = false;
+                    else rangeCounts[last] += frames;
+                    return;
+                }
+            }
+            if (rangeCount == MAX_SOURCE_RANGES) {
+                rangeBatchComplete = false;
+                return;
+            }
+            rangeStarts[rangeCount] = start;
+            rangeCounts[rangeCount] = frames;
+            rangeSynthetic[rangeCount] = isSynthetic;
+            rangeCount++;
+        }
         long sourceBytesDelivered() {
             synchronized (queue) { return sourceBytesDelivered; }
         }

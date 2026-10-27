@@ -26,11 +26,13 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         void start(AoaSessionContext context) throws IOException;
         void pause() throws IOException;
         void resume() throws IOException;
+        default void userPauseAcknowledged() {}
         void stop();
         boolean streaming() throws IOException;
         default void ready() {}
         byte[] playbackProgressPayloadV2();
         default boolean supportsPlaybackProgressExtension() { return false; }
+        default boolean supportsSourceFrameLoss() { return false; }
         default byte[] playbackProgressPayloadExtendedV2() { return null; }
         default byte[] playbackProgressPayloadExtendedV2(int schema) {
             return schema == 2 ? playbackProgressPayloadExtendedV2() : null;
@@ -344,7 +346,8 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                 if (!playbackStarted || audio == null || state == P5cReceiverCoordinator.STATE_STOPPED)
                     throw new IOException("AOA audio arrived before START");
                 AnpdAudioIngress.Result result = audio.ingress.accept(record.body, record.body.length);
-                if (result != AnpdAudioIngress.Result.FORMAT && result != AnpdAudioIngress.Result.AUDIO)
+                if (result != AnpdAudioIngress.Result.FORMAT && result != AnpdAudioIngress.Result.AUDIO
+                        && result != AnpdAudioIngress.Result.LOSS_LEDGER)
                     throw new IOException("AOA authenticated audio rejected: " + result);
                 continue;
             }
@@ -373,6 +376,11 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                         | (playback.supportsPlaybackProgressExtension()
                                 ? P5cControlProtocol.CAP_PROGRESS_EXT
                                         | P5cControlProtocol.CAP_BUFFER_METRICS : 0)
+                        | (playback.supportsSourceFrameLoss() && playback.supportsPlaybackProgressExtension()
+                                && supportedFormat
+                                 ? P5cControlProtocol.CAP_SOURCE_FRAME_LOSS
+                                         | P5cControlProtocol.CAP_SOURCE_LOSS_DETAILS
+                                         | P5cControlProtocol.CAP_SOURCE_SEGMENT_START : 0)
                         | P5cControlProtocol.CAP_PLAYBACK_PROGRESS
                         | P5cControlProtocol.CAP_TERMINAL_CAUSE
                         | (transport.isAdbStream() ? 0 : P5cControlProtocol.CAP_AOA_SESSION_RESTART);
@@ -398,6 +406,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
             }
 
             byte[] extra = new byte[0];
+            boolean resetLossPeriodAfterAck = false;
             int port = 0;
             boolean terminate = false;
             int result = P5cReceiverCoordinator.RESULT_OK;
@@ -443,7 +452,10 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                             && state != P5cReceiverCoordinator.STATE_STREAMING
                             && state != P5cReceiverCoordinator.STATE_PAUSED)
                         throw new IOException("invalid AOA PAUSE state");
-                    if (state != P5cReceiverCoordinator.STATE_PAUSED) playback.pause();
+                    if (state != P5cReceiverCoordinator.STATE_PAUSED) {
+                        playback.pause();
+                        resetLossPeriodAfterAck = true;
+                    }
                     state = P5cReceiverCoordinator.STATE_PAUSED;
                     break;
                 case P5cControlProtocol.RESUME:
@@ -473,6 +485,22 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                             && (supportedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0) {
                         extra = playback.playbackProgressPayloadExtendedV2(3);
                         if (extra == null) throw new IOException("AOA schema3 progress unavailable");
+                    } else if (command.payload.length == 1 && command.payload[0] == 4
+                            && (supportedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
+                            && (supportedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0
+                            && (supportedCapabilities & P5cControlProtocol.CAP_SOURCE_FRAME_LOSS) != 0) {
+                        extra = playback.playbackProgressPayloadExtendedV2(4);
+                        if (extra == null) throw new IOException("AOA schema4 progress unavailable");
+                    } else if (command.payload.length == 1 && command.payload[0] == 5
+                            && (supportedCapabilities & P5cControlProtocol.CAP_PROGRESS_EXT) != 0
+                            && (supportedCapabilities & P5cControlProtocol.CAP_BUFFER_METRICS) != 0
+                            && (supportedCapabilities & P5cControlProtocol.CAP_SOURCE_FRAME_LOSS) != 0) {
+                        extra = playback.playbackProgressPayloadExtendedV2(5);
+                        if (extra == null) throw new IOException("AOA schema5 progress unavailable");
+                    } else if (command.payload.length == 1 && command.payload[0] == 6
+                            && (supportedCapabilities & P5cControlProtocol.CAP_SOURCE_LOSS_DETAILS) != 0) {
+                        extra = playback.playbackProgressPayloadExtendedV2(6);
+                        if (extra == null) throw new IOException("AOA schema6 progress unavailable");
                     } else throw new IOException("invalid AOA progress query");
                     break;
                 case P5cControlProtocol.STOP:
@@ -492,6 +520,8 @@ final class AoaReceiverCoordinator implements AutoCloseable {
                     P5cControlProtocol.ackPayload(command.type, command.sequence,
                             result, state, port, extra));
             writeRecord(AnpuRecordCodec.CONTROL, ack);
+            if (resetLossPeriodAfterAck && result == P5cReceiverCoordinator.RESULT_OK)
+                playback.userPauseAcknowledged();
             if (terminate) {
                 stopAfterAck = true;
                 if (playbackStarted) { playback.stop(); playbackStarted = false; }

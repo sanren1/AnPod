@@ -11,7 +11,9 @@ final class AodTelemetrySnapshot {
     final Transport transport;
     final Long recvAudioPayloadBps;
     final Float receiverBufferMs;
-    final Float udpLossPercent;
+    final Float lossPercent;
+    final Float lossPercent10s;
+    final Float cumulativeLossPercent;
     final int outputSampleRate;
     final int outputChannels;
     final int underrunCount;
@@ -20,15 +22,27 @@ final class AodTelemetrySnapshot {
     final long sampledAtElapsedNanos;
 
     AodTelemetrySnapshot(long sessionGeneration, DisplayStatus status, Transport transport,
-            Long recvAudioPayloadBps, Float receiverBufferMs, Float udpLossPercent,
+            Long recvAudioPayloadBps, Float receiverBufferMs, Float lossPercent,
             int outputSampleRate, int outputChannels, int underrunCount, String actualOutputEngine,
+            boolean receivedAudioRecently, long sampledAtElapsedNanos) {
+        this(sessionGeneration, status, transport, recvAudioPayloadBps, receiverBufferMs,
+                lossPercent, null, null, outputSampleRate, outputChannels, underrunCount,
+                actualOutputEngine, receivedAudioRecently, sampledAtElapsedNanos);
+    }
+
+    AodTelemetrySnapshot(long sessionGeneration, DisplayStatus status, Transport transport,
+            Long recvAudioPayloadBps, Float receiverBufferMs, Float lossPercent,
+            Float lossPercent10s, Float cumulativeLossPercent, int outputSampleRate,
+            int outputChannels, int underrunCount, String actualOutputEngine,
             boolean receivedAudioRecently, long sampledAtElapsedNanos) {
         this.sessionGeneration = sessionGeneration;
         this.status = status;
         this.transport = transport;
         this.recvAudioPayloadBps = recvAudioPayloadBps;
         this.receiverBufferMs = receiverBufferMs;
-        this.udpLossPercent = udpLossPercent;
+        this.lossPercent = lossPercent;
+        this.lossPercent10s = lossPercent10s;
+        this.cumulativeLossPercent = cumulativeLossPercent;
         this.outputSampleRate = outputSampleRate;
         this.outputChannels = outputChannels;
         this.underrunCount = underrunCount;

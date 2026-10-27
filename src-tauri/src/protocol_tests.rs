@@ -1,6 +1,132 @@
 use super::*;
 
 #[test]
+fn loss_ledger_payload_matches_shared_java_vector() {
+    let ledger = LossLedger {
+        period_epoch: 0,
+        revision: 7,
+        capture_tail: 16,
+        settled_through: 12,
+        source_segment_generation: 0,
+        source_segment_start: Some(0),
+        complete: true,
+        intervals: vec![
+            LossInterval {
+                start: 2,
+                frame_count: 3,
+            },
+            LossInterval {
+                start: 10,
+                frame_count: 5,
+            },
+        ],
+    };
+    let expected = "03010200000000000000000000000000000000070000000000000010000000000000000c0000000000000000000000000000000000000000000000020000000000000003000000000000000a0000000000000005";
+    let encoded = ledger.encode().unwrap();
+    assert_eq!(
+        encoded
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        expected
+    );
+    assert_eq!(LossLedger::decode(&encoded).unwrap(), ledger);
+
+    let invalid = LossLedger {
+        intervals: vec![LossInterval {
+            start: 12,
+            frame_count: 5,
+        }],
+        ..ledger
+    };
+    assert_eq!(invalid.encode().unwrap_err(), ProtocolError::InvalidFormat);
+}
+
+#[test]
+fn loss_ledger_matches_anpd_v1_and_v2_java_packet_vectors() {
+    let vector_key: [u8; 32] = std::array::from_fn(|index| index as u8);
+    let vector_ledger = LossLedger {
+        period_epoch: 0,
+        revision: 7,
+        capture_tail: 16,
+        settled_through: 12,
+        source_segment_generation: 0,
+        source_segment_start: Some(0),
+        complete: true,
+        intervals: vec![
+            LossInterval {
+                start: 2,
+                frame_count: 3,
+            },
+            LossInterval {
+                start: 10,
+                frame_count: 5,
+            },
+        ],
+    };
+    let legacy_payload: Vec<u8> = "02010200000000000000000000000000000000070000000000000010000000000000000c00000000000000020000000000000003000000000000000a0000000000000005"
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let legacy_ledger = LossLedger::decode(&legacy_payload).unwrap();
+    let v1_packet = PacketEncoder::new(&vector_key, 0x0102_0304_0506_0708, HOST_TO_RECEIVER)
+        .encode_at(
+            0x1112_1314_1516_1718,
+            PacketType::LossLedger,
+            0,
+            &legacy_payload,
+        )
+        .unwrap();
+    assert_eq!(
+        v1_packet.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "414e504401030000010203040506070811121314151617180000000000000000004439d358e23c1d8fd383c7563d031edfd12b1063d3f80313eec3aea4c10383b03b6f607fdc9ab3f8c9c25c8e55a8f4af8cef3ab8935778a88b531232564293eedaa6de282354f421be4179f1a3887ce761218d3455"
+    );
+    assert_eq!(
+        PacketEncoder::new(&vector_key, 0x0102_0304_0506_0708, HOST_TO_RECEIVER)
+            .encode_at(
+                0x1112_1314_1516_1718,
+                PacketType::LossLedger,
+                1,
+                &vector_ledger.encode().unwrap(),
+            )
+            .unwrap_err(),
+        ProtocolError::InvalidFormat
+    );
+    let v1_decoder = PacketDecoder::new(&vector_key, 0x0102_0304_0506_0708, HOST_TO_RECEIVER);
+    assert_eq!(
+        LossLedger::decode(&v1_decoder.open(&v1_packet).unwrap().payload).unwrap(),
+        legacy_ledger
+    );
+
+    let format = AudioFormatV2::for_profile(1, 0).unwrap();
+    let vector_packet =
+        PacketEncoder::new_v2(&vector_key, 0x0102_0304_0506_0708, HOST_TO_RECEIVER, format)
+            .unwrap()
+            .encode_at(
+                0x1112_1314_1516_1718,
+                PacketType::LossLedger,
+                0,
+                &legacy_payload,
+            )
+            .unwrap();
+    let expected_packet = "414e504402030000010203040506070811121314151617180000000000000000004439d358e23c1d8fd383c7563d031edfd12b1063d3f80313eec3aea4c10383b03b6f607fdc9ab3f8c9c25c8e55a8f4af8cef3ab8935778a88b531232564293eedaa6de282391c8fc7f73a59562fb3445bd3982eb58";
+    assert_eq!(
+        vector_packet
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        expected_packet
+    );
+    let decoder =
+        PacketDecoder::new_v2(&vector_key, 0x0102_0304_0506_0708, HOST_TO_RECEIVER, format)
+            .unwrap();
+    assert_eq!(
+        LossLedger::decode(&decoder.open(&vector_packet).unwrap().payload).unwrap(),
+        legacy_ledger
+    );
+}
+#[test]
 fn java_jca_aes_gcm_vector() {
     let key: [u8; 32] = std::array::from_fn(|index| index as u8);
     let session_id = 0x0102_0304_0506_0708;
@@ -44,7 +170,7 @@ fn rejects_invalid_header_fields_and_length() {
         ProtocolError::UnsupportedVersion
     );
     let mut bad = valid.clone();
-    bad[5] = 3;
+    bad[5] = 4;
     assert_eq!(
         decoder.open(&bad).unwrap_err(),
         ProtocolError::UnsupportedType

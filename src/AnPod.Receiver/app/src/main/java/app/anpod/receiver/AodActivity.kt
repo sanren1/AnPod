@@ -605,7 +605,7 @@ private fun MetricsRow(telemetry: AodTelemetrySnapshot?, settings: AodDisplaySet
         if (settings.showProtocol) add("Protocol ${protocolLabel(telemetry)}")
         if (settings.showReceiveRate) add("Recv ${rateLabel(telemetry?.recvAudioPayloadBps)}")
         if (settings.showBuffer) add("Buffer ${latencyLabel(telemetry?.receiverBufferMs)}")
-        if (settings.showLoss) add("Loss ${lossLabel(telemetry?.udpLossPercent)}")
+        if (settings.showLoss) add("Loss ${lossLabel(telemetry?.lossPercent)}")
         if (settings.showAudioFormat) add("Format ${audioFormatLabel(telemetry)}")
         if (settings.showUnderruns) add("Underruns ${countLabel(telemetry?.underrunCount)}")
         if (settings.showOutputEngine) add("Output ${outputEngineLabel(telemetry)}")

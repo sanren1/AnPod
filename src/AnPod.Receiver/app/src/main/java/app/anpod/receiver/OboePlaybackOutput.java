@@ -97,7 +97,9 @@ final class OboePlaybackOutput implements PlaybackOutput {
     }
     @Override public synchronized long playbackHeadPosition() throws IOException {
         readMetrics();
-        return metrics[5] < 0 ? -1L : Integer.toUnsignedLong(metrics[7]);
+        if (metrics[5] < 0) return -1L;
+        long sourceFramesConsumed = Integer.toUnsignedLong(metrics[1]);
+        return Math.max(0L, sourceFramesConsumed - metrics[5]);
     }
     @Override public synchronized long pendingFrames(long acceptedFrames, long playedFrames) throws IOException {
         readMetrics();

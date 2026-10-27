@@ -9,7 +9,7 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/** Decoder for the fixed P3 ANPD v1 host-to-receiver AES-GCM datagram. */
+/** Decoder for authenticated ANPD v1 and v2 host-to-receiver AES-GCM datagrams. */
 final class UdpPacketDecoder {
     static final int HEADER_BYTES = 34;
     static final int TAG_BYTES = 16;
@@ -17,6 +17,7 @@ final class UdpPacketDecoder {
     static final int MAX_PLAINTEXT_BYTES = MAX_DATAGRAM_BYTES - HEADER_BYTES - TAG_BYTES;
     static final int FORMAT = 1;
     static final int AUDIO = 2;
+    static final int LOSS_LEDGER = 3;
     private static final int NONCE_DOMAIN = 0x414e5048; // ANPH
 
     private final long expectedSessionId;
@@ -51,7 +52,7 @@ final class UdpPacketDecoder {
         int expectedVersion = formatV2 == null ? 1 : 2;
         if ((datagram[4] & 0xff) != expectedVersion) throw new ProtocolException(ProtocolException.VERSION);
         int type = datagram[5] & 0xff;
-        if (type != FORMAT && type != AUDIO) throw new ProtocolException(ProtocolException.TYPE);
+        if (type != FORMAT && type != AUDIO && type != LOSS_LEDGER) throw new ProtocolException(ProtocolException.TYPE);
         if (datagram[6] != 0 || datagram[7] != 0) throw new ProtocolException(ProtocolException.FLAGS);
 
         ByteBuffer fields = ByteBuffer.wrap(datagram, 8, 26).order(ByteOrder.BIG_ENDIAN);
@@ -76,7 +77,12 @@ final class UdpPacketDecoder {
         } catch (Exception error) {
             throw new ProtocolException(ProtocolException.AUTHENTICATION, error);
         }
-        if (formatV2 != null) validateV2(type, sampleFrameIndex, plaintext);
+        if (type == LOSS_LEDGER) {
+            if (sampleFrameIndex != 0) throw new ProtocolException(ProtocolException.FORMAT);
+            AnpdLossLedger.decode(plaintext);
+        } else if (formatV2 != null) {
+            validateV2(type, sampleFrameIndex, plaintext);
+        }
         if (!wouldAccept(sequence)) throw new ProtocolException(ProtocolException.REPLAY);
         return new Packet(type, sessionId, sequence, sampleFrameIndex, plaintext);
     }
@@ -124,7 +130,10 @@ final class UdpPacketDecoder {
     }
 
     private void validateV2(int type, long frameIndex, byte[] payload) throws ProtocolException {
-        if (type == FORMAT) {
+        if (type == LOSS_LEDGER) {
+            if (frameIndex != 0) throw new ProtocolException(ProtocolException.FORMAT);
+            AnpdLossLedger.decode(payload);
+        } else if (type == FORMAT) {
             if (frameIndex != 0 || !Arrays.equals(payload, formatV2.encode()))
                 throw new ProtocolException(ProtocolException.FORMAT);
         } else if (payload.length == 0 || payload.length % formatV2.frameBytes != 0) {

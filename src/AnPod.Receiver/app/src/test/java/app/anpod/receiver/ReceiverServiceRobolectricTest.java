@@ -152,6 +152,8 @@ public final class ReceiverServiceRobolectricTest {
         int metricsStatus;
         int pauseAndFlushCalls;
         int reportedHead = 0x80000000;
+        int reportedRingConsumed = -1;
+        int reportedStreamPending;
         final List<Integer> offsets = new ArrayList<>();
         final List<Float> samples = new ArrayList<>();
         int acceptedAtStart = -1;
@@ -204,8 +206,8 @@ public final class ReceiverServiceRobolectricTest {
         @Override public int getMetrics(long handle, int[] metrics, long[] timestamp) {
             if (onGetMetrics != null) onGetMetrics.run();
             metrics[0] = acceptedFrames;
-            metrics[1] = acceptedFrames;
-            metrics[4] = 0; metrics[5] = headAvailable ? 0 : -1;
+            metrics[1] = reportedRingConsumed < 0 ? acceptedFrames : reportedRingConsumed;
+            metrics[4] = 0; metrics[5] = headAvailable ? reportedStreamPending : -1;
             metrics[6] = reportedHead; metrics[7] = reportedHead;
             metrics[8] = 13; metrics[10] = 0;
             timestamp[0] = -1; timestamp[1] = -1;
@@ -868,16 +870,22 @@ public final class ReceiverServiceRobolectricTest {
 
             float lsb = 1f / 8_388_608f;
             float[] samples = {lsb, -lsb, 0.25f, -0.25f, 0.5f, -0.5f, 0.75f, -0.75f};
-            assertTrue(service.writeV2Frames(session, output, samples, 4, null,
-                    session.focusState.writeGeneration()));
+            assertTrue(service.writeV2Frames(session, output, samples, 4, 4, null,
+                    session.focusState.writeGeneration(), 0L, false, true));
             assertEquals(java.util.Arrays.asList(0, 2), nativeCalls.offsets);
             assertEquals(lsb, nativeCalls.samples.get(0), 0f);
             assertEquals(-lsb, nativeCalls.samples.get(1), 0f);
             output.play();
             assertEquals("initial start must keep prefilled ring frames", 4, nativeCalls.acceptedAtStart);
-            assertEquals(2_147_483_648L, output.playbackHeadPosition());
+            assertEquals(4L, output.playbackHeadPosition());
             nativeCalls.reportedHead = -1;
-            assertEquals(4_294_967_295L, output.playbackHeadPosition());
+            assertEquals(4L, output.playbackHeadPosition());
+            nativeCalls.reportedRingConsumed = 100;
+            nativeCalls.reportedStreamPending = 40;
+            assertEquals(60L, output.playbackHeadPosition());
+            nativeCalls.reportedRingConsumed = 10;
+            nativeCalls.reportedStreamPending = 20;
+            assertEquals(0L, output.playbackHeadPosition());
             assertEquals(-1, output.underrunCount());
             assertEquals(13, output.oboeXrunCount());
 
@@ -889,6 +897,63 @@ public final class ReceiverServiceRobolectricTest {
             service.onDestroy();
             if (output != null) output.close();
             OboeNativeBridge.setTestCalls(null);
+            resetWaveformForTest();
+        }
+    }
+
+    @Test
+    public void floatDriftWritesKeepOriginalSourceSpanAcrossPartialOutputWrites() throws Exception {
+        FakeOboeCalls nativeCalls = new FakeOboeCalls();
+        OboeNativeBridge.setTestCalls(nativeCalls);
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(85,
+                new ReceiverService.AudioRequest(null, null, "lowlatency"), "test-owner", 1);
+        session.requestedOutputEngine = "oboeExperimental";
+        ReceiverService.currentAudio = session;
+        PlaybackOutput output = null;
+        try {
+            output = service.openOboeOutputIfRequested(session, 48_000, 2, true, 240);
+            for (int adjustment : new int[] {1, -1}) {
+                long sourceStart = adjustment > 0 ? 100 : 1_000;
+                com.anpod.server.FloatPcmFrameQueue queue =
+                        new com.anpod.server.FloatPcmFrameQueue(1_000, true);
+                float[] source = new float[40];
+                for (int frame = 0; frame < 20; frame++) {
+                    source[frame * 2] = frame / 20f;
+                    source[frame * 2 + 1] = -source[frame * 2];
+                }
+                assertTrue(queue.offer(sourceStart, source, 20));
+                float[] samples = new float[42];
+                assertEquals(20, queue.readFrames(samples, 0, 21));
+                int outputFrames = queue.adjustDrift(samples, 20, 21, adjustment);
+                assertEquals(adjustment > 0 ? 19 : 21, outputFrames);
+                assertEquals(20, queue.lastReadFrames());
+
+                session.sourceFrameOutputMap.beginSourceSegment(sourceStart);
+                assertTrue(service.writeV2Frames(session, output, samples, outputFrames,
+                        queue.lastReadFrames(), null, session.focusState.writeGeneration(),
+                        queue.lastReadFrameIndex(), queue.lastReadSynthetic(), false));
+
+                session.sourceFrameOutputMap.advancePlayed(outputFrames);
+                session.sourceFrameOutputMap.accountSourceGaps(new AnpdLossLedger.Interval[0],
+                        new com.anpod.server.SourceFrameRanges.Range[0],
+                        new com.anpod.server.SourceFrameRanges.Range[0], sourceStart + 20,
+                        true, true, true);
+                assertEquals(1, session.sourceFrameOutputMap.settledUnknownRanges().length);
+                assertEquals(sourceStart,
+                        session.sourceFrameOutputMap.settledUnknownRanges()[0].start);
+                assertEquals(20,
+                        session.sourceFrameOutputMap.settledUnknownRanges()[0].frameCount);
+                assertEquals(0, session.sourceFrameOutputMap.settledTransportMissingFrames());
+                nativeCalls.offsets.clear();
+                nativeCalls.samples.clear();
+                nativeCalls.acceptedFrames = 0;
+            }
+        } finally {
+            service.onDestroy();
+            if (output != null) output.close();
+            OboeNativeBridge.setTestCalls(null);
+            ReceiverService.currentAudio = null;
             resetWaveformForTest();
         }
     }
@@ -910,7 +975,8 @@ public final class ReceiverServiceRobolectricTest {
             nativeCalls.zeroWrites = 1;
             nativeCalls.onZeroWrite = () -> session.focusState.setUserPaused(true);
             float[] samples = {0.1f, -0.1f, 0.2f, -0.2f};
-            assertFalse(service.writeV2Frames(session, output, samples, 2, null, generation));
+            assertFalse(service.writeV2Frames(session, output, samples, 2, 2, null, generation,
+                    0L, false, true));
             assertEquals(1, nativeCalls.offsets.size());
             assertEquals(0, nativeCalls.acceptedFrames);
 
@@ -920,7 +986,8 @@ public final class ReceiverServiceRobolectricTest {
             nativeCalls.onZeroWrite = null;
             output.play();
             long resumedGeneration = session.focusState.writeGeneration();
-            assertTrue(service.writeV2Frames(session, output, samples, 2, null, resumedGeneration));
+            assertTrue(service.writeV2Frames(session, output, samples, 2, 2, null, resumedGeneration,
+                    0L, false, true));
             output.metrics();
             assertEquals("the flush starts a fresh metric epoch", 2, ((OboePlaybackOutput) output).extendedCounter(0));
             assertEquals(2, nativeCalls.acceptedFrames);
@@ -1435,7 +1502,7 @@ public final class ReceiverServiceRobolectricTest {
         assertEquals(AodTelemetrySnapshot.DisplayStatus.DISCONNECTED, snapshot.status);
         assertNull(snapshot.recvAudioPayloadBps);
         assertNull(snapshot.receiverBufferMs);
-        assertNull(snapshot.udpLossPercent);
+        assertNull(snapshot.lossPercent);
         assertFalse(snapshot.receivedAudioRecently);
     }
 
@@ -1456,7 +1523,7 @@ public final class ReceiverServiceRobolectricTest {
         try {
             AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
             assertEquals(AodTelemetrySnapshot.Transport.WIFI_UDP, snapshot.transport);
-            assertNull(snapshot.udpLossPercent);
+            assertNull(snapshot.lossPercent);
             assertEquals(24, ReceiverService.playbackMetricsSnapshot().queuedFrames);
         } finally {
             ReceiverService.currentAudio = null;
@@ -1479,7 +1546,7 @@ public final class ReceiverServiceRobolectricTest {
         try {
             AodTelemetrySnapshot snapshot = service.uiState.aodSnapshot();
             assertEquals(AodTelemetrySnapshot.Transport.USB_DIRECT, snapshot.transport);
-            assertNull(snapshot.udpLossPercent);
+            assertNull(snapshot.lossPercent);
             assertEquals(24, ReceiverService.playbackMetricsSnapshot().queuedFrames);
         } finally {
             ReceiverService.currentAudio = null;
@@ -1585,6 +1652,7 @@ public final class ReceiverServiceRobolectricTest {
                     @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
                 }, owner, generation, AoaReceiverCoordinator.TransportTag.WIFI_ADB);
         service.adbStreamCoordinator = coordinator;
+        org.robolectric.util.ReflectionHelpers.setField(coordinator, "lastControlAtNanos", System.nanoTime());
         org.robolectric.util.ReflectionHelpers.setField(coordinator, "authenticated", true);
         try {
             assertTrue(service.stopFromUi(owner, generation));
@@ -1764,9 +1832,15 @@ public final class ReceiverServiceRobolectricTest {
         setInstanceField(service, "aoaRecoveryDeadlineElapsedMs", deadline);
         setInstanceField(service, "aoaRecoveryAttempt", 0);
 
+        SourceFrameOutputMap recoverableMap = new SourceFrameOutputMap();
+        AodMetricsSampler recoverableSampler = new AodMetricsSampler();
+        setInstanceField(service, "recoverableSourceFrameMap", recoverableMap);
+        setInstanceField(service, "recoverableLossSampler", recoverableSampler);
         service.scheduleAoaRecovery(owner, generation, "injected transport failure");
         Shadows.shadowOf(Looper.getMainLooper()).idle();
         assertEquals(1, getInstanceField(service, "aoaRecoveryAttempt"));
+        assertEquals(true, getInstanceField(service, "preserveLossPeriodOnNextStart"));
+        assertTrue((Long) getInstanceField(service, "recoverableLossPauseStartedNanos") >= 0);
         long attemptDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         while (((Integer) getInstanceField(service, "aoaRecoveryAttempt")) < 2
                 && System.nanoTime() < attemptDeadline) {
@@ -1779,6 +1853,8 @@ public final class ReceiverServiceRobolectricTest {
         service.noteAoaPlaybackStarted(owner, generation);
         assertEquals(0L, getInstanceField(service, "aoaRecoveryDeadlineElapsedMs"));
         assertEquals(0, getInstanceField(service, "aoaRecoveryAttempt"));
+        assertEquals(false, getInstanceField(service, "preserveLossPeriodOnNextStart"));
+        assertEquals(-1L, getInstanceField(service, "recoverableLossPauseStartedNanos"));
 
         long nextDeadline = android.os.SystemClock.elapsedRealtime() + 10_000;
         setInstanceField(service, "aoaRecoveryDeadlineElapsedMs", nextDeadline);

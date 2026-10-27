@@ -1,5 +1,6 @@
 use crate::protocol::{
-    AudioFormatV2, PacketEncoder, PacketType, PcmFormat, HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
+    AudioFormatV2, LossInterval, LossLedger, PacketEncoder, PacketType, PcmFormat,
+    HOST_TO_RECEIVER, MAX_PAYLOAD_LEN,
 };
 #[cfg(test)]
 use crate::protocol::{PacketDecoder, ProtocolError, MAX_DATAGRAM_LEN};
@@ -23,6 +24,7 @@ const MAX_JITTER_PACKETS: usize = 4;
 const BALANCED_CAPTURE_QUEUE_MS: u64 = 40;
 const LOW_LATENCY_CAPTURE_QUEUE_MS: u64 = 20;
 const UDP_SEND_ATTEMPTS: usize = 3;
+const SOURCE_DROP_INTERVAL_CAPACITY: usize = 64;
 #[cfg(test)]
 static FAIL_NEXT_UDP_SEND: AtomicBool = AtomicBool::new(false);
 
@@ -50,12 +52,305 @@ struct QueueState {
     head: usize,
     len: usize,
     queued_frames: u64,
+    drop_intervals: [SourceFrameInterval; SOURCE_DROP_INTERVAL_CAPACITY],
+    drop_interval_count: usize,
+    drop_tracking_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SourceFrameInterval {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SourceFrameSnapshot {
+    pub(crate) period_epoch: u64,
+    pub(crate) source_segment_generation: u64,
+    pub(crate) source_segment_start: Option<u64>,
+    pub(crate) intervals: [SourceFrameInterval; SOURCE_DROP_INTERVAL_CAPACITY],
+    pub(crate) interval_count: usize,
+    pub(crate) capture_tail: Option<u64>,
+    pub(crate) settled_through: Option<u64>,
+    pub(crate) complete: bool,
+}
+fn stable_source_watermarks(
+    capture_tail: &AtomicU64,
+    capture_tail_known: &AtomicBool,
+    settled_through: &AtomicU64,
+    settled_through_known: &AtomicBool,
+) -> Option<(u64, u64)> {
+    for _ in 0..3 {
+        if !capture_tail_known.load(Ordering::Acquire)
+            || !settled_through_known.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let tail_before = capture_tail.load(Ordering::Acquire);
+        let settled = settled_through.load(Ordering::Acquire);
+        let tail_after = capture_tail.load(Ordering::Acquire);
+        if tail_before == tail_after && settled <= tail_before {
+            return Some((tail_before, settled));
+        }
+    }
+    None
+}
+#[derive(Default)]
+pub(crate) struct LossLedgerTxState {
+    snapshot: Option<SourceFrameSnapshot>,
+    revision: u64,
+    last_sent: Option<Instant>,
+}
+
+pub(crate) fn prepare_loss_ledger_payload(
+    snapshot: SourceFrameSnapshot,
+    acknowledged_revision: Option<u64>,
+    tx: &mut LossLedgerTxState,
+) -> Result<Option<Vec<u8>>, String> {
+    if snapshot.capture_tail.is_none()
+        || snapshot.settled_through.is_none()
+        || snapshot.source_segment_start.is_none()
+    {
+        return Ok(None);
+    }
+    let changed = tx.snapshot != Some(snapshot);
+    let segment_changed = tx.snapshot.is_none_or(|previous| {
+        previous.source_segment_generation != snapshot.source_segment_generation
+    });
+    if changed {
+        tx.revision = tx
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "Source-frame loss ledger revision exhausted.".to_string())?;
+        tx.snapshot = Some(snapshot);
+    }
+    if acknowledged_revision.is_some_and(|revision| revision >= tx.revision) {
+        return Ok(None);
+    }
+    let now = Instant::now();
+    let elapsed = tx
+        .last_sent
+        .map_or(Duration::MAX, |sent| now.saturating_duration_since(sent));
+    if (!segment_changed && elapsed < Duration::from_millis(100))
+        || (!changed && elapsed < Duration::from_secs(1))
+    {
+        return Ok(None);
+    }
+    let ledger = LossLedger {
+        period_epoch: snapshot.period_epoch,
+        revision: tx.revision,
+        capture_tail: snapshot
+            .capture_tail
+            .expect("known capture tail checked above"),
+        settled_through: snapshot
+            .settled_through
+            .expect("known settled cursor checked above"),
+        source_segment_generation: snapshot.source_segment_generation,
+        source_segment_start: snapshot.source_segment_start,
+        complete: snapshot.complete,
+        intervals: snapshot.intervals[..snapshot.interval_count]
+            .iter()
+            .map(|interval| LossInterval {
+                start: interval.start,
+                frame_count: interval.end - interval.start,
+            })
+            .collect(),
+    };
+    let payload = ledger.encode().map_err(|error| error.to_string())?;
+    tx.last_sent = Some(now);
+    Ok(Some(payload))
+}
+
+fn send_loss_ledger_if_due(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    encoder: &mut PacketEncoder,
+    snapshot: SourceFrameSnapshot,
+    acknowledged_revision: Option<u64>,
+    tx: &mut LossLedgerTxState,
+) -> Result<(), String> {
+    if let Some(payload) = prepare_loss_ledger_payload(snapshot, acknowledged_revision, tx)? {
+        send_packet(socket, remote, encoder, PacketType::LossLedger, 0, &payload)?;
+    }
+    Ok(())
+}
+
+fn merge_source_drop_interval(
+    intervals: &mut [SourceFrameInterval; SOURCE_DROP_INTERVAL_CAPACITY],
+    interval_count: &mut usize,
+    complete: &mut bool,
+    start: u64,
+    frame_count: u64,
+) {
+    let Some(end) = start.checked_add(frame_count) else {
+        *complete = false;
+        return;
+    };
+    if frame_count == 0 {
+        return;
+    }
+
+    let mut merged = SourceFrameInterval { start, end };
+    let mut first = 0;
+    while first < *interval_count && intervals[first].end < merged.start {
+        first += 1;
+    }
+    let mut last = first;
+    while last < *interval_count && intervals[last].start <= merged.end {
+        merged.start = merged.start.min(intervals[last].start);
+        merged.end = merged.end.max(intervals[last].end);
+        last += 1;
+    }
+    let removed = last - first;
+    let next_count = *interval_count - removed + 1;
+    if next_count > SOURCE_DROP_INTERVAL_CAPACITY {
+        *complete = false;
+        return;
+    }
+    if removed == 0 {
+        for index in (first..*interval_count).rev() {
+            intervals[index + 1] = intervals[index];
+        }
+    } else {
+        for index in last..*interval_count {
+            intervals[first + 1 + index - last] = intervals[index];
+        }
+    }
+    intervals[first] = merged;
+    *interval_count = next_count;
+}
+
+fn settled_after_drops(
+    intervals: &[SourceFrameInterval; SOURCE_DROP_INTERVAL_CAPACITY],
+    interval_count: usize,
+    mut settled: u64,
+) -> u64 {
+    loop {
+        let next = intervals[..interval_count]
+            .iter()
+            .find(|interval| interval.start <= settled && interval.end > settled)
+            .map(|interval| interval.end);
+        match next {
+            Some(end) if end > settled => settled = end,
+            _ => return settled,
+        }
+    }
+}
+struct SourceCaptureState<'a> {
+    capture_tail: &'a AtomicU64,
+    capture_tail_known: &'a AtomicBool,
+    settled_through: &'a AtomicU64,
+    settled_through_known: &'a AtomicBool,
+    source_segment_active: &'a AtomicBool,
+    source_segment_restart_pending: &'a AtomicBool,
+    tracking_lost: &'a AtomicBool,
+    source_frame_offset: &'a AtomicU64,
+    local_capture_tail: &'a AtomicU64,
+    local_capture_tail_known: &'a AtomicBool,
+    source_segment_start: &'a AtomicU64,
+    source_segment_start_known: &'a AtomicBool,
+}
+
+fn observe_source_capture(
+    state: SourceCaptureState<'_>,
+    frame_index: u64,
+    frame_count: u32,
+) -> u64 {
+    let SourceCaptureState {
+        capture_tail,
+        capture_tail_known,
+        settled_through,
+        settled_through_known,
+        source_segment_active,
+        source_segment_restart_pending,
+        tracking_lost,
+        source_frame_offset,
+        local_capture_tail,
+        local_capture_tail_known,
+        source_segment_start,
+        source_segment_start_known,
+    } = state;
+    if frame_count == 0 {
+        return frame_index.saturating_add(source_frame_offset.load(Ordering::Acquire));
+    }
+    let Some(local_end) = frame_index.checked_add(frame_count as u64) else {
+        tracking_lost.store(true, Ordering::Release);
+        return frame_index;
+    };
+    let active = source_segment_active.load(Ordering::Acquire);
+    let restarting = active && source_segment_restart_pending.swap(false, Ordering::AcqRel);
+    if restarting && local_capture_tail_known.load(Ordering::Acquire) {
+        let previous_local_end = local_capture_tail.load(Ordering::Acquire);
+        if frame_index < previous_local_end && capture_tail_known.load(Ordering::Acquire) {
+            let previous_global_end = capture_tail.load(Ordering::Acquire);
+            if let Some(offset) = previous_global_end.checked_sub(frame_index) {
+                source_frame_offset.store(offset, Ordering::Release);
+            } else {
+                tracking_lost.store(true, Ordering::Release);
+            }
+        }
+    }
+    local_capture_tail.fetch_max(local_end, Ordering::AcqRel);
+    local_capture_tail_known.store(true, Ordering::Release);
+    let offset = source_frame_offset.load(Ordering::Acquire);
+    let Some(global_start) = frame_index.checked_add(offset) else {
+        tracking_lost.store(true, Ordering::Release);
+        return frame_index;
+    };
+    let Some(global_end) = global_start.checked_add(frame_count as u64) else {
+        tracking_lost.store(true, Ordering::Release);
+        return frame_index;
+    };
+    if active && (restarting || !source_segment_start_known.load(Ordering::Acquire)) {
+        source_segment_start.store(global_start, Ordering::Release);
+        source_segment_start_known.store(true, Ordering::Release);
+    }
+    if capture_tail_known.load(Ordering::Acquire) {
+        capture_tail.fetch_max(global_end, Ordering::AcqRel);
+        if restarting {
+            if settled_through_known.load(Ordering::Acquire) {
+                let previous_settled = settled_through.load(Ordering::Acquire);
+                if global_start < previous_settled {
+                    tracking_lost.store(true, Ordering::Release);
+                } else {
+                    settled_through.store(global_start, Ordering::Release);
+                }
+            } else {
+                settled_through.store(global_start, Ordering::Release);
+                settled_through_known.store(true, Ordering::Release);
+            }
+        }
+    } else {
+        capture_tail.fetch_max(global_end, Ordering::AcqRel);
+        if active {
+            settled_through.fetch_min(global_start, Ordering::AcqRel);
+            settled_through_known.store(true, Ordering::Release);
+        }
+        capture_tail_known.store(true, Ordering::Release);
+    }
+    global_start
 }
 
 pub struct PcmQueue {
     state: Mutex<QueueState>,
     wake: Condvar,
     dropped_frames: AtomicU64,
+    capture_tail: AtomicU64,
+    capture_tail_known: AtomicBool,
+    source_tracking_lost: AtomicBool,
+    source_epoch: AtomicU64,
+    source_frame_offset: AtomicU64,
+    local_capture_tail: AtomicU64,
+    local_capture_tail_known: AtomicBool,
+    settled_through: AtomicU64,
+    settled_through_known: AtomicBool,
+    source_segment_active: AtomicBool,
+    source_segment_restart_pending: AtomicBool,
+    source_segment_generation: AtomicU64,
+    source_segment_start: AtomicU64,
+    source_segment_start_known: AtomicBool,
+    acknowledged_revision: AtomicU64,
+    acknowledged_revision_known: AtomicBool,
     target_format: Option<PcmFormat>,
     max_queue_ms: u64,
     stopped: AtomicBool,
@@ -80,6 +375,9 @@ struct FloatQueueState {
     head: usize,
     len: usize,
     queued_frames: u64,
+    drop_intervals: [SourceFrameInterval; SOURCE_DROP_INTERVAL_CAPACITY],
+    drop_interval_count: usize,
+    drop_tracking_complete: bool,
 }
 
 /// Preallocated, bounded Float32 capture queue for the high-precision encoder.
@@ -88,6 +386,22 @@ pub struct FloatPcmQueue {
     state: Mutex<FloatQueueState>,
     wake: Condvar,
     dropped_frames: AtomicU64,
+    capture_tail: AtomicU64,
+    capture_tail_known: AtomicBool,
+    source_tracking_lost: AtomicBool,
+    source_epoch: AtomicU64,
+    source_frame_offset: AtomicU64,
+    local_capture_tail: AtomicU64,
+    local_capture_tail_known: AtomicBool,
+    settled_through: AtomicU64,
+    settled_through_known: AtomicBool,
+    source_segment_active: AtomicBool,
+    source_segment_restart_pending: AtomicBool,
+    source_segment_generation: AtomicU64,
+    source_segment_start: AtomicU64,
+    source_segment_start_known: AtomicBool,
+    acknowledged_revision: AtomicU64,
+    acknowledged_revision_known: AtomicBool,
     sample_rate: AtomicU32,
     max_callback_frames: AtomicU32,
     max_queue_ms: u64,
@@ -115,9 +429,28 @@ impl FloatPcmQueue {
                 head: 0,
                 len: 0,
                 queued_frames: 0,
+                drop_intervals: [SourceFrameInterval::default(); SOURCE_DROP_INTERVAL_CAPACITY],
+                drop_interval_count: 0,
+                drop_tracking_complete: true,
             }),
             wake: Condvar::new(),
             dropped_frames: AtomicU64::new(0),
+            capture_tail: AtomicU64::new(0),
+            capture_tail_known: AtomicBool::new(false),
+            source_tracking_lost: AtomicBool::new(false),
+            source_epoch: AtomicU64::new(0),
+            source_frame_offset: AtomicU64::new(0),
+            local_capture_tail: AtomicU64::new(0),
+            local_capture_tail_known: AtomicBool::new(false),
+            settled_through: AtomicU64::new(u64::MAX),
+            settled_through_known: AtomicBool::new(false),
+            source_segment_active: AtomicBool::new(true),
+            source_segment_restart_pending: AtomicBool::new(false),
+            source_segment_generation: AtomicU64::new(0),
+            source_segment_start: AtomicU64::new(0),
+            source_segment_start_known: AtomicBool::new(false),
+            acknowledged_revision: AtomicU64::new(0),
+            acknowledged_revision_known: AtomicBool::new(false),
             sample_rate: AtomicU32::new(0),
             max_callback_frames: AtomicU32::new(0),
             max_queue_ms: if low_latency {
@@ -171,7 +504,74 @@ impl FloatPcmQueue {
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
     }
+    pub(crate) fn end_source_segment(&self) {
+        let Ok(_state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        self.source_segment_active.store(false, Ordering::Release);
+        self.source_segment_restart_pending
+            .store(false, Ordering::Release);
+        self.source_segment_start_known
+            .store(false, Ordering::Release);
+        self.source_segment_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
 
+    pub(crate) fn begin_source_segment(&self) {
+        let Ok(_state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        self.source_segment_restart_pending
+            .store(true, Ordering::Release);
+        self.source_segment_start_known
+            .store(false, Ordering::Release);
+        self.source_segment_active.store(true, Ordering::Release);
+    }
+    pub(crate) fn source_segment_generation(&self) -> u64 {
+        self.source_segment_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn source_frame_snapshot(&self) -> SourceFrameSnapshot {
+        match self.state.lock() {
+            Ok(state) => {
+                let watermarks = stable_source_watermarks(
+                    &self.capture_tail,
+                    &self.capture_tail_known,
+                    &self.settled_through,
+                    &self.settled_through_known,
+                );
+                SourceFrameSnapshot {
+                    period_epoch: self.source_epoch.load(Ordering::Acquire),
+                    source_segment_generation: self
+                        .source_segment_generation
+                        .load(Ordering::Acquire),
+                    source_segment_start: self
+                        .source_segment_start_known
+                        .load(Ordering::Acquire)
+                        .then(|| self.source_segment_start.load(Ordering::Acquire)),
+                    intervals: state.drop_intervals,
+                    interval_count: state.drop_interval_count,
+                    capture_tail: watermarks.map(|(tail, _)| tail),
+                    settled_through: watermarks.map(|(_, settled)| settled),
+                    complete: watermarks.is_some()
+                        && state.drop_tracking_complete
+                        && !self.source_tracking_lost.load(Ordering::Acquire),
+                }
+            }
+            Err(_) => SourceFrameSnapshot {
+                period_epoch: self.source_epoch.load(Ordering::Acquire),
+                source_segment_generation: self.source_segment_generation.load(Ordering::Acquire),
+                source_segment_start: None,
+                intervals: [SourceFrameInterval::default(); SOURCE_DROP_INTERVAL_CAPACITY],
+                interval_count: 0,
+                capture_tail: None,
+                settled_through: None,
+                complete: false,
+            },
+        }
+    }
     pub(crate) fn queued_frames(&self) -> u64 {
         self.state
             .lock()
@@ -212,8 +612,25 @@ impl FloatPcmQueue {
         Duration::from_millis(self.max_queue_ms)
     }
 
-    pub(crate) fn record_dropped_frames(&self, frames: u64) {
-        self.add_dropped(frames);
+    pub(crate) fn record_dropped_frames(&self, frame_index: Option<u64>, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        if let Some(frame_index) = frame_index {
+            if let Some(end) = frame_index.checked_add(frames) {
+                self.capture_tail.fetch_max(end, Ordering::AcqRel);
+                self.capture_tail_known.store(true, Ordering::Release);
+            } else {
+                self.mark_source_tracking_lost();
+            }
+            self.add_dropped_at(frame_index, frames);
+        } else {
+            self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+            if self.source_segment_active.load(Ordering::Acquire) {
+                self.mark_source_tracking_lost();
+            }
+            self.wake.notify_one();
+        }
     }
 
     pub(crate) fn push_raw(
@@ -225,8 +642,34 @@ impl FloatPcmQueue {
         frame_index: u64,
     ) -> bool {
         let frames = frame_count as usize;
+        let frame_index = if !self.stopped.load(Ordering::Acquire) {
+            observe_source_capture(
+                SourceCaptureState {
+                    capture_tail: &self.capture_tail,
+                    capture_tail_known: &self.capture_tail_known,
+                    settled_through: &self.settled_through,
+                    settled_through_known: &self.settled_through_known,
+                    source_segment_active: &self.source_segment_active,
+                    source_segment_restart_pending: &self.source_segment_restart_pending,
+                    tracking_lost: &self.source_tracking_lost,
+                    source_frame_offset: &self.source_frame_offset,
+                    local_capture_tail: &self.local_capture_tail,
+                    local_capture_tail_known: &self.local_capture_tail_known,
+                    source_segment_start: &self.source_segment_start,
+                    source_segment_start_known: &self.source_segment_start_known,
+                },
+                frame_index,
+                frame_count,
+            )
+        } else {
+            frame_index
+        };
         if self.stopped.load(Ordering::Acquire)
-            || samples.is_null()
+            || !self.source_segment_active.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if samples.is_null()
             || sample_rate != self.sample_rate.load(Ordering::Acquire)
             || sample_rate == 0
             || channels != FLOAT_QUEUE_CHANNELS
@@ -234,28 +677,27 @@ impl FloatPcmQueue {
             || frame_count > self.max_callback_frames.load(Ordering::Acquire)
             || frames > MAX_CAPTURE_FRAMES
         {
-            self.add_dropped(frame_count as u64);
+            self.add_dropped_at(frame_index, frame_count as u64);
             return false;
         }
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
-                self.add_dropped(frame_count as u64);
+                self.add_dropped_at(frame_index, frame_count as u64);
                 return false;
             }
         };
         if self.stopped.load(Ordering::Acquire) {
-            self.add_dropped(frame_count as u64);
             return false;
         }
         let max_queued_frames = (sample_rate as u64 * self.max_queue_ms / 1000).max(1);
         let kept_frames = (frames as u64).min(max_queued_frames) as usize;
         let skipped_frames = frames - kept_frames;
         let Some(kept_frame_index) = frame_index.checked_add(skipped_frames as u64) else {
-            self.add_dropped(frame_count as u64);
+            self.add_dropped_at(frame_index, frame_count as u64);
             return false;
         };
-        self.add_dropped(skipped_frames as u64);
+        self.add_dropped_locked(&mut state, frame_index, skipped_frames as u64);
         while state.len > 0 {
             let oldest = state.slots[state.head].info;
             if oldest.enqueued_at.elapsed() <= Duration::from_millis(self.max_queue_ms)
@@ -265,7 +707,7 @@ impl FloatPcmQueue {
                 break;
             }
             state.queued_frames -= oldest.frame_count as u64;
-            self.add_dropped(oldest.frame_count as u64);
+            self.add_dropped_locked(&mut state, oldest.frame_index, oldest.frame_count as u64);
             state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
             state.len -= 1;
         }
@@ -290,10 +732,95 @@ impl FloatPcmQueue {
         true
     }
 
-    fn add_dropped(&self, frames: u64) {
-        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+    fn add_dropped_at(&self, start: u64, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        if !self.source_segment_active.load(Ordering::Acquire) {
+            self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+            self.wake.notify_one();
+            return;
+        }
+        match self.state.try_lock() {
+            Ok(mut guard) => self.add_dropped_locked(&mut guard, start, frames),
+            Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
+                self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+                self.mark_source_tracking_lost();
+            }
+        }
+        self.wake.notify_one();
     }
 
+    fn add_dropped_locked(&self, state: &mut FloatQueueState, start: u64, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+        if !self.source_segment_active.load(Ordering::Acquire) {
+            return;
+        }
+        merge_source_drop_interval(
+            &mut state.drop_intervals,
+            &mut state.drop_interval_count,
+            &mut state.drop_tracking_complete,
+            start,
+            frames,
+        );
+        if self.settled_through_known.load(Ordering::Acquire) {
+            let settled = self.settled_through.load(Ordering::Acquire);
+            let advanced =
+                settled_after_drops(&state.drop_intervals, state.drop_interval_count, settled);
+            if advanced != settled {
+                self.settled_through.store(advanced, Ordering::Release);
+            }
+        }
+    }
+
+    fn mark_source_tracking_lost(&self) {
+        self.source_tracking_lost.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn note_audio_sent(&self, generation: u64, start: u64, frames: u64) {
+        if !self.source_segment_active.load(Ordering::Acquire)
+            || self.source_segment_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
+        let Some(end) = start.checked_add(frames) else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        let Ok(state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        if !self.source_segment_active.load(Ordering::Acquire)
+            || self.source_segment_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
+        let mut settled = self.settled_through.load(Ordering::Acquire);
+        settled = settled_after_drops(&state.drop_intervals, state.drop_interval_count, settled);
+        if !self.settled_through_known.load(Ordering::Acquire) || settled != start {
+            self.mark_source_tracking_lost();
+            return;
+        }
+        settled = settled_after_drops(&state.drop_intervals, state.drop_interval_count, end);
+        self.settled_through.store(settled, Ordering::Release);
+    }
+
+    pub(crate) fn acknowledge_source_revision(&self, revision: u64) {
+        self.acknowledged_revision
+            .fetch_max(revision, Ordering::AcqRel);
+        self.acknowledged_revision_known
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn acknowledged_source_revision(&self) -> Option<u64> {
+        self.acknowledged_revision_known
+            .load(Ordering::Acquire)
+            .then(|| self.acknowledged_revision.load(Ordering::Acquire))
+    }
     /// Encoder worker consumes blocks into a reusable scratch buffer.
     pub(crate) fn pop_wait(&self, scratch: &mut Vec<f32>) -> Option<FloatPcmBlockInfo> {
         let mut state = self.state.lock().ok()?;
@@ -310,7 +837,7 @@ impl FloatPcmQueue {
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
             if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
-                self.add_dropped(info.frame_count as u64);
+                self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
             let sample_count = info.frame_count as usize * info.channels as usize;
@@ -349,7 +876,7 @@ impl FloatPcmQueue {
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
             if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
-                self.add_dropped(info.frame_count as u64);
+                self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
             let sample_count = info.frame_count as usize * info.channels as usize;
@@ -381,9 +908,28 @@ impl PcmQueue {
                 head: 0,
                 len: 0,
                 queued_frames: 0,
+                drop_intervals: [SourceFrameInterval::default(); SOURCE_DROP_INTERVAL_CAPACITY],
+                drop_interval_count: 0,
+                drop_tracking_complete: true,
             }),
             wake: Condvar::new(),
             dropped_frames: AtomicU64::new(0),
+            capture_tail: AtomicU64::new(0),
+            capture_tail_known: AtomicBool::new(false),
+            source_tracking_lost: AtomicBool::new(false),
+            source_epoch: AtomicU64::new(0),
+            source_frame_offset: AtomicU64::new(0),
+            local_capture_tail: AtomicU64::new(0),
+            local_capture_tail_known: AtomicBool::new(false),
+            settled_through: AtomicU64::new(u64::MAX),
+            settled_through_known: AtomicBool::new(false),
+            source_segment_active: AtomicBool::new(true),
+            source_segment_restart_pending: AtomicBool::new(false),
+            source_segment_generation: AtomicU64::new(0),
+            source_segment_start: AtomicU64::new(0),
+            source_segment_start_known: AtomicBool::new(false),
+            acknowledged_revision: AtomicU64::new(0),
+            acknowledged_revision_known: AtomicBool::new(false),
             target_format: None,
             max_queue_ms: BALANCED_CAPTURE_QUEUE_MS,
             stopped: AtomicBool::new(false),
@@ -393,7 +939,74 @@ impl PcmQueue {
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
     }
+    pub(crate) fn end_source_segment(&self) {
+        let Ok(_state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        self.source_segment_active.store(false, Ordering::Release);
+        self.source_segment_restart_pending
+            .store(false, Ordering::Release);
+        self.source_segment_start_known
+            .store(false, Ordering::Release);
+        self.source_segment_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
 
+    pub(crate) fn begin_source_segment(&self) {
+        let Ok(_state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        self.source_segment_restart_pending
+            .store(true, Ordering::Release);
+        self.source_segment_start_known
+            .store(false, Ordering::Release);
+        self.source_segment_active.store(true, Ordering::Release);
+    }
+    pub(crate) fn source_segment_generation(&self) -> u64 {
+        self.source_segment_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn source_frame_snapshot(&self) -> SourceFrameSnapshot {
+        match self.state.lock() {
+            Ok(state) => {
+                let watermarks = stable_source_watermarks(
+                    &self.capture_tail,
+                    &self.capture_tail_known,
+                    &self.settled_through,
+                    &self.settled_through_known,
+                );
+                SourceFrameSnapshot {
+                    period_epoch: self.source_epoch.load(Ordering::Acquire),
+                    source_segment_generation: self
+                        .source_segment_generation
+                        .load(Ordering::Acquire),
+                    source_segment_start: self
+                        .source_segment_start_known
+                        .load(Ordering::Acquire)
+                        .then(|| self.source_segment_start.load(Ordering::Acquire)),
+                    intervals: state.drop_intervals,
+                    interval_count: state.drop_interval_count,
+                    capture_tail: watermarks.map(|(tail, _)| tail),
+                    settled_through: watermarks.map(|(_, settled)| settled),
+                    complete: watermarks.is_some()
+                        && state.drop_tracking_complete
+                        && !self.source_tracking_lost.load(Ordering::Acquire),
+                }
+            }
+            Err(_) => SourceFrameSnapshot {
+                period_epoch: self.source_epoch.load(Ordering::Acquire),
+                source_segment_generation: self.source_segment_generation.load(Ordering::Acquire),
+                source_segment_start: None,
+                intervals: [SourceFrameInterval::default(); SOURCE_DROP_INTERVAL_CAPACITY],
+                interval_count: 0,
+                capture_tail: None,
+                settled_through: None,
+                complete: false,
+            },
+        }
+    }
     pub(crate) fn queued_frames(&self) -> u64 {
         self.state
             .lock()
@@ -445,8 +1058,25 @@ impl PcmQueue {
         Duration::from_millis(self.max_queue_ms)
     }
 
-    pub(crate) fn record_dropped_frames(&self, frames: u64) {
-        self.add_dropped(frames);
+    pub(crate) fn record_dropped_frames(&self, frame_index: Option<u64>, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        if let Some(frame_index) = frame_index {
+            if let Some(end) = frame_index.checked_add(frames) {
+                self.capture_tail.fetch_max(end, Ordering::AcqRel);
+                self.capture_tail_known.store(true, Ordering::Release);
+            } else {
+                self.mark_source_tracking_lost();
+            }
+            self.add_dropped_at(frame_index, frames);
+        } else {
+            self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+            if self.source_segment_active.load(Ordering::Acquire) {
+                self.mark_source_tracking_lost();
+            }
+            self.wake.notify_one();
+        }
     }
 
     pub(crate) fn push_raw(
@@ -477,33 +1107,58 @@ impl PcmQueue {
         enqueued_at: Instant,
     ) -> bool {
         let frames = frame_count as usize;
+        let frame_index = if !self.stopped.load(Ordering::Acquire) {
+            observe_source_capture(
+                SourceCaptureState {
+                    capture_tail: &self.capture_tail,
+                    capture_tail_known: &self.capture_tail_known,
+                    settled_through: &self.settled_through,
+                    settled_through_known: &self.settled_through_known,
+                    source_segment_active: &self.source_segment_active,
+                    source_segment_restart_pending: &self.source_segment_restart_pending,
+                    tracking_lost: &self.source_tracking_lost,
+                    source_frame_offset: &self.source_frame_offset,
+                    local_capture_tail: &self.local_capture_tail,
+                    local_capture_tail_known: &self.local_capture_tail_known,
+                    source_segment_start: &self.source_segment_start,
+                    source_segment_start_known: &self.source_segment_start_known,
+                },
+                frame_index,
+                frame_count,
+            )
+        } else {
+            frame_index
+        };
         let sample_count = frames.checked_mul(channels as usize);
         if self.stopped.load(Ordering::Acquire)
-            || samples.is_null()
+            || !self.source_segment_active.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if samples.is_null()
             || sample_rate == 0
             || !matches!(channels, 1 | 2)
             || frames == 0
             || frames > MAX_CAPTURE_FRAMES
             || sample_count.is_none()
         {
-            self.add_dropped(frame_count as u64);
+            self.add_dropped_at(frame_index, frame_count as u64);
             return false;
         }
         let sample_count = sample_count.unwrap();
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
-                self.add_dropped(frame_count as u64);
+                self.add_dropped_at(frame_index, frame_count as u64);
                 return false;
             }
         };
         if self.stopped.load(Ordering::Acquire) {
-            self.add_dropped(frame_count as u64);
             return false;
         }
         let target_channels = match self.target_format {
             Some(format) if format.sample_rate != sample_rate => {
-                self.add_dropped(frame_count as u64);
+                self.add_dropped_locked(&mut state, frame_index, frame_count as u64);
                 return false;
             }
             Some(format) => format.channels,
@@ -513,10 +1168,12 @@ impl PcmQueue {
         let kept_frames = (frames as u64).min(max_queued_frames) as usize;
         let skipped_frames = frames - kept_frames;
         let Some(kept_frame_index) = frame_index.checked_add(skipped_frames as u64) else {
-            self.add_dropped(frame_count as u64);
+            self.dropped_frames
+                .fetch_add(frame_count as u64, Ordering::Relaxed);
+            self.mark_source_tracking_lost();
             return false;
         };
-        self.add_dropped(skipped_frames as u64);
+        self.add_dropped_locked(&mut state, frame_index, skipped_frames as u64);
         while state.len > 0 {
             let oldest = state.slots[state.head].info;
             if oldest.enqueued_at.elapsed() <= Duration::from_millis(self.max_queue_ms)
@@ -526,7 +1183,7 @@ impl PcmQueue {
                 break;
             }
             state.queued_frames -= oldest.frame_count as u64;
-            self.add_dropped(oldest.frame_count as u64);
+            self.add_dropped_locked(&mut state, oldest.frame_index, oldest.frame_count as u64);
             state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
             state.len -= 1;
         }
@@ -566,10 +1223,95 @@ impl PcmQueue {
         true
     }
 
-    fn add_dropped(&self, frames: u64) {
-        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+    fn add_dropped_at(&self, start: u64, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        if !self.source_segment_active.load(Ordering::Acquire) {
+            self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+            self.wake.notify_one();
+            return;
+        }
+        match self.state.try_lock() {
+            Ok(mut guard) => self.add_dropped_locked(&mut guard, start, frames),
+            Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => {
+                self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+                self.mark_source_tracking_lost();
+            }
+        }
+        self.wake.notify_one();
     }
 
+    fn add_dropped_locked(&self, state: &mut QueueState, start: u64, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+        if !self.source_segment_active.load(Ordering::Acquire) {
+            return;
+        }
+        merge_source_drop_interval(
+            &mut state.drop_intervals,
+            &mut state.drop_interval_count,
+            &mut state.drop_tracking_complete,
+            start,
+            frames,
+        );
+        if self.settled_through_known.load(Ordering::Acquire) {
+            let settled = self.settled_through.load(Ordering::Acquire);
+            let advanced =
+                settled_after_drops(&state.drop_intervals, state.drop_interval_count, settled);
+            if advanced != settled {
+                self.settled_through.store(advanced, Ordering::Release);
+            }
+        }
+    }
+
+    fn mark_source_tracking_lost(&self) {
+        self.source_tracking_lost.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn note_audio_sent(&self, generation: u64, start: u64, frames: u64) {
+        if !self.source_segment_active.load(Ordering::Acquire)
+            || self.source_segment_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
+        let Some(end) = start.checked_add(frames) else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        let Ok(state) = self.state.lock() else {
+            self.mark_source_tracking_lost();
+            return;
+        };
+        if !self.source_segment_active.load(Ordering::Acquire)
+            || self.source_segment_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
+        let mut settled = self.settled_through.load(Ordering::Acquire);
+        settled = settled_after_drops(&state.drop_intervals, state.drop_interval_count, settled);
+        if !self.settled_through_known.load(Ordering::Acquire) || settled != start {
+            self.mark_source_tracking_lost();
+            return;
+        }
+        settled = settled_after_drops(&state.drop_intervals, state.drop_interval_count, end);
+        self.settled_through.store(settled, Ordering::Release);
+    }
+
+    pub(crate) fn acknowledge_source_revision(&self, revision: u64) {
+        self.acknowledged_revision
+            .fetch_max(revision, Ordering::AcqRel);
+        self.acknowledged_revision_known
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn acknowledged_source_revision(&self) -> Option<u64> {
+        self.acknowledged_revision_known
+            .load(Ordering::Acquire)
+            .then(|| self.acknowledged_revision.load(Ordering::Acquire))
+    }
     pub(crate) fn pop_wait(
         &self,
         stopping: &AtomicBool,
@@ -593,7 +1335,7 @@ impl PcmQueue {
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
             if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
-                self.add_dropped(info.frame_count as u64);
+                self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
             let sample_count = info.frame_count as usize * info.channels as usize;
@@ -632,7 +1374,7 @@ impl PcmQueue {
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
             if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
-                self.add_dropped(info.frame_count as u64);
+                self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
             let sample_count = info.frame_count as usize * info.channels as usize;
@@ -711,6 +1453,7 @@ struct FloatSenderSignals {
     stopping: Arc<AtomicBool>,
     expected_queue_stop: Arc<AtomicBool>,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
+    send_loss_ledger: bool,
 }
 
 impl FloatUdpSender {
@@ -721,6 +1464,7 @@ impl FloatUdpSender {
         material: UdpSessionMaterial,
         format: AudioFormatV2,
         pcm_payload_bytes_sent: Arc<AtomicU64>,
+        send_loss_ledger: bool,
     ) -> Result<Self, String> {
         format.encode().map_err(|error| error.to_string())?;
         if !matches!(format.profile, 2..=5)
@@ -745,6 +1489,7 @@ impl FloatUdpSender {
             stopping: worker_stopping,
             expected_queue_stop: worker_expected_queue_stop,
             pcm_payload_bytes_sent: pcm_payload_bytes_sent.clone(),
+            send_loss_ledger,
         };
         let worker = thread::Builder::new()
             .name("AnPod local Float32 UDP audio".into())
@@ -865,6 +1610,7 @@ fn send_float_loop(
         stopping,
         expected_queue_stop,
         pcm_payload_bytes_sent,
+        send_loss_ledger,
     } = signals;
     let mut encoder =
         PacketEncoder::new_v2(&material.key, material.session_id, HOST_TO_RECEIVER, format)
@@ -882,8 +1628,25 @@ fn send_float_loop(
     let mut samples = Vec::with_capacity(MAX_CAPTURE_FRAMES * FLOAT_QUEUE_CHANNELS as usize);
     let mut payload = Vec::with_capacity(MAX_PAYLOAD_LEN);
     let frames_per_packet = MAX_PAYLOAD_LEN / format.frame_bytes as usize;
+    let mut ledger_tx = LossLedgerTxState::default();
 
-    while let Some(info) = queue.pop_wait(&mut samples) {
+    loop {
+        let Some(info) = queue.pop_timeout(&mut samples, Duration::from_millis(20)) else {
+            if stopping.load(Ordering::Acquire) || queue.is_stopped() {
+                break;
+            }
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
+            continue;
+        };
         if stopping.load(Ordering::Acquire) {
             break;
         }
@@ -902,7 +1665,15 @@ fn send_float_loop(
                 break;
             }
             if info.enqueued_at.elapsed() > Duration::from_millis(queue.max_queue_ms) {
-                queue.add_dropped((frames - offset_frames) as u64);
+                let dropped_frames = (frames - offset_frames) as u64;
+                if let Some(start) = info.frame_index.checked_add(offset_frames as u64) {
+                    queue.record_dropped_frames(Some(start), dropped_frames);
+                } else {
+                    queue
+                        .dropped_frames
+                        .fetch_add(dropped_frames, Ordering::Relaxed);
+                    queue.mark_source_tracking_lost();
+                }
                 break;
             }
             let packet_frames = frames_per_packet.min(frames - offset_frames);
@@ -922,6 +1693,17 @@ fn send_float_loop(
                 .frame_index
                 .checked_add(offset_frames as u64)
                 .ok_or_else(|| "PCM sample frame index exhausted.".to_string())?;
+            let segment_generation = queue.source_segment_generation();
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
             send_packet_with(
                 &mut encoder,
                 PacketType::Audio,
@@ -929,6 +1711,17 @@ fn send_float_loop(
                 &payload,
                 |packet| send_datagram(&socket, remote, packet),
             )?;
+            queue.note_audio_sent(segment_generation, frame_index, packet_frames as u64);
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
             stats.packets_sent = stats.packets_sent.saturating_add(1);
             stats.pcm_payload_bytes_sent = stats
                 .pcm_payload_bytes_sent
@@ -942,6 +1735,11 @@ fn send_float_loop(
     } else {
         Err("Float32 PCM queue stopped while the authenticated sender was active.".into())
     }
+}
+
+struct SenderSetup {
+    send_format: bool,
+    send_loss_ledger: bool,
 }
 
 impl UdpSender {
@@ -962,7 +1760,10 @@ impl UdpSender {
             material,
             format,
             Arc::new(AtomicU64::new(0)),
-            true,
+            SenderSetup {
+                send_format: true,
+                send_loss_ledger: false,
+            },
         )
     }
 
@@ -973,6 +1774,7 @@ impl UdpSender {
         material: UdpSessionMaterial,
         parameters: crate::security::AudioParameters,
         pcm_payload_bytes_sent: Arc<AtomicU64>,
+        send_loss_ledger: bool,
     ) -> Result<Self, String> {
         parameters
             .validate()
@@ -988,7 +1790,10 @@ impl UdpSender {
             material,
             format,
             pcm_payload_bytes_sent,
-            true,
+            SenderSetup {
+                send_format: true,
+                send_loss_ledger,
+            },
         )
     }
 
@@ -1015,7 +1820,10 @@ impl UdpSender {
             material,
             format,
             pcm_payload_bytes_sent,
-            false,
+            SenderSetup {
+                send_format: false,
+                send_loss_ledger: false,
+            },
         )
     }
 
@@ -1026,8 +1834,12 @@ impl UdpSender {
         material: UdpSessionMaterial,
         format: PcmFormat,
         pcm_payload_bytes_sent: Arc<AtomicU64>,
-        send_format: bool,
+        setup: SenderSetup,
     ) -> Result<Self, String> {
+        let SenderSetup {
+            send_format,
+            send_loss_ledger,
+        } = setup;
         if !matches!(format.channels, 1 | 2)
             || format.sample_rate == 0
             || !remote.is_ipv4()
@@ -1054,6 +1866,7 @@ impl UdpSender {
                     format,
                     worker_bytes,
                     send_format,
+                    send_loss_ledger,
                 )
             })
             .map_err(|error| error.to_string())?;
@@ -1114,6 +1927,7 @@ fn send_loop(
     format: PcmFormat,
     pcm_payload_bytes_sent: Arc<AtomicU64>,
     send_format: bool,
+    send_loss_ledger: bool,
 ) -> Result<NetworkStats, String> {
     let mut encoder = PacketEncoder::with_sequence(
         &material.key,
@@ -1143,8 +1957,25 @@ fn send_loop(
     let byte_limited_frames = MAX_PAYLOAD_LEN / sample_bytes_per_frame;
     let five_ms_frames = (format.sample_rate as usize / 200).max(1);
     let frames_per_packet = five_ms_frames.min(byte_limited_frames);
+    let mut ledger_tx = LossLedgerTxState::default();
 
-    while let Some(info) = queue.pop_wait(&stopping, &mut samples) {
+    loop {
+        let Some(info) = queue.pop_timeout(&mut samples, Duration::from_millis(20)) else {
+            if stopping.load(Ordering::Acquire) || queue.is_stopped() {
+                break;
+            }
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
+            continue;
+        };
         if info.sample_rate != format.sample_rate || info.channels != format.channels {
             continue;
         }
@@ -1155,7 +1986,15 @@ fn send_loop(
         let mut offset_frames = 0;
         while offset_frames < frames {
             if info.enqueued_at.elapsed() > Duration::from_millis(queue.max_queue_ms) {
-                queue.add_dropped((frames - offset_frames) as u64);
+                let dropped_frames = (frames - offset_frames) as u64;
+                if let Some(start) = info.frame_index.checked_add(offset_frames as u64) {
+                    queue.record_dropped_frames(Some(start), dropped_frames);
+                } else {
+                    queue
+                        .dropped_frames
+                        .fetch_add(dropped_frames, Ordering::Relaxed);
+                    queue.mark_source_tracking_lost();
+                }
                 break;
             }
             let packet_frames = frames_per_packet.min(frames - offset_frames);
@@ -1172,6 +2011,17 @@ fn send_loop(
                 .frame_index
                 .checked_add(offset_frames as u64)
                 .ok_or_else(|| "PCM sample frame index exhausted.".to_string())?;
+            let segment_generation = queue.source_segment_generation();
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
             send_packet_with(
                 &mut encoder,
                 PacketType::Audio,
@@ -1179,6 +2029,17 @@ fn send_loop(
                 &payload,
                 |packet| send_datagram(&socket, remote, packet),
             )?;
+            queue.note_audio_sent(segment_generation, frame_index, packet_frames as u64);
+            if send_loss_ledger {
+                send_loss_ledger_if_due(
+                    &socket,
+                    remote,
+                    &mut encoder,
+                    queue.source_frame_snapshot(),
+                    queue.acknowledged_source_revision(),
+                    &mut ledger_tx,
+                )?;
+            }
             stats.packets_sent = stats.packets_sent.saturating_add(1);
             stats.pcm_payload_bytes_sent = stats
                 .pcm_payload_bytes_sent
@@ -1346,6 +2207,7 @@ impl MockReceiver {
                 self.queue.insert(position, packet);
                 Ok(IngestResult::Queued)
             }
+            PacketType::LossLedger => Err(ProtocolError::InvalidFormat),
         }
     }
 

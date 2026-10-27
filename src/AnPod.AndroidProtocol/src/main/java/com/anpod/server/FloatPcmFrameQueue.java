@@ -41,11 +41,16 @@ public final class FloatPcmFrameQueue {
     private int plcFrames;
     private int queuedFrames;
     private long droppedFrames;
+    private final SourceFrameRanges receiverDropRanges = new SourceFrameRanges();
+    private final SourceFrameRanges startupOutputDropRanges = new SourceFrameRanges();
     private long expiredFrames;
     private long concealedFrames;
     private long oversizedGapSkips;
     private long insertedDriftFrames;
     private long deletedDriftFrames;
+    private long lastReadFrameIndex;
+    private int lastReadFrames;
+    private boolean lastReadSynthetic;
 
     public FloatPcmFrameQueue(int sampleRate, boolean lowLatency) {
         this(sampleRate, lowLatency, DEFAULT_MAX_PACKET_FRAMES);
@@ -83,13 +88,15 @@ public final class FloatPcmFrameQueue {
         long endFrame = frameIndex + frameCount;
         if (Long.compareUnsigned(endFrame, frameIndex) <= 0)
             throw new IllegalArgumentException("packet frame range overflows");
-        expireStalePackets(nowNanos);
-        if (hasAdvanced && Long.compareUnsigned(frameIndex, playoutFrame) < 0) {
+        if (paused || stopped) {
             droppedFrames += frameCount;
             return false;
         }
-        if (paused || stopped) {
+        expireStalePackets(nowNanos);
+        if (hasAdvanced && Long.compareUnsigned(frameIndex, playoutFrame) < 0) {
             droppedFrames += frameCount;
+            if (Long.compareUnsigned(endFrame, playoutFrame) > 0)
+                noteReceiverDrop(playoutFrame, (int) (endFrame - playoutFrame));
             return false;
         }
         int insert = 0;
@@ -98,10 +105,12 @@ public final class FloatPcmFrameQueue {
         if (insert > 0 && overlaps(packets.get(insert - 1), frameIndex, endFrame)
                 || insert < packets.size() && overlaps(packets.get(insert), frameIndex, endFrame)) {
             droppedFrames += frameCount;
+            if (!paused && !stopped) noteReceiverDropUncovered(frameIndex, endFrame);
             return false;
         }
         if (frameCount > maxQueuedFrames) {
             droppedFrames += frameCount;
+            if (!paused && !stopped) noteReceiverDrop(frameIndex, frameCount);
             expiredFrames += frameCount;
             return false;
         }
@@ -112,6 +121,7 @@ public final class FloatPcmFrameQueue {
             long oldestEnd = oldest.frameIndex + oldest.frameCount;
             if (Long.compareUnsigned(frameIndex, oldestEnd) < 0) {
                 droppedFrames += frameCount;
+                if (!paused && !stopped) noteReceiverDrop(frameIndex, frameCount);
                 expiredFrames += frameCount;
                 return false;
             }
@@ -120,6 +130,7 @@ public final class FloatPcmFrameQueue {
         }
         if (remainingFrames + frameCount > maxQueuedFrames) {
             droppedFrames += frameCount;
+            if (!paused && !stopped) noteReceiverDrop(frameIndex, frameCount);
             expiredFrames += frameCount;
             return false;
         }
@@ -131,6 +142,7 @@ public final class FloatPcmFrameQueue {
         discardStalePackets();
         if (hasAdvanced && Long.compareUnsigned(frameIndex, playoutFrame) < 0) {
             droppedFrames += frameCount;
+            if (!paused && !stopped) noteReceiverDrop(frameIndex, frameCount);
             expiredFrames += frameCount;
             return false;
         }
@@ -237,6 +249,9 @@ public final class FloatPcmFrameQueue {
         Packet packet = packets.get(0);
         int sourceOffsetFrames = (int) (playoutFrame - packet.frameIndex);
         int count = Math.min(maxFrames, packet.frameCount - sourceOffsetFrames);
+        lastReadFrameIndex = playoutFrame;
+        lastReadFrames = count;
+        lastReadSynthetic = false;
         int sourceOffset = sourceOffsetFrames * CHANNELS;
         int destinationOffset = destinationFrameOffset * CHANNELS;
         System.arraycopy(packet.samples, sourceOffset, destination, destinationOffset, count * CHANNELS);
@@ -282,6 +297,9 @@ public final class FloatPcmFrameQueue {
         }
 
         int count = Math.min(maxFrames, (int) gap);
+        lastReadFrameIndex = playoutFrame;
+        lastReadFrames = count;
+        lastReadSynthetic = true;
         int destinationOffset = destinationFrameOffset * CHANNELS;
         for (int frame = 0; frame < count; frame++) {
             float gain = hasLastFrame && plcFrames + frame < fadeFrames
@@ -340,11 +358,47 @@ public final class FloatPcmFrameQueue {
     public int audioTrackBufferFrames(int capacityFrames, boolean lowLatency) {
         return Pcm16FrameStream.requestedAudioTrackBufferFrames(sampleRate, capacityFrames, lowLatency);
     }
+    public synchronized long lastReadFrameIndex() { return lastReadFrameIndex; }
+    public synchronized int lastReadFrames() { return lastReadFrames; }
+    public synchronized boolean lastReadSynthetic() { return lastReadSynthetic; }
     public synchronized long playoutFrame() { return playoutFrame; }
     public synchronized int packetCount() { return packets.size(); }
     public int packetCapacity() { return maxQueuedFrames; }
     public synchronized int queuedFrames() { return queuedFrames; }
     public synchronized boolean isStopped() { return stopped; }
+    private void noteReceiverDrop(long start, int frameCount) {
+        if (frameCount > 0) receiverDropRanges.add(start, frameCount);
+    }
+
+    private void noteReceiverDropUncovered(long start, long end) {
+        long cursor = start;
+        for (Packet packet : packets) {
+            long packetStart = packet.frameIndex + packet.offsetFrames;
+            long packetEnd = packet.frameIndex + packet.frameCount;
+            if (Long.compareUnsigned(packetEnd, cursor) <= 0) continue;
+            if (Long.compareUnsigned(packetStart, end) >= 0) break;
+            if (Long.compareUnsigned(packetStart, cursor) > 0) {
+                long gapEnd = Long.compareUnsigned(packetStart, end) < 0 ? packetStart : end;
+                noteReceiverDrop(cursor, (int) (gapEnd - cursor));
+            }
+            if (Long.compareUnsigned(packetEnd, cursor) > 0) cursor = packetEnd;
+            if (Long.compareUnsigned(cursor, end) >= 0) return;
+        }
+        if (Long.compareUnsigned(cursor, end) < 0) noteReceiverDrop(cursor, (int) (end - cursor));
+    }
+
+    public synchronized void resetReceiverDropTrackingForPeriod() {
+        receiverDropRanges.clear();
+        startupOutputDropRanges.clear();
+    }
+    public synchronized SourceFrameRanges.Range[] receiverDropRanges() { return receiverDropRanges.snapshot(); }
+    public synchronized long receiverDropRevision() { return receiverDropRanges.revision(); }
+    public synchronized boolean receiverDropTrackingComplete() { return receiverDropRanges.complete(); }
+    public synchronized SourceFrameRanges.Range[] startupOutputDropRanges() {
+        return startupOutputDropRanges.snapshot();
+    }
+    public synchronized long startupOutputDropRevision() { return startupOutputDropRanges.revision(); }
+    public synchronized boolean startupOutputDropTrackingComplete() { return startupOutputDropRanges.complete(); }
     public synchronized long droppedFrames() { return droppedFrames; }
     public synchronized long expiredFrames() { return expiredFrames; }
     public synchronized long concealedFrames() { return concealedFrames; }
@@ -366,6 +420,7 @@ public final class FloatPcmFrameQueue {
             packets.remove(0);
             queuedFrames -= packet.frameCount - packet.offsetFrames;
             droppedFrames += packet.frameCount - packet.offsetFrames;
+            noteReceiverDrop(packet.frameIndex + packet.offsetFrames, packet.frameCount - packet.offsetFrames);
         }
     }
 
@@ -378,6 +433,7 @@ public final class FloatPcmFrameQueue {
             packet.offsetFrames += discardedFrames;
             queuedFrames -= discardedFrames;
             droppedFrames += discardedFrames;
+            startupOutputDropRanges.add(packet.frameIndex + packet.offsetFrames - discardedFrames, discardedFrames);
             excessFrames -= discardedFrames;
             if (packet.offsetFrames == packet.frameCount) packets.remove(0);
         }
@@ -406,6 +462,7 @@ public final class FloatPcmFrameQueue {
     private void dropQueuedPacket(Packet packet, boolean expired) {
         int remaining = packet.frameCount - packet.offsetFrames;
         droppedFrames += remaining;
+        noteReceiverDrop(packet.frameIndex + packet.offsetFrames, remaining);
         if (expired) expiredFrames += remaining;
         long end = packet.frameIndex + packet.frameCount;
         boolean future = !hasPlayoutFrame || Long.compareUnsigned(end, playoutFrame) > 0;
