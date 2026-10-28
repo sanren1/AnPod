@@ -29,6 +29,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
+| 0.25.0-v3-flow-candidate / code 51 | `9664fd513aacd5020ae009232d79af369ba498b90c083c96a084cde48f626c96` | PC 1.17.1 配套本地发布签名候选；source `82563c9bd8c58a2d25822cb0883a4288721209bd`（sourceModified=false，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.24.0-v3-flow-candidate / code 50 | `0c9cb3dd4a242291b5710d2440bd4c90f01e2a22494d8524cedbc37ac6132957` | PC 1.17.0 配套本地发布签名候选；source `ade7432f4efce167d510ad6ca6739ddfae2a3ca9`（sourceModified=false）；实机验证由用户完成 |
 | 0.23.0-v3-flow-candidate / code 49 | `837ca52ccf67d33304b6a24d24199c2896a0873e6413c8f6b91552ed429d4608` | PC 1.16.0 配套本地验证候选；提交 `8907f384a12e81c9133333e7e0a31650de466b32` 构建（sourceModified=false）；开机通知恢复待机，实机验证由用户完成 |
 | 0.22.0-v3-flow-candidate / code 48 | `4af5a5ba02ba06253d9e83118090d9559c008e76f5bdfe93270abceaf3576d98` | PC 1.15.0 配套本地验证候选；干净源码提交 `48b9f0773c88f51794ce411606b8406e1a4d139c` 构建（sourceModified=false）；实机验证由用户完成 |
