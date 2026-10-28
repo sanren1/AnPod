@@ -1164,6 +1164,33 @@ fn audited_receiver45_is_registered_and_preserves_receiver44() {
 }
 
 #[test]
+fn audited_receiver50_is_registered_and_preserves_receiver49() {
+    let current = ArtifactMetadata {
+        application_id: PACKAGE.into(),
+        version_code: 50,
+        version_name: "0.24.0-v3-flow-candidate".into(),
+        sha256: "0c9cb3dd4a242291b5710d2440bd4c90f01e2a22494d8524cedbc37ac6132957".into(),
+        signer_sha256: "f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573".into(),
+        source_commit: Some("ade7432f4efce167d510ad6ca6739ddfae2a3ca9".into()),
+    };
+    assert!(AUDITED_RECEIVER_ARTIFACTS.iter().any(|artifact| {
+        artifact.version_code == current.version_code
+            && artifact.version_name == current.version_name
+            && artifact.sha256 == current.sha256
+            && artifact.signer_sha256 == current.signer_sha256
+            && Some(artifact.source_commit) == current.source_commit.as_deref()
+    }));
+
+    let receiver49 = verified_installed_artifact(
+        "837ca52ccf67d33304b6a24d24199c2896a0873e6413c8f6b91552ed429d4608",
+        &current,
+    )
+    .unwrap();
+    assert_eq!(receiver49.version_code, 49);
+    assert_eq!(receiver49.version_name, "0.23.0-v3-flow-candidate");
+}
+
+#[test]
 fn recognizes_audited_code12_and_code13_for_code14_upgrade_but_rejects_unknown_apks() {
     let current = ArtifactMetadata {
         application_id: PACKAGE.into(),
