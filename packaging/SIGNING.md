@@ -29,6 +29,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
+| 0.26.0-v3-flow-candidate / code 53 | `199e3781ae97ed41fca998b0061006b016b6e5be050957686592547114bbad3c` | PC 1.17.3 配套本地发布签名候选；source `664928d580ad21530183548642c7d3167d9117ff`（sourceModified=false，sourceInputs `260dba520b3f3bda0c354de8a5e31419889105bbc314632a3b6af520ecdb7842`，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.25.1-v3-flow-candidate / code 52 | `aa8cb45243f69da0b2ecad665ddfab9852bde97b0a91ee68232e9e57fcabff7c` | PC 1.17.2 配套本地发布签名候选；source `0733199fe3993508c93eaee5a52588a02bcf50c7`（sourceModified=false，sourceInputs `a1e3927bebf908c355718b8c5136c3fdd2f62102e5e2cc2bb877670e0a033735`，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.25.0-v3-flow-candidate / code 51 | `9664fd513aacd5020ae009232d79af369ba498b90c083c96a084cde48f626c96` | PC 1.17.1 配套本地发布签名候选；source `82563c9bd8c58a2d25822cb0883a4288721209bd`（sourceModified=false，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.24.0-v3-flow-candidate / code 50 | `0c9cb3dd4a242291b5710d2440bd4c90f01e2a22494d8524cedbc37ac6132957` | PC 1.17.0 配套本地发布签名候选；source `ade7432f4efce167d510ad6ca6739ddfae2a3ca9`（sourceModified=false）；实机验证由用户完成 |
