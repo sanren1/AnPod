@@ -206,7 +206,7 @@ final class AodMetricsSampler {
             recordUnknownSourceRange(logicalStart + (start - sourceOrigin),
                     logicalStart + (end - sourceOrigin), sampleRate);
         }
-        if (!complete && unknownRanges.length == 0 && segmentEnd > logicalStart)
+        if (!complete && segmentEnd > logicalStart)
             recordUnknownSourceRange(logicalStart, segmentEnd, sampleRate);
     }
 
@@ -247,6 +247,14 @@ final class AodMetricsSampler {
         unknownSourceEnds[index] = mergedEnd;
     }
     synchronized LossWindow recentSourceLossWindow(long windowNanos, int sampleRate) {
+        return recentSourceLossWindow(windowNanos, sampleRate, false);
+    }
+
+    synchronized LossWindow recentKnownSourceLossWindow(long windowNanos, int sampleRate) {
+        return recentSourceLossWindow(windowNanos, sampleRate, true);
+    }
+
+    private LossWindow recentSourceLossWindow(long windowNanos, int sampleRate, boolean allowUnknown) {
         if (windowNanos <= 0 || sampleRate <= 0 || sourceTimelineBaseline < 0
                 || sourceTimelineThrough < sourceTimelineBaseline) return null;
         long windowFrames = Math.max(1, Math.round(windowNanos * (sampleRate / 1_000_000_000.0)));
@@ -257,16 +265,31 @@ final class AodMetricsSampler {
                 && Long.compareUnsigned(sourceLossOverflowThrough, cutoff) > 0) return null;
         if (unknownOverflowThrough != -1L
                 && Long.compareUnsigned(unknownOverflowThrough, cutoff) > 0) return null;
-        for (int i = 0; i < unknownSourceSize; i++)
-            if (Long.compareUnsigned(unknownSourceStarts[i], sourceTimelineThrough) < 0
-                    && Long.compareUnsigned(unknownSourceEnds[i], cutoff) > 0) return null;
+        long unknown = 0;
+        for (int i = 0; i < unknownSourceSize; i++) {
+            long start = Math.max(unknownSourceStarts[i], cutoff);
+            long end = Math.min(unknownSourceEnds[i], sourceTimelineThrough);
+            if (end > start) unknown += end - start;
+        }
+        if (!allowUnknown && unknown > 0) return null;
         long loss = 0;
         for (int i = 0; i < sourceLossSize; i++) {
             long start = Math.max(sourceLossStarts[i], cutoff);
             long end = Math.min(sourceLossEnds[i], sourceTimelineThrough);
-            if (end > start) loss += end - start;
+            long cursor = start;
+            for (int range = 0; range < unknownSourceSize && cursor < end; range++) {
+                long unknownStart = Math.max(unknownSourceStarts[range], cutoff);
+                long unknownEnd = Math.min(unknownSourceEnds[range], sourceTimelineThrough);
+                if (unknownEnd <= cursor) continue;
+                if (unknownStart >= end) break;
+                if (unknownStart > cursor) loss += unknownStart - cursor;
+                cursor = Math.max(cursor, unknownEnd);
+            }
+            if (cursor < end) loss += end - cursor;
         }
-        return new LossWindow(loss, eligible);
+        long knownEligible = eligible - unknown;
+        if (knownEligible < 0 || loss > knownEligible) return null;
+        return new LossWindow(loss, knownEligible, unknown);
     }
     synchronized void resetLossWindow() {
         clearLossWindow();
@@ -317,9 +340,14 @@ final class AodMetricsSampler {
     static final class LossWindow {
         final long lossFrames;
         final long eligibleFrames;
+        final long unknownFrames;
         LossWindow(long lossFrames, long eligibleFrames) {
+            this(lossFrames, eligibleFrames, 0);
+        }
+        LossWindow(long lossFrames, long eligibleFrames, long unknownFrames) {
             this.lossFrames = lossFrames;
             this.eligibleFrames = eligibleFrames;
+            this.unknownFrames = unknownFrames;
         }
     }
 

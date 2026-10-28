@@ -4,19 +4,22 @@ import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import android.graphics.Paint
 import android.graphics.Typeface
+import androidx.core.content.res.ResourcesCompat
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.sp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import kotlin.math.roundToInt
 import kotlin.math.ceil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 
 @RunWith(RobolectricTestRunner::class)
 class AodDisplaySettingsTest {
@@ -30,7 +33,7 @@ class AodDisplaySettingsTest {
 
         val selected = AodDisplaySettings(115, 120, false, true, false, true,
             clockFont = AodDisplaySettings.CLOCK_FONT_SERIF,
-            clockWeight = AodDisplaySettings.CLOCK_WEIGHT_NORMAL)
+            clockWeightLevel = 2)
         selected.save(preferences)
         assertEquals(selected, AodDisplaySettings.read(preferences))
     }
@@ -46,8 +49,46 @@ class AodDisplaySettingsTest {
         assertEquals(false, settings.showUnderruns)
         assertEquals(false, settings.showOutputEngine)
         assertEquals(AodDisplaySettings.CLOCK_FONT_RUBIK, settings.clockFont)
-        assertEquals(AodDisplaySettings.CLOCK_WEIGHT_BOLD, settings.clockWeight)
+        assertEquals(AodDisplaySettings.DEFAULT_CLOCK_WEIGHT_LEVEL, settings.clockWeightLevel)
+        assertEquals(AodDisplaySettings.CLOCK_WEIGHT_BLACK, settings.clockWeight)
         assertEquals(100, settings.clockScale)
+    }
+
+    @Test
+    fun legacyClockWeightsMigrateByFamilyAndNewLevelsStayStable() {
+        val preferences = ApplicationProvider.getApplicationContext<Context>()
+            .getSharedPreferences("aod_weight_migration_test", Context.MODE_PRIVATE)
+
+        preferences.edit().clear()
+            .putInt("aod_clock_weight", AodDisplaySettings.CLOCK_WEIGHT_NORMAL)
+            .putInt("aod_clock_font", AodDisplaySettings.CLOCK_FONT_RUBIK)
+            .commit()
+        val regular = AodDisplaySettings.read(preferences)
+        assertEquals(2, regular.clockWeightLevel)
+        assertEquals(400, regular.clockWeight)
+
+        preferences.edit().clear()
+            .putInt("aod_clock_weight", AodDisplaySettings.CLOCK_WEIGHT_BOLD)
+            .putInt("aod_clock_font", AodDisplaySettings.CLOCK_FONT_RUBIK)
+            .commit()
+        val legacyRubikBold = AodDisplaySettings.read(preferences)
+        assertEquals(9, legacyRubikBold.clockWeightLevel)
+        assertEquals(850, legacyRubikBold.clockWeight)
+
+        preferences.edit().clear()
+            .putInt("aod_clock_weight", AodDisplaySettings.CLOCK_WEIGHT_BOLD)
+            .putInt("aod_clock_font", AodDisplaySettings.CLOCK_FONT_SERIF)
+            .commit()
+        val legacySystemBold = AodDisplaySettings.read(preferences)
+        assertEquals(7, legacySystemBold.clockWeightLevel)
+        assertEquals(700, legacySystemBold.clockWeight)
+
+        legacySystemBold.copy(clockFont = AodDisplaySettings.CLOCK_FONT_RUBIK).save(preferences)
+        val saved700 = AodDisplaySettings.read(preferences)
+        assertEquals(7, saved700.clockWeightLevel)
+        assertEquals(700, saved700.clockWeight)
+        assertEquals(7, preferences.getInt("aod_clock_weight_level", -1))
+        assertEquals(700, preferences.getInt("aod_clock_weight", -1))
     }
 
     @Test
@@ -124,72 +165,87 @@ class AodDisplaySettingsTest {
     }
 
     @Test
-    fun clockScaleLevelsRemainDistinctAndFitRealTypefaceTimes() {
+    @Config(sdk = [23])
+    fun allBundledClockFontsLoadAtNineWeightsAndFitClockBounds() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val fonts = listOf(
-            Triple(AodDisplaySettings.CLOCK_FONT_RUBIK, AodDisplaySettings.CLOCK_WEIGHT_NORMAL,
-                context.resources.getFont(R.font.rubik_regular)),
-            Triple(AodDisplaySettings.CLOCK_FONT_RUBIK, AodDisplaySettings.CLOCK_WEIGHT_BOLD,
-                context.resources.getFont(R.font.rubik_black)),
-            Triple(AodDisplaySettings.CLOCK_FONT_SANS_SERIF, AodDisplaySettings.CLOCK_WEIGHT_NORMAL,
-                Typeface.create("sans-serif", Typeface.NORMAL)),
-            Triple(AodDisplaySettings.CLOCK_FONT_SANS_SERIF, AodDisplaySettings.CLOCK_WEIGHT_BOLD,
-                Typeface.create("sans-serif", Typeface.BOLD)),
-            Triple(AodDisplaySettings.CLOCK_FONT_SERIF, AodDisplaySettings.CLOCK_WEIGHT_NORMAL,
-                Typeface.create("serif", Typeface.NORMAL)),
-            Triple(AodDisplaySettings.CLOCK_FONT_SERIF, AodDisplaySettings.CLOCK_WEIGHT_BOLD,
-                Typeface.create("serif", Typeface.BOLD)),
-            Triple(AodDisplaySettings.CLOCK_FONT_MONOSPACE, AodDisplaySettings.CLOCK_WEIGHT_NORMAL,
-                Typeface.create("monospace", Typeface.NORMAL)),
-            Triple(AodDisplaySettings.CLOCK_FONT_MONOSPACE, AodDisplaySettings.CLOCK_WEIGHT_BOLD,
-                Typeface.create("monospace", Typeface.BOLD))
+        val families = listOf(
+            AodDisplaySettings.CLOCK_FONT_RUBIK,
+            AodDisplaySettings.CLOCK_FONT_SANS_SERIF,
+            AodDisplaySettings.CLOCK_FONT_SERIF,
+            AodDisplaySettings.CLOCK_FONT_MONOSPACE
         )
         val availableWidth = 420
         val availableHeight = 115
         val baseSize = 150f
+        val expectedCmap = (0x30..0x39).toSet() + 0x3a
+        val times = (0..23).flatMap { hour ->
+            (0..59).map { minute -> "%02d:%02d".format(java.util.Locale.US, hour, minute) }
+        }
 
-        fonts.forEach { (font, weight, typeface) ->
-            val style = clockTextStyle(font, weight, baseSize.sp)
-            assertEquals(when (font) {
-                AodDisplaySettings.CLOCK_FONT_SERIF -> FontFamily.Serif
-                AodDisplaySettings.CLOCK_FONT_MONOSPACE -> FontFamily.Monospace
-                AodDisplaySettings.CLOCK_FONT_SANS_SERIF -> FontFamily.SansSerif
-                else -> style.fontFamily
-            }, style.fontFamily)
-            assertEquals(if (weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD &&
-                font == AodDisplaySettings.CLOCK_FONT_RUBIK) FontWeight.Black else if (
-                weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD) FontWeight.Bold else FontWeight.Normal,
-                style.fontWeight)
-            val times = (0..23).flatMap { hour ->
-                (0..59).map { minute -> "%02d:%02d".format(java.util.Locale.US, hour, minute) }
-            }
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.typeface = typeface }
-            for (fontScale in listOf(1f, 1.3f, 2f)) {
-                val fitCeiling = baseSize * 1.2f
-                paint.textSize = fitCeiling * fontScale
-                val maximumWidth = times.maxOf { ceil(paint.measureText(it)).toInt() }
-                val metrics = paint.fontMetrics
-                val maximumHeight = ceil(metrics.descent - metrics.ascent).toInt()
-                val fittedBase = AodDisplaySettings.fitClockSizeSp(fitCeiling,
-                    availableWidth, availableHeight) { size ->
-                    AodDisplaySettings.scaleClockMeasurement(size, fitCeiling,
-                        IntSize(maximumWidth, maximumHeight))
+        families.forEach { font ->
+            AodDisplaySettings.CLOCK_WEIGHT_VALUES.forEach { weight ->
+                val resource = clockFontResource(font, weight)
+                val bytes = context.resources.openRawResource(resource).use { it.readBytes() }
+                assertEquals("font=$font weight=$weight", weight, sfntWeight(bytes))
+                assertFalse("font=$font weight=$weight retains fvar", "fvar" in sfntTables(bytes))
+                val cmap = sfntCmapCodepoints(bytes)
+                if (font == AodDisplaySettings.CLOCK_FONT_RUBIK && weight in listOf(400, 850)) {
+                    assertTrue("font=$font weight=$weight", cmap.containsAll(expectedCmap))
+                } else {
+                    assertEquals("font=$font weight=$weight", expectedCmap, cmap)
                 }
-                var previous = 0f
-                for (scale in 80..120 step 5) {
-                    val size = AodDisplaySettings.scaledClockSizeSp(fittedBase, scale)
-                    assertTrue("font=$font weight=$weight fontScale=$fontScale scale=$scale", size > previous)
-                    previous = size
-                    paint.textSize = size * fontScale
-                    assertTrue("width font=$font weight=$weight fontScale=$fontScale scale=$scale",
-                        times.all { paint.measureText(it) <= availableWidth })
-                    assertTrue("height font=$font weight=$weight fontScale=$fontScale scale=$scale",
-                        paint.fontMetrics.descent - paint.fontMetrics.ascent <= availableHeight)
+                assertEquals(FontWeight(weight), clockTextStyle(font, weight, baseSize.sp).fontWeight)
+                val typeface = ResourcesCompat.getFont(context, resource)
+                    ?: error("Unable to load clock font $font/$weight at API 23")
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.typeface = typeface }
+                for (fontScale in listOf(1f, 1.3f, 2f)) {
+                    val fitCeiling = baseSize * 1.2f
+                    paint.textSize = fitCeiling * fontScale
+                    val maximumWidth = times.maxOf { ceil(paint.measureText(it)).toInt() }
+                    val metrics = paint.fontMetrics
+                    val maximumHeight = ceil(metrics.descent - metrics.ascent).toInt()
+                    val fittedBase = AodDisplaySettings.fitClockSizeSp(fitCeiling,
+                        availableWidth, availableHeight) { size ->
+                        AodDisplaySettings.scaleClockMeasurement(size, fitCeiling,
+                            IntSize(maximumWidth, maximumHeight))
+                    }
+                    var previous = 0f
+                    for (scale in 80..120 step 5) {
+                        val size = AodDisplaySettings.scaledClockSizeSp(fittedBase, scale)
+                        assertTrue("font=$font weight=$weight fontScale=$fontScale scale=$scale", size > previous)
+                        previous = size
+                        paint.textSize = size * fontScale
+                        assertTrue("width font=$font weight=$weight fontScale=$fontScale scale=$scale",
+                            times.all { paint.measureText(it) <= availableWidth })
+                        assertTrue("height font=$font weight=$weight fontScale=$fontScale scale=$scale",
+                            paint.fontMetrics.descent - paint.fontMetrics.ascent <= availableHeight)
+                    }
                 }
             }
         }
         assertEquals(400, sfntWeight(context.resources.openRawResource(R.font.rubik_regular).use { it.readBytes() }))
         assertEquals(850, sfntWeight(context.resources.openRawResource(R.font.rubik_black).use { it.readBytes() }))
+    }
+
+    @Test
+    fun waveformWeightHasNineIncreasingStepsAndPreservesLegacyAnchors() {
+        var previous = 0f
+        for (weight in 80..120 step 5) {
+            val scale = AodDisplaySettings(waveformWeight = weight).waveformStrokeScale
+            assertTrue("waveformWeight=$weight", scale > previous)
+            previous = scale
+        }
+        assertEquals(0.5f, AodDisplaySettings(waveformWeight = 80).waveformStrokeScale)
+        assertEquals(1f, AodDisplaySettings(waveformWeight = 100).waveformStrokeScale)
+        assertEquals(2f, AodDisplaySettings(waveformWeight = 120).waveformStrokeScale)
+    }
+
+    @Test
+    fun previewKeepsUsableControlsSpaceAsWindowHeightShrinks() {
+        assertEquals(140.dp, aodSettingsPreviewHeight(480.dp))
+        assertEquals(90.dp, aodSettingsPreviewHeight(300.dp))
+        assertEquals(30f, aodSettingsPreviewHeight(100.dp).value, 0.001f)
+        assertEquals(0.dp, aodSettingsPreviewHeight(0.dp))
     }
 
     @Test
@@ -218,22 +274,53 @@ class AodDisplaySettingsTest {
     }
 
     private fun sfntWeight(bytes: ByteArray): Int {
-        val font = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
-        val tableCount = font.getShort(4).toInt() and 0xffff
-        for (index in 0 until tableCount) {
-            val record = 12 + index * 16
-            if (bytes.copyOfRange(record, record + 4).decodeToString() == "OS/2") {
-                val offset = font.getInt(record + 8)
-                return font.getShort(offset + 4).toInt() and 0xffff
-            }
-        }
-        error("Rubik font has no OS/2 table")
+        val offset = sfntTables(bytes)["OS/2"] ?: error("Font has no OS/2 table")
+        return ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).getShort(offset + 4).toInt() and 0xffff
     }
 
-    @Test
-    fun savedWaveformWeightsMapToThinDefaultAndBoldStrokeScales() {
-        assertEquals(0.5f, AodDisplaySettings(waveformWeight = 80).waveformStrokeScale)
-        assertEquals(1f, AodDisplaySettings().waveformStrokeScale)
-        assertEquals(2f, AodDisplaySettings(waveformWeight = 120).waveformStrokeScale)
+    private fun sfntTables(bytes: ByteArray): Map<String, Int> {
+        val font = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+        val tableCount = font.getShort(4).toInt() and 0xffff
+        return (0 until tableCount).associate { index ->
+            val record = 12 + index * 16
+            bytes.copyOfRange(record, record + 4).decodeToString() to font.getInt(record + 8)
+        }
     }
+
+    private fun sfntCmapCodepoints(bytes: ByteArray): Set<Int> {
+        val font = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+        val cmapOffset = sfntTables(bytes)["cmap"] ?: error("Font has no cmap table")
+        val subtableCount = font.getShort(cmapOffset + 2).toInt() and 0xffff
+        val subtableOffsets = (0 until subtableCount).mapNotNull { index ->
+            val record = cmapOffset + 4 + index * 8
+            val offset = cmapOffset + font.getInt(record + 4)
+            if ((font.getShort(offset).toInt() and 0xffff) == 4) offset else null
+        }
+        val subtable = subtableOffsets.firstOrNull() ?: error("Font has no cmap format 4 table")
+        val segmentCount = (font.getShort(subtable + 6).toInt() and 0xffff) / 2
+        val endCodes = subtable + 14
+        val startCodes = endCodes + segmentCount * 2 + 2
+        val deltas = startCodes + segmentCount * 2
+        val rangeOffsets = deltas + segmentCount * 2
+        val codepoints = mutableSetOf<Int>()
+        for (segment in 0 until segmentCount) {
+            val start = font.getShort(startCodes + segment * 2).toInt() and 0xffff
+            val end = font.getShort(endCodes + segment * 2).toInt() and 0xffff
+            val delta = font.getShort(deltas + segment * 2).toInt()
+            val rangeAddress = rangeOffsets + segment * 2
+            val rangeOffset = font.getShort(rangeAddress).toInt() and 0xffff
+            for (codepoint in start..end) {
+                val glyph = if (rangeOffset == 0) {
+                    (codepoint + delta) and 0xffff
+                } else {
+                    val glyphAddress = rangeAddress + rangeOffset + 2 * (codepoint - start)
+                    val glyphIndex = font.getShort(glyphAddress).toInt() and 0xffff
+                    if (glyphIndex == 0) 0 else (glyphIndex + delta) and 0xffff
+                }
+                if (glyph != 0) codepoints.add(codepoint)
+            }
+        }
+        return codepoints
+    }
+
 }

@@ -53,12 +53,12 @@ final class ReceiverUiState {
             session.lossSampler.recordUnknownSourceRange(lossMap.sourceSegmentUnknownStart(),
                     lossMap.sourceSegmentUnknownEnd(), sourceRate);
         AodMetricsSampler.LossWindow sixtySecondLoss =
-                session.lossSampler.recentSourceLossWindow(60_000_000_000L, sourceRate);
+                session.lossSampler.recentKnownSourceLossWindow(60_000_000_000L, sourceRate);
         AodMetricsSampler.LossWindow tenSecondLoss =
-                session.lossSampler.recentSourceLossWindow(10_000_000_000L, sourceRate);
-        Float lossPercent = sixtySecondLoss == null ? null
+                session.lossSampler.recentKnownSourceLossWindow(10_000_000_000L, sourceRate);
+        Float lossPercent = sixtySecondLoss == null || sixtySecondLoss.eligibleFrames <= 0 ? null
                 : 100.0f * sixtySecondLoss.lossFrames / sixtySecondLoss.eligibleFrames;
-        Float lossPercent10s = tenSecondLoss == null ? null
+        Float lossPercent10s = tenSecondLoss == null || tenSecondLoss.eligibleFrames <= 0 ? null
                 : 100.0f * tenSecondLoss.lossFrames / tenSecondLoss.eligibleFrames;
         Float cumulativeLossPercent = session.sourceFrameOutputMap.lossPercent();
         boolean receivedRecently = aodSampler.receivedAudioRecently(now, 2_000_000_000L);
@@ -71,6 +71,7 @@ final class ReceiverUiState {
                 : udp ? AodTelemetrySnapshot.Transport.WIFI_UDP : AodTelemetrySnapshot.Transport.USB_ADB;
         return new AodTelemetrySnapshot(session.id, status, transport, bitsPerSecond, bufferMs,
                 lossPercent, lossPercent10s, cumulativeLossPercent,
+                sixtySecondLoss == null ? -1 : sixtySecondLoss.unknownFrames,
                 metrics.sampleRate, metrics.channels, metrics.underrunCount,
                 session.actualOutputEngine, receivedRecently, now);
     }

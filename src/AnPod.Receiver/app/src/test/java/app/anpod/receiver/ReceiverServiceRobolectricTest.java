@@ -221,6 +221,42 @@ public final class ReceiverServiceRobolectricTest {
         @Override public String lastErrorMessage() { return "fake Oboe error"; }
     }
 
+    private static final class ImmediatePlaybackOutput implements PlaybackOutput {
+        Runnable beforeWrite;
+        @Override public String engine() { return "test"; }
+        @Override public AudioTrack audioTrack() { return null; }
+        @Override public int sampleRate() { return 48_000; }
+        @Override public int channels() { return 2; }
+        @Override public int formatCode() { return 3; }
+        @Override public int capacityFrames() { return 48_000; }
+        @Override public int effectiveBufferFrames() { return 48_000; }
+        @Override public int startThresholdFrames() { return -1; }
+        @Override public int framesPerBurst() { return 0; }
+        @Override public int ringCapacityFrames() { return 0; }
+        @Override public int underrunCount() { return 0; }
+        @Override public int discontinuityCount() { return 0; }
+        @Override public int oboeXrunCount() { return -1; }
+        @Override public long playbackHeadPosition() { return 0; }
+        @Override public long pendingFrames(long acceptedFrames, long playedFrames) { return 0; }
+        @Override public int writePcm16(byte[] data, int offsetBytes, int lengthBytes) {
+            if (beforeWrite != null) beforeWrite.run();
+            return lengthBytes;
+        }
+        @Override public int writeFloatFrames(float[] samples, int offsetFrames, int frameCount,
+                byte[] packedScratch) {
+            if (beforeWrite != null) beforeWrite.run();
+            return frameCount;
+        }
+        @Override public void play() { }
+        @Override public void requestPause() { }
+        @Override public void pauseAndFlush() { }
+        @Override public void setVolume(float volume) { }
+        @Override public int[] info() { return null; }
+        @Override public int[] metrics() { return null; }
+        @Override public long[] timestamp() { return null; }
+        @Override public void close() { }
+    }
+
     @Implements(value = AudioTrack.class)
     public static final class WrongSampleRateShadow extends ShadowAudioTrack {
         @Implementation
@@ -1036,6 +1072,167 @@ public final class ReceiverServiceRobolectricTest {
             OboeNativeBridge.setTestCalls(null);
             ReceiverService.currentAudio = null;
             resetWaveformForTest();
+        }
+    }
+
+    @Test(timeout = 15000)
+    public void floatDriftUnknownKeepsRollingLossValidAndAgesOutThroughAodSnapshot() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        AoaSessionContext context = new AoaSessionContext(851, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(851,
+                ReceiverService.AudioRequest.aoa(context), "float-drift-loss", 1);
+        session.floatQueue = context.floatQueue;
+        ReceiverService.currentAudio = session;
+        ImmediatePlaybackOutput output = new ImmediatePlaybackOutput();
+        try {
+            seedRecentLoss(session.sourceFrameOutputMap);
+            assertTrue(session.sourceFrameOutputMap.rollingComplete());
+            assertEquals(100, session.sourceFrameOutputMap.settledPcDropFrames());
+            AodTelemetrySnapshot initial = service.uiState.aodSnapshot();
+            assertNotNull("the service snapshot should retain seeded recent loss", initial.lossPercent);
+            float priorLoss = initial.lossPercent;
+            assertTrue("the fixture must include retained recent loss", priorLoss > 0f);
+            output.beforeWrite = () -> {
+                AodTelemetrySnapshot beforeWrite = service.uiState.aodSnapshot();
+                assertNotNull("drift must not invalidate the prior rolling window", beforeWrite.lossPercent);
+                assertEquals(priorLoss, beforeWrite.lossPercent, 0.001f);
+            };
+
+            int prefillFrames = context.floatQueue.initialTargetFrames();
+            long sourceIndex = 6_000;
+            for (int remaining = prefillFrames; remaining > 0;) {
+                int packetFrames = Math.min(190, remaining);
+                assertTrue(context.floatQueue.offer(sourceIndex, new float[packetFrames * 2], packetFrames));
+                sourceIndex += packetFrames;
+                remaining -= packetFrames;
+            }
+            float[] samples = new float[44];
+            assertEquals(21, context.floatQueue.readFrames(samples, 0, 21));
+            long driftSourceStart = context.floatQueue.lastReadFrameIndex();
+            int driftSourceFrames = context.floatQueue.lastReadFrames();
+            assertEquals(6_000, driftSourceStart);
+            assertEquals(21, driftSourceFrames);
+            int outputFrames = context.floatQueue.adjustDrift(samples, 21, 22, 1);
+            assertEquals(20, outputFrames);
+            assertTrue(service.writeFloatDriftAdjustedFrames(session, output, context.floatQueue,
+                    samples, outputFrames, null, session.focusState.writeGeneration(), 1));
+            output.beforeWrite = null;
+
+            session.sourceFrameOutputMap.advancePlayed(5_920);
+            settleSourceThrough(session.sourceFrameOutputMap, driftSourceStart + driftSourceFrames);
+            assertTrue("a bounded drift range must not invalidate the whole rolling segment",
+                    session.sourceFrameOutputMap.rollingComplete());
+            AodTelemetrySnapshot duringUnknown = service.uiState.aodSnapshot();
+            assertEquals(priorLoss, duringUnknown.lossPercent, 0.001f);
+            assertEquals(driftSourceFrames, duringUnknown.lossUnknownFrames);
+
+            ageOutDriftUnknown(service, session, output, driftSourceStart + driftSourceFrames, 5_920);
+            AodTelemetrySnapshot agedOut = service.uiState.aodSnapshot();
+            assertEquals(0f, agedOut.lossPercent, 0f);
+            assertEquals(0, agedOut.lossUnknownFrames);
+        } finally {
+            ReceiverService.currentAudio = null;
+            context.destroy();
+            service.onDestroy();
+        }
+    }
+
+    @Test(timeout = 15000)
+    public void pcm16DriftUnknownKeepsRollingLossValidAndAgesOutThroughAodSnapshot() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        byte[] key = new byte[32];
+        AoaSessionContext context = new AoaSessionContext(852, key,
+                UdpPacketDecoder.AudioFormatV2.forProfile(1, 0));
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(852,
+                ReceiverService.AudioRequest.aoa(context), "pcm-drift-loss", 1);
+        session.udpQueue = context.pcmQueue;
+        ReceiverService.currentAudio = session;
+        ImmediatePlaybackOutput output = new ImmediatePlaybackOutput();
+        UdpPacketDecoder decoder = new UdpPacketDecoder(852, key);
+        try {
+            seedRecentLoss(session.sourceFrameOutputMap);
+            assertTrue(session.sourceFrameOutputMap.rollingComplete());
+            assertEquals(100, session.sourceFrameOutputMap.settledPcDropFrames());
+            AodTelemetrySnapshot initial = service.uiState.aodSnapshot();
+            assertNotNull("the service snapshot should retain seeded recent loss", initial.lossPercent);
+            float priorLoss = initial.lossPercent;
+            assertTrue("the fixture must include retained recent loss", priorLoss > 0f);
+            output.beforeWrite = () -> {
+                AodTelemetrySnapshot beforeWrite = service.uiState.aodSnapshot();
+                assertNotNull("drift must not invalidate the prior rolling window", beforeWrite.lossPercent);
+                assertEquals(priorLoss, beforeWrite.lossPercent, 0.001f);
+            };
+
+            context.pcmQueue.acceptAt(new UdpPacketDecoder.Packet(UdpPacketDecoder.AUDIO,
+                    852, 1, 6_000, new byte[20 * 4]), decoder, System.nanoTime());
+            UdpPcmQueue.QueueInputStream sourceRanges =
+                    (UdpPcmQueue.QueueInputStream) context.pcmQueue.asPcmInputStream();
+            byte[] header = new byte[8];
+            assertEquals(8, sourceRanges.read(header, 0, header.length));
+            sourceRanges.beginSourceRangeBatch();
+            com.anpod.server.Pcm16FrameStream pcm = new com.anpod.server.Pcm16FrameStream(2);
+            byte[] buffer = new byte[20 * 4];
+            assertEquals(buffer.length, pcm.readFrames(sourceRanges, buffer, buffer.length));
+            assertTrue(sourceRanges.sourceRangeBatchComplete());
+            assertEquals(1, sourceRanges.sourceRangeCount());
+            assertEquals(6_000, sourceRanges.sourceRangeStart(0));
+            assertEquals(20, sourceRanges.sourceRangeFrames(0));
+            assertTrue(service.writePcmDriftAdjustedFrames(session, output, pcm, buffer, buffer.length,
+                    buffer.length, 4, session.focusState.writeGeneration(), sourceRanges, 1));
+            output.beforeWrite = null;
+            assertTrue(service.writeV2Frames(session, output, new float[2], 1, 1, null,
+                    session.focusState.writeGeneration(), 6_020, false, true));
+
+            session.sourceFrameOutputMap.advancePlayed(5_921);
+            settleSourceThrough(session.sourceFrameOutputMap, 6_021);
+            assertTrue("a bounded drift range must not invalidate the whole rolling segment",
+                    session.sourceFrameOutputMap.rollingComplete());
+            AodTelemetrySnapshot duringUnknown = service.uiState.aodSnapshot();
+            assertEquals(priorLoss, duringUnknown.lossPercent, 0.001f);
+            assertEquals(20, duringUnknown.lossUnknownFrames);
+
+            ageOutDriftUnknown(service, session, output, 6_021, 5_921);
+            AodTelemetrySnapshot agedOut = service.uiState.aodSnapshot();
+            assertEquals(0f, agedOut.lossPercent, 0f);
+            assertEquals(0, agedOut.lossUnknownFrames);
+            sourceRanges.close();
+        } finally {
+            ReceiverService.currentAudio = null;
+            context.destroy();
+            service.onDestroy();
+        }
+    }
+
+    private static void seedRecentLoss(SourceFrameOutputMap map) {
+        map.beginSourceSegment(0);
+        map.recordWrite(0, 1_000, false);
+        map.recordWrite(1_100, 4_900, false);
+        map.advancePlayed(5_900);
+        map.accountSourceGaps(new AnpdLossLedger.Interval[] {
+                new AnpdLossLedger.Interval(1_000, 100)},
+                new com.anpod.server.SourceFrameRanges.Range[0],
+                new com.anpod.server.SourceFrameRanges.Range[0], 6_000, true, true, true);
+    }
+
+    private static void settleSourceThrough(SourceFrameOutputMap map, long settledThrough) {
+        map.accountSourceGaps(new AnpdLossLedger.Interval[0],
+                new com.anpod.server.SourceFrameRanges.Range[0],
+                new com.anpod.server.SourceFrameRanges.Range[0], settledThrough,
+                true, true, true);
+    }
+
+    private static void ageOutDriftUnknown(ReceiverService service, ReceiverService.AudioSession session,
+            PlaybackOutput output, long sourceStart, long outputFramesBeforeAging) throws Exception {
+        int sampleRate = session.request.sourceSampleRate();
+        float[] samples = new float[sampleRate * 2];
+        long generation = session.focusState.writeGeneration();
+        for (int second = 0; second < 60; second++) {
+            assertTrue(service.writeV2Frames(session, output, samples, sampleRate, sampleRate, null,
+                    generation, sourceStart, false, true));
+            sourceStart += sampleRate;
+            session.sourceFrameOutputMap.advancePlayed(outputFramesBeforeAging + (second + 1L) * sampleRate);
+            settleSourceThrough(session.sourceFrameOutputMap, sourceStart);
         }
     }
 
@@ -1989,6 +2186,47 @@ public final class ReceiverServiceRobolectricTest {
         service.noteAoaPlaybackStarted(owner, generation);
         assertEquals(nextDeadline, getInstanceField(service, "aoaRecoveryDeadlineElapsedMs"));
         service.onDestroy();
+    }
+
+    @Test
+    public void healthProviderExportsKnownLossBasisAndUnknownCoverage() {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        AoaSessionContext context = new AoaSessionContext(620, new byte[32],
+                UdpPacketDecoder.AudioFormatV2.forProfile(2, 0));
+        ReceiverService.AudioSession session = new ReceiverService.AudioSession(620,
+                ReceiverService.AudioRequest.aoa(context), "loss-health", 1);
+        ReceiverService.currentAudio = session;
+        try {
+            session.sourceFrameOutputMap.beginSourceSegment(0);
+            session.sourceFrameOutputMap.recordWrite(0, 50, false);
+            session.sourceFrameOutputMap.recordUnknownWrite(50, 10, 10);
+            session.sourceFrameOutputMap.recordWrite(60, 40, false);
+            session.sourceFrameOutputMap.advancePlayed(100);
+            settleSourceThrough(session.sourceFrameOutputMap, 100);
+
+            ReceiverStateProvider provider = new ReceiverStateProvider();
+            android.content.pm.ProviderInfo info = new android.content.pm.ProviderInfo();
+            info.authority = "app.anpod.receiver.state";
+            provider.attachInfo(RuntimeEnvironment.getApplication(), info);
+            try (android.database.Cursor cursor = provider.query(
+                    android.net.Uri.parse("content://app.anpod.receiver.state/health"),
+                    new String[] {"sourceLossBasis", "sourceLossRollingComplete",
+                            "sourceLossWindowComplete60s",
+                            "sourceLossKnownFrames60s", "sourceLossKnownLossFrames60s",
+                            "sourceLossUnknownFrames60s"}, null, null, null)) {
+                assertTrue(cursor.moveToFirst());
+                assertEquals("known_source_frames_excluding_unknown", cursor.getString(0));
+                assertEquals("true", cursor.getString(1));
+                assertEquals("false", cursor.getString(2));
+                assertEquals(90, cursor.getLong(3));
+                assertEquals(0, cursor.getLong(4));
+                assertEquals(10, cursor.getLong(5));
+            }
+        } finally {
+            ReceiverService.currentAudio = null;
+            context.destroy();
+            service.onDestroy();
+        }
     }
 
     @Test

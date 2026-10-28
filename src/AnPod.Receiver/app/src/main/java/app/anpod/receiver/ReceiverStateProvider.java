@@ -46,7 +46,9 @@ public final class ReceiverStateProvider extends ContentProvider {
             "effectiveBufferFrames", "startThresholdFrames", "preRollFrames", "trackPendingFrames", "underrunCount", "underrunIncrement",
             "udpJitterTargetFrames", "udpQueuedFrames", "udpExpiredFrames", "tcpDroppedBacklogFrames", "playbackAdvancing",
             "startedAtElapsedMs", "error", "operationOwnerId", "operationGeneration",
-            "terminalCause", "terminalOwnerId", "terminalGeneration"
+            "terminalCause", "terminalOwnerId", "terminalGeneration", "sourceLossBasis",
+            "sourceLossRollingComplete", "sourceLossWindowComplete60s", "sourceLossKnownFrames60s",
+            "sourceLossKnownLossFrames60s", "sourceLossUnknownFrames60s"
     };
     private final AtomicBoolean bindingWriteInProgress = new AtomicBoolean();
     private final Object bindingStateLock = new Object();
@@ -109,6 +111,11 @@ public final class ReceiverStateProvider extends ContentProvider {
         MatrixCursor result = new MatrixCursor(columns, 1);
         Object[] values = new Object[columns.length];
         PlaybackMetrics metrics = ReceiverService.playbackMetricsSnapshot();
+        ReceiverService.AudioSession lossSession = ReceiverService.currentAudio;
+        if (lossSession != null) ReceiverService.recordSettledLossSnapshot(lossSession);
+        AodMetricsSampler.LossWindow lossWindow = lossSession == null ? null
+                : lossSession.lossSampler.recentKnownSourceLossWindow(60_000_000_000L,
+                        lossSession.request.sourceSampleRate());
         for (int i = 0; i < columns.length; i++) {
             switch (columns[i]) {
                 case "applicationId": values[i] = BuildConfig.APPLICATION_ID; break;
@@ -142,6 +149,18 @@ public final class ReceiverStateProvider extends ContentProvider {
                 case "terminalCause": values[i] = ReceiverService.terminalCause; break;
                 case "terminalOwnerId": values[i] = ReceiverService.terminalOwnerId; break;
                 case "terminalGeneration": values[i] = ReceiverService.terminalGeneration; break;
+                case "sourceLossBasis": values[i] = lossSession == null ? "unavailable"
+                        : "known_source_frames_excluding_unknown"; break;
+                case "sourceLossRollingComplete": values[i] = lossSession == null ? null
+                        : lossSession.sourceFrameOutputMap.rollingComplete(); break;
+                case "sourceLossWindowComplete60s": values[i] = lossWindow != null
+                        && lossWindow.eligibleFrames > 0 && lossWindow.unknownFrames == 0; break;
+                case "sourceLossKnownFrames60s": values[i] = lossWindow == null ? -1
+                        : lossWindow.eligibleFrames; break;
+                case "sourceLossKnownLossFrames60s": values[i] = lossWindow == null ? -1
+                        : lossWindow.lossFrames; break;
+                case "sourceLossUnknownFrames60s": values[i] = lossWindow == null ? -1
+                        : lossWindow.unknownFrames; break;
                 default: throw new IllegalArgumentException("Unsupported receiver status column");
             }
         }

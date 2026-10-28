@@ -14,6 +14,8 @@ final class AodTelemetrySnapshot {
     final Float lossPercent;
     final Float lossPercent10s;
     final Float cumulativeLossPercent;
+    /** Unknown source frames in the 60-second loss window, or -1 when its range is unavailable. */
+    final long lossUnknownFrames;
     final int outputSampleRate;
     final int outputChannels;
     final int underrunCount;
@@ -26,14 +28,14 @@ final class AodTelemetrySnapshot {
             int outputSampleRate, int outputChannels, int underrunCount, String actualOutputEngine,
             boolean receivedAudioRecently, long sampledAtElapsedNanos) {
         this(sessionGeneration, status, transport, recvAudioPayloadBps, receiverBufferMs,
-                lossPercent, null, null, outputSampleRate, outputChannels, underrunCount,
+                lossPercent, null, null, -1, outputSampleRate, outputChannels, underrunCount,
                 actualOutputEngine, receivedAudioRecently, sampledAtElapsedNanos);
     }
 
     AodTelemetrySnapshot(long sessionGeneration, DisplayStatus status, Transport transport,
             Long recvAudioPayloadBps, Float receiverBufferMs, Float lossPercent,
-            Float lossPercent10s, Float cumulativeLossPercent, int outputSampleRate,
-            int outputChannels, int underrunCount, String actualOutputEngine,
+            Float lossPercent10s, Float cumulativeLossPercent, long lossUnknownFrames,
+            int outputSampleRate, int outputChannels, int underrunCount, String actualOutputEngine,
             boolean receivedAudioRecently, long sampledAtElapsedNanos) {
         this.sessionGeneration = sessionGeneration;
         this.status = status;
@@ -43,6 +45,7 @@ final class AodTelemetrySnapshot {
         this.lossPercent = lossPercent;
         this.lossPercent10s = lossPercent10s;
         this.cumulativeLossPercent = cumulativeLossPercent;
+        this.lossUnknownFrames = lossUnknownFrames;
         this.outputSampleRate = outputSampleRate;
         this.outputChannels = outputChannels;
         this.underrunCount = underrunCount;

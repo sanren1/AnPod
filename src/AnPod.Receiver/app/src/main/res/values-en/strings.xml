@@ -138,12 +138,8 @@
     <string name="aod_font_serif">Serif</string>
     <string name="aod_font_monospace">Mono</string>
     <string name="aod_clock_weight">Clock weight</string>
-    <string name="aod_clock_weight_normal">Standard</string>
-    <string name="aod_clock_weight_bold">Bold</string>
     <string name="aod_waveform_weight">Waveform weight</string>
-    <string name="aod_weight_thin">Thin</string>
-    <string name="aod_weight_default">Default</string>
-    <string name="aod_weight_bold">Bold</string>
+    <string name="aod_waveform_weight_value">%1$.2fx</string>
     <string name="aod_detail_metrics">Detailed data</string>
     <string name="aod_metric_protocol">Protocol</string>
     <string name="aod_metric_receive_rate">Receive rate</string>

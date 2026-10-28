@@ -154,7 +154,17 @@ Requirements that still apply to every published package:
 
 ## 6. AOD 字体
 
-The Receiver AOD screen bundles **Rubik** under the SIL Open Font License 1.1.
-Copyright 2015 The Rubik Project Authors (https://github.com/googlefonts/rubik).
-The license text ships as `LICENSES/Rubik-OFL.txt` and inside the APK at
-`assets/licenses/Rubik-OFL.txt`.
+The Receiver AOD screen bundles four font families under the SIL Open Font
+License 1.1:
+
+- **Rubik** — Copyright 2015 The Rubik Project Authors
+  (https://github.com/googlefonts/rubik).
+- **Roboto** — Copyright 2011 The Roboto Project Authors
+  (https://github.com/googlefonts/roboto-classic).
+- **Roboto Serif** — Copyright 2020 The Roboto Serif Project Authors
+  (https://github.com/googlefonts/RobotoSerif).
+- **Noto Sans Mono** — Copyright 2022 The Noto Project Authors
+  (https://github.com/notofonts/latin-greek-cyrillic).
+
+The license texts ship under `LICENSES/` and inside the APK under
+`assets/licenses/`.

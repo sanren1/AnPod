@@ -1,5 +1,111 @@
 use super::*;
 
+#[tokio::test]
+async fn restart_releases_old_cancel_after_join_before_reopen_and_keeps_generation() {
+    let state = AppState::new();
+    let (operation_generation, token) = state.start_preemptible_background_operation().unwrap();
+    let io = Arc::new(());
+    let weak_io = Arc::downgrade(&io);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal: SessionCancelSignal = {
+        let io = io.clone();
+        let cancelled = cancelled.clone();
+        Arc::new(move || {
+            let _ = Arc::strong_count(&io);
+            cancelled.store(true, Ordering::Release);
+        })
+    };
+    let mut signal_during_join = Some(signal.clone());
+    assert!(state.install_session_cancel(0, 11, operation_generation, &token, signal,));
+
+    let reopened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reopened_in_callback = reopened.clone();
+    state
+        .stop_owner_release_cancel_then(
+            11,
+            || {
+                signal_during_join.take().unwrap()();
+                assert!(cancelled.load(Ordering::Acquire));
+                drop(io); // model the owner dropping stream references after its worker joins
+                assert!(
+                    weak_io.upgrade().is_some(),
+                    "cancel signal remains during join"
+                );
+                Ok(())
+            },
+            || async {
+                assert!(
+                    weak_io.upgrade().is_none(),
+                    "reopen runs after old IO drops"
+                );
+                assert!(state.session_generation_is_current(11));
+                reopened_in_callback.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        weak_io.upgrade().is_none(),
+        "old control handle must be dropped before reopen"
+    );
+    assert!(reopened.load(Ordering::Acquire));
+    assert!(state.session_generation_is_current(11));
+
+    assert!(state.install_session_cancel(11, 12, operation_generation, &token, Arc::new(|| {}),));
+    state.clear_session_cancel(11);
+    assert!(state.session_generation_is_current(12));
+    state.release_session_cancel_signal(12);
+    state.clear_session_cancel(12);
+    assert!(!state.session_generation_is_current(12));
+    state.finish_operation(operation_generation);
+
+    let cancelled_state = AppState::new();
+    let (operation_generation, token) = cancelled_state
+        .start_preemptible_background_operation()
+        .unwrap();
+    let io = Arc::new(());
+    let weak_io = Arc::downgrade(&io);
+    let signal: SessionCancelSignal = {
+        let io = io.clone();
+        Arc::new(move || {
+            let _ = Arc::strong_count(&io);
+        })
+    };
+    assert!(cancelled_state.install_session_cancel(0, 31, operation_generation, &token, signal,));
+    let reopened = std::sync::atomic::AtomicBool::new(false);
+    let stop = cancelled_state
+        .stop_owner_release_cancel_then(
+            31,
+            || {
+                cancelled_state.cancel_active_session(true);
+                drop(io);
+                assert!(
+                    weak_io.upgrade().is_some(),
+                    "cancel signal remains during join"
+                );
+                Err("owner stopped by user cancellation".into())
+            },
+            || async {
+                reopened.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+    assert!(stop.is_err());
+    assert!(!reopened.load(Ordering::Acquire));
+    assert!(weak_io.upgrade().is_none());
+    assert!(!cancelled_state.install_session_cancel(
+        31,
+        32,
+        operation_generation,
+        &token,
+        Arc::new(|| {}),
+    ));
+    assert!(!cancelled_state.session_generation_is_current(31));
+    cancelled_state.finish_operation(operation_generation);
+}
+
 #[test]
 fn audio_settings_batch_validates_without_silent_legacy_downgrade() {
     let current = AppSettings::default();

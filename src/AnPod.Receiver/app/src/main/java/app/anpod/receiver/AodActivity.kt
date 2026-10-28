@@ -45,12 +45,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -86,6 +86,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -269,7 +270,7 @@ private fun AodVisualLayout(
             )
 
             val referenceStyle = clockTextStyle(AodDisplaySettings.CLOCK_FONT_RUBIK,
-                AodDisplaySettings.CLOCK_WEIGHT_BOLD, baseClockSize.sp)
+                AodDisplaySettings.CLOCK_WEIGHT_BLACK, baseClockSize.sp)
             val referenceMeasurement = measureClock("04:44", referenceStyle,
                 Density(density.density, fontScale = 1f))
             val clockBottom = AodWaveformGeometry.clockBottom(
@@ -377,86 +378,98 @@ internal fun AodSettingsDialog(
         onDismissRequest = onClose,
         title = { Text(stringResource(R.string.aod_settings)) },
         text = {
-            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                AodSettingsPreview(settings)
-                Text(stringResource(R.string.aod_clock_size), style = MaterialTheme.typography.titleMedium)
-                val clockSizeLabel = stringResource(R.string.aod_clock_size)
-                Slider(value = settings.clockScale.toFloat(), onValueChange = {
-                    onChange(settings.copy(clockScale = it.toInt().coerceIn(80, 120)))
-                }, valueRange = 80f..120f, steps = 7,
-                    modifier = Modifier.semantics { contentDescription = clockSizeLabel })
-                Text(stringResource(R.string.aod_clock_size_value, settings.clockScale))
-                Text(stringResource(R.string.aod_clock_font), style = MaterialTheme.typography.titleMedium)
-                val clockFonts = listOf(
-                    AodDisplaySettings.CLOCK_FONT_RUBIK to R.string.aod_font_rubik,
-                    AodDisplaySettings.CLOCK_FONT_SANS_SERIF to R.string.aod_font_sans_serif,
-                    AodDisplaySettings.CLOCK_FONT_SERIF to R.string.aod_font_serif,
-                    AodDisplaySettings.CLOCK_FONT_MONOSPACE to R.string.aod_font_monospace
-                )
-                clockFonts.chunked(2).forEach { options ->
-                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                        options.forEachIndexed { index, (font, label) ->
-                            SegmentedButton(
-                                selected = settings.clockFont == font,
-                                onClick = { onChange(settings.copy(clockFont = font)) },
-                                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                                modifier = Modifier.heightIn(min = 48.dp)
-                            ) { Text(stringResource(label), maxLines = 1, softWrap = false) }
+            BoxWithConstraints(Modifier.heightIn(max = 480.dp)) {
+                val contentHeight = minOf(maxHeight, 480.dp)
+                Column(Modifier.height(contentHeight)) {
+                    AodSettingsPreview(
+                        settings,
+                        Modifier.height(aodSettingsPreviewHeight(contentHeight))
+                    )
+                    Column(
+                        Modifier.weight(1f).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(stringResource(R.string.aod_clock_size), style = MaterialTheme.typography.titleMedium)
+                        val clockSizeLabel = stringResource(R.string.aod_clock_size)
+                        Slider(value = settings.clockScale.toFloat(), onValueChange = {
+                            onChange(settings.copy(clockScale = it.toInt().coerceIn(80, 120)))
+                        }, valueRange = 80f..120f, steps = 7,
+                            modifier = Modifier.semantics { contentDescription = clockSizeLabel })
+                        Text(stringResource(R.string.aod_clock_size_value, settings.clockScale))
+                        Text(stringResource(R.string.aod_clock_font), style = MaterialTheme.typography.titleMedium)
+                        val clockFonts = listOf(
+                            AodDisplaySettings.CLOCK_FONT_RUBIK to R.string.aod_font_rubik,
+                            AodDisplaySettings.CLOCK_FONT_SANS_SERIF to R.string.aod_font_sans_serif,
+                            AodDisplaySettings.CLOCK_FONT_SERIF to R.string.aod_font_serif,
+                            AodDisplaySettings.CLOCK_FONT_MONOSPACE to R.string.aod_font_monospace
+                        )
+                        var fontMenuExpanded by remember { mutableStateOf(false) }
+                        Column {
+                            OutlinedButton(
+                                onClick = { fontMenuExpanded = true },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) {
+                                Text(stringResource(clockFonts.first { it.first == settings.clockFont }.second))
+                            }
+                            DropdownMenu(
+                                expanded = fontMenuExpanded,
+                                onDismissRequest = { fontMenuExpanded = false }
+                            ) {
+                                clockFonts.forEach { (font, label) ->
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(label)) },
+                                        onClick = {
+                                            onChange(settings.copy(clockFont = font))
+                                            fontMenuExpanded = false
+                                        },
+                                        modifier = Modifier.heightIn(min = 48.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Text(stringResource(R.string.aod_clock_weight), style = MaterialTheme.typography.titleMedium)
+                        val clockWeightLabel = stringResource(R.string.aod_clock_weight)
+                        Slider(
+                            value = settings.clockWeightLevel.toFloat(),
+                            onValueChange = { onChange(settings.copy(clockWeightLevel = it.roundToInt())) },
+                            valueRange = 1f..9f,
+                            steps = 7,
+                            modifier = Modifier.semantics { contentDescription = clockWeightLabel }
+                        )
+                        Text(settings.clockWeight.toString())
+                        Text(stringResource(R.string.aod_waveform_weight), style = MaterialTheme.typography.titleMedium)
+                        val waveformWeightLabel = stringResource(R.string.aod_waveform_weight)
+                        Slider(
+                            value = settings.waveformWeight.toFloat(),
+                            onValueChange = { onChange(settings.copy(waveformWeight = it.roundToInt())) },
+                            valueRange = 80f..120f,
+                            steps = 7,
+                            modifier = Modifier.semantics { contentDescription = waveformWeightLabel }
+                        )
+                        Text(stringResource(R.string.aod_waveform_weight_value, settings.waveformStrokeScale))
+                        Text(stringResource(R.string.aod_detail_metrics), style = MaterialTheme.typography.titleMedium)
+                        AodSettingSwitch(R.string.aod_metric_protocol, settings.showProtocol) {
+                            onChange(settings.copy(showProtocol = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_receive_rate, settings.showReceiveRate) {
+                            onChange(settings.copy(showReceiveRate = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_buffer, settings.showBuffer) {
+                            onChange(settings.copy(showBuffer = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_loss, settings.showLoss) {
+                            onChange(settings.copy(showLoss = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_audio_format, settings.showAudioFormat) {
+                            onChange(settings.copy(showAudioFormat = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_underruns, settings.showUnderruns) {
+                            onChange(settings.copy(showUnderruns = it))
+                        }
+                        AodSettingSwitch(R.string.aod_metric_output_engine, settings.showOutputEngine) {
+                            onChange(settings.copy(showOutputEngine = it))
                         }
                     }
-                }
-                Text(stringResource(R.string.aod_clock_weight), style = MaterialTheme.typography.titleMedium)
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                    listOf(AodDisplaySettings.CLOCK_WEIGHT_NORMAL to R.string.aod_clock_weight_normal,
-                        AodDisplaySettings.CLOCK_WEIGHT_BOLD to R.string.aod_clock_weight_bold)
-                        .forEachIndexed { index, (weight, label) ->
-                            SegmentedButton(
-                                selected = settings.clockWeight == weight,
-                                onClick = { onChange(settings.copy(clockWeight = weight)) },
-                                shape = SegmentedButtonDefaults.itemShape(index, 2),
-                                modifier = Modifier.heightIn(min = 48.dp)
-                            ) { Text(stringResource(label)) }
-                        }
-                }
-                Text(stringResource(R.string.aod_waveform_weight), style = MaterialTheme.typography.titleMedium)
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                    listOf(80, 100, 120).forEachIndexed { index, weight ->
-                        SegmentedButton(
-                            selected = settings.waveformWeight == weight,
-                            onClick = { onChange(settings.copy(waveformWeight = weight)) },
-                            shape = SegmentedButtonDefaults.itemShape(index, 3),
-                            modifier = Modifier.heightIn(min = 48.dp)
-                        ) {
-                            Text(stringResource(when (weight) {
-                                80 -> R.string.aod_weight_thin
-                                120 -> R.string.aod_weight_bold
-                                else -> R.string.aod_weight_default
-                            }))
-                        }
-                    }
-                }
-                Text(stringResource(R.string.aod_detail_metrics), style = MaterialTheme.typography.titleMedium)
-                AodSettingSwitch(R.string.aod_metric_protocol, settings.showProtocol) {
-                    onChange(settings.copy(showProtocol = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_receive_rate, settings.showReceiveRate) {
-                    onChange(settings.copy(showReceiveRate = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_buffer, settings.showBuffer) {
-                    onChange(settings.copy(showBuffer = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_loss, settings.showLoss) {
-                    onChange(settings.copy(showLoss = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_audio_format, settings.showAudioFormat) {
-                    onChange(settings.copy(showAudioFormat = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_underruns, settings.showUnderruns) {
-                    onChange(settings.copy(showUnderruns = it))
-                }
-                AodSettingSwitch(R.string.aod_metric_output_engine, settings.showOutputEngine) {
-                    onChange(settings.copy(showOutputEngine = it))
                 }
             }
         },
@@ -468,8 +481,10 @@ internal fun AodSettingsDialog(
     )
 }
 
+internal fun aodSettingsPreviewHeight(availableHeight: Dp): Dp = minOf(140.dp, availableHeight * 0.30f)
+
 @Composable
-private fun AodSettingsPreview(settings: AodDisplaySettings) {
+private fun AodSettingsPreview(settings: AodDisplaySettings, modifier: Modifier) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
@@ -496,7 +511,7 @@ private fun AodSettingsPreview(settings: AodDisplaySettings) {
         }
         PcmWaveformTap.Waveform(channel, channel.copyOf(), 0L, false)
     }
-    BoxWithConstraints(Modifier.fillMaxWidth().height(140.dp), contentAlignment = Alignment.Center) {
+    BoxWithConstraints(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         val scale = minOf(maxWidth.value / screenWidth, maxHeight.value / screenHeight)
         Box(
             Modifier.requiredSize(screenWidth.dp * scale, screenHeight.dp * scale)
@@ -767,23 +782,47 @@ private fun outputEngineLabel(telemetry: AodTelemetrySnapshot?): String = when (
     else -> "—"
 }
 
-private val RubikClock = FontFamily(
-    Font(R.font.rubik_regular, FontWeight.Normal),
-    Font(R.font.rubik_black, FontWeight.Black)
+internal fun clockFontResource(font: Int, weight: Int): Int {
+    val resources = when (font) {
+        AodDisplaySettings.CLOCK_FONT_SANS_SERIF -> listOf(
+            R.font.sans_w300, R.font.sans_w400, R.font.sans_w450, R.font.sans_w500,
+            R.font.sans_w550, R.font.sans_w600, R.font.sans_w700, R.font.sans_w775, R.font.sans_w850
+        )
+        AodDisplaySettings.CLOCK_FONT_SERIF -> listOf(
+            R.font.serif_w300, R.font.serif_w400, R.font.serif_w450, R.font.serif_w500,
+            R.font.serif_w550, R.font.serif_w600, R.font.serif_w700, R.font.serif_w775, R.font.serif_w850
+        )
+        AodDisplaySettings.CLOCK_FONT_MONOSPACE -> listOf(
+            R.font.mono_w300, R.font.mono_w400, R.font.mono_w450, R.font.mono_w500,
+            R.font.mono_w550, R.font.mono_w600, R.font.mono_w700, R.font.mono_w775, R.font.mono_w850
+        )
+        else -> listOf(
+            R.font.rubik_w300, R.font.rubik_regular, R.font.rubik_w450, R.font.rubik_w500,
+            R.font.rubik_w550, R.font.rubik_w600, R.font.rubik_w700, R.font.rubik_w775, R.font.rubik_black
+        )
+    }
+    return resources[AodDisplaySettings.CLOCK_WEIGHT_VALUES.indexOf(weight)]
+}
+
+private fun clockFontFamily(font: Int) = FontFamily(
+    *AodDisplaySettings.CLOCK_WEIGHT_VALUES.map { weight ->
+        Font(clockFontResource(font, weight), FontWeight(weight))
+    }.toTypedArray()
 )
+
+private val RubikClock = clockFontFamily(AodDisplaySettings.CLOCK_FONT_RUBIK)
+private val SansClock = clockFontFamily(AodDisplaySettings.CLOCK_FONT_SANS_SERIF)
+private val SerifClock = clockFontFamily(AodDisplaySettings.CLOCK_FONT_SERIF)
+private val MonospaceClock = clockFontFamily(AodDisplaySettings.CLOCK_FONT_MONOSPACE)
 
 internal fun clockTextStyle(font: Int, weight: Int, size: androidx.compose.ui.unit.TextUnit) = TextStyle(
     fontFamily = when (font) {
-        AodDisplaySettings.CLOCK_FONT_SANS_SERIF -> FontFamily.SansSerif
-        AodDisplaySettings.CLOCK_FONT_SERIF -> FontFamily.Serif
-        AodDisplaySettings.CLOCK_FONT_MONOSPACE -> FontFamily.Monospace
+        AodDisplaySettings.CLOCK_FONT_SANS_SERIF -> SansClock
+        AodDisplaySettings.CLOCK_FONT_SERIF -> SerifClock
+        AodDisplaySettings.CLOCK_FONT_MONOSPACE -> MonospaceClock
         else -> RubikClock
     },
-    fontWeight = when {
-        font == AodDisplaySettings.CLOCK_FONT_RUBIK && weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD -> FontWeight.Black
-        weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD -> FontWeight.Bold
-        else -> FontWeight.Normal
-    },
+    fontWeight = FontWeight(weight),
     fontSize = size,
     letterSpacing = if (font == AodDisplaySettings.CLOCK_FONT_RUBIK) (-5).sp else 0.sp
 )

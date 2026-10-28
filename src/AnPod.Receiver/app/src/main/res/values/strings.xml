@@ -138,12 +138,8 @@
     <string name="aod_font_serif">衬线</string>
     <string name="aod_font_monospace">等宽</string>
     <string name="aod_clock_weight">时钟粗细</string>
-    <string name="aod_clock_weight_normal">标准</string>
-    <string name="aod_clock_weight_bold">加粗</string>
     <string name="aod_waveform_weight">波形粗细</string>
-    <string name="aod_weight_thin">细</string>
-    <string name="aod_weight_default">默认</string>
-    <string name="aod_weight_bold">粗</string>
+    <string name="aod_waveform_weight_value">%1$.2f×</string>
     <string name="aod_detail_metrics">详细数据</string>
     <string name="aod_metric_protocol">协议</string>
     <string name="aod_metric_receive_rate">接收速率</string>

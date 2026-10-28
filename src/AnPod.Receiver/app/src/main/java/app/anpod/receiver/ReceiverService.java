@@ -2717,11 +2717,8 @@ public final class ReceiverService extends Service {
                     outputFrames = queue.adjustDrift(samples, count, chunkFrames + 1, adjustment);
                     drift.commit(adjustment);
                 }
-                boolean sourceMappingValid = adjustment == 0 && outputFrames == count
-                        && queue.lastReadFrames() == count;
-                if (!sourceMappingValid) session.sourceFrameOutputMap.markIncomplete();
-                writeV2Frames(session, output, samples, outputFrames, queue.lastReadFrames(), packed,
-                        blockGeneration, queue.lastReadFrameIndex(), queue.lastReadSynthetic(), sourceMappingValid);
+                writeFloatDriftAdjustedFrames(session, output, queue, samples, outputFrames, packed,
+                        blockGeneration, adjustment);
                 observedDriftResetGeneration = session.driftResetGeneration;
                 observedConcealedFrames = concealedFrames;
                 observedDroppedFrames = droppedFrames;
@@ -3579,14 +3576,8 @@ public final class ReceiverService extends Service {
                     }
                     if (resumeAfterSynthetic) driftNeedsRealAudio = false;
                     session.driftLastOutputDiscontinuities = underruns;
-                    boolean sourceMappingValid = udpPcmInput != null && outputBytes == count
-                            && sourceReadAdjustmentFrames == 0
-                            && udpPcmInput.sourceRangeBatchComplete()
-                            && udpPcmInput.sourceRangeFramesTotal() == count / frameBytes;
-                    if (!sourceMappingValid && udpPcmInput != null)
-                        session.sourceFrameOutputMap.markIncomplete();
-                    writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, blockGeneration,
-                            udpPcmInput, sourceMappingValid);
+                    writePcmDriftAdjustedFrames(session, output, pcm, buffer, count, outputBytes,
+                            frameBytes, blockGeneration, udpPcmInput, sourceReadAdjustmentFrames);
                     if (trackUnderruns >= 0) {
                         int reportedUnderruns = output.underrunCount();
                         if (udpQueue != null) udpQueue.reportTrackUnderruns(reportedUnderruns);
@@ -3713,6 +3704,25 @@ public final class ReceiverService extends Service {
         }, buffer, count);
         if (count % frameBytes != 0) throw new IOException("PCM frame alignment failed");
         return completed[0] && session.focusState.acceptsWrite(writeGeneration);
+    }
+
+    boolean writeFloatDriftAdjustedFrames(AudioSession session, PlaybackOutput output,
+            FloatPcmFrameQueue queue, float[] samples, int outputFrames, byte[] packed,
+            long generation, int adjustment) throws IOException {
+        int sourceFrames = queue.lastReadFrames();
+        boolean sourceMappingValid = adjustment == 0 && outputFrames == sourceFrames;
+        return writeV2Frames(session, output, samples, outputFrames, sourceFrames, packed, generation,
+                queue.lastReadFrameIndex(), queue.lastReadSynthetic(), sourceMappingValid);
+    }
+
+    boolean writePcmDriftAdjustedFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
+            byte[] buffer, int count, int outputBytes, int frameBytes, long generation,
+            UdpPcmQueue.QueueInputStream sourceRanges, int sourceReadAdjustmentFrames) throws IOException {
+        boolean sourceMappingValid = sourceRanges != null && outputBytes == count
+                && sourceReadAdjustmentFrames == 0 && sourceRanges.sourceRangeBatchComplete()
+                && sourceRanges.sourceRangeFramesTotal() == count / frameBytes;
+        return writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, generation,
+                sourceRanges, sourceMappingValid);
     }
 
     private void handleAudioFocusChange(AudioSession session, PlaybackOutput output, int change) {
@@ -4333,7 +4343,7 @@ public final class ReceiverService extends Service {
         }
     }
 
-    private static void recordSettledLossSnapshot(AudioSession session) {
+    static void recordSettledLossSnapshot(AudioSession session) {
         accountSettledPcDropGaps(session);
         SourceFrameOutputMap map = session.sourceFrameOutputMap;
         if (!map.hasCurrentSegmentSettlement()) return;

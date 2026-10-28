@@ -59,6 +59,70 @@ public final class AodMetricsSamplerTest {
         assertEquals(10, window.lossFrames);
         assertEquals(10_000, window.eligibleFrames);
     }
+
+    @Test
+    public void knownLossWindowExcludesUnknownUnionAndLossOverlap() {
+        AodMetricsSampler sampler = new AodMetricsSampler();
+        com.anpod.server.SourceFrameRanges.Range[] loss = {
+                new com.anpod.server.SourceFrameRanges.Range(10, 20)};
+        com.anpod.server.SourceFrameRanges.Range[] unknown = {
+                new com.anpod.server.SourceFrameRanges.Range(20, 10)};
+        sampler.recordSourceLossSnapshot(1, 0, 0, 60, 1, loss, true, unknown);
+        sampler.recordUnknownSourceRange(25, 35, 1);
+
+        assertNull(sampler.recentSourceLossWindow(60_000_000_000L, 1));
+        AodMetricsSampler.LossWindow partial = sampler.recentKnownSourceLossWindow(60_000_000_000L, 1);
+        assertEquals(10, partial.lossFrames);
+        assertEquals(45, partial.eligibleFrames);
+        assertEquals(15, partial.unknownFrames);
+
+        sampler.recordSourceLossSnapshot(1, 0, 0, 80, 1, loss, true, unknown);
+        AodMetricsSampler.LossWindow aged = sampler.recentKnownSourceLossWindow(60_000_000_000L, 1);
+        assertEquals(0, aged.lossFrames);
+        assertEquals(45, aged.eligibleFrames);
+        assertEquals(15, aged.unknownFrames);
+
+        sampler.recordSourceLossSnapshot(1, 0, 0, 95, 1, loss, true, unknown);
+        AodMetricsSampler.LossWindow expired = sampler.recentKnownSourceLossWindow(60_000_000_000L, 1);
+        assertEquals(0, expired.lossFrames);
+        assertEquals(60, expired.eligibleFrames);
+        assertEquals(0, expired.unknownFrames);
+    }
+
+    @Test
+    public void allUnknownAndUnknownRangeOverflowRemainUnavailable() {
+        AodMetricsSampler fullUnknown = new AodMetricsSampler();
+        com.anpod.server.SourceFrameRanges.Range[] none = new com.anpod.server.SourceFrameRanges.Range[0];
+        com.anpod.server.SourceFrameRanges.Range[] all = {
+                new com.anpod.server.SourceFrameRanges.Range(0, 60)};
+        fullUnknown.recordSourceLossSnapshot(1, 0, 0, 60, 1, none, true, all);
+        assertNull(fullUnknown.recentSourceLossWindow(60_000_000_000L, 1));
+        AodMetricsSampler.LossWindow noKnownFrames =
+                fullUnknown.recentKnownSourceLossWindow(60_000_000_000L, 1);
+        assertEquals(0, noKnownFrames.eligibleFrames);
+        assertEquals(60, noKnownFrames.unknownFrames);
+
+        AodMetricsSampler invalidSegment = new AodMetricsSampler();
+        invalidSegment.recordSourceLossSnapshot(3, 0, 0, 30, 1, none, true,
+                new com.anpod.server.SourceFrameRanges.Range[] {
+                        new com.anpod.server.SourceFrameRanges.Range(20, 10)});
+        invalidSegment.recordSourceLossSnapshot(3, 0, 0, 40, 1,
+                new com.anpod.server.SourceFrameRanges.Range[] {
+                        new com.anpod.server.SourceFrameRanges.Range(10, 2)}, false,
+                new com.anpod.server.SourceFrameRanges.Range[] {
+                        new com.anpod.server.SourceFrameRanges.Range(20, 10)});
+        AodMetricsSampler.LossWindow invalidWindow =
+                invalidSegment.recentKnownSourceLossWindow(60_000_000_000L, 1);
+        assertEquals(0, invalidWindow.eligibleFrames);
+        assertEquals(40, invalidWindow.unknownFrames);
+
+        AodMetricsSampler overflow = new AodMetricsSampler();
+        overflow.recordSourceLossSnapshot(2, 0, 0, 200, 1_000, none, true);
+        for (int range = 0; range < 65; range++)
+            overflow.recordUnknownSourceRange(range * 2L, range * 2L + 1, 1_000);
+        assertNull(overflow.recentKnownSourceLossWindow(60_000_000_000L, 1_000));
+    }
+
     @Test
     public void rateNeedsAFullWindow() {
         AodMetricsSampler sampler = new AodMetricsSampler();

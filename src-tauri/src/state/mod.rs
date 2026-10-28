@@ -987,13 +987,40 @@ impl AppState {
             .is_some_and(|(current, _)| *current == generation);
         if matches {
             slot.take();
-            let _ = self.current_session_generation.compare_exchange(
-                generation,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
         }
+        let _ = self.current_session_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn release_session_cancel_signal(&self, generation: u64) {
+        let mut slot = self.session_cancel.lock().expect("session cancel lock");
+        if slot
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            slot.take();
+        }
+    }
+
+    async fn stop_owner_release_cancel_then<T, Stop, Reopen, Open>(
+        &self,
+        generation: u64,
+        stop_and_join: Stop,
+        reopen: Reopen,
+    ) -> Result<T, String>
+    where
+        Stop: FnOnce() -> Result<(), String>,
+        Reopen: FnOnce() -> Open,
+        Open: std::future::Future<Output = Result<T, String>>,
+    {
+        let result = stop_and_join();
+        self.release_session_cancel_signal(generation);
+        result?;
+        reopen().await
     }
 
     fn clear_invalidated_session_cancel(&self) {
@@ -2471,25 +2498,20 @@ impl AppState {
             .as_mut()
             .filter(|session| session.aoa_owner.is_some())
             .ok_or_else(|| "USB Direct 会话已结束。".to_string())?;
+        let previous_generation = active.generation;
         let old_owner = active.aoa_owner.take().expect("AOA session owner");
-        if let Err(error) = old_owner.stop_for_restart() {
-            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
-            drop(session);
-            self.emit(app);
-            return Err(detail);
-        }
-        if let Err(error) = self
-            .audio
-            .stop_pcm_sink()
-            .and_then(|()| self.audio.restore_muted())
-        {
-            let detail = self.clear_aoa_session_after_restart_failure(&mut session, error);
-            drop(session);
-            self.emit(app);
-            return Err(detail);
-        }
         let (owner, queue, mix_format) = match self
-            .create_aoa_owner(target_id, binding_reference, format, token)
+            .stop_owner_release_cancel_then(
+                previous_generation,
+                || old_owner.stop_for_restart(),
+                || async {
+                    self.audio
+                        .stop_pcm_sink()
+                        .and_then(|()| self.audio.restore_muted())?;
+                    self.create_aoa_owner(target_id, binding_reference, format, token)
+                        .await
+                },
+            )
             .await
         {
             Ok(connection) => connection,
@@ -2532,7 +2554,6 @@ impl AppState {
             self.emit(app);
             return Err(detail);
         }
-        let previous_generation = active.generation;
         active.generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
         let cancel_signal = owner.cancel_signal();
         active.aoa_owner = Some(owner);
@@ -3482,7 +3503,13 @@ impl AppState {
         if let Some(owner) = session.as_mut().and_then(|active| active.aoa_owner.take()) {
             // The owner already recorded TransportFailure; joining it must not
             // turn that original link failure into a new cleanup failure.
-            let _ = owner.stop();
+            let _ = self
+                .stop_owner_release_cancel_then(
+                    session_generation,
+                    || owner.stop(),
+                    || async { Ok(()) },
+                )
+                .await;
         }
         let cleanup_result = self
             .audio

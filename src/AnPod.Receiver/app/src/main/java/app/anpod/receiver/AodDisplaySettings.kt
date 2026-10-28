@@ -2,6 +2,7 @@ package app.anpod.receiver
 
 import android.content.SharedPreferences
 import androidx.compose.ui.unit.IntSize
+import kotlin.math.pow
 
 internal data class AodDisplaySettings(
     val clockScale: Int = DEFAULT_CLOCK_SCALE,
@@ -14,18 +15,18 @@ internal data class AodDisplaySettings(
     val showUnderruns: Boolean = false,
     val showOutputEngine: Boolean = false,
     val clockFont: Int = CLOCK_FONT_RUBIK,
-    val clockWeight: Int = CLOCK_WEIGHT_BOLD
+    val clockWeightLevel: Int = DEFAULT_CLOCK_WEIGHT_LEVEL
 ) {
+    val clockWeight: Int
+        get() = CLOCK_WEIGHT_VALUES[clockWeightLevel - 1]
+
     val waveformStrokeScale: Float
-        get() = when (waveformWeight) {
-            80 -> 0.5f
-            120 -> 2f
-            else -> 1f
-        }
+        get() = 2.0.pow((waveformWeight - 100) / 20.0).toFloat()
 
     companion object {
         const val DEFAULT_CLOCK_SCALE = 100
         const val DEFAULT_WAVEFORM_WEIGHT = 100
+        const val DEFAULT_CLOCK_WEIGHT_LEVEL = 9
         private const val KEY_CLOCK_SCALE = "aod_clock_scale"
         private const val KEY_WAVEFORM_WEIGHT = "aod_waveform_weight"
         private const val KEY_PROTOCOL = "aod_show_protocol"
@@ -37,6 +38,7 @@ internal data class AodDisplaySettings(
         private const val KEY_OUTPUT_ENGINE = "aod_show_output_engine"
         private const val KEY_CLOCK_FONT = "aod_clock_font"
         private const val KEY_CLOCK_WEIGHT = "aod_clock_weight"
+        private const val KEY_CLOCK_WEIGHT_LEVEL = "aod_clock_weight_level"
 
         const val CLOCK_FONT_RUBIK = 0
         const val CLOCK_FONT_SANS_SERIF = 1
@@ -44,6 +46,15 @@ internal data class AodDisplaySettings(
         const val CLOCK_FONT_MONOSPACE = 3
         const val CLOCK_WEIGHT_NORMAL = 400
         const val CLOCK_WEIGHT_BOLD = 700
+        const val CLOCK_WEIGHT_BLACK = 850
+        val CLOCK_WEIGHT_VALUES = listOf(300, 400, 450, 500, 550, 600, 700, 775, 850)
+
+        fun legacyClockWeightLevel(weight: Int, font: Int): Int = when {
+            weight == CLOCK_WEIGHT_NORMAL -> 2
+            weight == CLOCK_WEIGHT_BOLD && font == CLOCK_FONT_RUBIK -> DEFAULT_CLOCK_WEIGHT_LEVEL
+            weight == CLOCK_WEIGHT_BOLD -> 7
+            else -> error("Unsupported legacy AOD clock weight: $weight")
+        }
 
         fun fitClockSizeSp(
             requestedSizeSp: Float,
@@ -80,19 +91,30 @@ internal data class AodDisplaySettings(
         fun scaledClockSizeSp(maximumSizeSp: Float, clockScale: Int): Float =
             maximumSizeSp * clockScale.coerceIn(80, 120) / 120f
 
-        fun read(preferences: SharedPreferences) = AodDisplaySettings(
-            clockScale = preferences.getInt(KEY_CLOCK_SCALE, DEFAULT_CLOCK_SCALE),
-            waveformWeight = preferences.getInt(KEY_WAVEFORM_WEIGHT, DEFAULT_WAVEFORM_WEIGHT),
-            showProtocol = preferences.getBoolean(KEY_PROTOCOL, true),
-            showReceiveRate = preferences.getBoolean(KEY_RECEIVE_RATE, true),
-            showBuffer = preferences.getBoolean(KEY_BUFFER, true),
-            showLoss = preferences.getBoolean(KEY_LOSS, true),
-            showAudioFormat = preferences.getBoolean(KEY_AUDIO_FORMAT, false),
-            showUnderruns = preferences.getBoolean(KEY_UNDERRUNS, false),
-            showOutputEngine = preferences.getBoolean(KEY_OUTPUT_ENGINE, false),
-            clockFont = preferences.getInt(KEY_CLOCK_FONT, CLOCK_FONT_RUBIK),
-            clockWeight = preferences.getInt(KEY_CLOCK_WEIGHT, CLOCK_WEIGHT_BOLD)
-        )
+        fun read(preferences: SharedPreferences): AodDisplaySettings {
+            val font = preferences.getInt(KEY_CLOCK_FONT, CLOCK_FONT_RUBIK)
+            val level = if (preferences.contains(KEY_CLOCK_WEIGHT_LEVEL)) {
+                preferences.getInt(KEY_CLOCK_WEIGHT_LEVEL, DEFAULT_CLOCK_WEIGHT_LEVEL)
+            } else {
+                legacyClockWeightLevel(
+                    preferences.getInt(KEY_CLOCK_WEIGHT, CLOCK_WEIGHT_BOLD),
+                    font
+                )
+            }
+            return AodDisplaySettings(
+                clockScale = preferences.getInt(KEY_CLOCK_SCALE, DEFAULT_CLOCK_SCALE),
+                waveformWeight = preferences.getInt(KEY_WAVEFORM_WEIGHT, DEFAULT_WAVEFORM_WEIGHT),
+                showProtocol = preferences.getBoolean(KEY_PROTOCOL, true),
+                showReceiveRate = preferences.getBoolean(KEY_RECEIVE_RATE, true),
+                showBuffer = preferences.getBoolean(KEY_BUFFER, true),
+                showLoss = preferences.getBoolean(KEY_LOSS, true),
+                showAudioFormat = preferences.getBoolean(KEY_AUDIO_FORMAT, false),
+                showUnderruns = preferences.getBoolean(KEY_UNDERRUNS, false),
+                showOutputEngine = preferences.getBoolean(KEY_OUTPUT_ENGINE, false),
+                clockFont = font,
+                clockWeightLevel = level
+            )
+        }
     }
 
     fun save(preferences: SharedPreferences) {
@@ -107,7 +129,7 @@ internal data class AodDisplaySettings(
             .putBoolean(KEY_UNDERRUNS, showUnderruns)
             .putBoolean(KEY_OUTPUT_ENGINE, showOutputEngine)
             .putInt(KEY_CLOCK_FONT, clockFont)
-            .putInt(KEY_CLOCK_WEIGHT, clockWeight)
+            .putInt(KEY_CLOCK_WEIGHT_LEVEL, clockWeightLevel)
             .apply()
     }
 }
