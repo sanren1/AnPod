@@ -106,7 +106,7 @@ internal fun primaryActionFor(
     connectionPending: Boolean = false,
     backgroundStandbyEnabled: Boolean = false
 ): PrimaryAction = when {
-    operationStopping -> PrimaryAction.DISABLED
+    operationStopping -> PrimaryAction.STOP_RECEIVER
     receiverActive -> PrimaryAction.STOP_RECEIVER
     backgroundStandbyEnabled -> PrimaryAction.STOP_BACKGROUND_STANDBY
     usbPermissionPending -> PrimaryAction.CANCEL_USB_PERMISSION
@@ -135,7 +135,9 @@ open class MainActivity : ComponentActivity() {
         val backgroundStandby: Boolean,
         val recoveryBindingCommitment: String? = null,
         val recoveryOperationId: String? = null,
-        val operationId: String? = null
+        val operationId: String? = null,
+        val operationGeneration: Long? = null,
+        val requestId: String? = null
     )
     private var pendingConnection by mutableStateOf<PendingConnection?>(null)
     private var aodEnabled by mutableStateOf(false)
@@ -353,8 +355,11 @@ open class MainActivity : ComponentActivity() {
                     onRevokeBackgroundTrust = { target, grantKind -> revokeBackgroundTrust(target, grantKind) },
                     onStop = {
                         val current = snapshot
+                        val hadPendingStart = pendingConnection != null
                         cancelPendingConnection()
-                        if (current != null) receiver?.stop(current.operationId)
+                        if (!hadPendingStart && current != null &&
+                            receiver?.stop(current.operationId, current.operationGeneration) != true)
+                            localMessage = getString(R.string.receiver_operation_changed_retry)
                     },
                     aodEnabled = aodEnabled,
                     aodDisplaySettings = aodDisplaySettings,
@@ -595,13 +600,15 @@ open class MainActivity : ComponentActivity() {
         }
         if (pendingUsbPermission != null) cancelUsbPermission()
         localMessage = ""
+        val requestId = UUID.randomUUID().toString()
+        pendingConnection = pending.copy(requestId = requestId)
         localMessage = if (pending.backgroundStandby && pending.recoveryBindingCommitment != null
             && pending.recoveryOperationId != null)
-            service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString(),
+            service.startBackgroundStandby(selectedAddress, selectedPrefix, requestId,
                 pending.recoveryBindingCommitment, pending.recoveryOperationId)
         else if (pending.backgroundStandby)
-            service.startBackgroundStandby(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
-        else service.startReceiving(selectedAddress, selectedPrefix, UUID.randomUUID().toString())
+            service.startBackgroundStandby(selectedAddress, selectedPrefix, requestId)
+        else service.startReceiving(selectedAddress, selectedPrefix, requestId)
         if (localMessage.isNotEmpty()) pendingConnection = null
         refresh()
     }
@@ -610,12 +617,6 @@ open class MainActivity : ComponentActivity() {
         var pending = pendingConnection ?: return
         if (!activityStarted || pending.generation != discoveryGeneration.get()) { pendingConnection = null; return }
         if (current == null) { pendingConnection = null; return }
-        if (pending.operationId == null && current.operationId.isNotEmpty() && current.operationId != pending.previousOperationId) {
-            pending = pending.copy(operationId = current.operationId)
-            pendingConnection = pending
-        }
-        val targetOperationId = pending.operationId ?: return
-        if (current.operationId != targetOperationId) { pendingConnection = null; return }
         if (current.backgroundStandbyEnabled != pending.backgroundStandby) { pendingConnection = null; return }
         if (current.serviceState == "prepared" && current.operationState == "running" && current.networkPort > 0) {
             pendingConnection = null
@@ -626,6 +627,17 @@ open class MainActivity : ComponentActivity() {
     }
 
     private fun cancelPendingConnection() {
+        val pending = pendingConnection
+        if (pending != null) {
+            val service = receiver
+            val stopped = when {
+                pending.requestId == null -> true
+                service == null -> false
+                else -> service.cancelStartRequest(pending.requestId)
+            }
+            if (!stopped) localMessage = getString(if (service == null)
+                R.string.receiver_service_not_ready_retry else R.string.receiver_operation_changed_retry)
+        }
         pendingConnection = null
         discoveryGeneration.incrementAndGet()
     }

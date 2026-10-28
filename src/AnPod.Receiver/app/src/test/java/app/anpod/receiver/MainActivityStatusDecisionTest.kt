@@ -116,7 +116,7 @@ class MainActivityStatusDecisionTest {
             primaryActionFor(ConnectionChoice.USB_ADB, receiverActive = true))
         assertEquals(PrimaryAction.STOP_BACKGROUND_STANDBY,
             primaryActionFor(ConnectionChoice.WIFI, backgroundStandbyEnabled = true))
-        assertEquals(PrimaryAction.DISABLED,
+        assertEquals(PrimaryAction.STOP_RECEIVER,
             primaryActionFor(ConnectionChoice.WIFI, operationStopping = true))
     }
 

@@ -445,9 +445,21 @@ final class P5cReceiverCoordinator implements AutoCloseable {
         // Defer service teardown only while an authenticated host can receive the
         // terminal ACK. A listening or not-yet-negotiated owner must clean up locally.
         if (shutdownRequested || finished.getCount() == 0 || authenticatedSocket == null
-                || !terminalCauseNegotiated) return false;
+                || !terminalCauseNegotiated || userStopRequested) return false;
         userStopRequested = true;
         return true;
+    }
+
+    void signalCancel() {
+        shutdownRequested = true;
+        try { listener.close(); } catch (IOException ignored) { }
+        Socket authenticated = authenticatedSocket;
+        if (authenticated != null) try { authenticated.close(); } catch (IOException ignored) { }
+        Socket[] pending;
+        synchronized (this) { pending = preAuthSockets.keySet().toArray(new Socket[0]); }
+        for (Socket socket : pending) try { socket.close(); } catch (IOException ignored) { }
+        Thread thread = worker;
+        if (thread != null && thread != Thread.currentThread()) thread.interrupt();
     }
 
     private void serve() {

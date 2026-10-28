@@ -142,6 +142,9 @@ public final class ReceiverService extends Service {
     private final AtomicLong networkBootstrapGeneration = new AtomicLong();
     final ReceiverUiOperation uiOperation = new ReceiverUiOperation();
     private String pendingUiStartRequestId = "";
+    private String uiStartRequestId = "";
+    private String uiStartOwnerId = "";
+    private long uiStartGeneration = -1L;
     private String pendingAoaRequestId = "";
     private UsbAccessory pendingAoaAccessory;
     private boolean pendingUiStandbyStart;
@@ -152,6 +155,7 @@ public final class ReceiverService extends Service {
     long currentOperationGeneration;
     private boolean cleanupCoordinatorClosed;
     private boolean cleanupFailed;
+    private boolean cleanupOwnerRetained;
     private String cleanupError = "";
     private int latestDeliveredStartId;
     volatile AoaReceiverCoordinator aoaCoordinator;
@@ -380,7 +384,10 @@ public final class ReceiverService extends Service {
             ownerId = uiOperation.ownerId();
             generation = currentOperationGeneration;
         } else {
-            if (!uiOperation.canBegin()) return START_NOT_STICKY;
+            if (!uiOperation.canBegin() || cleanupOwnerRetained) {
+                stopRejectedStartIfIdle();
+                return START_NOT_STICKY;
+            }
             ownerId = UUID.randomUUID().toString();
             if (!uiOperation.begin(ownerId)) return START_NOT_STICKY;
             generation = networkBootstrapGeneration.incrementAndGet();
@@ -642,6 +649,11 @@ public final class ReceiverService extends Service {
         String failure = coordinator.failureMessage();
         handler.post(() -> {
             if (adbStreamCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            if (coordinator.retainsTransportOwner()) {
+                requestTermination(ownerId, generation, true,
+                        failure.isEmpty() ? "ADB transport owner close failed" : failure);
+                return;
+            }
             adbStreamCoordinator = null;
             requestTermination(ownerId, generation, !failure.isEmpty(), failure);
         });
@@ -653,6 +665,11 @@ public final class ReceiverService extends Service {
         String failure = coordinator.failureMessage();
         handler.post(() -> {
             if (aoaCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
+            if (coordinator.retainsTransportOwner()) {
+                requestTermination(ownerId, generation, true,
+                        failure.isEmpty() ? "USB accessory owner close failed" : failure);
+                return;
+            }
             boolean restartRequested = failure.isEmpty() && coordinator.restartRequested();
             boolean unexpectedFailure = coordinator.shouldRecoverUnexpectedFailure();
             if ((restartRequested || unexpectedFailure) && aoaAccessory != null) {
@@ -935,7 +952,8 @@ public final class ReceiverService extends Service {
         if (keepReceiveIntent && !applicationIsVisible()) return "请在 AnPod 界面中点击“连接电脑”。";
         if (backgroundStandby && !applicationIsVisible()) return "请在 Receiver 前台界面中启用后台待机。";
         if (keepReceiveIntent && !notificationPermissionAvailable()) return "请先允许 AnPod 通知，再连接电脑。";
-        if (!uiOperation.canBegin() || currentAudio != null || networkCoordinator != null) return "已有接收会话正在运行。";
+        if (!uiOperation.canBegin() || currentAudio != null || networkCoordinator != null
+                || cleanupOwnerRetained) return "已有接收会话正在运行或清理尚未完成。";
         try {
             BindingStore.Status binding = new BindingStore(getFilesDir()).status();
             if (!"saved".equals(binding.state)) throw new IOException("请先通过 USB 完成电脑绑定。");
@@ -963,6 +981,9 @@ public final class ReceiverService extends Service {
                     backgroundStandbyEnabled = backgroundStandby;
                     receiveIntentEnabled = keepReceiveIntent || backgroundStandby;
                     pendingUiStartRequestId = requestId;
+                    uiStartRequestId = requestId;
+                    uiStartOwnerId = ownerId;
+                    uiStartGeneration = generation;
                     pendingUiStandbyStart = backgroundStandby;
                     pendingUiReceiveIntent = keepReceiveIntent || backgroundStandby;
                     networkAudioState = "starting";
@@ -1059,17 +1080,74 @@ public final class ReceiverService extends Service {
     }
 
     boolean stopFromUi(String ownerId) {
+        if (isPendingCleanup(ownerId, currentOperationGeneration))
+            return signalStoppingCleanup(ownerId, currentOperationGeneration);
         if (!uiOperation.owns(ownerId) || !(ReceiverUiOperation.STARTING.equals(uiOperation.phase())
                 || ReceiverUiOperation.RUNNING.equals(uiOperation.phase()))) return false;
         recordManualStop(ownerId, currentOperationGeneration);
-        requestTermination(ownerId, currentOperationGeneration, false, "");
+        requestUserStopOrCancelRecovery(ownerId, currentOperationGeneration);
         return true;
     }
 
     boolean stopFromUi(String ownerId, long generation) {
+        if (isPendingCleanup(ownerId, generation)) return signalStoppingCleanup(ownerId, generation);
         if (!isCurrentOperation(ownerId, generation)) return false;
         recordManualStop(ownerId, generation);
-        requestTermination(ownerId, generation, false, "");
+        requestUserStopOrCancelRecovery(ownerId, generation);
+        return true;
+    }
+
+    boolean cancelStartRequestFromUi(String requestId) {
+        if (requestId == null || requestId.isEmpty() || !requestId.equals(uiStartRequestId)
+                || !uiOperation.owns(uiStartOwnerId)) return false;
+        String ownerId = uiStartOwnerId;
+        long generation = uiStartGeneration;
+        if (isPendingCleanup(ownerId, currentOperationGeneration))
+            return signalStoppingCleanup(ownerId, currentOperationGeneration);
+        if (!isCurrentOperation(ownerId, generation)) return false;
+        recordManualStop(ownerId, generation);
+        requestUserStopOrCancelRecovery(ownerId, generation);
+        return true;
+    }
+
+    private void requestUserStopOrCancelRecovery(String ownerId, long generation) {
+        if (aoaRecoveryDeadlineElapsedMs > 0 || networkRecoveryDeadlineElapsedMs > 0) {
+            requestLocalTermination(ownerId, generation);
+        } else requestTermination(ownerId, generation, false, "");
+    }
+
+    private void requestLocalTermination(String ownerId, long generation) {
+        if (Looper.myLooper() != Looper.getMainLooper())
+            handler.post(() -> beginTermination(ownerId, generation, false, "", true));
+        else beginTermination(ownerId, generation, false, "", true);
+    }
+
+    private boolean signalStoppingCleanup(String ownerId, long generation) {
+        if (!isPendingCleanup(ownerId, generation)) return false;
+        Thread aoaOpening = null;
+        Thread adbOpening = null;
+        LocalSocket connectingSocket = null;
+        AoaReceiverCoordinator aoa = null;
+        AoaReceiverCoordinator adb = null;
+        P5cReceiverCoordinator network = null;
+        synchronized (networkCoordinatorLock) {
+            if (ownerId.equals(aoaOwnerId)) {
+                aoaOpening = aoaBootstrapThread;
+                aoa = aoaCoordinator;
+            }
+            if (ownerId.equals(adbOwnerId)) {
+                adbOpening = adbStreamBootstrapThread;
+                connectingSocket = adbConnectingSocket;
+                adb = adbStreamCoordinator;
+            }
+            if (ownerId.equals(networkCoordinatorOwnerId)) network = networkCoordinator;
+        }
+        if (connectingSocket != null) try { connectingSocket.close(); } catch (IOException ignored) { }
+        if (adb != null) adb.cancel("AdbStreamOwnerStopped");
+        if (aoa != null) aoa.cancel("AoaOwnerStopped");
+        if (network != null) network.signalCancel();
+        if (aoaOpening != null) aoaOpening.interrupt();
+        if (adbOpening != null) adbOpening.interrupt();
         return true;
     }
 
@@ -1214,12 +1292,17 @@ public final class ReceiverService extends Service {
 
     void requestTermination(String ownerId, long generation, boolean failed, String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> beginTermination(ownerId, generation, failed, reason));
-        } else beginTermination(ownerId, generation, failed, reason);
+            handler.post(() -> beginTermination(ownerId, generation, failed, reason, false));
+        } else beginTermination(ownerId, generation, failed, reason, false);
     }
 
     private void beginTermination(String ownerId, long generation, boolean failed, String reason) {
-        if (!failed && (reason == null || reason.isEmpty()) && isManualStop(ownerId, generation)) {
+        beginTermination(ownerId, generation, failed, reason, false);
+    }
+
+    private void beginTermination(String ownerId, long generation, boolean failed, String reason,
+            boolean forceLocalStop) {
+        if (!forceLocalStop && !failed && (reason == null || reason.isEmpty()) && isManualStop(ownerId, generation)) {
             AoaReceiverCoordinator activeAoa;
             AoaReceiverCoordinator activeAdbStream;
             P5cReceiverCoordinator activeNetwork;
@@ -1255,6 +1338,7 @@ public final class ReceiverService extends Service {
         cleanupGeneration = networkBootstrapGeneration.incrementAndGet();
         currentOperationGeneration = cleanupGeneration;
         cleanupFailed = failed;
+        cleanupOwnerRetained = false;
         cleanupError = failed ? (reason == null || reason.isEmpty() ? "ReceiverOperationFailed" : reason) : "";
         cleanupCoordinatorClosed = true;
         if (timeout != null) handler.removeCallbacks(timeout);
@@ -1301,6 +1385,7 @@ public final class ReceiverService extends Service {
         }
         if (coordinator != null) {
             P5cReceiverCoordinator closingCoordinator = coordinator;
+            closingCoordinator.signalCancel();
             cleanupCoordinatorClosed = false;
             long terminatingGeneration = cleanupGeneration;
             new Thread(() -> {
@@ -1324,6 +1409,7 @@ public final class ReceiverService extends Service {
                     catch (InterruptedException error) { interrupted = true; }
                 }
                 AoaReceiverCoordinator completedCoordinator = initialCoordinator;
+                boolean transportOwnerRetained = false;
                 synchronized (networkCoordinatorLock) {
                     if (completedCoordinator == null && ownerId.equals(aoaOwnerId)
                             && aoaOwnerGeneration == generation) completedCoordinator = aoaCoordinator;
@@ -1335,6 +1421,7 @@ public final class ReceiverService extends Service {
                         break;
                     } catch (InterruptedException error) { interrupted = true; }
                     String aoaCleanupFailure = completedCoordinator.failureMessage();
+                    transportOwnerRetained = completedCoordinator.retainsTransportOwner();
                     if (!aoaCleanupFailure.isEmpty()) {
                         cleanupFailed = true;
                         cleanupError = cleanupError.isEmpty() ? aoaCleanupFailure
@@ -1343,10 +1430,11 @@ public final class ReceiverService extends Service {
                 }
                 if (interrupted) Thread.currentThread().interrupt();
                 AoaReceiverCoordinator cleaned = completedCoordinator;
+                final boolean retainsOwner = transportOwnerRetained;
                 handler.post(() -> {
                     if (!isPendingCleanup(ownerId, terminatingGeneration)) return;
                     synchronized (networkCoordinatorLock) {
-                        if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation) {
+                        if (ownerId.equals(aoaOwnerId) && aoaOwnerGeneration == generation && !retainsOwner) {
                             if (cleaned == null || aoaCoordinator == cleaned) aoaCoordinator = null;
                             aoaAccessory = null;
                             aoaOwnerId = "";
@@ -1354,6 +1442,7 @@ public final class ReceiverService extends Service {
                             aoaBootstrapThread = null;
                         }
                     }
+                    cleanupOwnerRetained |= retainsOwner;
                     unregisterAoaDetachReceiver();
                     cleanupCoordinatorClosed = true;
                     finishTerminationIfReady(ownerId, terminatingGeneration);
@@ -1382,6 +1471,7 @@ public final class ReceiverService extends Service {
                     catch (InterruptedException error) { interrupted = true; }
                 }
                 AoaReceiverCoordinator completedCoordinator = initialCoordinator;
+                boolean transportOwnerRetained = false;
                 synchronized (networkCoordinatorLock) {
                     if (completedCoordinator == null && ownerId.equals(adbOwnerId)
                             && adbOwnerGeneration == generation) completedCoordinator = adbStreamCoordinator;
@@ -1393,6 +1483,7 @@ public final class ReceiverService extends Service {
                         break;
                     } catch (InterruptedException error) { interrupted = true; }
                     String streamCleanupFailure = completedCoordinator.failureMessage();
+                    transportOwnerRetained = completedCoordinator.retainsTransportOwner();
                     if (!streamCleanupFailure.isEmpty()) {
                         cleanupFailed = true;
                         cleanupError = cleanupError.isEmpty() ? streamCleanupFailure
@@ -1401,10 +1492,11 @@ public final class ReceiverService extends Service {
                 }
                 if (interrupted) Thread.currentThread().interrupt();
                 AoaReceiverCoordinator cleaned = completedCoordinator;
+                final boolean retainsOwner = transportOwnerRetained;
                 handler.post(() -> {
                     if (!isPendingCleanup(ownerId, terminatingGeneration)) return;
                     synchronized (networkCoordinatorLock) {
-                        if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation) {
+                        if (ownerId.equals(adbOwnerId) && adbOwnerGeneration == generation && !retainsOwner) {
                             if (cleaned == null || adbStreamCoordinator == cleaned) adbStreamCoordinator = null;
                             adbOwnerId = "";
                             adbOwnerGeneration = 0;
@@ -1414,6 +1506,7 @@ public final class ReceiverService extends Service {
                             adbConnectingSocket = null;
                         }
                     }
+                    cleanupOwnerRetained |= retainsOwner;
                     cleanupCoordinatorClosed = true;
                     finishTerminationIfReady(ownerId, terminatingGeneration);
                 });

@@ -37,6 +37,7 @@ import java.util.List;
         }
         public boolean stop(String ownerId) { return service.stopFromUi(ownerId); }
         public boolean stop(String ownerId, long generation) { return service.stopFromUi(ownerId, generation); }
+        public boolean cancelStartRequest(String requestId) { return service.cancelStartRequestFromUi(requestId); }
         public boolean trustBindingUntilRevoked(String ownerId, long generation) {
             return service.trustBindingUntilRevokedFromUi(ownerId, generation);
         }

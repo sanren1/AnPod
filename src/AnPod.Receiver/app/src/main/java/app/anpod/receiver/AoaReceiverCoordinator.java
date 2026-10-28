@@ -233,6 +233,10 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         return terminated.await(timeout, unit);
     }
 
+    boolean retainsTransportOwner() {
+        synchronized (OWNER_LOCK) { return owner == this; }
+    }
+
     String failureMessage() {
         IOException current = failure;
         if (current == null) current = cleanupFailure;
@@ -269,7 +273,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     }
 
     boolean requestUserStop() {
-        if (cancelled || !authenticated) return false;
+        if (cancelled || !authenticated || userStopRequested) return false;
         userStopRequested = true;
         return true;
     }

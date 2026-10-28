@@ -545,6 +545,10 @@ public final class ReceiverServiceRobolectricTest {
             service.requestTermination(owner, generation, false, "");
             assertTrue("cleanup should reach the accessory close", closeEntered.await(2, TimeUnit.SECONDS));
             assertEquals(ReceiverUiOperation.STOPPING, service.uiOperation.phase());
+            long cleanupGeneration = service.currentOperationGeneration;
+            assertTrue(service.stopFromUi(owner, cleanupGeneration));
+            assertEquals("a repeated stop must not replace the cleanup generation", cleanupGeneration,
+                    service.currentOperationGeneration);
             allowClose.countDown();
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
             while (ReceiverUiOperation.STOPPING.equals(service.uiOperation.phase())
@@ -611,6 +615,72 @@ public final class ReceiverServiceRobolectricTest {
             coordinator.cancel("test-finished");
             coordinator.awaitTermination(2, TimeUnit.SECONDS);
             service.onDestroy();
+        }
+    }
+
+    @Test
+    public void failedTransportCloseRemainsOwnedAndRejectsReplacementStart() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "aoa-close-failure-owner";
+        long generation = 46;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation));
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(new AoaAccessoryIo(
+                new CloseFailInput(), new IdleOutput(), () -> { }),
+                new PairingProtocol.BindingMaterial(new byte[16], new byte[16], new byte[32]),
+                new AoaReceiverCoordinator.PlaybackEndpoint() {
+                    @Override public boolean isCurrent(String id, long token) { return true; }
+                    @Override public boolean supportsAudio(UdpPacketDecoder.AudioFormatV2 format) { return true; }
+                    @Override public void start(AoaSessionContext context) { }
+                    @Override public void pause() { }
+                    @Override public void resume() { }
+                    @Override public void stop() { }
+                    @Override public boolean streaming() { return false; }
+                    @Override public byte[] playbackProgressPayloadV2() { return new byte[78]; }
+                }, owner, generation, 5000);
+        service.aoaCoordinator = coordinator;
+        service.aoaOwnerId = owner;
+        service.aoaOwnerGeneration = generation;
+        Method monitor = ReceiverService.class.getDeclaredMethod("monitorAoaCoordinator",
+                AoaReceiverCoordinator.class, String.class, long.class);
+        monitor.setAccessible(true);
+        try {
+            assertTrue(coordinator.awaitTermination(2, TimeUnit.SECONDS));
+            assertTrue(coordinator.retainsTransportOwner());
+            monitor.invoke(service, coordinator, owner, generation);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!ReceiverUiOperation.FAILED.equals(service.uiOperation.phase())
+                    && System.nanoTime() < deadline) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle();
+                Thread.sleep(2);
+            }
+            Shadows.shadowOf(Looper.getMainLooper()).idle();
+            assertEquals(ReceiverUiOperation.FAILED, service.uiOperation.phase());
+            assertSame(coordinator, service.aoaCoordinator);
+            assertTrue(org.robolectric.util.ReflectionHelpers.<Boolean>getField(service, "cleanupOwnerRetained"));
+            assertFalse(AoaReceiverCoordinator.isAvailable());
+            assertEquals("已有接收会话正在运行或清理尚未完成。",
+                    service.startFromUi("192.0.2.2", 24, "replacement-request"));
+            long retainedGeneration = service.currentOperationGeneration;
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(
+                    new Intent(RuntimeEnvironment.getApplication(), ReceiverService.class)
+                            .setAction(BootstrapActivity.ACTION_START_NETWORK_AUDIO), 0, 901));
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(
+                    new Intent(RuntimeEnvironment.getApplication(), ReceiverService.class)
+                            .setAction(BootstrapActivity.ACTION_START_AUDIO), 0, 902));
+            assertEquals(902, Shadows.shadowOf(service).getStopSelfId());
+            assertEquals(owner, service.uiOperation.ownerId());
+            assertEquals("a retained close-failure owner cannot be replaced by a bootstrap start",
+                    retainedGeneration, service.currentOperationGeneration);
+        } finally {
+            coordinator.cancel("test-finished");
+            service.onDestroy();
+            Field ownerField = AoaReceiverCoordinator.class.getDeclaredField("owner");
+            ownerField.setAccessible(true);
+            ownerField.set(null, null);
         }
     }
 
@@ -810,6 +880,17 @@ public final class ReceiverServiceRobolectricTest {
         }
         @Override public boolean isOpen() { return open; }
         @Override public void close() { open = false; }
+    }
+
+    private static final class CloseFailInput implements java.nio.channels.ReadableByteChannel {
+        private volatile boolean open = true;
+        @Override public int read(java.nio.ByteBuffer destination) throws IOException {
+            throw new IOException("test transport failure");
+        }
+        @Override public boolean isOpen() { return open; }
+        @Override public void close() throws IOException {
+            throw new IOException("test transport close failure");
+        }
     }
 
     @Test
@@ -1495,6 +1576,47 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test
+    public void pendingStartCancellationTargetsOnlyItsServiceOwner() throws Exception {
+        ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
+        String owner = "pending-cancel-owner";
+        String request = "pending-cancel-request";
+        long generation = 171;
+        assertTrue(service.uiOperation.begin(owner));
+        assertTrue(service.uiOperation.running(owner));
+        service.currentOperationGeneration = generation;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation));
+        setInstanceField(service, "uiStartRequestId", request);
+        setInstanceField(service, "uiStartOwnerId", owner);
+        setInstanceField(service, "uiStartGeneration", generation);
+
+        assertFalse(service.cancelStartRequestFromUi("stale-request"));
+        assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+        assertEquals(owner, service.uiOperation.ownerId());
+
+        assertTrue(service.uiOperation.stop(owner));
+        assertTrue(service.uiOperation.completeStop(owner));
+        String replacementOwner = "replacement-owner";
+        assertTrue(service.uiOperation.begin(replacementOwner));
+        assertTrue(service.uiOperation.running(replacementOwner));
+        service.currentOperationGeneration = generation + 1;
+        setInstanceField(service, "networkBootstrapGeneration",
+                new java.util.concurrent.atomic.AtomicLong(generation + 1));
+        setInstanceField(service, "uiStartRequestId", "replacement-request");
+        setInstanceField(service, "uiStartOwnerId", replacementOwner);
+        setInstanceField(service, "uiStartGeneration", generation + 1);
+        assertFalse("a stale request must not stop a replacement owner",
+                service.cancelStartRequestFromUi(request));
+        assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
+        assertEquals(replacementOwner, service.uiOperation.ownerId());
+
+        assertTrue(service.cancelStartRequestFromUi("replacement-request"));
+        assertEquals(ReceiverUiOperation.STOPPED, service.uiOperation.phase());
+        assertEquals(replacementOwner, service.uiOperation.ownerId());
+        service.onDestroy();
+    }
+
+    @Test
     public void aodSnapshotIsDisconnectedWhenIdle() {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
 
@@ -1658,6 +1780,9 @@ public final class ReceiverServiceRobolectricTest {
             assertTrue(service.stopFromUi(owner, generation));
             assertEquals(ReceiverUiOperation.RUNNING, service.uiOperation.phase());
             assertSame("service waits for the authenticated ADB stop ACK", coordinator, service.adbStreamCoordinator);
+            assertTrue("a repeated stop must escape a missing peer ACK", service.stopFromUi(owner, generation));
+            assertEquals(ReceiverUiOperation.STOPPING, service.uiOperation.phase());
+            assertTrue(coordinator.awaitTermination(2, TimeUnit.SECONDS));
         } finally {
             coordinator.cancel("test-finished");
             coordinator.awaitTermination(2, TimeUnit.SECONDS);
@@ -1984,6 +2109,10 @@ public final class ReceiverServiceRobolectricTest {
             coordinator.start();
             assertFalse("a listening owner has no authenticated host to receive terminal ACK",
                     coordinator.requestUserStop());
+            org.robolectric.util.ReflectionHelpers.setField(coordinator, "authenticatedSocket", new java.net.Socket());
+            org.robolectric.util.ReflectionHelpers.setField(coordinator, "terminalCauseNegotiated", true);
+            assertTrue(coordinator.requestUserStop());
+            assertFalse("a repeated stop must proceed to local cancellation", coordinator.requestUserStop());
         } finally {
             coordinator.close();
             binding.close();

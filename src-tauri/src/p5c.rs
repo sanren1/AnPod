@@ -1916,6 +1916,15 @@ pub(crate) struct SessionOwner {
 }
 
 impl SessionOwner {
+    pub(crate) fn cancel_signal(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let enabled = self.enabled.clone();
+        let cancellation = self.cancellation.clone();
+        Arc::new(move || {
+            enabled.store(false, Ordering::Release);
+            cancellation.cancel();
+        })
+    }
+
     pub(crate) fn start(
         peer: SocketAddr,
         binding: BindingMaterial,

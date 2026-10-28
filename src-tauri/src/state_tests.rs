@@ -150,6 +150,36 @@ fn diagnostics_sample_requires_matching_session_generation() {
 }
 
 #[test]
+fn retiring_a_session_does_not_cancel_its_recovery_operation_or_clear_a_new_slot() {
+    let state = AppState::new();
+    let (operation_generation, token) = state.start_preemptible_background_operation().unwrap();
+    let old_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let old_signal = {
+        let cancelled = old_cancelled.clone();
+        Arc::new(move || cancelled.store(true, Ordering::Release)) as Arc<dyn Fn() + Send + Sync>
+    };
+    assert!(state.install_session_cancel(0, 11, operation_generation, &token, old_signal));
+
+    state.cancel_active_session(false);
+    assert!(!state.session_generation_is_current(11));
+    assert!(state.operation_is_current(operation_generation, &token));
+    assert!(!token.is_cancelled());
+    assert!(!old_cancelled.load(Ordering::Acquire));
+
+    let new_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let new_signal = {
+        let cancelled = new_cancelled.clone();
+        Arc::new(move || cancelled.store(true, Ordering::Release)) as Arc<dyn Fn() + Send + Sync>
+    };
+    assert!(state.install_session_cancel(0, 12, operation_generation, &token, new_signal));
+    state.clear_session_cancel(11);
+    state.cancel_active_session(true);
+    assert!(!old_cancelled.load(Ordering::Acquire));
+    assert!(new_cancelled.load(Ordering::Acquire));
+    state.finish_operation(operation_generation);
+}
+
+#[test]
 fn adb_cleanup_keeps_receiver_user_stop_across_reverse_retry() {
     let mut cleanup = PendingAdbCleanup {
         serial: "192.0.2.10:5555".into(),

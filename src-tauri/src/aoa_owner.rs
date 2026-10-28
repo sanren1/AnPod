@@ -197,6 +197,11 @@ pub(crate) struct AoaSnapshot {
 }
 
 impl AoaOwner {
+    pub(crate) fn cancel_signal(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let cancel = self.cancel.clone();
+        Arc::new(move || cancel.cancel_io())
+    }
+
     pub(crate) fn connect(
         stream: AoaStream,
         material: BindingMaterial,

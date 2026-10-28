@@ -211,6 +211,8 @@ pub struct AndroidOutputFormat {
     pub encoding: Option<String>,
 }
 
+type SessionCancelSignal = Arc<dyn Fn() + Send + Sync>;
+
 fn negotiated_v2_audio_format(format: AudioFormatV2) -> NegotiatedAudioFormat {
     NegotiatedAudioFormat {
         codec_version: 2,
@@ -766,7 +768,12 @@ impl AdbRecoveryAttemptOps for AppStateAdbRecoveryAttemptOps<'_> {
                     if !self.was_playing {
                         let _ = self
                             .state
-                            .set_output_locked(self.app, "computer", cancel)
+                            .set_output_locked(
+                                self.app,
+                                "computer",
+                                self.operation_generation,
+                                cancel,
+                            )
                             .await;
                         self.state.emit(self.app);
                     }
@@ -870,6 +877,8 @@ pub struct AppState {
     last_pairing_endpoint: Mutex<Option<String>>,
     gate: AsyncMutex<()>,
     session: AsyncMutex<Option<Session>>,
+    session_cancel: Mutex<Option<(u64, SessionCancelSignal)>>,
+    current_session_generation: AtomicU64,
     pcm_rate_sample: Mutex<Option<(u64, u64, Instant)>>,
     receiver_health_sample: Mutex<Option<(u64, u32)>>,
     diagnostics_timeline: Mutex<DiagnosticsTimelineBuffer>,
@@ -933,6 +942,83 @@ fn append_audio_apply_failures(
 }
 
 impl AppState {
+    fn install_session_cancel(
+        &self,
+        expected_generation: u64,
+        generation: u64,
+        operation_generation: u64,
+        token: &CancellationToken,
+        signal: SessionCancelSignal,
+    ) -> bool {
+        let mut slot = self.session_cancel.lock().expect("session cancel lock");
+        if !self.operation_is_current(operation_generation, token)
+            || self.current_session_generation.load(Ordering::Acquire) != expected_generation
+        {
+            return false;
+        }
+        self.current_session_generation
+            .store(generation, Ordering::Release);
+        *slot = Some((generation, signal));
+        true
+    }
+
+    fn register_session_generation(
+        &self,
+        expected_generation: u64,
+        generation: u64,
+        operation_generation: u64,
+        token: &CancellationToken,
+    ) -> bool {
+        let _slot = self.session_cancel.lock().expect("session cancel lock");
+        if !self.operation_is_current(operation_generation, token)
+            || self.current_session_generation.load(Ordering::Acquire) != expected_generation
+        {
+            return false;
+        }
+        self.current_session_generation
+            .store(generation, Ordering::Release);
+        true
+    }
+
+    fn clear_session_cancel(&self, generation: u64) {
+        let mut slot = self.session_cancel.lock().expect("session cancel lock");
+        let matches = slot
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation);
+        if matches {
+            slot.take();
+            let _ = self.current_session_generation.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    fn clear_invalidated_session_cancel(&self) {
+        let mut slot = self.session_cancel.lock().expect("session cancel lock");
+        if self.current_session_generation.load(Ordering::Acquire) == 0 {
+            slot.take();
+        }
+    }
+
+    fn session_generation_is_current(&self, generation: u64) -> bool {
+        generation != 0 && self.current_session_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn cancel_active_session(&self, force_io: bool) {
+        let slot = self.session_cancel.lock().expect("session cancel lock");
+        self.current_session_generation.store(0, Ordering::Release);
+        let signal = slot.as_ref().map(|(_, signal)| signal.clone());
+        drop(slot);
+        if force_io {
+            if let Some(signal) = signal {
+                signal();
+            }
+        }
+    }
+
     pub async fn receiver_update_candidate(
         &self,
     ) -> Result<Option<ReceiverUpdateCandidate>, String> {
@@ -1042,6 +1128,8 @@ impl AppState {
             last_pairing_endpoint: Mutex::new(None),
             gate: AsyncMutex::new(()),
             session: AsyncMutex::new(None),
+            session_cancel: Mutex::new(None),
+            current_session_generation: AtomicU64::new(0),
             pcm_rate_sample: Mutex::new(None),
             receiver_health_sample: Mutex::new(None),
             diagnostics_timeline: Mutex::new(DiagnosticsTimelineBuffer::new()),
@@ -1294,6 +1382,8 @@ impl AppState {
                 .as_deref()
                 .is_some_and(|error| error.contains("audio format"));
             let capabilities = owner_snapshot.capabilities;
+            let cancel_signal = owner.cancel_signal();
+            let failed_install_signal = cancel_signal.clone();
             *self.session.lock().await = Some(Session {
                 generation: session_generation,
                 serial: "network".into(), transport: "lan".into(), reverse: String::new(), child: None,
@@ -1305,6 +1395,11 @@ impl AppState {
                 aoa_target_id: None,
                 windows_mix_format: mix_format.clone(),
             });
+            if !self.install_session_cancel(0, session_generation, generation, &token, cancel_signal) {
+                failed_install_signal();
+                self.teardown(Some(app)).await?;
+                return Err("无线会话已取消。".into());
+            }
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.session_active = true;
@@ -1769,7 +1864,8 @@ impl AppState {
     ) -> bool {
         let session = self.session.lock().await;
         let Some(_active) = session.as_ref().filter(|active| {
-            active.generation == generation
+            self.session_generation_is_current(active.generation)
+                && active.generation == generation
                 && active.serial == serial
                 && active.network_owner.is_none()
                 && active.aoa_owner.is_none()
@@ -2183,6 +2279,8 @@ impl AppState {
             }
             let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
             let owner_snapshot = owner.snapshot();
+            let cancel_signal = owner.cancel_signal();
+            let failed_install_signal = cancel_signal.clone();
             *self.session.lock().await = Some(Session {
                 generation: session_generation,
                 serial: String::new(),
@@ -2202,6 +2300,17 @@ impl AppState {
                 network_binding_ref: Some(binding_reference.to_owned()),
                 windows_mix_format: mix_format.clone(),
             });
+            if !self.install_session_cancel(
+                0,
+                session_generation,
+                generation,
+                &token,
+                cancel_signal,
+            ) {
+                failed_install_signal();
+                let _ = self.teardown(Some(app)).await;
+                return Err("USB Direct 会话已取消。".into());
+            }
             {
                 let mut view = self.view.lock().expect("view lock");
                 view.busy = false;
@@ -2329,9 +2438,11 @@ impl AppState {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     async fn restart_aoa_session_locked(
         &self,
         app: &AppHandle,
+        operation_generation: u64,
         target_id: &str,
         binding_reference: &str,
         format: AudioFormatV2,
@@ -2405,13 +2516,29 @@ impl AppState {
             self.emit(app);
             return Err(detail);
         }
+        let previous_generation = active.generation;
         active.generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let cancel_signal = owner.cancel_signal();
         active.aoa_owner = Some(owner);
         active.aoa_target_id = Some(target_id.to_owned());
         active.network_binding_ref = Some(binding_reference.to_owned());
         active.output = output.to_owned();
         active.windows_mix_format = mix_format.clone();
         let generation = active.generation;
+        let failed_install_signal = cancel_signal.clone();
+        if !self.install_session_cancel(
+            previous_generation,
+            generation,
+            operation_generation,
+            token,
+            cancel_signal,
+        ) {
+            failed_install_signal();
+            drop(session);
+            self.clear_session_cancel(previous_generation);
+            let _ = self.teardown(Some(app)).await;
+            return Err("USB Direct 会话已取消。".into());
+        }
         let snapshot = active.aoa_owner.as_ref().expect("new AOA owner").snapshot();
         let mut view = self.view.lock().expect("app view lock");
         view.session_generation = Some(generation);
@@ -2444,7 +2571,11 @@ impl AppState {
         session: &mut Option<Session>,
         error: String,
     ) -> String {
+        let retired_generation = session.as_ref().map(|active| active.generation);
         *session = None;
+        if let Some(generation) = retired_generation {
+            self.clear_session_cancel(generation);
+        }
         let mut cleanup = Vec::new();
         if let Err(stop_error) = self.audio.stop_and_cleanup() {
             cleanup.push(stop_error);
@@ -2939,7 +3070,9 @@ impl AppState {
             if needs_bootstrap {
                 detail.push_str("；请重新通过授权 USB/bootstrap 启动 Receiver");
             }
+            let retired_generation = active.generation;
             *session = None;
+            self.clear_session_cancel(retired_generation);
             {
                 let mut view = self.view.lock().expect("app view lock");
                 view.session_active = false;
@@ -3043,10 +3176,10 @@ impl AppState {
 
     async fn monitor_aoa_session(&self, app: &AppHandle) -> bool {
         let mut session = self.session.lock().await;
-        let Some(active) = session
-            .as_mut()
-            .filter(|session| session.aoa_owner.is_some() || session.adb_stream_owner.is_some())
-        else {
+        let Some(active) = session.as_mut().filter(|session| {
+            self.session_generation_is_current(session.generation)
+                && (session.aoa_owner.is_some() || session.adb_stream_owner.is_some())
+        }) else {
             return false;
         };
         let adb_stream = active.adb_stream_owner.is_some();
@@ -3056,6 +3189,9 @@ impl AppState {
             .or(active.adb_stream_owner.as_ref())
             .expect("record stream owner")
             .snapshot();
+        if !self.session_generation_is_current(active.generation) {
+            return false;
+        }
         let failure = self.audio.take_last_error().ok().flatten().or_else(|| {
             (snapshot.state == crate::p5c::ReceiverState::Stopped).then(|| {
                 snapshot
@@ -3146,7 +3282,9 @@ impl AppState {
             {
                 let _ = owner.stop();
             }
+            let retired_generation = active.generation;
             *session = None;
+            self.clear_session_cancel(retired_generation);
             let mut view = self.view.lock().expect("view lock");
             view.session_active = false;
             view.session_serial = None;
@@ -3258,6 +3396,7 @@ impl AppState {
             }
         }
         *session = None;
+        self.clear_session_cancel(generation);
         let detail = if cleanup.is_empty() {
             message.to_string()
         } else {
@@ -3297,6 +3436,9 @@ impl AppState {
         output: String,
         reason: String,
     ) {
+        if !self.session_generation_is_current(session_generation) {
+            return;
+        }
         if self.recovering.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -3305,11 +3447,18 @@ impl AppState {
             self.recovering.store(false, Ordering::Release);
             return;
         };
-        let mut session = self.session.lock().await;
-        if !session
-            .as_ref()
-            .is_some_and(|active| active.generation == session_generation)
+        if !self.session_generation_is_current(session_generation)
+            || !self.operation_is_current(operation_generation, &token)
         {
+            self.finish_operation(operation_generation);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
+        let mut session = self.session.lock().await;
+        if !session.as_ref().is_some_and(|active| {
+            active.generation == session_generation
+                && self.session_generation_is_current(active.generation)
+        }) {
             self.finish_operation(operation_generation);
             self.recovering.store(false, Ordering::Release);
             return;
@@ -3344,7 +3493,7 @@ impl AppState {
         }
         drop(session);
         for attempt in 0..3 {
-            if token.is_cancelled() {
+            if token.is_cancelled() || !self.session_generation_is_current(session_generation) {
                 break;
             }
             self.set_state(
@@ -3362,6 +3511,7 @@ impl AppState {
                 _ = tokio::time::sleep(Duration::from_millis([1000, 2000, 5000][attempt])) => {}
             }
             if token.is_cancelled()
+                || !self.session_generation_is_current(session_generation)
                 || !operation_generation_matches(&self.operation_generation, operation_generation)
                 || !self
                     .session
@@ -3395,20 +3545,42 @@ impl AppState {
                 continue;
             }
             if token.is_cancelled()
+                || !self.session_generation_is_current(session_generation)
                 || !operation_generation_matches(&self.operation_generation, operation_generation)
             {
+                (owner.cancel_signal())();
                 let _ = owner.stop();
                 break;
             }
             let mut session = self.session.lock().await;
-            let Some(active) = session
-                .as_mut()
-                .filter(|active| active.generation == session_generation)
-            else {
+            let Some(active) = session.as_mut().filter(|active| {
+                active.generation == session_generation
+                    && self.session_generation_is_current(active.generation)
+            }) else {
+                (owner.cancel_signal())();
                 let _ = owner.stop();
                 break;
             };
-            active.generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let cancel_signal = owner.cancel_signal();
+            let recovered_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+            if !self.install_session_cancel(
+                session_generation,
+                recovered_generation,
+                operation_generation,
+                &token,
+                cancel_signal.clone(),
+            ) {
+                cancel_signal();
+                let _ = owner.stop();
+                break;
+            }
+            if token.is_cancelled() || !self.session_generation_is_current(recovered_generation) {
+                cancel_signal();
+                let _ = owner.stop();
+                self.clear_session_cancel(recovered_generation);
+                break;
+            }
+            active.generation = recovered_generation;
             active.aoa_owner = Some(owner);
             active.aoa_target_id = Some(target_id);
             active.network_binding_ref = Some(binding);
@@ -3470,6 +3642,9 @@ impl AppState {
         session_key: String,
         reason: String,
     ) {
+        if !self.session_generation_is_current(session_generation) {
+            return;
+        }
         if self.recovering.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -3477,6 +3652,13 @@ impl AppState {
             self.recovering.store(false, Ordering::Release);
             return;
         };
+        if !self.session_generation_is_current(session_generation)
+            || !self.operation_is_current(generation, &token)
+        {
+            self.finish_operation(generation);
+            self.recovering.store(false, Ordering::Release);
+            return;
+        }
         let (same_session, adb_stream) = self
             .session
             .lock()
@@ -3485,6 +3667,7 @@ impl AppState {
             .map(|session| {
                 (
                     session.generation == session_generation
+                        && self.session_generation_is_current(session.generation)
                         && session.serial == serial
                         && session.reverse == session_key,
                     session.adb_stream_owner.is_some(),
@@ -3524,7 +3707,7 @@ impl AppState {
                 return;
             }
         };
-        if token.is_cancelled() {
+        if !self.operation_is_current(generation, &token) {
             self.finish_operation(generation);
             self.recovering.store(false, Ordering::Release);
             return;
@@ -3537,7 +3720,7 @@ impl AppState {
         }
         let mut last_cleanup_error = None;
         for attempt in 0..3 {
-            if token.is_cancelled() {
+            if !self.operation_is_current(generation, &token) {
                 break;
             }
             self.set_state(
@@ -3547,6 +3730,9 @@ impl AppState {
                 device_name.clone(),
             );
             tokio::select! { _ = token.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis([1000, 2000, 5000][attempt])) => {} }
+            if !self.operation_is_current(generation, &token) {
+                break;
+            }
             if adb_stream {
                 let ops = AppStateAdbRecoveryAttemptOps {
                     state: self,
@@ -3604,7 +3790,9 @@ impl AppState {
                     {
                         if result.success {
                             if !was_playing {
-                                let _ = self.set_output_locked(app, "computer", &token).await;
+                                let _ = self
+                                    .set_output_locked(app, "computer", generation, &token)
+                                    .await;
                                 self.emit(app);
                             }
                             self.finish_operation(generation);
@@ -3801,7 +3989,9 @@ impl AppState {
             "正在建立音频连接…",
             Some(device.display_name.clone()),
         );
-        let result = self.connect_inner(app, &device, token, play_on_phone).await;
+        let result = self
+            .connect_inner(app, &device, generation, token, play_on_phone)
+            .await;
         if !self.operation_is_current(generation, token) {
             let cleanup = self.teardown(Some(app)).await;
             let message = cleanup.as_ref().err().map_or_else(
@@ -3849,6 +4039,7 @@ impl AppState {
         &self,
         app: &AppHandle,
         device: &Device,
+        operation_generation: u64,
         token: &CancellationToken,
         play_on_phone: bool,
         settings: AppSettings,
@@ -3919,6 +4110,9 @@ impl AppState {
         .await?;
 
         let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if !self.register_session_generation(0, generation, operation_generation, token) {
+            return Err("ADB audio session was cancelled.".into());
+        }
         *self.session.lock().await = Some(Session {
             generation,
             serial: serial.into(),
@@ -4055,20 +4249,40 @@ impl AppState {
         } else {
             owner.pause()?;
         }
-        let session = self.session.lock().await;
+        let mut session = self.session.lock().await;
         let active = session.as_ref().ok_or("ADB audio session was cancelled.")?;
         if active.generation != generation {
             let _ = owner.stop();
             return Err("ADB audio session generation changed during startup.".into());
         }
-        drop(session);
-        if let Some(active) = self.session.lock().await.as_mut() {
+        let session_generation = active.generation;
+        let cancel_signal = owner.cancel_signal();
+        if !self.install_session_cancel(
+            session_generation,
+            session_generation,
+            operation_generation,
+            token,
+            cancel_signal.clone(),
+        ) {
+            cancel_signal();
+            drop(session);
+            let _ = owner.stop();
+            return Err("ADB audio session was cancelled.".into());
+        }
+        if token.is_cancelled() || !self.session_generation_is_current(session_generation) {
+            cancel_signal();
+            drop(session);
+            let _ = owner.stop();
+            return Err("ADB audio session was cancelled.".into());
+        }
+        if let Some(active) = session.as_mut() {
             active.adb_stream_owner = Some(owner);
             active.receiver_owner_id = Some(receiver_owner_id);
             active.receiver_generation = Some(receiver_generation);
             active.output = if play_on_phone { "phone" } else { "computer" }.into();
             active.windows_mix_format = mix_format.clone();
         }
+        drop(session);
         {
             let mut view = self.view.lock().expect("app view lock");
             view.output = if play_on_phone { "phone" } else { "computer" }.into();
@@ -4140,6 +4354,7 @@ impl AppState {
         &self,
         app: &AppHandle,
         device: &Device,
+        operation_generation: u64,
         token: &CancellationToken,
         play_on_phone: bool,
     ) -> Result<String, String> {
@@ -4150,7 +4365,14 @@ impl AppState {
         let settings = self.view.lock().expect("app view lock").settings.clone();
         if settings.audio_backend == "receiver" && settings.audio_quality != "standard" {
             return self
-                .connect_adb_stream_inner(app, device, token, play_on_phone, settings)
+                .connect_adb_stream_inner(
+                    app,
+                    device,
+                    operation_generation,
+                    token,
+                    play_on_phone,
+                    settings,
+                )
                 .await;
         }
         let installed_receiver =
@@ -4177,6 +4399,9 @@ impl AppState {
         )
         .await?;
         let session_generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if !self.register_session_generation(0, session_generation, operation_generation, token) {
+            return Err("ADB session was cancelled.".into());
+        }
         *self.session.lock().await = Some(Session {
             generation: session_generation,
             serial: serial.into(),
@@ -4406,8 +4631,18 @@ impl AppState {
     pub async fn disconnect(&self, app: &AppHandle) -> Result<OperationResult, String> {
         self.cancel_active_operation();
         self.cancel_qr_pairing();
-        let _guard = self.gate.lock().await;
+        let _guard = match self.gate.try_lock() {
+            Ok(guard) => {
+                self.cancel_active_session(false);
+                guard
+            }
+            Err(_) => {
+                self.cancel_active_session(true);
+                self.gate.lock().await
+            }
+        };
         self.cancel_active_operation();
+        self.cancel_active_session(false);
         let cleanup = self.teardown(Some(app)).await;
         let mut view = self.view.lock().expect("view lock");
         view.state = if cleanup.is_err() {
@@ -4722,6 +4957,9 @@ impl AppState {
                 let owner_still_matches = {
                     let mut session = self.session.lock().await;
                     session.as_mut().is_some_and(|active| {
+                        if !self.session_generation_is_current(active.generation) {
+                            return false;
+                        }
                         let Some(owner) = active.network_owner.as_ref() else {
                             return false;
                         };
@@ -4870,8 +5108,10 @@ impl AppState {
                 let mode = u8::from(candidate.playback_mode == "LowLatency");
                 let format = AudioFormatV2::for_profile(profile, mode)
                     .map_err(|_| "所选音质不支持该播放模式。".to_string())?;
-                self.restart_aoa_session_locked(app, &target_id, &binding, format, &output, &token)
-                    .await?;
+                self.restart_aoa_session_locked(
+                    app, generation, &target_id, &binding, format, &output, &token,
+                )
+                .await?;
                 if !self.operation_is_current(generation, &token) {
                     let reason = "音频配置应用已取消。";
                     return Err(match self.teardown(Some(app)).await {
@@ -5038,8 +5278,10 @@ impl AppState {
             let format = AudioFormatV2::for_profile(current_format.profile, mode)
                 .map_err(|_| "USB Direct 音频格式不支持所选播放模式。".to_string())?;
             self.update_mode_setting(kind, value)?;
-            self.restart_aoa_session_locked(app, &target_id, &binding, format, &output, token)
-                .await?;
+            self.restart_aoa_session_locked(
+                app, generation, &target_id, &binding, format, &output, token,
+            )
+            .await?;
             self.emit(app);
             return Ok(self.snapshot());
         }
@@ -5245,7 +5487,8 @@ impl AppState {
                 return Err(result.message);
             }
             if old_output == "computer" {
-                self.set_output_locked(app, "computer", token).await?;
+                self.set_output_locked(app, "computer", generation, token)
+                    .await?;
             }
         } else {
             let guidance = match selection {
@@ -5587,11 +5830,18 @@ impl AppState {
     }
 
     async fn teardown(&self, app: Option<&AppHandle>) -> Result<(), String> {
+        self.cancel_active_session(false);
         self.host_offer_listener
             .lock()
             .expect("offer listener lock")
             .take();
         let mut errors = Vec::new();
+        let retired_generation = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.generation);
         if let Some(mut session) = self.session.lock().await.take() {
             let adb_stream =
                 session.adb_stream_owner.is_some() || session.reverse.starts_with("anpod_adb_");
@@ -5702,7 +5952,9 @@ impl AppState {
                     errors.push(format!("ADB 映射清理失败：{error}"));
                 }
             }
+            self.clear_session_cancel(retired_generation.expect("retired session generation"));
         } else {
+            self.clear_invalidated_session_cancel();
             if let Err(error) = self.audio.stop_and_cleanup() {
                 errors.push(format!("本机音频采集停止失败：{error}"));
             }
@@ -5768,7 +6020,8 @@ impl AppState {
             }
             return Ok(result.snapshot);
         }
-        self.set_output_locked(app, output, token).await?;
+        self.set_output_locked(app, output, generation, token)
+            .await?;
         self.emit(app);
         Ok(self.snapshot())
     }
@@ -5777,6 +6030,7 @@ impl AppState {
         &self,
         app: &AppHandle,
         output: &str,
+        generation: u64,
         token: &CancellationToken,
     ) -> Result<(), String> {
         let adb_stream_serial = {
@@ -5828,8 +6082,10 @@ impl AppState {
                             .into(),
                     );
                 }
-                self.restart_aoa_session_locked(app, &target_id, &binding, format, "phone", token)
-                    .await?;
+                self.restart_aoa_session_locked(
+                    app, generation, &target_id, &binding, format, "phone", token,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -5884,12 +6140,14 @@ impl AppState {
                     .and_then(|()| owner.resume())
                 };
                 if let Err(error) = changed {
+                    let retired_generation = active.generation;
                     let _ = self.audio.stop_pcm_sink();
                     let _ = self.audio.restore_muted();
                     if let Some(owner) = active.aoa_owner.take() {
                         let _ = owner.stop();
                     }
                     *session = None;
+                    self.clear_session_cancel(retired_generation);
                     let mut view = self.view.lock().expect("view lock");
                     view.session_active = false;
                     view.session_serial = None;
@@ -6044,6 +6302,7 @@ impl AppState {
                 }
                 .await;
                 if let Err(error) = change {
+                    let retired_generation = active.generation;
                     let mut cleanup = Vec::new();
                     if let Err(stop_error) = self.audio.stop_pcm_sink() {
                         cleanup.push(stop_error);
@@ -6055,6 +6314,7 @@ impl AppState {
                         owner.stop();
                     }
                     *session = None;
+                    self.clear_session_cancel(retired_generation);
                     let detail = if cleanup.is_empty() {
                         error.clone()
                     } else {
@@ -6223,27 +6483,42 @@ impl AppState {
     }
 
     pub async fn cancel_operation(&self, app: &AppHandle) -> AppSnapshot {
+        let force_session_io = matches!(
+            self.snapshot().state.as_str(),
+            "connecting" | "reconnecting"
+        );
         self.cancel_active_operation();
-        let _guard = self.gate.lock().await;
-        self.cancel_active_operation();
-        if self
-            .session
-            .try_lock()
-            .map_or(true, |session| session.is_none())
-        {
-            let mut view = self.view.lock().expect("view lock");
-            if view.busy {
-                view.state = if view.devices.is_empty() {
-                    "noDevice".into()
-                } else {
-                    "ready".into()
-                };
-                view.message = "连接已取消".into();
-                view.device_name = None;
-                view.output = "computer".into();
-                view.busy = false;
+        let _guard = match self.gate.try_lock() {
+            Ok(guard) => {
+                self.cancel_active_session(force_session_io);
+                guard
             }
+            Err(_) => {
+                self.cancel_active_session(true);
+                self.gate.lock().await
+            }
+        };
+        self.cancel_active_operation();
+        self.cancel_active_session(false);
+        let cleanup = self.teardown(Some(app)).await;
+        let mut view = self.view.lock().expect("view lock");
+        view.state = if cleanup.is_err() {
+            "error".into()
+        } else if view.devices.is_empty() {
+            "noDevice".into()
+        } else {
+            "ready".into()
+        };
+        view.message = cleanup.as_ref().err().map_or_else(
+            || "连接已取消".into(),
+            |error| format!("取消连接时清理失败：{error}"),
+        );
+        if cleanup.is_ok() {
+            view.device_name = None;
         }
+        view.output = "computer".into();
+        view.busy = false;
+        drop(view);
         self.emit(app);
         self.snapshot()
     }
