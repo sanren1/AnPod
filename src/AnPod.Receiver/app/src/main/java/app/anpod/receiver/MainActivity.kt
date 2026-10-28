@@ -962,7 +962,9 @@ private fun ReceiverScreen(
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
+                            if (snapshot?.backgroundListenerState != "pending") {
+                                Text(backgroundGrantStatus(snapshot), style = MaterialTheme.typography.bodyMedium)
+                            }
                             if (snapshot?.backgroundAuthorizationError?.isNotEmpty() == true) {
                                 Text(stringResource(R.string.background_authorization_failed), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
                             }

@@ -2,7 +2,7 @@
     <string name="app_name">AnPod</string>
     <string name="audio_output">声音输出</string>
     <string name="output_engine_title">播放引擎</string>
-    <string name="output_engine_description">新会话默认用 Oboe；格式不匹配时回退到 AudioTrack。当前会话不会切换。</string>
+    <string name="output_engine_description">下次连接生效；Oboe 不支持当前格式时回退到 AudioTrack。</string>
     <string name="output_engine_audio_track">AudioTrack（备用）</string>
     <string name="output_engine_oboe">Oboe（默认）</string>
     <string name="output_engine_unknown">未知</string>
@@ -21,7 +21,7 @@
     <string name="background_grant_eight_hours">允许后台连接，最多 8 小时；约剩 %1$d 小时 %2$d 分钟，仅手机应用运行期间有效。</string>
     <string name="background_grant_none">电脑在后台发起连接时，手机会询问是否允许。</string>
     <string name="background_grant_once">仅允许本次连接；手机应用关闭后失效。</string>
-    <string name="background_grant_until_revoked">已记住这台电脑，授权保留到取消；开启后可直接连接。</string>
+    <string name="background_grant_until_revoked">已授权这台电脑，直到撤销。</string>
     <string name="background_grant_status_loading">正在读取授权状态…</string>
     <string name="background_notification_permission_required">需要通知权限，才能提示你电脑发来的连接请求。</string>
     <string name="background_standby_requires_binding">请先通过 USB 与电脑配对，再允许电脑连接。</string>
@@ -31,7 +31,7 @@
     <string name="background_standby_recovery_text">点按即可继续等待电脑连接。</string>
     <string name="background_standby_recovery_expired">待机恢复请求已失效，请在 Receiver 中重新启用后台待机。</string>
     <string name="background_standby_status_disabled">已关闭电脑连接许可。</string>
-    <string name="background_standby_status_enabled">已允许电脑连接。</string>
+    <string name="background_standby_status_enabled">后台待机已开启。</string>
     <string name="background_standby_status_listening">正在等待这台电脑连接。</string>
     <string name="background_standby_status_loading">正在读取状态…</string>
     <string name="background_standby_status_pending">电脑已发起连接，请在手机通知中选择是否允许。</string>
@@ -150,7 +150,7 @@
     <string name="aod_metric_output_engine">输出引擎</string>
     <string name="aod_title">屏幕常显</string>
     <string name="aod_toggle">屏幕常显</string>
-    <string name="aod_toggle_description">收到电脑声音时显示时钟和波形；屏幕会一直亮着。</string>
+    <string name="aod_toggle_description">收到电脑声音时显示时钟和波形，并保持屏幕点亮。</string>
     <string name="aod_preview">进入常显</string>
     <string name="aod_disconnected">未连接</string>
     <string name="aod_connected">已连接</string>

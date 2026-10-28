@@ -2,7 +2,7 @@
     <string name="app_name">AnPod</string>
     <string name="audio_output">Audio output</string>
     <string name="output_engine_title">Playback engine</string>
-    <string name="output_engine_description">New sessions use Oboe by default; format mismatches fall back to AudioTrack. The current session will not switch.</string>
+    <string name="output_engine_description">Applies to the next connection; Oboe falls back to AudioTrack when the format is unsupported.</string>
     <string name="output_engine_audio_track">AudioTrack (backup)</string>
     <string name="output_engine_oboe">Oboe (default)</string>
     <string name="output_engine_unknown">Unknown</string>
@@ -21,7 +21,7 @@
     <string name="background_grant_eight_hours">Allow automatic connections for up to 8 hours; about %1$d hr %2$d min left. Only while AnPod is running.</string>
     <string name="background_grant_none">Your phone will ask before allowing a computer to connect in the background.</string>
     <string name="background_grant_once">Allow this background connection once. Permission ends when AnPod closes.</string>
-    <string name="background_grant_until_revoked">This computer is remembered until you cancel permission. It can connect while computer connections are allowed.</string>
+    <string name="background_grant_until_revoked">This computer stays authorized until you revoke it.</string>
     <string name="background_grant_status_loading">Checking permission…</string>
     <string name="background_notification_permission_required">Allow notifications so your phone can alert you when the computer asks to connect.</string>
     <string name="background_standby_requires_binding">Connect to the computer with a cable once to pair before allowing computer connections.</string>
@@ -31,7 +31,7 @@
     <string name="background_standby_recovery_text">Tap to wait for your computer again.</string>
     <string name="background_standby_recovery_expired">This standby request has expired. Enable standby again in Receiver.</string>
     <string name="background_standby_status_disabled">Computer connections are not allowed.</string>
-    <string name="background_standby_status_enabled">Computer connections are allowed.</string>
+    <string name="background_standby_status_enabled">Background standby is on.</string>
     <string name="background_standby_status_listening">Waiting for this computer to connect.</string>
     <string name="background_standby_status_loading">Checking status…</string>
     <string name="background_standby_status_pending">The computer asked to connect. Choose whether to allow it in the phone notification.</string>
@@ -150,7 +150,7 @@
     <string name="aod_metric_output_engine">Output engine</string>
     <string name="aod_title">Always-on screen</string>
     <string name="aod_toggle">Always-on screen</string>
-    <string name="aod_toggle_description">Shows a clock and waveform when computer audio arrives. The screen stays on.</string>
+    <string name="aod_toggle_description">Shows a clock and waveform when computer audio arrives and keeps the screen on.</string>
     <string name="aod_preview">Enter AOD</string>
     <string name="aod_disconnected">Not connected</string>
     <string name="aod_connected">Connected</string>

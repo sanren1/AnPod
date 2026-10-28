@@ -1034,7 +1034,7 @@ function App() {
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
               <strong>{active ? lanSession ? strings.app.connectedPhone : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.chooseUsbDirectPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
-              <span>{active ? aoaSession ? actualConnectionLabel(snapshot) : strings.app.connectedPhone : cleanupPending ? strings.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? strings.app.wireless : strings.app.usb}</span>
+              <span>{active ? actualConnectionLabel(snapshot) : cleanupPending ? strings.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? strings.app.wireless : strings.app.usb}</span>
               {cleanupPending && <span className="device-live-state" role="status">{strings.app.retryCleanup}</span>}
             </span>
             <ChevronDown size={18} aria-hidden="true" />
@@ -1080,7 +1080,6 @@ function App() {
         <button className="primary-button main-action" type="button" disabled={mainActionDisabled} onClick={runMainAction}>
           {mainActionLabel}
         </button>
-        {!active && wirelessUdpMode && !snapshot.wirelessConnectionOffers.active && <p className="status-description">{strings.app.backgroundStartIdleHint}</p>}
         {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
           className="status-description actionable-error"
           summary={failureSummary}

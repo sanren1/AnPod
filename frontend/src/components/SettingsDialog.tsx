@@ -52,7 +52,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
     <section className="settings-group settings-appearance" aria-labelledby="settings-appearance-title">
       <h3 id="settings-appearance-title">{strings.app.settingsInterface}</h3>
       <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy || savingKeys.has("appearanceTheme")} value={settings.appearanceTheme} onChange={event => void update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
-      <SettingToggle title={strings.app.enlargeText} description={strings.app.enlargeTextDescription} checked={largeText} onChange={onLargeText} />
+      <SettingToggle title={strings.app.enlargeText} checked={largeText} onChange={onLargeText} />
       <SettingToggle disabled={snapshot.busy || savingKeys.has("minimizeToTray")} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => void update("minimizeToTray", value)} />
     </section>
     <section className="settings-audio-summary" aria-label={strings.app.settingsAudio}>
@@ -66,11 +66,10 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       </div>
     </section>
     <details className="settings-disclosure">
-      <summary><span>{strings.app.advancedConnection}<small>{strings.app.advancedSettingsHint}</small></span></summary>
+      <summary>{strings.app.advancedConnection}</summary>
       <section className="settings-group settings-audio" aria-labelledby="settings-audio-title">
         <h3 id="settings-audio-title">{strings.app.settingsAudio}</h3>
-        <fieldset className="audio-quality-settings" aria-describedby="audio-quality-help">
-          <legend>{strings.app.transportQuality}</legend>
+        <fieldset className="audio-quality-settings" aria-label={strings.app.transportQuality} aria-describedby="audio-quality-help">
           <div className="audio-quality-options">
             {(["standard", "hifi", "hires"] as const).map(quality => {
               const fullLabel = strings.app.audioQualityLabels[quality];
@@ -79,7 +78,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
                 <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || savingKeys.has("audioQuality") || !canSetAudioQuality(snapshot, quality)} onChange={() => void update("audioQuality", quality)} />
                 <span>
                   <strong>{strings.app.audioQualityShortLabels[quality]}</strong>
-                  <small>{strings.app.requestedSpecification}: {requestedSpec}</small>
+                  <small>{requestedSpec}</small>
                   {quality !== "standard" && <small>{strings.app.audioExperimental}</small>}
                 </span>
               </label>;
