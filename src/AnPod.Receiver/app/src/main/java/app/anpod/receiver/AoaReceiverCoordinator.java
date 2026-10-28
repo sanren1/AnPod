@@ -316,7 +316,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
     }
 
     private PairingProtocol.SessionKeys authenticate() throws IOException, PairingProtocol.Failure {
-        AnpuRecordCodec.Record hello = readExpected(AnpuRecordCodec.HANDSHAKE);
+        AnpuRecordCodec.Record hello = readExpected(AnpuRecordCodec.HANDSHAKE, "hello");
         startupDeadlineNanos = System.nanoTime() + FINISH_TIMEOUT_NANOS;
             PairingProtocol.BindingMaterial derived = transport.isAdbStream()
                     ? binding.deriveAdbStream() : binding.deriveAoa();
@@ -325,7 +325,7 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         catch (PairingProtocol.Failure | RuntimeException error) { derived.close(); throw error; }
         try (PairingProtocol.V2.ReceiverAwaitFinish awaiting = handshake) {
             writeRecord(AnpuRecordCodec.HANDSHAKE, awaiting.challenge);
-            AnpuRecordCodec.Record finish = readExpected(AnpuRecordCodec.HANDSHAKE);
+            AnpuRecordCodec.Record finish = readExpected(AnpuRecordCodec.HANDSHAKE, "finish");
             PairingProtocol.V2.FinishResult completed = awaiting.acceptFinish(finish.body);
             try (PairingProtocol.V2.AuthenticatedSessionV2 session = completed.session) {
                 format = session.format;
@@ -565,9 +565,14 @@ final class AoaReceiverCoordinator implements AutoCloseable {
         if (cancelled && !stopAfterAck) throw new IOException("AOA write cancelled");
     }
 
-    private AnpuRecordCodec.Record readExpected(int type) throws IOException {
+    private AnpuRecordCodec.Record readExpected(int type, String stage) throws IOException {
         AnpuRecordCodec.Record record = io.readRecord();
-        if (record.type != type) throw new IOException("unexpected AOA record during handshake");
+        if (record.type != type) {
+            String detail = "unexpected AOA record during handshake stage=" + stage
+                    + " expected=" + type + " actual=" + record.type + " bodyLength=" + record.body.length
+                    + " ownerGeneration=" + generation + " transport=" + transport.name();
+            throw new IOException(detail);
+        }
         return record;
     }
 

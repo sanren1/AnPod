@@ -134,6 +134,7 @@ final class AnpuRecordCodec {
                 || body[0] != 'A' || body[1] != 'N' || body[2] != 'P' || body[3] != 'D'
                 || (body[4] & 0xff) != 2 || (body[5] & 0xff) != UdpPacketDecoder.FORMAT
                         && (body[5] & 0xff) != UdpPacketDecoder.AUDIO
+                        && (body[5] & 0xff) != UdpPacketDecoder.LOSS_LEDGER
                 || body[6] != 0 || body[7] != 0)
             throw new IOException("invalid ANPU audio body");
         int payloadLength = ((body[32] & 0xff) << 8) | (body[33] & 0xff);

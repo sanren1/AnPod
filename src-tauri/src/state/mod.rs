@@ -2195,7 +2195,13 @@ impl AppState {
             return Err("请选择有效的已保存 Receiver 绑定。".into());
         }
         let (generation, token) = self.start_operation();
+        self.log(&format!(
+            "USB Direct connect phase=waiting_for_gate generation={generation}"
+        ));
         let _gate = self.gate.lock().await;
+        self.log(&format!(
+            "USB Direct connect phase=gate_acquired generation={generation}"
+        ));
         if let Err(error) = token_check(&token) {
             self.finish_operation(generation);
             return Err(error);
@@ -2336,6 +2342,16 @@ impl AppState {
             Ok(self.snapshot())
         }
         .await;
+        let outcome = if result.is_ok() {
+            "connected"
+        } else if token.is_cancelled() || !self.operation_is_current(generation, &token) {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        self.log(&format!(
+            "USB Direct connect operation generation={generation} outcome={outcome}"
+        ));
         if result.is_err() && audio_initialized {
             let _ = self.audio.stop_pcm_sink();
             let _ = self.audio.stop_and_cleanup();
@@ -6483,10 +6499,8 @@ impl AppState {
     }
 
     pub async fn cancel_operation(&self, app: &AppHandle) -> AppSnapshot {
-        let force_session_io = matches!(
-            self.snapshot().state.as_str(),
-            "connecting" | "reconnecting"
-        );
+        let state = self.snapshot().state;
+        let force_session_io = matches!(state.as_str(), "connecting" | "reconnecting");
         self.cancel_active_operation();
         let _guard = match self.gate.try_lock() {
             Ok(guard) => {
@@ -6501,6 +6515,10 @@ impl AppState {
         self.cancel_active_operation();
         self.cancel_active_session(false);
         let cleanup = self.teardown(Some(app)).await;
+        self.log(&format!(
+            "cancel_operation state={state} cleanup={}",
+            if cleanup.is_ok() { "ok" } else { "failed" }
+        ));
         let mut view = self.view.lock().expect("view lock");
         view.state = if cleanup.is_err() {
             "error".into()

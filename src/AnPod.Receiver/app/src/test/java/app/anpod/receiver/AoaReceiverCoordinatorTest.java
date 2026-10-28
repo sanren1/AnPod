@@ -128,6 +128,26 @@ public class AoaReceiverCoordinatorTest {
         saved.close();
     }
 
+    @Test public void unexpectedHandshakeRecordReportsOnlyBoundedRecordMetadata() throws Exception {
+        byte[] key = sequence(0, 32);
+        PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(
+                sequence(0x10, 16), sequence(0x20, 16), key);
+        Duplex io = new Duplex();
+        AoaReceiverCoordinator coordinator = AoaReceiverCoordinator.start(
+                io.owner(), saved, new Endpoint(), "handshake-diagnostic", 77, 1000);
+        io.send(AnpuRecordCodec.AUDIO, packet(1, key, 1, UdpPacketDecoder.AUDIO, 0, new byte[4]));
+        assertTrue(coordinator.awaitTermination(2, TimeUnit.SECONDS));
+        String failure = coordinator.failureMessage();
+        assertTrue(failure, failure.contains("stage=hello"));
+        assertTrue(failure, failure.contains("expected=1 actual=3"));
+        assertTrue(failure, failure.contains("bodyLength=54 ownerGeneration=77 transport=USB_DIRECT"));
+        assertFalse(failure.contains("00010203"));
+        assertTrue(io.ownerClosed);
+        assertTrue(AoaReceiverCoordinator.isAvailable());
+        saved.close();
+        Arrays.fill(key, (byte) 0);
+    }
+
     @Test public void localCancelDoesNotBecomeAProtocolFailure() throws Exception {
         PairingProtocol.BindingMaterial saved = new PairingProtocol.BindingMaterial(
                 sequence(0x10, 16), sequence(0x20, 16), sequence(0, 32));
@@ -228,8 +248,25 @@ public class AoaReceiverCoordinatorTest {
 
                 io.send(AnpuRecordCodec.AUDIO, packet(hostSession.sessionId, keys.hostToReceiverAudio,
                         0, 0, format.encode()));
+                byte[] ledger = snapshotV3(1, 0, 0);
                 io.send(AnpuRecordCodec.AUDIO, packet(hostSession.sessionId, keys.hostToReceiverAudio,
-                        1, 0, new byte[format.frameBytes]));
+                        1, UdpPacketDecoder.LOSS_LEDGER, 0, ledger));
+                long ledgerDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (endpoint.context.ingress.appliedLossLedgerRevision() != 1
+                        && System.nanoTime() < ledgerDeadline) Thread.sleep(2);
+                assertEquals("authenticated loss ledger must pass the complete ANPU record path",
+                        1, endpoint.context.ingress.appliedLossLedgerRevision());
+                byte[] unknownAudioType = packet(hostSession.sessionId, keys.hostToReceiverAudio,
+                        3, 99, 0, new byte[] {1});
+                assertThrows(IOException.class,
+                        () -> AnpuRecordCodec.encode(AnpuRecordCodec.AUDIO, unknownAudioType));
+                byte[] malformedLedgerLength = packet(hostSession.sessionId, keys.hostToReceiverAudio,
+                        3, UdpPacketDecoder.LOSS_LEDGER, 0, ledger);
+                malformedLedgerLength[33]++;
+                assertThrows(IOException.class,
+                        () -> AnpuRecordCodec.encode(AnpuRecordCodec.AUDIO, malformedLedgerLength));
+                io.send(AnpuRecordCodec.AUDIO, packet(hostSession.sessionId, keys.hostToReceiverAudio,
+                        4, 0, new byte[format.frameBytes]));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
                 while (!endpoint.context.ingress.hasAuthenticatedAudio() && System.nanoTime() < deadline)
                     Thread.sleep(2);
@@ -314,10 +351,15 @@ public class AoaReceiverCoordinatorTest {
     }
 
     private static byte[] packet(long sid, byte[] key, long sequence, long frameIndex, byte[] plaintext) throws Exception {
+        return packet(sid, key, sequence, sequence == 0 ? UdpPacketDecoder.FORMAT : UdpPacketDecoder.AUDIO,
+                frameIndex, plaintext);
+    }
+
+    private static byte[] packet(long sid, byte[] key, long sequence, int type, long frameIndex, byte[] plaintext) throws Exception {
         byte[] header = new byte[UdpPacketDecoder.HEADER_BYTES];
         ByteBuffer b = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
         b.put(new byte[] {'A', 'N', 'P', 'D'}).put((byte) 2)
-                .put((byte) (sequence == 0 ? UdpPacketDecoder.FORMAT : UdpPacketDecoder.AUDIO))
+                .put((byte) type)
                 .putShort((short) 0).putLong(sid).putLong(sequence).putLong(frameIndex).putShort((short) plaintext.length);
         byte[] nonce = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN).putInt(0x414e5048).putLong(sequence).array();
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
@@ -327,6 +369,12 @@ public class AoaReceiverCoordinatorTest {
         byte[] datagram = Arrays.copyOf(header, header.length + encrypted.length);
         System.arraycopy(encrypted, 0, datagram, header.length, encrypted.length);
         return datagram;
+    }
+
+    private static byte[] snapshotV3(long revision, long captureTail, long settledThrough) {
+        return ByteBuffer.allocate(52).order(ByteOrder.BIG_ENDIAN).put((byte) 3).put((byte) 1)
+                .put((byte) 0).put((byte) 0).putLong(0).putLong(revision).putLong(captureTail)
+                .putLong(settledThrough).putLong(0).putLong(0).array();
     }
 
     private static byte[] sequence(int start, int length) {

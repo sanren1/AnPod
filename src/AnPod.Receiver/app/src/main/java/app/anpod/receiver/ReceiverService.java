@@ -647,6 +647,8 @@ public final class ReceiverService extends Service {
         try { coordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS); }
         catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
         String failure = coordinator.failureMessage();
+        if (failure.startsWith("unexpected AOA record during handshake stage="))
+            android.util.Log.w("AnPodReceiver", failure);
         handler.post(() -> {
             if (adbStreamCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
             if (coordinator.retainsTransportOwner()) {
@@ -663,6 +665,8 @@ public final class ReceiverService extends Service {
         try { coordinator.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS); }
         catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
         String failure = coordinator.failureMessage();
+        if (failure.startsWith("unexpected AOA record during handshake stage="))
+            android.util.Log.w("AnPodReceiver", failure);
         handler.post(() -> {
             if (aoaCoordinator != coordinator || !isCurrentOperation(ownerId, generation)) return;
             if (coordinator.retainsTransportOwner()) {

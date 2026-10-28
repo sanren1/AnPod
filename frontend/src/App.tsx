@@ -50,6 +50,8 @@ function App() {
   const [mainListenerPending, setMainListenerPending] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
   const cancelOperationLock = useRef(false);
+  const cancellableConnectionStart = useRef(false);
+  const connectionStartGeneration = useRef(0);
   const [networkStartPending, setNetworkStartPending] = useState(false);
   const networkStartPendingRef = useRef(false);
   const networkStartGeneration = useRef(0);
@@ -251,19 +253,44 @@ function App() {
   const startAoa = async (targetId: string, bindingReference: string) => {
     const configurationId = aoaConfigurationActive.current;
     if (!snapshot || active || configurationId === null) return;
+    const generation = ++connectionStartGeneration.current;
+    cancellableConnectionStart.current = true;
     setWorking(true);
     try {
-      apply(await invokeApp<Snapshot>("start_aoa_audio", { targetId, bindingReference }));
+      const started = await invokeApp<Snapshot>("start_aoa_audio", { targetId, bindingReference });
+      if (connectionStartGeneration.current !== generation) return;
+      cancellableConnectionStart.current = false;
+      apply(started);
       if (aoaConfigurationActive.current === configurationId && !aoaConfigurationClosing.current) {
-        apply(await invokeApp<Snapshot>("end_usb_direct_configuration", { configurationId }));
+        const ended = await invokeApp<Snapshot>("end_usb_direct_configuration", { configurationId });
+        if (connectionStartGeneration.current !== generation) return;
+        apply(ended);
         if (aoaConfigurationActive.current === configurationId) {
           aoaConfigurationActive.current = null;
           setPanel(null);
         }
       }
-    } finally { setWorking(false); }
+    } finally {
+      if (connectionStartGeneration.current === generation) {
+        cancellableConnectionStart.current = false;
+        setWorking(false);
+      }
+    }
   };
-  const cancelAoaStart = async () => apply(await invokeApp<Snapshot>("cancel_operation"));
+  const cancelPendingConnection = async () => {
+    if (cancelOperationLock.current) return;
+    cancelOperationLock.current = true;
+    setCancelPending(true);
+    try {
+      const cancelled = await invokeApp<Snapshot>("cancel_operation");
+      connectionStartGeneration.current++;
+      cancellableConnectionStart.current = false;
+      setWorking(false);
+      apply(cancelled);
+    } catch (error) { throw error; }
+    finally { cancelOperationLock.current = false; setCancelPending(false); }
+  };
+  const cancelAoaStart = cancelPendingConnection;
 
   const startNetworkOperation = async (operation: () => Promise<Snapshot>) => {
     const generation = ++networkStartGeneration.current;
@@ -862,13 +889,21 @@ function App() {
       return;
     }
     if (output === "phone" && !active && selected) {
+      const generation = ++connectionStartGeneration.current;
+      cancellableConnectionStart.current = true;
       setWorking(true);
       try {
         const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("connect_device", { serial: selected.serial });
+        if (connectionStartGeneration.current !== generation) return;
         apply(result.snapshot);
         if (!result.success) notify(result.message);
-      } catch (error) { notify(String(error)); }
-      finally { setWorking(false); }
+      } catch (error) { if (connectionStartGeneration.current === generation) notify(String(error)); }
+      finally {
+        if (connectionStartGeneration.current === generation) {
+          cancellableConnectionStart.current = false;
+          setWorking(false);
+        }
+      }
       return;
     }
     setWorking(true);
@@ -892,12 +927,8 @@ function App() {
     if (!snapshot) return;
     if (networkStartPending) {
       void cancelNetworkStart();
-    } else if (snapshot.state === "connecting" || snapshot.state === "reconnecting") {
-      if (cancelOperationLock.current) return;
-      cancelOperationLock.current = true; setCancelPending(true);
-      void invokeApp<Snapshot>("cancel_operation").then(apply).catch(error => notify(String(error))).finally(() => {
-        cancelOperationLock.current = false; setCancelPending(false);
-      });
+    } else if (cancellableConnectionStart.current || snapshot.state === "connecting" || snapshot.state === "reconnecting") {
+      void cancelPendingConnection().catch(error => notify(String(error)));
     } else if (snapshot.wirelessConnectionOffers.active || mainListenerPending) {
       mainListenerGeneration.current++;
       setMainListenerPending(false);
@@ -923,13 +954,21 @@ function App() {
       openNetworkDialog(); return;
     }
     if (!selected?.connectable) return;
+    const generation = ++connectionStartGeneration.current;
+    cancellableConnectionStart.current = true;
     setWorking(true);
     try {
       const result = await invokeApp<{ success: boolean; message: string; snapshot: Snapshot }>("connect_device_only", { serial: selected.serial });
+      if (connectionStartGeneration.current !== generation) return;
       apply(result.snapshot);
       if (!result.success) notify(result.message);
-    } catch (error) { notify(String(error)); }
-    finally { setWorking(false); }
+    } catch (error) { if (connectionStartGeneration.current === generation) notify(String(error)); }
+    finally {
+      if (connectionStartGeneration.current === generation) {
+        cancellableConnectionStart.current = false;
+        setWorking(false);
+      }
+    }
   };
 
   const chooseDevice = (device: Device) => {
@@ -946,7 +985,7 @@ function App() {
 
   if (!snapshot) return <main className="loading-shell"><AudioLines size={25} /><span>{strings.app.loading}</span></main>;
   const empty = devices.length === 0;
-  const cancellingConnection = snapshot.state === "connecting" || snapshot.state === "reconnecting";
+  const cancellingConnection = cancellableConnectionStart.current || snapshot.state === "connecting" || snapshot.state === "reconnecting";
   const statusTitle = networkStartPending && !cleanupPending ? strings.app.connecting : readableStatus(snapshot, cleanupPending);
   const statusDetail = snapshot.state === "streaming"
     ? snapshot.output !== "phone" ? strings.app.outputComputer
