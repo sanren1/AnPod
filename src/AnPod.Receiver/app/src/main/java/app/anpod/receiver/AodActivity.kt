@@ -249,28 +249,29 @@ private fun AodVisualLayout(
         val baseClockSize = (maxHeight.value * 0.40f).coerceIn(96f, 184f)
         val density = LocalDensity.current
         val textMeasurer = rememberTextMeasurer()
-        val clockBaseStyle = TextStyle(fontFamily = RubikClock, fontWeight = FontWeight.Black,
-            fontSize = baseClockSize.sp, letterSpacing = (-5).sp)
+        val clockBaseStyle = clockTextStyle(settings.clockFont, settings.clockWeight, baseClockSize.sp)
         val screenHeightPx = with(density) { maxHeight.toPx() }
         val clearancePx = with(density) { 4.dp.toPx() }
         var footerTopPx by remember { mutableStateOf(Float.NaN) }
         val footerTop = if (footerTopPx.isFinite()) footerTopPx else screenHeightPx * 0.88f
         val maximumDriftY = with(density) { AodDrift.MAX_Y_DP.dp.toPx() }
         val clockTopPaddingPx = screenHeightPx * 0.10f
-        val (clockBottomPx, clockSize, clockHeightPx) = remember(
+        val (clockBottomPx, maximumClockSize) = remember(
             textMeasurer, clockBaseStyle, density.density, density.fontScale, maxWidth, maxHeight,
-            footerTop, settings.clockScale
+            footerTop
         ) {
-            val text = AnnotatedString("04:44")
-            fun measureClock(size: Float, measureDensity: Density) = textMeasurer.measure(
-                text,
-                style = clockBaseStyle.copy(fontSize = size.sp),
+            fun measureClock(text: String, style: TextStyle, measureDensity: Density) = textMeasurer.measure(
+                AnnotatedString(text),
+                style = style,
                 density = measureDensity,
                 maxLines = 1,
                 softWrap = false
             )
 
-            val referenceMeasurement = measureClock(baseClockSize, Density(density.density, fontScale = 1f))
+            val referenceStyle = clockTextStyle(AodDisplaySettings.CLOCK_FONT_RUBIK,
+                AodDisplaySettings.CLOCK_WEIGHT_BOLD, baseClockSize.sp)
+            val referenceMeasurement = measureClock("04:44", referenceStyle,
+                Density(density.density, fontScale = 1f))
             val clockBottom = AodWaveformGeometry.clockBottom(
                 screenHeightPx,
                 referenceMeasurement.size.height.toFloat(),
@@ -283,14 +284,27 @@ private fun AodVisualLayout(
                 with(density) { (2 * AodDrift.MAX_X_DP).dp.toPx() }).coerceAtLeast(0f)
             val maximumHeight = (clockBottom - with(density) { (16 + AodDrift.MAX_Y_DP).dp.toPx() })
                 .coerceAtLeast(0f)
-            val requestedSize = baseClockSize * settings.clockScale / 100f
-            val size = AodDisplaySettings.fitClockSizeSp(
-                requestedSize,
+            val fitCeiling = baseClockSize * 1.2f
+            val fitStyle = clockBaseStyle.copy(fontSize = fitCeiling.sp)
+            val widestTime = (0..23).asSequence().flatMap { hour ->
+                (0..59).asSequence().map { minute -> String.format(Locale.US, "%02d:%02d", hour, minute) }
+            }.map { measureClock(it, fitStyle, density).size }
+                .fold(androidx.compose.ui.unit.IntSize.Zero) { widest, size ->
+                    androidx.compose.ui.unit.IntSize(maxOf(widest.width, size.width), maxOf(widest.height, size.height))
+                }
+            val sizeAtBase = AodDisplaySettings.fitClockSizeSp(
+                fitCeiling,
                 maximumWidth.toInt(),
                 maximumHeight.toInt()
-            ) { measureClock(it, density).size }
-            val rendered = measureClock(size, density)
-            Triple(clockBottom, size, rendered.size.height.toFloat())
+            ) { size -> AodDisplaySettings.scaleClockMeasurement(size, fitCeiling, widestTime) }
+            clockBottom to sizeAtBase
+        }
+        val clockSize = AodDisplaySettings.scaledClockSizeSp(maximumClockSize, settings.clockScale)
+        val clockHeightPx = remember(textMeasurer, clockBaseStyle, clockSize, density.density,
+            density.fontScale, clockText) {
+            textMeasurer.measure(AnnotatedString(clockText),
+                style = clockBaseStyle.copy(fontSize = clockSize.sp), density = density,
+                maxLines = 1, softWrap = false).size.height.toFloat()
         }
         val driftYPx = with(density) { driftY.dp.toPx() }
         val waveformLayout = AodWaveformGeometry.layout(
@@ -373,6 +387,38 @@ internal fun AodSettingsDialog(
                 }, valueRange = 80f..120f, steps = 7,
                     modifier = Modifier.semantics { contentDescription = clockSizeLabel })
                 Text(stringResource(R.string.aod_clock_size_value, settings.clockScale))
+                Text(stringResource(R.string.aod_clock_font), style = MaterialTheme.typography.titleMedium)
+                val clockFonts = listOf(
+                    AodDisplaySettings.CLOCK_FONT_RUBIK to R.string.aod_font_rubik,
+                    AodDisplaySettings.CLOCK_FONT_SANS_SERIF to R.string.aod_font_sans_serif,
+                    AodDisplaySettings.CLOCK_FONT_SERIF to R.string.aod_font_serif,
+                    AodDisplaySettings.CLOCK_FONT_MONOSPACE to R.string.aod_font_monospace
+                )
+                clockFonts.chunked(2).forEach { options ->
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                        options.forEachIndexed { index, (font, label) ->
+                            SegmentedButton(
+                                selected = settings.clockFont == font,
+                                onClick = { onChange(settings.copy(clockFont = font)) },
+                                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                                modifier = Modifier.heightIn(min = 48.dp)
+                            ) { Text(stringResource(label), maxLines = 1, softWrap = false) }
+                        }
+                    }
+                }
+                Text(stringResource(R.string.aod_clock_weight), style = MaterialTheme.typography.titleMedium)
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    listOf(AodDisplaySettings.CLOCK_WEIGHT_NORMAL to R.string.aod_clock_weight_normal,
+                        AodDisplaySettings.CLOCK_WEIGHT_BOLD to R.string.aod_clock_weight_bold)
+                        .forEachIndexed { index, (weight, label) ->
+                            SegmentedButton(
+                                selected = settings.clockWeight == weight,
+                                onClick = { onChange(settings.copy(clockWeight = weight)) },
+                                shape = SegmentedButtonDefaults.itemShape(index, 2),
+                                modifier = Modifier.heightIn(min = 48.dp)
+                            ) { Text(stringResource(label)) }
+                        }
+                }
                 Text(stringResource(R.string.aod_waveform_weight), style = MaterialTheme.typography.titleMedium)
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                     listOf(80, 100, 120).forEachIndexed { index, weight ->
@@ -721,7 +767,26 @@ private fun outputEngineLabel(telemetry: AodTelemetrySnapshot?): String = when (
     else -> "—"
 }
 
-private val RubikClock = FontFamily(Font(R.font.rubik_black, FontWeight.Black))
+private val RubikClock = FontFamily(
+    Font(R.font.rubik_regular, FontWeight.Normal),
+    Font(R.font.rubik_black, FontWeight.Black)
+)
+
+internal fun clockTextStyle(font: Int, weight: Int, size: androidx.compose.ui.unit.TextUnit) = TextStyle(
+    fontFamily = when (font) {
+        AodDisplaySettings.CLOCK_FONT_SANS_SERIF -> FontFamily.SansSerif
+        AodDisplaySettings.CLOCK_FONT_SERIF -> FontFamily.Serif
+        AodDisplaySettings.CLOCK_FONT_MONOSPACE -> FontFamily.Monospace
+        else -> RubikClock
+    },
+    fontWeight = when {
+        font == AodDisplaySettings.CLOCK_FONT_RUBIK && weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD -> FontWeight.Black
+        weight == AodDisplaySettings.CLOCK_WEIGHT_BOLD -> FontWeight.Bold
+        else -> FontWeight.Normal
+    },
+    fontSize = size,
+    letterSpacing = if (font == AodDisplaySettings.CLOCK_FONT_RUBIK) (-5).sp else 0.sp
+)
 
 @Composable
 private fun rememberDrift(): Pair<Float, Float> {

@@ -132,6 +132,14 @@
     <string name="aod_settings_close">Close settings</string>
     <string name="aod_clock_size">Clock size</string>
     <string name="aod_clock_size_value">%1$d%%</string>
+    <string name="aod_clock_font">Clock font</string>
+    <string name="aod_font_rubik">Rubik</string>
+    <string name="aod_font_sans_serif">Sans</string>
+    <string name="aod_font_serif">Serif</string>
+    <string name="aod_font_monospace">Mono</string>
+    <string name="aod_clock_weight">Clock weight</string>
+    <string name="aod_clock_weight_normal">Standard</string>
+    <string name="aod_clock_weight_bold">Bold</string>
     <string name="aod_waveform_weight">Waveform weight</string>
     <string name="aod_weight_thin">Thin</string>
     <string name="aod_weight_default">Default</string>

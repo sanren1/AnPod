@@ -132,6 +132,14 @@
     <string name="aod_settings_close">关闭设置</string>
     <string name="aod_clock_size">时钟字号</string>
     <string name="aod_clock_size_value">%1$d%%</string>
+    <string name="aod_clock_font">时钟字体</string>
+    <string name="aod_font_rubik">Rubik</string>
+    <string name="aod_font_sans_serif">无衬线</string>
+    <string name="aod_font_serif">衬线</string>
+    <string name="aod_font_monospace">等宽</string>
+    <string name="aod_clock_weight">时钟粗细</string>
+    <string name="aod_clock_weight_normal">标准</string>
+    <string name="aod_clock_weight_bold">加粗</string>
     <string name="aod_waveform_weight">波形粗细</string>
     <string name="aod_weight_thin">细</string>
     <string name="aod_weight_default">默认</string>

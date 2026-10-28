@@ -12,7 +12,9 @@ internal data class AodDisplaySettings(
     val showLoss: Boolean = true,
     val showAudioFormat: Boolean = false,
     val showUnderruns: Boolean = false,
-    val showOutputEngine: Boolean = false
+    val showOutputEngine: Boolean = false,
+    val clockFont: Int = CLOCK_FONT_RUBIK,
+    val clockWeight: Int = CLOCK_WEIGHT_BOLD
 ) {
     val waveformStrokeScale: Float
         get() = when (waveformWeight) {
@@ -33,6 +35,15 @@ internal data class AodDisplaySettings(
         private const val KEY_AUDIO_FORMAT = "aod_show_audio_format"
         private const val KEY_UNDERRUNS = "aod_show_underruns"
         private const val KEY_OUTPUT_ENGINE = "aod_show_output_engine"
+        private const val KEY_CLOCK_FONT = "aod_clock_font"
+        private const val KEY_CLOCK_WEIGHT = "aod_clock_weight"
+
+        const val CLOCK_FONT_RUBIK = 0
+        const val CLOCK_FONT_SANS_SERIF = 1
+        const val CLOCK_FONT_SERIF = 2
+        const val CLOCK_FONT_MONOSPACE = 3
+        const val CLOCK_WEIGHT_NORMAL = 400
+        const val CLOCK_WEIGHT_BOLD = 700
 
         fun fitClockSizeSp(
             requestedSizeSp: Float,
@@ -58,6 +69,17 @@ internal data class AodDisplaySettings(
             return lower
         }
 
+        fun scaleClockMeasurement(sizeSp: Float, measuredAtSp: Float, measuredSize: IntSize): IntSize {
+            val ratio = sizeSp / measuredAtSp
+            return IntSize(
+                kotlin.math.ceil(measuredSize.width * ratio).toInt(),
+                kotlin.math.ceil(measuredSize.height * ratio).toInt()
+            )
+        }
+
+        fun scaledClockSizeSp(maximumSizeSp: Float, clockScale: Int): Float =
+            maximumSizeSp * clockScale.coerceIn(80, 120) / 120f
+
         fun read(preferences: SharedPreferences) = AodDisplaySettings(
             clockScale = preferences.getInt(KEY_CLOCK_SCALE, DEFAULT_CLOCK_SCALE),
             waveformWeight = preferences.getInt(KEY_WAVEFORM_WEIGHT, DEFAULT_WAVEFORM_WEIGHT),
@@ -67,7 +89,9 @@ internal data class AodDisplaySettings(
             showLoss = preferences.getBoolean(KEY_LOSS, true),
             showAudioFormat = preferences.getBoolean(KEY_AUDIO_FORMAT, false),
             showUnderruns = preferences.getBoolean(KEY_UNDERRUNS, false),
-            showOutputEngine = preferences.getBoolean(KEY_OUTPUT_ENGINE, false)
+            showOutputEngine = preferences.getBoolean(KEY_OUTPUT_ENGINE, false),
+            clockFont = preferences.getInt(KEY_CLOCK_FONT, CLOCK_FONT_RUBIK),
+            clockWeight = preferences.getInt(KEY_CLOCK_WEIGHT, CLOCK_WEIGHT_BOLD)
         )
     }
 
@@ -82,6 +106,8 @@ internal data class AodDisplaySettings(
             .putBoolean(KEY_AUDIO_FORMAT, showAudioFormat)
             .putBoolean(KEY_UNDERRUNS, showUnderruns)
             .putBoolean(KEY_OUTPUT_ENGINE, showOutputEngine)
+            .putInt(KEY_CLOCK_FONT, clockFont)
+            .putInt(KEY_CLOCK_WEIGHT, clockWeight)
             .apply()
     }
 }
