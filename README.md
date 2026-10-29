@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。目前处于 Preview 阶段。本地候选为 PC 1.14.2 + Receiver 0.21.1-v3-flow-candidate/code 47，实机连接、音质与长期播放待用户验证；公开下载以 Releases 为准。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。正式版本为 PC 1.18.0 + Receiver 0.26.1-v3-flow-candidate/code 54，tag `v1.18.0-main` 发布在 `main`（非预发布）。下载：[v1.18.0-main](https://github.com/sanren1/AnPod/releases/tag/v1.18.0-main)。实机连接、音质与长期播放仍需用户验证。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置按界面、音频、连接、关于与诊断分组，并区分请求音质档位和实际格式。
 
@@ -61,7 +61,7 @@ Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音�
 
 完整说明、指标口径与限制见 [`docs/AOD.md`](docs/AOD.md)。
 
-![手机常显预览](docs/aod-preview.jpg)
+![手机常显界面截图](docs/aod-preview.jpg)
 
 ## 升级
 
@@ -75,21 +75,30 @@ Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音�
 
 ## 延迟测试记录
 
-PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 匹配并经独立复核。
+### 最近一次短测（2026-10-29）
 
-下表是 **1.2.1 的历史测量**。后续版本尚未重新测量，因此这些数字不能当作当前版本的延迟结论。
+以下为六种连接模式的声学端到端时差，单位为毫秒。每组约 26 秒；PC 1.18.0 为用户确认的实测版本。HiFi 档由用户手动填写，UDP 模式由用户确认；Receiver 版本与 health 状态未采集。
+
+| 连接与档位 | 中位数 | P95 | 范围 | 匹配 |
+| --- | ---: | ---: | ---: | ---: |
+| USB Direct · 均衡 | 180.29845 ms | 180.80458 ms | 179.7611–180.8494 ms | 10/10 |
+| USB Direct · 低延迟 | 127.20345 ms | 127.87039 ms | 126.401–127.9468 ms | 10/10 |
+| USB ADB · 均衡 | 228.4808 ms | 236.77315 ms | 219.2927–237.7789 ms | 10/10 |
+| USB ADB · 低延迟 | 138.28305 ms | 138.96505 ms | 137.8651–139.0501 ms | 10/10 |
+| 无线 UDP · 均衡 | 239.50025 ms | 259.85765 ms | 177.7524–260.8832 ms | 10/10 |
+| 无线 UDP · 低延迟 | 166.6709 ms | 171.74108 ms | 159.4513–172.9416 ms | 9/10 |
+
+这些约 26 秒的短测不代表音乐音质或长时间稳定性。测量包含输出、声学与麦克风采集链路，不是纯传输延迟。
+
+### 历史基准（PC 1.2.1 + Receiver 0.9.1/code 12；2026-10-17 记录）
+
+这项电脑本机基准来自约 24 秒的历史测量，10 个提示音均匹配并经独立复核。
 
 | 连接与档位 | 中位数 | P95 |
 | --- | ---: | ---: |
-| USB · 均衡 | 156.720 ms | 157.111 ms |
-| USB · 低延迟 | 123.269 ms | 125.299 ms |
-| 无线 UDP · 均衡 | 310.645 ms | 314.294 ms |
-| 无线 UDP · 低延迟 | 187.394 ms | 200.240 ms |
 | 电脑本机 · 基准 | 71.699 ms | 71.778 ms |
 
-电脑本机基准是独立路径，仅作参照，不与四档结果相减。测量包含声学与麦克风链路，是端到端时差，并非纯传输延迟。无线 UDP 低延迟组有两次低匹配分，仅供参考；这不代表音乐音质通过。
-
-这组历史测量的完整记录保存在本地测试资料中，不随公开源码分发。
+电脑本机基准是独立声学路径，仅作参照，不与连接模式测量结果相减。测量包含声学与麦克风链路，是端到端时差，并非纯传输延迟。
 
 ## 已知问题
 
@@ -100,12 +109,12 @@ PC 1.2.1 + Receiver 0.9.1/code 12；每档约 24 秒、10 个提示音，10/10 �
 
 ## 下载与反馈
 
-公开版本发布后可从 [GitHub Releases](https://github.com/sanren1/AnPod/releases) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
+从 [v1.18.0-main 正式发布页](https://github.com/sanren1/AnPod/releases/tag/v1.18.0-main) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
 
 ## 开发
 
 源码构建依赖 Rust stable、Node.js/npm、MSVC x64 C++ 工具；重建 Receiver 另需 JDK 17 与 Android SDK。前端使用 `cd frontend; npm ci; npm run build`。便携包入口见 [`packaging/publish-tauri.ps1`](packaging/publish-tauri.ps1)，构建前请阅读其中参数及脚本要求。旧 WPF 实现保留在 `src/AnPod.Desktop/`。
 
-提交 Rust 改动前运行 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`；发现排版差异先运行同命令去掉 `--check` 修正，再复查。其余检查以 [Windows CI 工作流](https://github.com/sanren1/AnPod/blob/dev/.github/workflows/windows-checks.yml) 为准。
+提交 Rust 改动前运行 `cargo fmt --manifest-path src-tauri/Cargo.toml --check`；发现排版差异先运行同命令去掉 `--check` 修正，再复查。其余检查以 [Windows CI 工作流](https://github.com/sanren1/AnPod/blob/main/.github/workflows/windows-checks.yml) 为准。
 
 第三方许可与上游声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)、[`LICENSES/`](LICENSES/) 和 [`upstream/`](upstream/)。项目自有代码以 **GPL-3.0-or-later** 发布，完整文本见 [`LICENSE`](LICENSE)；其中改编自 AudioShare 的部分仍按 LGPL-3.0-or-later 说明处理。
