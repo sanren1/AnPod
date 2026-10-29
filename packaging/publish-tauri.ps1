@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version,
+    [string]$PackageDirectory,
     [switch]$IncludeReceiverCandidate,
     [switch]$IncludeReceiverRelease,
     [ValidateSet('p1', 'p2', 'v2', 'v3')]
@@ -83,14 +84,33 @@ if ($manifestVersion -ne $Version -or $config.version -ne $Version) { throw "Req
 
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
 $artifactsRoot = [System.IO.Path]::GetFullPath($artifacts).TrimEnd('\', '/')
-$packageDir = [System.IO.Path]::GetFullPath((Join-Path $artifacts $packageName))
-$zipPath = [System.IO.Path]::GetFullPath((Join-Path $artifacts "$packageName.zip"))
+$packageDir = if ($PackageDirectory) {
+    [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($PackageDirectory)) { $PackageDirectory } else { Join-Path $root $PackageDirectory }))
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $artifacts $packageName))
+}
+$packageDir = $packageDir.TrimEnd('\', '/')
+$zipPath = [System.IO.Path]::GetFullPath("$packageDir.zip")
 foreach ($target in @($packageDir, $zipPath)) {
     if (-not $target.StartsWith($artifactsRoot + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to write outside artifacts/: $target"
     }
 }
-if ($IncludeReceiverCandidate -and $ReceiverCandidate -in @('v2', 'v3') -and ((Test-Path -LiteralPath $packageDir) -or (Test-Path -LiteralPath $zipPath))) {
+if ($PackageDirectory) {
+    $pathToCheck = $packageDir
+    while ($true) {
+        if (Test-Path -LiteralPath $pathToCheck) {
+            $existingPath = Get-Item -LiteralPath $pathToCheck -Force
+            if ($existingPath.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a redirected package path ancestor: $pathToCheck" }
+        }
+        if ($pathToCheck.Equals($artifactsRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $pathToCheck = [IO.Directory]::GetParent($pathToCheck).FullName
+    }
+    if ((Test-Path -LiteralPath $packageDir) -or (Test-Path -LiteralPath $zipPath)) {
+        throw "Refusing to overwrite an existing explicit package path: $packageDir"
+    }
+}
+if (-not $PackageDirectory -and $IncludeReceiverCandidate -and $ReceiverCandidate -in @('v2', 'v3') -and ((Test-Path -LiteralPath $packageDir) -or (Test-Path -LiteralPath $zipPath))) {
     throw "Refusing to overwrite an existing v$ReceiverCandidate candidate path: $packageName"
 }
 
