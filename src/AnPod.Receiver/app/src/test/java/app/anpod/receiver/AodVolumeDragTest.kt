@@ -3,8 +3,104 @@ package app.anpod.receiver
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 class AodVolumeDragTest {
+    @Test
+    fun blockedSystemWriteKeepsOnlyLatestPendingTarget() = runBlocking {
+        val targets = AodVolumeTargetQueue()
+        val firstWriteStarted = CompletableDeferred<Unit>()
+        val releaseFirstWrite = CompletableDeferred<Unit>()
+        val applied = mutableListOf<Int>()
+        targets.offer(4)
+
+        val writer = launch {
+            consumeAodVolumeTargets(targets) { target ->
+                applied.add(target)
+                if (applied.size == 1) {
+                    firstWriteStarted.complete(Unit)
+                    releaseFirstWrite.await()
+                }
+            }
+        }
+
+        firstWriteStarted.await()
+        targets.offer(5)
+        targets.offer(7)
+        targets.offer(6)
+        targets.close()
+        releaseFirstWrite.complete(Unit)
+        writer.join()
+
+        assertEquals(listOf(4, 6), applied)
+    }
+
+    @Test
+    fun nextGestureStartsFromLatestPendingTargetUntilSystemWritesCatchUp() = runBlocking {
+        val targets = AodVolumeTargetQueue()
+        val firstWriteStarted = CompletableDeferred<Unit>()
+        val releaseFirstWrite = CompletableDeferred<Unit>()
+        val applied = mutableListOf<Int>()
+        var systemVolume = 3
+        targets.offer(4)
+
+        val writer = launch {
+            consumeAodVolumeTargets(targets) { target ->
+                applied.add(target)
+                if (applied.size == 1) {
+                    firstWriteStarted.complete(Unit)
+                    releaseFirstWrite.await()
+                }
+                systemVolume = target
+            }
+        }
+
+        firstWriteStarted.await()
+        val nextDrag = AodVolumeDrag(targets.startingVolume { systemVolume }, 0, 10, 200f)
+        assertEquals(4, targets.startingVolume { systemVolume })
+        assertEquals(5, nextDrag.move(-20f))
+        targets.offer(5)
+        targets.close()
+        releaseFirstWrite.complete(Unit)
+        writer.join()
+
+        assertEquals(listOf(4, 5), applied)
+        systemVolume = 7
+        assertEquals(7, targets.startingVolume { systemVolume })
+    }
+
+    @Test
+    fun canceledWriterDoesNotApplyPendingTargetsAfterInFlightWriteReturns() = runBlocking {
+        val targets = AodVolumeTargetQueue()
+        val firstWriteStarted = CompletableDeferred<Unit>()
+        val releaseFirstWrite = CompletableDeferred<Unit>()
+        val applied = mutableListOf<Int>()
+        targets.offer(4)
+
+        val writer = launch {
+            consumeAodVolumeTargets(targets) { target ->
+                applied.add(target)
+                if (applied.size == 1) {
+                    firstWriteStarted.complete(Unit)
+                    withContext(NonCancellable) { releaseFirstWrite.await() }
+                }
+            }
+        }
+
+        firstWriteStarted.await()
+        targets.offer(6)
+        targets.cancel()
+        writer.cancel()
+        releaseFirstWrite.complete(Unit)
+        writer.join()
+
+        assertEquals(listOf(4), applied)
+    }
+
     @Test
     fun upwardRaisesAndDownwardLowersMediaVolume() {
         val drag = AodVolumeDrag(5, 0, 10, 200f)

@@ -171,6 +171,7 @@ export const en: typeof zhCN = {
     windowAppearance: "Window and appearance",
     minimizeToTray: "Minimize to tray when closing",
     minimizeToTrayDescription: "Reopen AnPod from the tray menu",
+    launchAtLogin: "Start AnPod when I sign in",
     enlargeText: "Larger text",
     theme: "Theme",
     followSystem: "Follow system",

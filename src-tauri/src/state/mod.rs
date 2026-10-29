@@ -2016,6 +2016,10 @@ impl AppState {
         }
     }
 
+    pub(crate) fn log_launch_at_login_error(&self, error: &str) {
+        self.log(&format!("登录启动项同步失败：{error}"));
+    }
+
     fn recover_mute_state(&self) {
         let marker = self.data_dir.join("muted-endpoints.txt");
         if let Ok(contents) = fs::read_to_string(&marker) {

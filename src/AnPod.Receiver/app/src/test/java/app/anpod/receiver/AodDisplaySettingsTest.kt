@@ -3,6 +3,7 @@ package app.anpod.receiver
 import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Typeface
 import androidx.core.content.res.ResourcesCompat
 import androidx.compose.ui.unit.IntSize
@@ -31,7 +32,7 @@ class AodDisplaySettingsTest {
 
         assertEquals(AodDisplaySettings(), AodDisplaySettings.read(preferences))
 
-        val selected = AodDisplaySettings(115, 120, false, true, false, true,
+        val selected = AodDisplaySettings(115, 7, false, true, false, true,
             clockFont = AodDisplaySettings.CLOCK_FONT_SERIF,
             clockWeightLevel = 2)
         selected.save(preferences)
@@ -188,6 +189,12 @@ class AodDisplaySettingsTest {
                 val bytes = context.resources.openRawResource(resource).use { it.readBytes() }
                 assertEquals("font=$font weight=$weight", weight, sfntWeight(bytes))
                 assertFalse("font=$font weight=$weight retains fvar", "fvar" in sfntTables(bytes))
+                if (font == AodDisplaySettings.CLOCK_FONT_SERIF) {
+                    assertTrue("font=$font weight=$weight retains lining/tabular substitutions",
+                        sfntFeatureTags(bytes).containsAll(setOf("lnum", "tnum")))
+                    assertEquals("\"lnum\", \"tnum\"",
+                        clockTextStyle(font, weight, baseSize.sp).fontFeatureSettings)
+                }
                 val cmap = sfntCmapCodepoints(bytes)
                 if (font == AodDisplaySettings.CLOCK_FONT_RUBIK && weight in listOf(400, 850)) {
                     assertTrue("font=$font weight=$weight", cmap.containsAll(expectedCmap))
@@ -228,16 +235,61 @@ class AodDisplaySettingsTest {
     }
 
     @Test
-    fun waveformWeightHasNineIncreasingStepsAndPreservesLegacyAnchors() {
+    @Config(sdk = [23])
+    fun allClockFamiliesKeepDigitsOnTheSameBaselineAtEverySerifWeight() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val families = listOf(
+            AodDisplaySettings.CLOCK_FONT_RUBIK to listOf(400),
+            AodDisplaySettings.CLOCK_FONT_SANS_SERIF to listOf(400),
+            AodDisplaySettings.CLOCK_FONT_SERIF to AodDisplaySettings.CLOCK_WEIGHT_VALUES,
+            AodDisplaySettings.CLOCK_FONT_MONOSPACE to listOf(400)
+        )
+        for ((family, weights) in families) {
+            for (weight in weights) {
+                val typeface = ResourcesCompat.getFont(context, clockFontResource(family, weight))
+                    ?: error("Missing clock font $family/$weight")
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    this.typeface = typeface
+                    textSize = 120f
+                    if (family == AodDisplaySettings.CLOCK_FONT_SERIF) fontFeatureSettings = "\"lnum\", \"tnum\""
+                }
+                val bottomOffsets = (0..9).map { digit ->
+                    val bounds = Rect()
+                    paint.getTextBounds(digit.toString(), 0, 1, bounds)
+                    bounds.bottom
+                }
+                assertTrue("family=$family weight=$weight digit bottoms=$bottomOffsets",
+                    bottomOffsets.maxOrNull()!! - bottomOffsets.minOrNull()!! <= 3)
+            }
+        }
+    }
+
+    @Test
+    fun waveformWeightHasNineIncreasingStepsAndMigratesLegacyExponentialValues() {
         var previous = 0f
-        for (weight in 80..120 step 5) {
-            val scale = AodDisplaySettings(waveformWeight = weight).waveformStrokeScale
-            assertTrue("waveformWeight=$weight", scale > previous)
+        AodDisplaySettings.WAVEFORM_SCALE_VALUES.forEachIndexed { index, scale ->
+            assertEquals(index + 1, AodDisplaySettings(waveformWeightLevel = index + 1).waveformWeightLevel)
+            assertTrue("waveformWeightLevel=${index + 1}", scale > previous)
             previous = scale
         }
-        assertEquals(0.5f, AodDisplaySettings(waveformWeight = 80).waveformStrokeScale)
-        assertEquals(1f, AodDisplaySettings(waveformWeight = 100).waveformStrokeScale)
-        assertEquals(2f, AodDisplaySettings(waveformWeight = 120).waveformStrokeScale)
+        assertEquals(1f, AodDisplaySettings().waveformStrokeScale)
+        assertEquals(0.5f, AodDisplaySettings(
+            waveformWeightLevel = AodDisplaySettings.legacyWaveformWeightLevel(80)
+        ).waveformStrokeScale)
+        assertEquals(1f, AodDisplaySettings(waveformWeightLevel = 3).waveformStrokeScale)
+        assertEquals(2f, AodDisplaySettings(waveformWeightLevel =
+            AodDisplaySettings.legacyWaveformWeightLevel(120)).waveformStrokeScale)
+
+        val preferences = ApplicationProvider.getApplicationContext<Context>()
+            .getSharedPreferences("aod_waveform_migration_test", Context.MODE_PRIVATE)
+        for ((legacy, expectedLevel) in listOf(80 to 1, 90 to 2, 100 to 3, 110 to 5, 120 to 7)) {
+            preferences.edit().clear().putInt("aod_waveform_weight", legacy).commit()
+            val migrated = AodDisplaySettings.read(preferences)
+            assertEquals("legacy=$legacy", expectedLevel, migrated.waveformWeightLevel)
+            migrated.save(preferences)
+            assertEquals(expectedLevel, preferences.getInt("aod_waveform_weight_level", -1))
+            assertEquals(migrated, AodDisplaySettings.read(preferences))
+        }
     }
 
     @Test
@@ -285,6 +337,17 @@ class AodDisplaySettingsTest {
             val record = 12 + index * 16
             bytes.copyOfRange(record, record + 4).decodeToString() to font.getInt(record + 8)
         }
+    }
+
+    private fun sfntFeatureTags(bytes: ByteArray): Set<String> {
+        val font = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+        val gsub = sfntTables(bytes)["GSUB"] ?: return emptySet()
+        val featureList = gsub + (font.getShort(gsub + 6).toInt() and 0xffff)
+        val count = font.getShort(featureList).toInt() and 0xffff
+        return (0 until count).map { index ->
+            val record = featureList + 2 + index * 6
+            bytes.copyOfRange(record, record + 4).decodeToString()
+        }.toSet()
     }
 
     private fun sfntCmapCodepoints(bytes: ByteArray): Set<Int> {

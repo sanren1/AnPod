@@ -8,6 +8,7 @@ mod aoa_owner;
 mod aoa_winusb;
 mod audio;
 mod receiver;
+mod startup;
 mod state;
 // Receiver-side protocol, session, and handshake code below is a cross-language
 // test oracle for the Java Receiver: the shipped binary only drives the host
@@ -144,6 +145,16 @@ fn update_setting(
     key: String,
     value: serde_json::Value,
 ) -> Result<AppSnapshot, String> {
+    if key == "launchAtLogin" {
+        let previous = state.snapshot().settings.launch_at_login;
+        let enabled = value.as_bool().ok_or("无效设置值")?;
+        startup::apply_launch_at_login(
+            || startup::set_launch_at_login(enabled),
+            || state.update_setting(&key, value),
+            || startup::set_launch_at_login(previous),
+        )?;
+        return Ok(state.snapshot());
+    }
     state.update_setting(&key, value)?;
     Ok(state.snapshot())
 }
@@ -538,6 +549,11 @@ fn main() {
         .setup(|app| {
             let state = app.state::<AppState>();
             state.initialize(app.handle())?;
+            if let Err(error) = startup::reconcile_launch_at_login_on_startup(
+                state.snapshot().settings.launch_at_login,
+            ) {
+                state.log_launch_at_login_error(&error);
+            }
             let monitor_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {

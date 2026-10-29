@@ -54,6 +54,7 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy || savingKeys.has("appearanceTheme")} value={settings.appearanceTheme} onChange={event => void update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
       <SettingToggle title={strings.app.enlargeText} checked={largeText} onChange={onLargeText} />
       <SettingToggle disabled={snapshot.busy || savingKeys.has("minimizeToTray")} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => void update("minimizeToTray", value)} />
+      <SettingToggle disabled={snapshot.busy || savingKeys.has("launchAtLogin")} title={strings.app.launchAtLogin} checked={settings.launchAtLogin} onChange={value => void update("launchAtLogin", value)} />
     </section>
     <section className="settings-audio-summary" aria-label={strings.app.settingsAudio}>
       <span>{strings.app.transportQuality}</span>

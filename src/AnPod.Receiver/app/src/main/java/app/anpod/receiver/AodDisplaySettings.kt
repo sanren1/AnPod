@@ -6,7 +6,7 @@ import kotlin.math.pow
 
 internal data class AodDisplaySettings(
     val clockScale: Int = DEFAULT_CLOCK_SCALE,
-    val waveformWeight: Int = DEFAULT_WAVEFORM_WEIGHT,
+    val waveformWeightLevel: Int = DEFAULT_WAVEFORM_WEIGHT_LEVEL,
     val showProtocol: Boolean = true,
     val showReceiveRate: Boolean = true,
     val showBuffer: Boolean = true,
@@ -21,14 +21,15 @@ internal data class AodDisplaySettings(
         get() = CLOCK_WEIGHT_VALUES[clockWeightLevel - 1]
 
     val waveformStrokeScale: Float
-        get() = 2.0.pow((waveformWeight - 100) / 20.0).toFloat()
+        get() = WAVEFORM_SCALE_VALUES[waveformWeightLevel - 1]
 
     companion object {
         const val DEFAULT_CLOCK_SCALE = 100
-        const val DEFAULT_WAVEFORM_WEIGHT = 100
+        const val DEFAULT_WAVEFORM_WEIGHT_LEVEL = 3
         const val DEFAULT_CLOCK_WEIGHT_LEVEL = 9
         private const val KEY_CLOCK_SCALE = "aod_clock_scale"
         private const val KEY_WAVEFORM_WEIGHT = "aod_waveform_weight"
+        private const val KEY_WAVEFORM_WEIGHT_LEVEL = "aod_waveform_weight_level"
         private const val KEY_PROTOCOL = "aod_show_protocol"
         private const val KEY_RECEIVE_RATE = "aod_show_receive_rate"
         private const val KEY_BUFFER = "aod_show_buffer"
@@ -48,6 +49,12 @@ internal data class AodDisplaySettings(
         const val CLOCK_WEIGHT_BOLD = 700
         const val CLOCK_WEIGHT_BLACK = 850
         val CLOCK_WEIGHT_VALUES = listOf(300, 400, 450, 500, 550, 600, 700, 775, 850)
+        val WAVEFORM_SCALE_VALUES = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.25f, 2.5f)
+
+        fun legacyWaveformWeightLevel(weight: Int): Int {
+            val oldScale = 2.0.pow((weight - 100) / 20.0).toFloat()
+            return WAVEFORM_SCALE_VALUES.indices.minBy { kotlin.math.abs(WAVEFORM_SCALE_VALUES[it] - oldScale) } + 1
+        }
 
         fun legacyClockWeightLevel(weight: Int, font: Int): Int = when {
             weight == CLOCK_WEIGHT_NORMAL -> 2
@@ -103,7 +110,11 @@ internal data class AodDisplaySettings(
             }
             return AodDisplaySettings(
                 clockScale = preferences.getInt(KEY_CLOCK_SCALE, DEFAULT_CLOCK_SCALE),
-                waveformWeight = preferences.getInt(KEY_WAVEFORM_WEIGHT, DEFAULT_WAVEFORM_WEIGHT),
+                waveformWeightLevel = if (preferences.contains(KEY_WAVEFORM_WEIGHT_LEVEL)) {
+                    preferences.getInt(KEY_WAVEFORM_WEIGHT_LEVEL, DEFAULT_WAVEFORM_WEIGHT_LEVEL)
+                } else {
+                    legacyWaveformWeightLevel(preferences.getInt(KEY_WAVEFORM_WEIGHT, 100))
+                },
                 showProtocol = preferences.getBoolean(KEY_PROTOCOL, true),
                 showReceiveRate = preferences.getBoolean(KEY_RECEIVE_RATE, true),
                 showBuffer = preferences.getBoolean(KEY_BUFFER, true),
@@ -120,7 +131,7 @@ internal data class AodDisplaySettings(
     fun save(preferences: SharedPreferences) {
         preferences.edit()
             .putInt(KEY_CLOCK_SCALE, clockScale)
-            .putInt(KEY_WAVEFORM_WEIGHT, waveformWeight)
+            .putInt(KEY_WAVEFORM_WEIGHT_LEVEL, waveformWeightLevel)
             .putBoolean(KEY_PROTOCOL, showProtocol)
             .putBoolean(KEY_RECEIVE_RATE, showReceiveRate)
             .putBoolean(KEY_BUFFER, showBuffer)

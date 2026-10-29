@@ -168,6 +168,7 @@ export const zhCN = {
     windowAppearance: "窗口和外观",
     minimizeToTray: "关闭时最小化到托盘",
     minimizeToTrayDescription: "从托盘菜单可以重新打开 AnPod",
+    launchAtLogin: "登录 Windows 时启动 AnPod",
     enlargeText: "放大文字",
     theme: "主题",
     followSystem: "跟随系统",

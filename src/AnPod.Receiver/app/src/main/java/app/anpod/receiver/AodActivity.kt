@@ -91,6 +91,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.channels.Channel
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -440,9 +449,9 @@ internal fun AodSettingsDialog(
                         Text(stringResource(R.string.aod_waveform_weight), style = MaterialTheme.typography.titleMedium)
                         val waveformWeightLabel = stringResource(R.string.aod_waveform_weight)
                         Slider(
-                            value = settings.waveformWeight.toFloat(),
-                            onValueChange = { onChange(settings.copy(waveformWeight = it.roundToInt())) },
-                            valueRange = 80f..120f,
+                            value = settings.waveformWeightLevel.toFloat(),
+                            onValueChange = { onChange(settings.copy(waveformWeightLevel = it.roundToInt())) },
+                            valueRange = 1f..9f,
                             steps = 7,
                             modifier = Modifier.semantics { contentDescription = waveformWeightLabel }
                         )
@@ -550,38 +559,92 @@ private fun VolumeGestureArea(modifier: Modifier) {
     val context = LocalContext.current
     val audioManager = remember(context) { context.getSystemService(AudioManager::class.java) }
     Box(modifier.pointerInput(audioManager) {
-        // No touch-slop wait: this area only adjusts volume, so the first moved pixel already counts
-        // and a short swipe reaches the next level. detectVerticalDragGestures delayed both.
-        awaitEachGesture {
-            val down = awaitFirstDown(requireUnconsumed = false)
-            if (audioManager.isVolumeFixed) {
-                Toast.makeText(context, "This device's media volume is fixed by the system.", Toast.LENGTH_SHORT).show()
-                return@awaitEachGesture
-            }
-            val minimum = if (Build.VERSION.SDK_INT >= 28)
-                audioManager.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0
-            val drag = AodVolumeDrag(
-                audioManager.getStreamVolume(AudioManager.STREAM_MUSIC), minimum,
-                audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
-                size.height * VOLUME_GESTURE_TRAVEL
-            )
-            while (true) {
-                val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                if (!change.pressed) break
-                val delta = change.positionChange().y
-                if (delta == 0f) continue
-                change.consume()
-                val target = drag.move(delta) ?: continue
+        coroutineScope {
+            val targets = AodVolumeTargetQueue()
+            launch(Dispatchers.IO) {
                 try {
-                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+                    consumeAodVolumeTargets(targets) { target ->
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+                    }
                 } catch (error: SecurityException) {
+                    targets.cancel()
                     android.util.Log.w("AnPodAod", "Media volume adjustment denied", error)
-                    Toast.makeText(context, "Android does not allow volume changes here. Use the volume buttons.", Toast.LENGTH_SHORT).show()
-                    break
+                    withContext(Dispatchers.Main.immediate) {
+                        Toast.makeText(context, "Android does not allow volume changes here. Use the volume buttons.", Toast.LENGTH_SHORT).show()
+                    }
                 }
+            }
+            try {
+                // No touch-slop wait: the first moved pixel already adjusts this dedicated area.
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    if (audioManager.isVolumeFixed) {
+                        Toast.makeText(context, "This device's media volume is fixed by the system.", Toast.LENGTH_SHORT).show()
+                        return@awaitEachGesture
+                    }
+                    val minimum = if (Build.VERSION.SDK_INT >= 28)
+                        audioManager.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0
+                    val drag = AodVolumeDrag(
+                        targets.startingVolume { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }, minimum,
+                        audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+                        size.height * VOLUME_GESTURE_TRAVEL
+                    )
+                    while (true) {
+                        val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) break
+                        val delta = change.positionChange().y
+                        if (delta == 0f) continue
+                        change.consume()
+                        val target = drag.move(delta) ?: continue
+                        if (!targets.offer(target)) break
+                    }
+                }
+            } finally {
+                targets.cancel()
             }
         }
     })
+}
+
+/** One in-flight system call and at most the latest pending finger target. */
+internal data class AodVolumeTarget(val id: Long, val volume: Int)
+
+internal class AodVolumeTargetQueue {
+    private val targets = Channel<AodVolumeTarget>(Channel.CONFLATED)
+    private val sequence = AtomicLong()
+    private val latestPending = AtomicReference<AodVolumeTarget?>(null)
+
+    fun offer(volume: Int): Boolean {
+        val target = AodVolumeTarget(sequence.incrementAndGet(), volume)
+        latestPending.set(target)
+        if (targets.trySend(target).isSuccess) return true
+        latestPending.compareAndSet(target, null)
+        return false
+    }
+
+    fun startingVolume(readSystemVolume: () -> Int): Int = latestPending.get()?.volume ?: readSystemVolume()
+
+    suspend fun next(): AodVolumeTarget? = targets.receiveCatching().getOrNull()
+
+    fun complete(target: AodVolumeTarget) {
+        latestPending.compareAndSet(target, null)
+    }
+
+    fun cancel() {
+        latestPending.set(null)
+        targets.cancel()
+    }
+
+    fun close() = targets.close()
+}
+
+internal suspend fun consumeAodVolumeTargets(targets: AodVolumeTargetQueue, writeTarget: suspend (Int) -> Unit) {
+    while (true) {
+        val target = targets.next() ?: break
+        currentCoroutineContext().ensureActive()
+        writeTarget(target.volume)
+        targets.complete(target)
+    }
 }
 
 /** Retains sub-step movement and discards overscroll at the phone's volume limits. */
@@ -824,7 +887,8 @@ internal fun clockTextStyle(font: Int, weight: Int, size: androidx.compose.ui.un
     },
     fontWeight = FontWeight(weight),
     fontSize = size,
-    letterSpacing = if (font == AodDisplaySettings.CLOCK_FONT_RUBIK) (-5).sp else 0.sp
+    letterSpacing = if (font == AodDisplaySettings.CLOCK_FONT_RUBIK) (-5).sp else 0.sp,
+    fontFeatureSettings = if (font == AodDisplaySettings.CLOCK_FONT_SERIF) "\"lnum\", \"tnum\"" else null
 )
 
 @Composable
