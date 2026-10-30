@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。正式版本为 PC 1.18.0 + Receiver 0.26.1-v3-flow-candidate/code 54，tag `v1.18.0-main` 发布在 `main`（非预发布）。下载：[v1.18.0-main](https://github.com/sanren1/AnPod/releases/tag/v1.18.0-main)。实机连接、音质与长期播放仍需用户验证。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。正式版本为 PC 1.19.0 + Receiver 0.26.1-v3-flow-candidate/code 54，tag `v1.19.0-main` 发布在 `main`（非预发布）。下载：[v1.19.0-main](https://github.com/sanren1/AnPod/releases/tag/v1.19.0-main)。实机连接、音质与长期播放仍需用户验证。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置分为常规、音频、连接、关于四个标签页，并区分请求音质档位和实际格式。
 
@@ -71,7 +71,7 @@ Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音�
 
 下载、校验或安装失败时会显示原因；安装失败会尝试回滚到原版本。若程序目录不可写，请从正式发布页下载便携包并手动解压到可写目录。设置保存在 Windows 用户的 AppData 中，更新会保留这些配置。
 
-正式版本仍为上方列出的 PC 1.18.0。当前 PC 1.19.0 只是候选版本，尚未正式发布；1.18 用户需先从正式发布页手动升级到首个支持此功能的版本，之后才能使用应用内更新。
+PC 1.19.0 是首个支持应用内更新的正式版本。1.18 及更早版本的用户需先退出旧版，从正式发布页下载并手动升级到 1.19.0，之后可在应用内获取后续版本。
 
 手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。1.5.0 起 Receiver 使用独立的发布密钥签名；从 1.4.0 及更早的 debug 预览包切过来需要先卸载一次（配对会一起清掉，需重新走 USB 配对），此后同签名的版本可原地升级。密钥与打包流程见 [`packaging/SIGNING.md`](packaging/SIGNING.md)。
 
@@ -117,7 +117,7 @@ Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音�
 
 ## 下载与反馈
 
-从 [v1.18.0-main 正式发布页](https://github.com/sanren1/AnPod/releases/tag/v1.18.0-main) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
+从 [v1.19.0-main 正式发布页](https://github.com/sanren1/AnPod/releases/tag/v1.19.0-main) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
 
 ## 开发
 
