@@ -4,7 +4,7 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接。正式版本为 PC 1.19.0 + Receiver 0.26.1-v3-flow-candidate/code 54，tag `v1.19.0-main` 发布在 `main`（非预发布）。下载：[v1.19.0-main](https://github.com/sanren1/AnPod/releases/tag/v1.19.0-main)。实机连接、音质与长期播放仍需用户验证。
+把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接、音质与播放模式切换，以及带时钟和音频波形的手机常显。[下载最新版](https://github.com/sanren1/AnPod/releases/latest)。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置分为常规、音频、连接、关于四个标签页，并区分请求音质档位和实际格式。
 
@@ -32,7 +32,7 @@ USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前�
 2. AnPod 自动刷新只读发现的设备；发现唯一设备时会预选。需要物理切换 USB 模式时，展开切换选项并按提示操作；切换仅支持已验证的 iQOO 11，且须明确允许停止电脑上的全局 ADB server。然后在手机 Receiver 中允许配件权限。
 3. 选择已配对的接收端，或使用同一设备的已认证记忆，再明确点击“开始连接”才会播放。初次连接始终手动发起；意外断线仅在同一连接方式内有界恢复，不会自动切换 Direct、ADB 或 LAN；任一端手动停止后不会重连。
 
-Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音质；Legacy 和更早 Receiver 的 ADB 仍仅支持 Standard。Standard 为 48 kHz PCM16，HiFi 为 48 kHz Float32，Hi-Res 为 96 kHz Float32，均为双声道。HiFi／Hi-Res 要求 Windows 混音与采集格式匹配；Android 实际输出以诊断为准，设备可能重采样，Float32 不代表 DAC 位深。Oboe 为默认引擎，AudioTrack 为备用；已有手选设置保留。实机连接、播放与声学表现待验证，见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
+配套 Receiver 在 USB／无线 ADB、Direct 与 LAN 均支持三档音质，Legacy 兼容方式仅支持 Standard。Standard 为 48 kHz PCM16，HiFi 为 48 kHz Float32，Hi-Res 为 96 kHz Float32，均为双声道。HiFi／Hi-Res 要求 Windows 混音与采集格式匹配；Android 实际输出以诊断为准，设备可能重采样，Float32 不代表 DAC 位深。Oboe 为默认引擎，AudioTrack 为备用；已有手选设置保留。格式与验证范围见 [AOA 传输记录](docs/audio-quality/06-aoa-transport.md)。
 
 ## 无线 UDP 快速开始
 
@@ -71,15 +71,11 @@ Receiver 从 46 版起在 USB／无线 ADB、Direct 与 LAN 均支持三档音�
 
 下载、校验或安装失败时会显示原因；安装失败会尝试回滚到原版本。若程序目录不可写，请从正式发布页下载便携包并手动解压到可写目录。设置保存在 Windows 用户的 AppData 中，更新会保留这些配置。
 
-PC 1.19.0 是首个支持应用内更新的正式版本。1.18 及更早版本的用户需先退出旧版，从正式发布页下载并手动升级到 1.19.0，之后可在应用内获取后续版本。
+若旧程序没有“检查更新”入口，请先退出旧版，从发布页下载并手动解压新版，之后即可使用应用内更新。
 
-手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。1.5.0 起 Receiver 使用独立的发布密钥签名；从 1.4.0 及更早的 debug 预览包切过来需要先卸载一次（配对会一起清掉，需重新走 USB 配对），此后同签名的版本可原地升级。密钥与打包流程见 [`packaging/SIGNING.md`](packaging/SIGNING.md)。
+手机 APK 随 PC 便携包提供。USB 连接后从 PC 的“手机应用”入口检查并升级。同签名版本可原地升级；从旧调试包迁移时需要先卸载，配对信息会被清除，之后需重新通过 USB 配对。
 
-每次生成新的 Receiver APK 都会递增 `versionCode`，并同步更新 PC 端的 `AUDITED_RECEIVER_ARTIFACTS`；仅 PC 改动可沿用已审计的同签名 APK。不要用同 `versionCode` 的 APK 覆盖安装：部分手机（vivo 等）会要求确认“已安装相同版本”，且 PC 会按精确哈希判定为未核验。PC 与手机请使用同一套发布包。
-
-## 版本与变更
-
-手机 APK 随 PC 便携包提供，两端需配套使用。各版本改动与制品见 [GitHub Releases](https://github.com/sanren1/AnPod/releases) 和提交历史。
+PC 与手机请使用同一套发布包中的配套程序；仅 PC 更新时可沿用已经核验的手机应用。签名和打包说明见 [`packaging/SIGNING.md`](packaging/SIGNING.md)。
 
 ## 延迟测试记录
 
@@ -98,7 +94,7 @@ PC 1.19.0 是首个支持应用内更新的正式版本。1.18 及更早版本�
 
 这些约 26 秒的短测不代表音乐音质或长时间稳定性。测量包含输出、声学与麦克风采集链路，不是纯传输延迟。
 
-### 历史基准（PC 1.2.1 + Receiver 0.9.1/code 12；2026-10-17 记录）
+### 历史基准（PC 1.2.1，2026-10-17 记录）
 
 这项电脑本机基准来自约 24 秒的历史测量，10 个提示音均匹配并经独立复核。
 
@@ -117,7 +113,7 @@ PC 1.19.0 是首个支持应用内更新的正式版本。1.18 及更早版本�
 
 ## 下载与反馈
 
-从 [v1.19.0-main 正式发布页](https://github.com/sanren1/AnPod/releases/tag/v1.19.0-main) 下载。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
+从 [最新版发布页](https://github.com/sanren1/AnPod/releases/latest) 下载，历史变更见 [Release 记录](https://github.com/sanren1/AnPod/releases)。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
 
 ## 开发
 
