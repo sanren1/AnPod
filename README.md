@@ -14,7 +14,7 @@ PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作
 - Android 6.0 或更高版本。
 - 首次安装和配对需通过 USB 调试授权电脑；USB Direct 配件模式另需手机授权。
 - 无线 UDP 需要电脑和手机网络可互访，并在手机安装本版附带的 Receiver APK。
-- 默认使用 Receiver 手机应用接收；Legacy 兼容方式和无线调试 ADB 可在高级设置中选择。
+- 默认使用 Receiver 手机应用接收；Legacy 兼容方式和无线调试 ADB 可在“设置 → 连接”中选择。
 
 ## USB 快速开始
 
