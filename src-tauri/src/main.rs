@@ -22,12 +22,14 @@ mod network;
 mod network_interface;
 #[allow(dead_code)]
 mod p5c;
+mod pc_update;
 mod presence;
 #[allow(dead_code)]
 mod protocol;
 #[allow(dead_code)]
 mod security;
 
+use pc_update::PcUpdater;
 use state::{AoaDeviceTarget, AppSnapshot, AppState, OperationResult, UsbDirectConfiguration};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -427,6 +429,58 @@ fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn check_pc_update(updater: State<'_, PcUpdater>) -> Result<pc_update::UpdateCheck, String> {
+    updater.check().await
+}
+
+#[tauri::command]
+async fn download_pc_update(
+    updater: State<'_, PcUpdater>,
+) -> Result<pc_update::PreparedUpdate, String> {
+    updater.download().await
+}
+
+#[tauri::command]
+async fn install_pc_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    updater: State<'_, PcUpdater>,
+) -> Result<(), String> {
+    let _install_guard = updater.reserve_install().await;
+    let snapshot = state.snapshot();
+    if snapshot.busy || snapshot.can_disconnect {
+        return Err("请先手动断开当前连接，再安装更新。".into());
+    }
+    updater.ensure_prepared()?;
+    let disconnected = state.disconnect(&app).await?;
+    if !disconnected.success {
+        return Err(disconnected.message);
+    }
+    let snapshot = state.snapshot();
+    if snapshot.busy || snapshot.can_disconnect {
+        return Err("断开后仍检测到活动会话或操作；为避免更新时写入文件，安装已取消。".into());
+    }
+    updater.install_reserved(&app).await
+}
+
+#[tauri::command]
+fn get_pc_update_status(
+    updater: State<'_, PcUpdater>,
+) -> Result<pc_update::PcUpdateStatus, String> {
+    updater.status()
+}
+
+#[tauri::command]
+fn open_pc_update_download(updater: State<'_, PcUpdater>) -> Result<(), String> {
+    updater.open_download()
+}
+
+#[tauri::command]
+fn open_pc_update_release(updater: State<'_, PcUpdater>) -> Result<(), String> {
+    updater.open_release()
+}
+
+#[tauri::command]
 async fn close_to_tray(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
@@ -460,7 +514,10 @@ fn claim_single_instance() -> Result<bool, String> {
         fn SetEvent(handle: isize) -> i32;
         fn GetLastError() -> u32;
     }
-    let mutex_name: Vec<u16> = "Local\\AnPod.SingleInstance\0".encode_utf16().collect();
+    let mutex_name: Vec<u16> = pc_update::SINGLE_INSTANCE_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let show_name: Vec<u16> = "Local\\AnPod.ShowWindow\0".encode_utf16().collect();
     unsafe {
         let mutex = CreateMutexW(ptr::null(), 1, mutex_name.as_ptr());
@@ -498,6 +555,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(AppState::new())
+        .manage(PcUpdater::new())
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             refresh_devices,
@@ -544,6 +602,12 @@ fn main() {
             show_main_window,
             open_logs,
             export_diagnostics,
+            check_pc_update,
+            download_pc_update,
+            install_pc_update,
+            get_pc_update_status,
+            open_pc_update_download,
+            open_pc_update_release,
             close_to_tray
         ])
         .setup(|app| {

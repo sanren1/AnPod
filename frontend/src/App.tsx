@@ -6,7 +6,7 @@ import type { Device, Snapshot, PrivateIpv4Interface, ReceiverStatus, NetworkCan
 import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, endpointFitsInterface, CAP_AOA_SESSION_RESTART } from "./appRuntime";
 import { NetworkReceiverDialog } from "./components/NetworkReceiverDialog";
 import { DeviceDialog } from "./components/DeviceDialog";
-import { SettingsDialog } from "./components/SettingsDialog";
+import { SettingsDialog, type PcUpdateState } from "./components/SettingsDialog";
 import { PairDialog } from "./components/PairDialog";
 import { HelpDialog } from "./components/HelpDialog";
 import { DiagnosticsDialog } from "./components/DiagnosticsDialog";
@@ -44,6 +44,8 @@ function App() {
   const [networkChoiceNeedsConfirmation, setNetworkChoiceNeedsConfirmation] = useState({ interfaceAddress: false, bindingReference: false });
   const [localSelected, setLocalSelected] = useState<string | null>(null);
   const [largeText, setLargeText] = useState(false);
+  const [pcUpdate, setPcUpdate] = useState<PcUpdateState>({ phase: "idle" });
+  const pcUpdateOperationLock = useRef(false);
   const [notice, setNotice] = useState("");
   const [noticeDetail, setNoticeDetail] = useState("");
   const [working, setWorking] = useState(false);
@@ -157,7 +159,7 @@ function App() {
   const cleanupPending = canDisconnect && snapshot?.state === "error";
   const receiverUpdateNeeded = snapshot?.state === "error" && needsReceiverUpdate(`${snapshot.message} ${snapshot.statusDetail}`)
     || snapshot?.state === "managementOnly" && snapshot.sessionCapabilities?.audioCompatible === false;
-  const controlsDisabled = working || cancelPending || snapshot?.busy === true || cleanupPending || receiverOperationBusy;
+  const controlsDisabled = working || cancelPending || snapshot?.busy === true || cleanupPending || receiverOperationBusy || pcUpdate.phase === "installing";
   const aoaPlaybackRestartUnavailable = aoaSession && !controlsDisabled && snapshot.sessionCapabilities !== null
     && (snapshot.sessionCapabilities.capabilityBits & CAP_AOA_SESSION_RESTART) === 0;
   const activeDevice = snapshot?.sessionTransport === "aoa" ? undefined
@@ -460,6 +462,63 @@ function App() {
     } catch (error) {
       notify(String(error));
       throw error;
+    }
+  };
+
+  const checkPcUpdate = async () => {
+    if (pcUpdateOperationLock.current || pcUpdate.phase === "installing") return;
+    pcUpdateOperationLock.current = true;
+    setPcUpdate(current => ({ phase: "checking", installResult: current.installResult }));
+    try {
+      const result = await invokeApp<{ currentVersion: string; latestVersion: string; available: boolean; releaseUrl: string; assetName: string; assetSize: number }>("check_pc_update");
+      setPcUpdate(current => ({ phase: "idle", ...result, prepared: false, installResult: current.installResult }));
+    } catch (error) {
+      setPcUpdate(current => ({ phase: "error", failedAction: "check", errorMessage: String(error), installResult: current.installResult }));
+    } finally {
+      pcUpdateOperationLock.current = false;
+    }
+  };
+  const downloadPcUpdate = async () => {
+    if (pcUpdateOperationLock.current || pcUpdate.phase === "installing" || !pcUpdate.available || pcUpdate.prepared) return;
+    pcUpdateOperationLock.current = true;
+    setPcUpdate(current => ({ ...current, phase: "downloading", errorMessage: undefined }));
+    try {
+      await invokeApp<{ status: "prepared" }>("download_pc_update");
+      setPcUpdate(current => ({ ...current, phase: "ready", prepared: true }));
+    } catch (error) {
+      setPcUpdate(current => ({ ...current, phase: "error", prepared: false, failedAction: "download", errorMessage: String(error) }));
+    } finally {
+      pcUpdateOperationLock.current = false;
+    }
+  };
+  const installPcUpdate = async () => {
+    if (pcUpdateOperationLock.current || controlsDisabled || active || !pcUpdate.prepared) return;
+    pcUpdateOperationLock.current = true;
+    setPcUpdate(current => ({ ...current, phase: "installing", errorMessage: undefined }));
+    try { await invokeApp("install_pc_update"); }
+    catch (error) { setPcUpdate(current => ({ ...current, phase: "error", failedAction: "install", errorMessage: String(error) })); }
+    finally { pcUpdateOperationLock.current = false; }
+  };
+  const openPcUpdateDownload = async () => {
+    if (pcUpdateOperationLock.current || pcUpdate.phase === "installing" || !pcUpdate.prepared) return;
+    pcUpdateOperationLock.current = true;
+    try { await invokeApp("open_pc_update_download"); }
+    catch (error) { setPcUpdate(current => ({ ...current, phase: "error", failedAction: "open", errorMessage: String(error) })); }
+    finally { pcUpdateOperationLock.current = false; }
+  };
+  const openPcUpdateRelease = async () => {
+    if (pcUpdateOperationLock.current || pcUpdate.phase === "installing" || !pcUpdate.releaseUrl) return;
+    pcUpdateOperationLock.current = true;
+    try { await invokeApp("open_pc_update_release"); }
+    catch (error) { setPcUpdate(current => ({ ...current, phase: "error", failedAction: "open", errorMessage: String(error) })); }
+    finally { pcUpdateOperationLock.current = false; }
+  };
+  const loadPcUpdateStatus = async () => {
+    try {
+      const result = await invokeApp<{ installResult: PcUpdateState["installResult"] }>("get_pc_update_status");
+      if (result.installResult) setPcUpdate(current => ({ ...current, installResult: result.installResult }));
+    } catch (error) {
+      setPcUpdate(current => ({ ...current, phase: "error", failedAction: "status", errorMessage: String(error) }));
     }
   };
 
@@ -1127,7 +1186,7 @@ function App() {
     {notice && <div className="toast" role="status"><span>{notice}</span>{noticeDetail && <details><summary>{strings.app.showTechnicalDetails}</summary><pre>{noticeDetail}</pre></details>}</div>}
 
     {panel === "device" && <DeviceDialog devices={deviceChoices} selected={localSelected} activeSerial={snapshot.sessionTransport === "aoa" ? null : snapshot.sessionSerial} activeBinding={lanSession ? snapshot.sessionReceiverBinding : null} busy={working || snapshot.busy} onSelect={chooseDevice} onRefresh={refresh} onConnectOnly={() => void connectOnly()} onAddPhone={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" ? () => setPanel("pair") : null} onFirstSetup={null} onClose={() => setPanel(null)} />}
-    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} onSetOption={(kind, value) => setOption(kind, value, true)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onSave={saveSetting} onClose={() => setPanel(null)} />}
+    {panel === "settings" && <SettingsDialog snapshot={snapshot} largeText={largeText} onLargeText={setLargeText} udpBackendFixed={udpBackendFixed} aoaSession={aoaSession} busy={controlsDisabled} updateState={pcUpdate} onCheckUpdate={() => void checkPcUpdate()} onDownloadUpdate={() => void downloadPcUpdate()} onInstallUpdate={() => void installPcUpdate()} onOpenUpdateDownload={() => void openPcUpdateDownload()} onOpenUpdateRelease={() => void openPcUpdateRelease()} onLoadUpdateStatus={() => void loadPcUpdateStatus()} onSetOption={(kind, value) => setOption(kind, value, true)} onOpenReceiverManager={() => { setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onOpenDiagnostics={() => setPanel("diagnostics")} onOpenHelp={() => setPanel("help")} onSave={saveSetting} onClose={() => setPanel(null)} />}
     {(panel === "network" || panel === "receiver" || panel === "setup") && <NetworkReceiverDialog key={`${panel}:${backgroundStartMode}:${networkRecoveryMode}`} snapshot={snapshot} backgroundStartMode={backgroundStartMode && panel === "network"} backgroundChoicePrefill={backgroundChoicePrefill} networkRecoveryMode={networkRecoveryMode} onNetworkRecoveryChange={setNetworkRecoveryMode} onConnect={startBackgroundConnection} preferredBindingReference={lastOfferListenerChoice.current?.bindingReference ?? snapshot.wirelessConnectionOffers.automaticBinding ?? ""} setupWizard={panel === "setup"} receiverManagerOnly={panel === "receiver"} initialReceiverSerial={receiverManagerSerial} requiredChoices={networkChoiceNeedsConfirmation} usbDevices={snapshot.devices.filter(device => device.transport === "usb" && device.connectable)} usbSeenDevices={snapshot.devices.filter(device => device.transport === "usb")} disabled={working || cancelPending || snapshot.busy} receiverOperationBusy={receiverOperationBusy} receiverOperationResult={receiverOperationResult} receiverOperationProgress={receiverOperationProgress} audioSessionActive={active} udpMode={snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp"} offers={snapshot.wirelessConnectionOffers} error={networkDialogError} onError={setNetworkDialogError} onStart={startNetwork} onSetOfferListener={setOfferListener} onAcceptOffer={acceptOffer} onReceiverSerialChange={serial => { if (serial !== receiverManagerSerial) setReceiverOperationResult(null); setReceiverManagerSerial(serial); }} onRefreshDevices={refresh} onReceiverOperation={requestReceiverUsbOperation} onAddPhone={() => setPanel("pair")} onOpenReceiverManager={() => { setBackgroundStartMode(false); setNetworkDialogError(""); setReceiverOperationResult(null); setPanel("receiver"); }} onClose={() => { if (networkStartPendingRef.current) void cancelNetworkStart(); if (panel === "network") retainOfferListenerOnClose.current = true; setBackgroundStartMode(false); if (!receiverOperationBusy) { setReceiverOperationResult(null); setReceiverOperationProgress(null); } setPanel(null); }} />}
     {panel === "pair" && <PairDialog transport="wifi" initialEndpoint={snapshot.settings.lastWirelessEndpoint ?? ""} disabled={working || snapshot.busy} onClose={() => setPanel(null)} onDone={async () => { apply(await invokeApp<Snapshot>("refresh_devices")); setPanel(wirelessUdpMode ? "network" : "device"); }} />}
     {panel === "help" && <HelpDialog transport={snapshot.connectionTransport} wirelessProtocol={snapshot.settings.wirelessProtocol} onClose={() => setPanel(null)} returnFocusTarget={() => helpButtonRef.current} />}
