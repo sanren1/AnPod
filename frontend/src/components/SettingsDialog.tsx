@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { strings } from "../strings";
 import type { Settings, Snapshot } from "../appTypes";
-import { Activity, CircleHelp, Smartphone } from "lucide-react";
+import { Smartphone } from "lucide-react";
 import { ErrorDetails, Modal } from "./Modal";
 import { SettingToggle } from "./SettingToggle";
-import { canSetAudioQuality, hasActiveSession } from "../appRuntime";
+import { hasActiveSession } from "../appRuntime";
 
 type SettingsTab = "general" | "audio" | "connection" | "about";
 export type PcUpdateState = { phase: "idle" | "checking" | "downloading" | "installing" | "ready" | "error"; currentVersion?: string; latestVersion?: string; available?: boolean; prepared?: boolean; releaseUrl?: string; assetName?: string; assetSize?: number; failedAction?: "check" | "download" | "install" | "open" | "status"; errorMessage?: string; installResult?: { status: "installed" | "failed" | "rolledBack" | "rollbackFailed"; message: string } };
 
-export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFixed, aoaSession, busy, updateState, onCheckUpdate, onDownloadUpdate, onInstallUpdate, onOpenUpdateDownload, onOpenUpdateRelease, onLoadUpdateStatus, onSetOption, onOpenReceiverManager, onOpenDiagnostics, onOpenHelp, onSave, onClose }: { snapshot: Snapshot; largeText: boolean; onLargeText: (value: boolean) => void; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; updateState: PcUpdateState; onCheckUpdate: () => void; onDownloadUpdate: () => void; onInstallUpdate: () => void; onOpenUpdateDownload: () => void; onOpenUpdateRelease: () => void; onLoadUpdateStatus: () => void; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onOpenDiagnostics: () => void; onOpenHelp: () => void; onSave: (key: keyof Settings, value: unknown) => Promise<void>; onClose: () => void }) {
+export function SettingsDialog({ snapshot, udpBackendFixed, aoaSession, busy, updateState, onCheckUpdate, onDownloadUpdate, onInstallUpdate, onOpenUpdateDownload, onOpenUpdateRelease, onLoadUpdateStatus, onSetOption, onOpenReceiverManager, onSave, onClose }: { snapshot: Snapshot; udpBackendFixed: boolean; aoaSession: boolean; busy: boolean; updateState: PcUpdateState; onCheckUpdate: () => void; onDownloadUpdate: () => void; onInstallUpdate: () => void; onOpenUpdateDownload: () => void; onOpenUpdateRelease: () => void; onLoadUpdateStatus: () => void; onSetOption: (kind: "wirelessProtocol" | "audioBackend", value: string) => Promise<void>; onOpenReceiverManager: () => void; onSave: (key: keyof Settings, value: unknown) => Promise<void>; onClose: () => void }) {
   const [savingKeys, setSavingKeys] = useState<Set<keyof Settings>>(() => new Set());
   const [saveError, setSaveError] = useState(false);
   const [tab, setTab] = useState<SettingsTab>("general");
@@ -93,39 +93,20 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
       </div>}
       <div className="settings-tab-panel" role="tabpanel" id="settings-panel-general" aria-labelledby="settings-tab-general" tabIndex={0} hidden={tab !== "general"}><section className="settings-group settings-appearance" aria-label={strings.app.settingsGeneral}>
         <label className="select-setting"><span>{strings.app.theme}</span><select disabled={snapshot.busy || savingKeys.has("appearanceTheme")} value={settings.appearanceTheme} onChange={event => void update("appearanceTheme", event.target.value)}><option value="System">{strings.app.followSystem}</option><option value="Light">{strings.app.light}</option><option value="Dark">{strings.app.dark}</option></select></label>
-        <SettingToggle title={strings.app.enlargeText} checked={largeText} onChange={onLargeText} />
         <SettingToggle disabled={snapshot.busy || savingKeys.has("minimizeToTray")} title={strings.app.minimizeToTray} description={strings.app.minimizeToTrayDescription} checked={settings.minimizeToTray} onChange={value => void update("minimizeToTray", value)} />
         <SettingToggle disabled={snapshot.busy || savingKeys.has("launchAtLogin")} title={strings.app.launchAtLogin} checked={settings.launchAtLogin} onChange={value => void update("launchAtLogin", value)} />
       </section></div>
       <div className="settings-tab-panel" role="tabpanel" id="settings-panel-audio" aria-labelledby="settings-tab-audio" tabIndex={0} hidden={tab !== "audio"}><section className="settings-group settings-audio" aria-label={strings.app.settingsAudio}>
-        <fieldset className="audio-quality-settings" aria-label={strings.app.transportQuality} aria-describedby="audio-quality-help">
-          <div className="audio-quality-options">
-            {(["standard", "hifi", "hires"] as const).map(quality => {
-              const fullLabel = strings.app.audioQualityLabels[quality];
-              const requestedSpec = fullLabel.split(" · ").slice(1).join(" · ").replace(/\s*(?:（实验）|\(experimental\))$/i, "");
-              return <label className="audio-quality-card" key={quality}>
-                <input type="radio" name="audioQuality" value={quality} aria-label={fullLabel} checked={settings.audioQuality === quality} disabled={busy || savingKeys.has("audioQuality") || !canSetAudioQuality(snapshot, quality)} onChange={() => void update("audioQuality", quality)} />
-                <span><strong>{strings.app.audioQualityShortLabels[quality]}</strong><small>{requestedSpec}</small>{quality !== "standard" && <small>{strings.app.audioExperimental}</small>}</span>
-              </label>;
-            })}
-          </div>
-          <p id="audio-quality-help" className="dialog-footnote">{strings.app.audioQualityInDevelopment}</p>
-          <details className="audio-format-disclosure">
-            <summary>{strings.app.audioFormatDetails}</summary>
-            <dl className="audio-quality-status">
-              <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>
-              <div><dt>{strings.app.windowsMixFormat}</dt><dd>{mixFormat}</dd></div>
-              <div><dt>{strings.app.androidOutputFormat}</dt><dd>{outputFormat}</dd></div>
-            </dl>
-            <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
-          </details>
-        </fieldset>
+        <dl className="audio-quality-status">
+          <div><dt>{strings.app.actualTransportFormat}</dt><dd>{actualFormat}</dd></div>
+          <div><dt>{strings.app.windowsMixFormat}</dt><dd>{mixFormat}</dd></div>
+          <div><dt>{strings.app.androidOutputFormat}</dt><dd>{outputFormat}</dd></div>
+        </dl>
+        <p className="dialog-footnote">{strings.app.audioOutputPrecisionNotice}</p>
       </section></div>
       <div className="settings-tab-panel" role="tabpanel" id="settings-panel-connection" aria-labelledby="settings-tab-connection" tabIndex={0} hidden={tab !== "connection"}>
         <section className="settings-group settings-connection">
-          <label className="select-setting"><span>{strings.app.wirelessProtocol}<small>{strings.app.wirelessProtocolHelp}</small></span><select aria-label={strings.app.wirelessProtocol} disabled={busy || savingKeys.has("wirelessProtocol")} value={settings.wirelessProtocol} onChange={event => { const value = event.target.value; void update("wirelessProtocol", value, () => onSetOption("wirelessProtocol", value)); }}><option value="udp">{strings.app.udpRecommended}</option><option value="adb">{strings.app.wirelessAdbCompatible}</option></select></label>
           <label className="select-setting"><span>{strings.app.receiverBackend}<small>{strings.app.receiverBackendHelp}</small></span><select aria-label={strings.app.receiverBackend} disabled={busy || udpBackendFixed || savingKeys.has("audioBackend")} value={settings.audioBackend} onChange={event => { const value = event.target.value; void update("audioBackend", value, () => onSetOption("audioBackend", value)); }}><option value="legacy">{strings.app.legacyCompatible}</option><option value="receiver">{strings.app.receiverModeRecommended}</option></select></label>
-          {settings.wirelessProtocol === "adb" && <p className="dialog-footnote">{strings.app.wirelessAdbHelp}</p>}
           {aoaSession ? <p className="dialog-footnote">{strings.app.aoaReceiverBackendFixed}</p> : udpBackendFixed && <p className="dialog-footnote">{strings.app.udpUsesReceiver}</p>}
         </section>
         <section className="settings-group settings-connection-shortcut" aria-labelledby="settings-phone-title">
@@ -137,9 +118,11 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
         <section className="settings-group settings-about">
           <p className="settings-version">{strings.app.pcVersion}: <strong>{snapshot.version}</strong></p>
           <div className="settings-update-actions">
-            <button type="button" disabled={updateBusy} onClick={onCheckUpdate}>{checking ? strings.app.pcUpdateChecking : strings.app.pcUpdateCheck}</button>
-            <button type="button" disabled={updateBusy || !updateState.available || updateState.prepared} onClick={onDownloadUpdate}>{downloading ? strings.app.pcUpdateDownloading : strings.app.pcUpdateDownload}</button>
-            <button type="button" className="primary-button" disabled={!updateState.prepared || updateBusy || activeSession} onClick={onInstallUpdate}>{strings.app.pcUpdateInstall}</button>
+            {updateState.prepared
+              ? <button type="button" className="primary-button" disabled={updateBusy || activeSession} onClick={onInstallUpdate}>{updateState.phase === "installing" ? strings.app.pcUpdateInstalling : strings.app.pcUpdateInstall}</button>
+              : updateState.available
+                ? <button type="button" className="primary-button" disabled={updateBusy} onClick={onDownloadUpdate}>{downloading ? strings.app.pcUpdateDownloading : strings.app.pcUpdateDownload}</button>
+                : <button type="button" className="primary-button" disabled={updateBusy} onClick={onCheckUpdate}>{checking ? strings.app.pcUpdateChecking : strings.app.pcUpdateCheck}</button>}
           </div>
           {updateMessage && !(updateState.phase === "error" && updateState.errorMessage) && <p className={`dialog-footnote ${updateState.phase === "error" ? "actionable-error" : ""}`} role={updateState.phase === "error" ? "alert" : "status"} aria-live="polite">{updateMessage}</p>}
           {updateState.errorMessage && updateState.phase === "error" && <ErrorDetails className="settings-update-error" summary={strings.app.pcUpdateFailed(updateState.failedAction ?? "check")} details={updateState.errorMessage} />}
@@ -150,14 +133,6 @@ export function SettingsDialog({ snapshot, largeText, onLargeText, udpBackendFix
             <button type="button" disabled={!updateState.prepared || updateBusy} onClick={onOpenUpdateDownload}>{strings.app.pcUpdateOpenDownloads}</button>
           </div>
           {activeSession && <p className="dialog-footnote">{strings.app.pcUpdateDisconnectFirst}</p>}
-        </section>
-        <section className="settings-group settings-about" aria-labelledby="settings-support-title">
-          <h3 id="settings-support-title">{strings.app.settingsSupport}</h3>
-          <div className="settings-about-actions">
-            <button type="button" onClick={onOpenDiagnostics}><Activity size={15} aria-hidden="true" />{strings.app.diagnostics}</button>
-            <button type="button" onClick={onOpenHelp}><CircleHelp size={15} aria-hidden="true" />{strings.app.help}</button>
-          </div>
-          <p className="dialog-footnote">{strings.app.settingsPrivacy}</p>
         </section>
       </div>
     </div>

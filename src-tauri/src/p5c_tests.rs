@@ -1591,7 +1591,7 @@ fn verify_java_v2_discovery(classes: &Path) {
     let receiver_address = Ipv4Addr::new(127, 0, 0, 1);
     let interface = crate::network_interface::interface_for_test(host_address, 8);
     let listener =
-        crate::discovery::HostOfferListener::start_loopback_for_test(&interface).unwrap();
+        crate::discovery::HostOfferListener::start_loopback_for_test(&interface, || {}).unwrap();
     let (_, java) = java_paths();
     let output = Command::new(java)
         .arg("-cp")

@@ -570,6 +570,7 @@ fn diagnostics_timeline_prunes_samples_older_than_one_hour() {
         drift_correction_ppm: None,
         drift_reset_reason: None,
         playback: None,
+        capture_send_timing: None,
     };
     timeline.push(sample(0), start);
     timeline.push(sample(3_601_000), start + Duration::from_secs(3_601));
@@ -1701,4 +1702,51 @@ fn receiver_reset_preflight_rejects_pending_or_failed_phone_state_before_stop() 
         ..preview.clone()
     };
     assert!(validate_receiver_reset_preview(&changed, &preview).is_err());
+}
+
+#[test]
+fn binding_profile_sidecar_merges_fields_and_skips_unchanged_writes() {
+    let data_dir =
+        std::env::temp_dir().join(format!("anpod-binding-profile-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&data_dir);
+    fs::create_dir_all(data_dir.join("receiver-bindings")).unwrap();
+    let reference = "a".repeat(64);
+    assert_eq!(
+        load_binding_profile(&data_dir, &reference),
+        BindingProfile::default()
+    );
+
+    update_binding_profile(&data_dir, &reference, |profile| {
+        profile.model = Some("Pixel 8".into())
+    })
+    .unwrap();
+    update_binding_profile(&data_dir, &reference, |profile| {
+        profile.version_code = Some(50)
+    })
+    .unwrap();
+    assert_eq!(
+        load_binding_profile(&data_dir, &reference),
+        BindingProfile {
+            model: Some("Pixel 8".into()),
+            version_code: Some(50)
+        }
+    );
+    let path = data_dir
+        .join("receiver-bindings")
+        .join(format!("{reference}.json"));
+    let written = fs::metadata(&path).unwrap().modified().unwrap();
+    update_binding_profile(&data_dir, &reference, |profile| {
+        profile.version_code = Some(50)
+    })
+    .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written);
+
+    // Records written before the sidecar existed, or a damaged one, read as empty.
+    fs::write(&path, b"not json").unwrap();
+    assert_eq!(
+        load_binding_profile(&data_dir, &reference),
+        BindingProfile::default()
+    );
+    assert!(update_binding_profile(&data_dir, "../escape", |_| {}).is_err());
+    let _ = fs::remove_dir_all(&data_dir);
 }

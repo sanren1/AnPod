@@ -72,6 +72,7 @@ src-tauri/icons/StoreLogo.png
 # Local project instructions and private planning records
 /AGENTS.md
 /AGENTS.override.md
+/Claude.md
 /plan.md
 /AnPod_plan_v2.md
 /AnPod 审查与优化报告.md
@@ -88,3 +89,6 @@ AnPod_UI_UX_Plan/
 /tools/CaptureProbe/
 /tools/SessionProbe/
 /tools/UiSnapshot/
+
+# Local-only planning, probes and measurement evidence
+/local/

@@ -75,6 +75,8 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
+          npm run lint
+          npm test
           npm run build
 
       - name: Format

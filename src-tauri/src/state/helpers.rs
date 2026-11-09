@@ -25,7 +25,9 @@ pub(crate) fn try_begin_exclusive_operation(
     generation: &AtomicU64,
     slot: &Mutex<Option<ActiveOperation>>,
 ) -> Option<(u64, CancellationToken)> {
-    let mut current = slot.lock().expect("operation lock");
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if current.is_some() {
         return None;
     }
@@ -46,7 +48,9 @@ fn begin_operation_slot_with_preemptibility(
     background: bool,
     receiver_preemptible: bool,
 ) -> Option<(u64, CancellationToken)> {
-    let mut current = slot.lock().expect("operation lock");
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if background && current.is_some() {
         return None;
     }
@@ -68,7 +72,9 @@ pub(crate) fn begin_foreground_receiver_operation(
     generation: &AtomicU64,
     slot: &Mutex<Option<ActiveOperation>>,
 ) -> Option<(u64, CancellationToken)> {
-    let mut current = slot.lock().expect("operation lock");
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if current
         .as_ref()
         .is_some_and(|active| !(active.background && active.receiver_preemptible))
@@ -90,7 +96,9 @@ pub(crate) fn begin_foreground_receiver_operation(
 }
 
 pub(crate) fn cancel_operation_slot(generation: &AtomicU64, slot: &Mutex<Option<ActiveOperation>>) {
-    let mut current = slot.lock().expect("operation lock");
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     generation.fetch_add(1, Ordering::AcqRel);
     if let Some(operation) = current.as_ref() {
         operation.token.cancel();
@@ -99,7 +107,9 @@ pub(crate) fn cancel_operation_slot(generation: &AtomicU64, slot: &Mutex<Option<
 }
 
 pub(crate) fn finish_operation_slot(slot: &Mutex<Option<ActiveOperation>>, generation: u64) {
-    let mut current = slot.lock().expect("operation lock");
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if current
         .as_ref()
         .is_some_and(|active| active.generation == generation)
@@ -330,6 +340,44 @@ pub(crate) fn binding_store_path(data_dir: &Path, reference: &str) -> Result<Pat
     Ok(data_dir
         .join("receiver-bindings")
         .join(format!("{}.dat", reference.to_ascii_lowercase())))
+}
+
+/// Phone model and last confirmed Receiver version for one binding. Stored as plain JSON
+/// beside the DPAPI key file; it holds no secret and is not part of diagnostics exports.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u32>,
+}
+
+pub(crate) fn load_binding_profile(data_dir: &Path, reference: &str) -> BindingProfile {
+    binding_store_path(data_dir, reference)
+        .ok()
+        .and_then(|path| fs::read(path.with_extension("json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Applies `change` and writes the profile only when it differs from what is stored.
+pub(crate) fn update_binding_profile(
+    data_dir: &Path,
+    reference: &str,
+    change: impl FnOnce(&mut BindingProfile),
+) -> Result<(), String> {
+    let path = binding_store_path(data_dir, reference)?.with_extension("json");
+    let before = load_binding_profile(data_dir, reference);
+    let mut after = before.clone();
+    change(&mut after);
+    if after == before {
+        return Ok(());
+    }
+    let body = serde_json::to_vec(&after).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, body).map_err(|error| error.to_string())?;
+    atomic_replace(&temporary, &path).map_err(|error| error.to_string())
 }
 
 pub(crate) fn choose_selected_serial(
@@ -580,7 +628,6 @@ pub(crate) async fn capture_child_output<R>(
     reader: R,
     stream: &'static str,
     tail: Arc<Mutex<VecDeque<String>>>,
-    log_path: PathBuf,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -589,9 +636,11 @@ pub(crate) async fn capture_child_output<R>(
     while let Ok(Some(line)) = lines.next_line().await {
         let entry = format!("{stream}: {line}");
         if safe_android_diagnostic(&entry) {
-            append_app_log(&log_path, &format!("Android server: {line}"));
+            crate::applog::info("android", "server_output", &line);
         }
-        let mut tail = tail.lock().expect("output log lock");
+        let mut tail = tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tail.push_back(entry);
         while tail.len() > 100 {
             tail.pop_front();
@@ -627,16 +676,6 @@ pub(crate) fn safe_android_tail(lines: &[String]) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-pub(crate) fn append_app_log(path: &Path, message: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    use std::io::Write;
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{} {message}", chrono_stub_timestamp());
-    }
 }
 
 pub(crate) async fn checked_adb(
@@ -948,16 +987,6 @@ pub(crate) fn uuid_token() -> Result<String, String> {
     getrandom::fill(&mut bytes).map_err(|_| "无法生成本次连接的安全握手令牌。".to_string())?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
-pub(crate) fn chrono_stub_timestamp() -> String {
-    format!(
-        "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    )
-}
-
 pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {

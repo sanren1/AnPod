@@ -46,6 +46,7 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
   const mounted = useRef(false);
   const switchHasSucceededRef = useRef(false);
 
+  const singleChoice = targets.length === 1 && bindings.length === 1 && targetId === targets[0].id && bindingReference === bindings[0];
   const selectTarget = (value: string) => { targetIdRef.current = value; setTargetId(value); };
   const selectSwitchTarget = (value: string) => { switchTargetIdRef.current = value; setSwitchTargetId(value); };
   const selectBinding = (value: string) => { bindingReferenceRef.current = value; setBindingReference(value); };
@@ -119,6 +120,8 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
           && nextBindings.includes(lastUsbDirectBindingReference)) {
           selectBinding(lastUsbDirectBindingReference);
           bindingSelectionTouched.current = true;
+        } else if (!currentBinding && !bindingSelectionTouched.current && nextBindings.length === 1) {
+          selectBinding(nextBindings[0]);
         }
       } else if (initial || manual) {
         setErrorSummary(strings.aoaDialog.loadFailed);
@@ -265,6 +268,8 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
     </details>
     <hr className="aoa-divider" />
     <h3 className="aoa-section-title">{strings.aoaDialog.connectTitle}</h3>
+    {/* With one device and one paired phone there is nothing to choose; confirm in one step. */}
+    {singleChoice ? <p className="aoa-single-choice">{targets[0].label} · {bindingReferenceLabel(bindings[0])}</p> : <>
     <label className="aoa-field">
       <span>{strings.aoaDialog.target}</span>
       <select value={targetId} onChange={event => {
@@ -292,6 +297,7 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
       </select>
     </label>
     {!loading && bindings.length === 0 && !errorSummary && <p className="empty-note">{strings.aoaDialog.noBindings}</p>}
+    </>}
     <div className="dialog-actions">
       {starting ? <button className="dialog-secondary" type="button" onClick={() => void cancelStart()} disabled={cancelling}>
         {cancelling ? strings.aoaDialog.cancelling : strings.aoaDialog.cancelConnection}
@@ -300,7 +306,7 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
           <RefreshCw size={15} aria-hidden="true" />{strings.aoaDialog.refresh}
         </button>
         <button className="primary-button" type="button" onClick={() => void start()} disabled={busy || !targetId || !bindingReference}>
-          <Usb size={16} aria-hidden="true" />{strings.aoaDialog.start}
+          <Usb size={16} aria-hidden="true" />{singleChoice ? strings.aoaDialog.confirmAndStart : strings.aoaDialog.start}
         </button>
       </>}
     </div>

@@ -1,0 +1,78 @@
+/* Keep the common mode and quality choices visible and balanced in compact windows. */
+.home-choice-section { padding-top: 9px; border-top: 0; }
+.home-choice-section > h2 { margin: 0 0 6px; font-size: 13px; line-height: 18px; font-weight: 650; }
+.home-choice-section .fluid-segmented-control { width: 100%; min-height: 44px; border-radius: 10px; }
+.home-choice-section .fluid-segmented-control > button { min-height: 38px; padding: 4px 5px; border-radius: 8px; font-size: 13px; line-height: 18px; }
+.home-quality-section { padding-bottom: 8px; }
+
+/* Refresh the existing connection controls without changing their snapshot-confirmed behavior. */
+.fluid-segmented-control.transport-switch { min-height: 40px; border-radius: 11px; }
+.fluid-segmented-control.mode-switch { width: 100%; min-height: 44px; border-radius: 10px; }
+.fluid-segmented-control.transport-switch > button { min-height: 36px; padding-block: 4px; }
+.fluid-segmented-control.mode-switch > button { min-height: 38px; border-radius: 8px; }
+.fluid-segmented-control.transport-switch > button:disabled,
+.fluid-segmented-control.mode-switch > button:disabled { opacity: .62; }
+
+/* Settings keep navigation fixed while each category scrolls inside the dialog. */
+.settings-dialog { display: flex; flex-direction: column; overflow: hidden; }
+.settings-tabs { flex: 0 0 auto; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.settings-tabs button { min-width: 0; min-height: 40px; padding: 4px 2px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; font: inherit; font-size: 12px; }
+.settings-tabs button[aria-selected="true"] { border-color: var(--line); color: var(--text); background: var(--wash); font-weight: 650; }
+.settings-tabs button:focus-visible, .settings-panel:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.settings-panel { min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; }
+.settings-dialog .settings-group { margin: 8px 14px 0; padding: 10px 0 2px; border-top: 1px solid var(--line); }
+.settings-dialog .settings-save-feedback { position: sticky; top: 0; z-index: 1; margin: 0; padding: 6px 18px; background: var(--surface); }
+.settings-save-feedback > p { margin: 0; }
+.settings-dialog .settings-appearance { margin-top: 0; border-top: 0; }
+.settings-dialog .settings-group > h3 { margin: 0 4px 7px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+.settings-dialog .settings-group .select-setting,
+.settings-dialog .settings-group .setting-toggle { margin-inline: 0; }
+.settings-dialog .settings-audio { margin-inline: 0; }
+.settings-dialog .settings-audio > h3 { margin-inline: 18px; }
+.settings-dialog .settings-about { margin-top: 8px; }
+.settings-connection-shortcut .settings-about-actions { grid-template-columns: minmax(0, 1fr); }
+.settings-version { margin: 8px 4px 12px; color: var(--muted); }
+.settings-version strong { color: var(--text); font-weight: 600; }
+.settings-update-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 0 4px; }
+.settings-update-actions button { min-width: 0; min-height: 42px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--bg); font: inherit; font-size: 12px; cursor: pointer; }
+.settings-update-actions .primary-button { grid-column: 1 / -1; border-color: var(--color-accent-strong); color: var(--on-accent); background: var(--color-accent-strong); font-weight: 600; }
+.settings-update-actions button:disabled { opacity: .62; cursor: default; }
+.settings-dialog .settings-update-links { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 9px; }
+.settings-update-asset { overflow-wrap: anywhere; }
+.settings-update-error { margin: 8px 4px; }
+.status-hero { gap: 5px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.status-hero .status-line { min-height: 26px; gap: 9px; color: var(--text); font-size: 15px; font-weight: 650; }
+.status-hero .status-dot { width: 9px; height: 9px; }
+.status-hero .main-action { min-height: 44px; margin: 1px 0 0; border-radius: 10px; font-size: 15px; }
+.status-hero .status-description { margin: 0; }
+.status-hero .primary-button:not(.main-action) { min-height: 42px; }
+.settings-about-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0 4px; }
+.settings-about-actions button { min-width: 0; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 5px 4px; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: var(--bg); font-size: 12px; cursor: pointer; }
+.settings-about-actions button:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+.settings-about-actions button:disabled { opacity: .62; }
+.settings-about-actions button svg { flex: 0 0 auto; color: var(--accent); }
+.settings-dialog .settings-about > .dialog-footnote { margin-inline: 4px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* Keep dialogs calm and readable while leaving their existing focus and close behavior intact. */
+.modal { border-radius: 12px; }
+.modal-head { background: var(--surface); }
+.network-active-card { border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); border-radius: 10px; }
+.setup-step { border-color: transparent; background: var(--wash); }
+.setup-step[aria-current="step"] { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.diagnostic-group { border-color: var(--line); background: var(--bg); }
+.diagnostics-dialog .diagnostic-group h3 { color: var(--muted); }
+
+@media (max-width: 390px) {
+  .device-select { min-height: 56px; }
+  .connection-section { margin-top: 4px; padding-bottom: 8px; }
+  .wired-mode-section { margin-top: 2px; }
+  .wired-mode-section .mode-row { min-height: 44px; }
+  .status-hero { padding-block: 6px; }
+  .status-hero .status-line { min-height: 24px; }
+  .home-choice-section { padding-top: 7px; }
+  .settings-dialog .settings-group { margin-inline: 12px; }
+}
+.toast > details { grid-column: 1; }
+.toast-close { grid-column: 2; grid-row: 1; width: 28px; height: 28px; margin: -4px -6px 0 0; }
+.aoa-single-choice { margin: 8px 18px 0; font-weight: 600; overflow-wrap: anywhere; }

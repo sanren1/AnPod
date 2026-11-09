@@ -106,9 +106,10 @@ export function DiagnosticsDialog({ snapshot, onClose, returnFocusTarget }: { sn
         <h3>{strings.diagnostics.playbackDiagnostics}</h3>
         {diagnostic ? groups.map(metricGroup) : <p className="diagnostic-empty">{unavailable}</p>}
       </section>
-      <div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={15} />{strings.diagnostics.copyDiagnostics}</button><button className="dialog-secondary" disabled={exporting} onClick={() => void exportSnapshot()}><Download size={15} />{exporting ? strings.diagnostics.exporting : strings.diagnostics.exportDiagnostics}</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>{strings.diagnostics.openLogs}<ExternalLink size={14} /></button></div>
-      {exportPath && <p className="diagnostic-context" role="status">{strings.diagnostics.exportSaved(exportPath)}</p>}
-      {exportError && <ErrorDetails summary={strings.diagnostics.exportFailed} details={exportError} />}
     </details>
+    <div className="dialog-actions"><button className="dialog-secondary" onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={15} />{strings.diagnostics.copyDiagnostics}</button><button className="dialog-secondary" disabled={exporting} onClick={() => void exportSnapshot()}><Download size={15} />{exporting ? strings.diagnostics.exporting : strings.diagnostics.exportDiagnostics}</button><button className="dialog-secondary" onClick={() => void invokeApp("open_logs")}>{strings.diagnostics.openLogs}<ExternalLink size={14} /></button></div>
+    {exportPath && <p className="dialog-footnote" role="status">{strings.diagnostics.exportSaved(exportPath)}</p>}
+    {exportError && <ErrorDetails summary={strings.diagnostics.exportFailed} details={exportError} />}
+    <p className="dialog-footnote">{strings.diagnostics.privacy}</p>
   </Modal>;
 }

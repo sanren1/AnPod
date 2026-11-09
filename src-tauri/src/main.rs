@@ -6,6 +6,7 @@ mod aoa;
 mod aoa_owner;
 #[allow(dead_code)]
 mod aoa_winusb;
+mod applog;
 mod audio;
 mod receiver;
 mod startup;
@@ -28,10 +29,29 @@ mod presence;
 mod protocol;
 #[allow(dead_code)]
 mod security;
+mod timing;
 
 use pc_update::PcUpdater;
 use state::{AoaDeviceTarget, AppSnapshot, AppState, OperationResult, UsbDirectConfiguration};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Logs a failed connection or mode command with a stable event name; the
+/// error text is the user-facing message (IPv4 is masked by the logger).
+fn log_command_error<T>(command: &str, result: Result<T, String>) -> Result<T, String> {
+    if let Err(error) = &result {
+        let event = if error.contains(receiver::RECEIVER_UPDATE_REQUIRED) {
+            "receiver.update_required"
+        } else {
+            "command.failed"
+        };
+        applog::warn(
+            "command",
+            event,
+            format_args!("command={command} error={error}"),
+        );
+    }
+    result
+}
 
 #[tauri::command]
 fn get_snapshot(state: State<'_, AppState>) -> AppSnapshot {
@@ -67,9 +87,12 @@ async fn switch_aoa_mode(
     target_id: String,
     release_adb_server: bool,
 ) -> Result<state::AoaSwitchResult, String> {
-    state
-        .switch_aoa_mode(&app, &target_id, release_adb_server)
-        .await
+    log_command_error(
+        "switch_aoa_mode",
+        state
+            .switch_aoa_mode(&app, &target_id, release_adb_server)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -79,9 +102,12 @@ async fn start_aoa_audio(
     target_id: String,
     binding_reference: String,
 ) -> Result<AppSnapshot, String> {
-    state
-        .start_aoa_audio(&app, &target_id, &binding_reference)
-        .await
+    log_command_error(
+        "start_aoa_audio",
+        state
+            .start_aoa_audio(&app, &target_id, &binding_reference)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -90,7 +116,7 @@ async fn connect_device(
     state: State<'_, AppState>,
     serial: String,
 ) -> Result<OperationResult, String> {
-    state.connect_device(&app, serial).await
+    log_command_error("connect_device", state.connect_device(&app, serial).await)
 }
 
 #[tauri::command]
@@ -99,7 +125,10 @@ async fn connect_device_only(
     state: State<'_, AppState>,
     serial: String,
 ) -> Result<OperationResult, String> {
-    state.connect_device_only(&app, serial).await
+    log_command_error(
+        "connect_device_only",
+        state.connect_device_only(&app, serial).await,
+    )
 }
 
 #[tauri::command]
@@ -108,7 +137,7 @@ async fn switch_device(
     state: State<'_, AppState>,
     serial: String,
 ) -> Result<OperationResult, String> {
-    state.switch_device(&app, serial).await
+    log_command_error("switch_device", state.switch_device(&app, serial).await)
 }
 
 #[tauri::command]
@@ -130,7 +159,7 @@ async fn set_output(
     state: State<'_, AppState>,
     output: String,
 ) -> Result<AppSnapshot, String> {
-    state.set_output(&app, &output).await
+    log_command_error("set_output", state.set_output(&app, &output).await)
 }
 
 #[tauri::command]
@@ -204,6 +233,21 @@ async fn receiver_status(
     serial: String,
 ) -> Result<receiver::ReceiverStatus, String> {
     state.receiver_status(&serial).await
+}
+
+#[tauri::command]
+fn receiver_binding_profiles(
+    state: State<'_, AppState>,
+) -> Result<std::collections::BTreeMap<String, state::BindingProfile>, String> {
+    state.receiver_binding_profiles()
+}
+
+#[tauri::command]
+async fn receiver_installed_version(
+    state: State<'_, AppState>,
+    serial: String,
+) -> Result<Option<u32>, String> {
+    state.receiver_installed_version(&serial).await
 }
 
 #[tauri::command]
@@ -317,18 +361,21 @@ async fn start_network_audio(
     binding_reference: Option<String>,
     background_authorization_required: Option<bool>,
 ) -> Result<AppSnapshot, String> {
-    state
-        .start_network_audio(
-            &app,
-            &local_address,
-            &peer,
-            bootstrap_serial.as_deref(),
-            receiver_address.as_deref(),
-            receiver_prefix_length,
-            binding_reference.as_deref(),
-            background_authorization_required.unwrap_or(false),
-        )
-        .await
+    log_command_error(
+        "start_network_audio",
+        state
+            .start_network_audio(
+                &app,
+                &local_address,
+                &peer,
+                bootstrap_serial.as_deref(),
+                receiver_address.as_deref(),
+                receiver_prefix_length,
+                binding_reference.as_deref(),
+                background_authorization_required.unwrap_or(false),
+            )
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -350,12 +397,20 @@ async fn revoke_background_trust(
 
 #[tauri::command]
 fn set_wireless_connection_offers(
+    app: AppHandle,
     state: State<'_, AppState>,
     local_address: String,
     allowed: bool,
     binding_reference: Option<String>,
 ) -> Result<discovery::HostDiscoverySnapshot, String> {
-    state.set_wireless_connection_offers(&local_address, allowed, binding_reference.as_deref())
+    state.set_wireless_connection_offers(
+        &local_address,
+        allowed,
+        binding_reference.as_deref(),
+        move || {
+            let _ = app.emit("anpod://offers-changed", ());
+        },
+    )
 }
 
 #[tauri::command]
@@ -365,9 +420,12 @@ async fn accept_wireless_connection_offer(
     offer_id: String,
     binding_reference: String,
 ) -> Result<AppSnapshot, String> {
-    state
-        .accept_wireless_connection_offer(&app, &offer_id, &binding_reference)
-        .await
+    log_command_error(
+        "accept_wireless_connection_offer",
+        state
+            .accept_wireless_connection_offer(&app, &offer_id, &binding_reference)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -382,7 +440,10 @@ async fn reconfigure_session(
     kind: String,
     value: String,
 ) -> Result<AppSnapshot, String> {
-    state.reconfigure_session(&app, &kind, &value).await
+    log_command_error(
+        "reconfigure_session",
+        state.reconfigure_session(&app, &kind, &value).await,
+    )
 }
 
 #[tauri::command]
@@ -392,9 +453,12 @@ async fn apply_audio_settings(
     audio_quality: String,
     playback_mode: String,
 ) -> Result<AppSnapshot, String> {
-    state
-        .apply_audio_settings(&app, &audio_quality, &playback_mode)
-        .await
+    log_command_error(
+        "apply_audio_settings",
+        state
+            .apply_audio_settings(&app, &audio_quality, &playback_mode)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -545,6 +609,11 @@ fn claim_single_instance() -> Result<bool, String> {
 
 #[cfg(not(test))]
 fn main() {
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        applog::record_panic(info);
+        default_panic_hook(info);
+    }));
     match claim_single_instance() {
         Ok(true) => {}
         Ok(false) => return,
@@ -577,6 +646,8 @@ fn main() {
             qr_credentials,
             pair_qr,
             receiver_status,
+            receiver_installed_version,
+            receiver_binding_profiles,
             receiver_install,
             receiver_upgrade_usb,
             receiver_start,

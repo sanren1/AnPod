@@ -89,11 +89,20 @@ pub(crate) struct HostOfferListener {
 }
 
 impl HostOfferListener {
-    pub(crate) fn start(interface: &Ipv4Interface) -> Result<Self, String> {
-        Self::start_inner(interface, false)
+    /// `on_change` runs on the listener thread when offers appear or expire;
+    /// it must not lock AppState (Drop joins this thread under that lock).
+    pub(crate) fn start(
+        interface: &Ipv4Interface,
+        on_change: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::start_inner(interface, false, on_change)
     }
 
-    fn start_inner(interface: &Ipv4Interface, allow_loopback: bool) -> Result<Self, String> {
+    fn start_inner(
+        interface: &Ipv4Interface,
+        allow_loopback: bool,
+        on_change: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
         if !((interface.address.is_private() && !interface.address.is_link_local())
             || (allow_loopback && interface.address.is_loopback()))
             || interface.prefix_length == 0
@@ -132,6 +141,7 @@ impl HostOfferListener {
                     prefix,
                     worker_cancel,
                     worker_snapshot,
+                    on_change,
                 )
             })
             .map_err(|error| {
@@ -147,8 +157,11 @@ impl HostOfferListener {
     }
 
     #[cfg(test)]
-    pub(crate) fn start_loopback_for_test(interface: &Ipv4Interface) -> Result<Self, String> {
-        Self::start_inner(interface, true)
+    pub(crate) fn start_loopback_for_test(
+        interface: &Ipv4Interface,
+        on_change: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::start_inner(interface, true, on_change)
     }
 
     pub(crate) fn snapshot(&self) -> HostDiscoverySnapshot {
@@ -218,6 +231,7 @@ fn run_host_offer_listener(
     prefix: u8,
     cancellation: CancellationToken,
     snapshot: Arc<Mutex<HostDiscoverySnapshot>>,
+    on_change: impl Fn(),
 ) {
     let mut pending_nonces: VecDeque<([u8; 16], Ipv4Addr, Instant)> = VecDeque::new();
     let mut used_nonces: VecDeque<([u8; 16], Instant)> = VecDeque::new();
@@ -292,9 +306,23 @@ fn run_host_offer_listener(
                         continue;
                     }
                     current.offers.push(offer);
+                    drop(current);
+                    on_change();
                 }
             }
-            Err(error) if is_poll_timeout(&error) => {}
+            Err(error) if is_poll_timeout(&error) => {
+                let expired = {
+                    let mut current = snapshot
+                        .lock()
+                        .expect("host discovery snapshot lock poisoned");
+                    let before = current.offers.len();
+                    discard_expired_offers(&mut current.offers);
+                    current.offers.len() != before
+                };
+                if expired {
+                    on_change();
+                }
+            }
             Err(_) => break,
         }
     }

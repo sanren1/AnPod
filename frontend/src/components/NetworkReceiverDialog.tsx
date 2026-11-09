@@ -504,7 +504,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
         audioSessionActive={audioSessionActive} checkReceiver={checkReceiver} serialRef={serialRef} error={error} alertRef={alertRef}
         interfaces={interfaces} localAddress={localAddress} setLocalAddress={setLocalAddress} receiverAddress={receiverAddress}
         setReceiverAddress={setReceiverAddress} receiverInterfaces={receiverInterfaces} compatibleReceiverInterfaces={compatibleReceiverInterfaces}
-        hasValidBootstrapPairs={validBootstrapPairs.length > 0} localError={localError} loadNetworkInfo={loadNetworkInfo}
+        hasValidBootstrapPairs={validBootstrapPairs.length > 0} singleBootstrapPair={validBootstrapPairs.length === 1} localError={localError} loadNetworkInfo={loadNetworkInfo}
         canStart={canStart} onInstallOrUpgrade={requestUsbOperation} onClearErrors={() => { setLocalError(""); onError(""); }}
       />}
       {!setupWizard && !receiverManagerOnly && !networkRecoveryMode && <NetworkConnectionEntry

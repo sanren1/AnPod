@@ -1319,7 +1319,10 @@ mod tests {
     fn production_pipe_query_uses_reported_bulk_ids_and_rejects_ambiguous_pairs() {
         let queried = Mutex::new(Vec::new());
         let pipes = query_bulk_pipes(4, |index| {
-            queried.lock().unwrap().push(index);
+            queried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(index);
             Ok([
                 PipeDescriptor {
                     id: 0x83,
@@ -1347,7 +1350,12 @@ mod tests {
                 output: 0x02
             }
         );
-        assert_eq!(*queried.lock().unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            *queried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![0, 1, 2, 3]
+        );
         assert!(query_bulk_pipes(2, |index| Ok(PipeDescriptor {
             id: if index == 0 { 0x81 } else { 0x82 },
             is_bulk: true,
@@ -1386,7 +1394,10 @@ mod tests {
             {
                 return Ok(0);
             }
-            let mut input = self.input.lock().unwrap();
+            let mut input = self
+                .input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if input.is_empty() {
                 return Ok(0);
             }
@@ -1412,7 +1423,7 @@ mod tests {
             let count = input.len().min(self.max_transfer);
             self.output
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend_from_slice(&input[..count]);
             Ok(count)
         }
@@ -1457,7 +1468,13 @@ mod tests {
             record_deadline: None,
         };
         writer.write_all(payload).unwrap();
-        assert_eq!(*fake.output.lock().unwrap(), payload);
+        assert_eq!(
+            *fake
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            payload
+        );
 
         let cancel = AoaCancel(fake.clone());
         cancel.cancel();
@@ -1494,7 +1511,13 @@ mod tests {
             reader.read(&mut [0; 4]).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
-        assert_eq!(*fake.input.lock().unwrap(), b"still-buffered");
+        assert_eq!(
+            *fake
+                .input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            b"still-buffered"
+        );
 
         let invalid = Arc::new(FakeIo {
             input: Mutex::new(vec![0; 8]),

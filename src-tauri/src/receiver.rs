@@ -84,6 +84,13 @@ pub struct ReceiverNetworkStatus {
     pub network_audio_port: u16,
 }
 
+/// Error prefix the frontend reads to offer the Receiver upgrade flow.
+pub(crate) const RECEIVER_UPDATE_REQUIRED: &str = "RECEIVER_UPDATE_REQUIRED:";
+
+pub(crate) fn receiver_update_required(detail: &str) -> String {
+    format!("{RECEIVER_UPDATE_REQUIRED}{detail}")
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiverStatus {
@@ -247,7 +254,10 @@ impl StartupDiagnosticsCapture {
         audio_profile: u8,
         playback_mode: u8,
     ) -> StartupDiagnosticsRecorder {
-        let mut buffer = self.0.lock().expect("startup diagnostics lock");
+        let mut buffer = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         buffer.next_owner_generation = buffer.next_owner_generation.saturating_add(1);
         StartupDiagnosticsRecorder {
             capture: self.clone(),
@@ -259,7 +269,10 @@ impl StartupDiagnosticsCapture {
     }
 
     pub(crate) fn export(&self) -> StartupDiagnosticsExport {
-        let buffer = self.0.lock().expect("startup diagnostics lock");
+        let buffer = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         StartupDiagnosticsExport {
             enabled: true,
             sample_interval_ms: STARTUP_DIAGNOSTICS_INTERVAL.as_millis() as u64,
@@ -283,7 +296,11 @@ impl StartupDiagnosticsRecorder {
         else {
             return false;
         };
-        let buffer = self.capture.0.lock().expect("startup diagnostics lock");
+        let buffer = self
+            .capture
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         buffer
             .windows
             .iter()
@@ -318,7 +335,11 @@ impl StartupDiagnosticsRecorder {
         if playback.progress_schema != Some(3) {
             return;
         }
-        let mut buffer = self.capture.0.lock().expect("startup diagnostics lock");
+        let mut buffer = self
+            .capture
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if buffer.limit_reached {
             return;
         }
@@ -1118,7 +1139,9 @@ async fn require_binding_reset_capability(
     if supported {
         Ok(())
     } else {
-        Err("RECEIVER_UPDATE_REQUIRED:已安装 Receiver 不支持条件绑定重置。".into())
+        Err(receiver_update_required(
+            "已安装 Receiver 不支持条件绑定重置。",
+        ))
     }
 }
 
@@ -1455,7 +1478,11 @@ async fn reset_binding_with(
     let binding_path = data_dir
         .join("receiver-bindings")
         .join(format!("{}.dat", before.binding_reference));
-    if let Err(error) = BindingStore::remove_if_matches(&binding_path, expected_pc.as_ref()) {
+    let removal = BindingStore::remove_if_matches(&binding_path, expected_pc.as_ref());
+    if removal.is_ok() {
+        let _ = fs::remove_file(binding_path.with_extension("json"));
+    }
+    if let Err(error) = removal {
         let (pc_state, pc_commitment) = local_reset_binding(&binding_path);
         let outcome = pc_partial_outcome(&before, &pc_state, &pc_commitment);
         return Ok(reset_result(
@@ -1939,7 +1966,7 @@ pub async fn start_network(
         }
         let status = network_status_rows(&runner, serial, &user, cancel).await?;
         if status.network_audio_version != 1 {
-            return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络协议版本不兼容。".into());
+            return Err(receiver_update_required("Receiver 网络协议版本不兼容。"));
         }
         if network_listener_ready(&status.network_audio_state) {
             if status.network_audio_address != address || status.network_audio_port == 0 {
@@ -2053,7 +2080,7 @@ async fn network_status_rows(
         "--uri", NETWORK_URI, "--projection", "networkAudioVersion:networkAudioState:networkAudioFailure:pcmBytesWritten:networkAudioAddress:networkAudioPort"],
         Duration::from_secs(8), Some(cancel)).await?;
     if !result.success {
-        return Err("RECEIVER_UPDATE_REQUIRED:Receiver 网络状态版本不可用。".into());
+        return Err(receiver_update_required("Receiver 网络状态版本不可用。"));
     }
     parse_network_status(&result.stdout)
 }
@@ -2370,10 +2397,9 @@ async fn start_adb_stream_audio_with(
     }
     let installed = verify_installed_identity(adb, serial, &user, &metadata, cancel).await?;
     if installed.version_code < 46 {
-        return Err(
-            "RECEIVER_UPDATE_REQUIRED:ADB Float32 streaming requires Receiver code 46 or newer."
-                .into(),
-        );
+        return Err(receiver_update_required(
+            "ADB Float32 streaming requires Receiver code 46 or newer.",
+        ));
     }
     let args = [
         "shell",
@@ -2800,7 +2826,7 @@ async fn verify_installed_identity(
         return Err("设备没有返回有效的 Receiver APK 摘要；未读取其状态或执行管理动作。".into());
     }
     verified_installed_artifact(installed_digest, metadata)
-        .ok_or_else(|| "RECEIVER_UPDATE_REQUIRED:设备上的 Receiver APK 不在已核验版本中。".into())
+        .ok_or_else(|| receiver_update_required("设备上的 Receiver APK 不在已核验版本中。"))
 }
 
 async fn current_android_user(
@@ -2822,6 +2848,52 @@ async fn current_android_user(
         return Err("Android 未返回有效的当前用户编号；已停止 Receiver 管理。".into());
     }
     Ok(user.to_owned())
+}
+
+/// Installed Receiver versionCode, read without the device-operation slot. Only drives the
+/// update hint; installing or upgrading still verifies the APK digest.
+pub async fn installed_version_code(
+    adb: &Path,
+    serial: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<u32>, String> {
+    let runner = SystemAdb(adb);
+    let user = current_android_user(&runner, serial, cancel).await?;
+    let result = runner
+        .run(
+            Some(serial),
+            &[
+                "shell",
+                "pm",
+                "list",
+                "packages",
+                "--show-versioncode",
+                "--user",
+                &user,
+                PACKAGE,
+            ],
+            Duration::from_secs(6),
+            Some(cancel),
+        )
+        .await?;
+    if !result.success {
+        return Err(adb_error(&result));
+    }
+    Ok(listed_version_code(&result.stdout))
+}
+
+fn listed_version_code(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let (name, version) = line
+            .trim()
+            .strip_prefix("package:")?
+            .split_once(" versionCode:")?;
+        if name == PACKAGE {
+            version.trim().parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn has_listed_package(output: &str) -> bool {

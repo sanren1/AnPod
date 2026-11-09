@@ -3,7 +3,9 @@ import { createRoot } from 'react-dom/client'
 import './design/tokens.css'
 import './design/base.css'
 import './design/layout.css'
-import './index.css'
+import './design/main-screen.css'
+import './design/dialogs.css'
+import './design/refinements.css'
 import App from './App.tsx'
 
 const root = createRoot(document.getElementById('root')!)

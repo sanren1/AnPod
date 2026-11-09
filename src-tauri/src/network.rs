@@ -4,6 +4,7 @@ use crate::protocol::{
 };
 #[cfg(test)]
 use crate::protocol::{PacketDecoder, ProtocolError, MAX_DATAGRAM_LEN};
+use crate::timing::CaptureSendTiming;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::{
@@ -354,6 +355,7 @@ pub struct PcmQueue {
     target_format: Option<PcmFormat>,
     max_queue_ms: u64,
     stopped: AtomicBool,
+    pub(crate) timing: CaptureSendTiming,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -406,6 +408,7 @@ pub struct FloatPcmQueue {
     max_callback_frames: AtomicU32,
     max_queue_ms: u64,
     stopped: AtomicBool,
+    pub(crate) timing: CaptureSendTiming,
 }
 
 impl FloatPcmQueue {
@@ -459,6 +462,7 @@ impl FloatPcmQueue {
                 BALANCED_CAPTURE_QUEUE_MS
             },
             stopped: AtomicBool::new(false),
+            timing: CaptureSendTiming::new(),
         }
     }
 
@@ -641,6 +645,7 @@ impl FloatPcmQueue {
         channels: u16,
         frame_index: u64,
     ) -> bool {
+        self.timing.record_capture(Instant::now());
         let frames = frame_count as usize;
         let frame_index = if !self.stopped.load(Ordering::Acquire) {
             observe_source_capture(
@@ -875,10 +880,12 @@ impl FloatPcmQueue {
             state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
-            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+            let waited = info.enqueued_at.elapsed();
+            if waited > Duration::from_millis(self.max_queue_ms) {
                 self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
+            self.timing.record_queue_wait(waited);
             let sample_count = info.frame_count as usize * info.channels as usize;
             scratch.clear();
             scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
@@ -933,6 +940,7 @@ impl PcmQueue {
             target_format: None,
             max_queue_ms: BALANCED_CAPTURE_QUEUE_MS,
             stopped: AtomicBool::new(false),
+            timing: CaptureSendTiming::new(),
         }
     }
 
@@ -1010,7 +1018,7 @@ impl PcmQueue {
     pub(crate) fn queued_frames(&self) -> u64 {
         self.state
             .lock()
-            .expect("PCM queue lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queued_frames
     }
 
@@ -1106,6 +1114,7 @@ impl PcmQueue {
         frame_index: u64,
         enqueued_at: Instant,
     ) -> bool {
+        self.timing.record_capture(enqueued_at);
         let frames = frame_count as usize;
         let frame_index = if !self.stopped.load(Ordering::Acquire) {
             observe_source_capture(
@@ -1373,10 +1382,12 @@ impl PcmQueue {
             state.head = (state.head + 1) % PCM_QUEUE_CAPACITY;
             state.len -= 1;
             state.queued_frames -= info.frame_count as u64;
-            if info.enqueued_at.elapsed() > Duration::from_millis(self.max_queue_ms) {
+            let waited = info.enqueued_at.elapsed();
+            if waited > Duration::from_millis(self.max_queue_ms) {
                 self.add_dropped_locked(&mut state, info.frame_index, info.frame_count as u64);
                 continue;
             }
+            self.timing.record_queue_wait(waited);
             let sample_count = info.frame_count as usize * info.channels as usize;
             scratch.clear();
             scratch.extend_from_slice(&state.slots[index].samples[..sample_count]);
@@ -1394,7 +1405,10 @@ impl PcmQueue {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.state.lock().unwrap().len
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len
     }
 }
 
@@ -1709,7 +1723,12 @@ fn send_float_loop(
                 PacketType::Audio,
                 frame_index,
                 &payload,
-                |packet| send_datagram(&socket, remote, packet),
+                |packet| {
+                    let started = Instant::now();
+                    let sent = send_datagram(&socket, remote, packet);
+                    queue.timing.record_send(started.elapsed());
+                    sent
+                },
             )?;
             queue.note_audio_sent(segment_generation, frame_index, packet_frames as u64);
             if send_loss_ledger {
@@ -2027,7 +2046,12 @@ fn send_loop(
                 PacketType::Audio,
                 frame_index,
                 &payload,
-                |packet| send_datagram(&socket, remote, packet),
+                |packet| {
+                    let started = Instant::now();
+                    let sent = send_datagram(&socket, remote, packet);
+                    queue.timing.record_send(started.elapsed());
+                    sent
+                },
             )?;
             queue.note_audio_sent(segment_generation, frame_index, packet_frames as u64);
             if send_loss_ledger {
@@ -2247,7 +2271,10 @@ pub(crate) fn verify_capture_queue_bounds() {
     let queue = Arc::new(PcmQueue::for_session(format, false));
     assert!(queue.push_raw(samples.as_ptr(), MAX_CAPTURE_FRAMES as u32, 48_000, 2, 10));
     {
-        let state = queue.state.lock().unwrap();
+        let state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let info = state.slots[state.head].info;
         let kept_frames = 48_000 * BALANCED_CAPTURE_QUEUE_MS as usize / 1000;
         assert_eq!(state.queued_frames, kept_frames as u64);
@@ -2339,4 +2366,35 @@ pub(crate) fn verify_capture_queue_bounds() {
     assert_eq!(stale_stats.packets_sent, 1);
     assert_eq!(stale_stats.pcm_payload_bytes_sent, 0);
     assert_eq!(stale_queue.dropped_frames(), 240);
+}
+
+#[cfg(test)]
+#[test]
+fn pcm_queue_records_capture_interval_and_queue_wait_for_the_session() {
+    let format = PcmFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let samples = vec![0i16; 480 * 2];
+    let queue = PcmQueue::for_session(format, false);
+    let start = Instant::now();
+    assert!(queue.push_raw_at(samples.as_ptr(), 480, 48_000, 2, 0, start));
+    assert!(queue.push_raw_at(
+        samples.as_ptr(),
+        480,
+        48_000,
+        2,
+        480,
+        start + Duration::from_millis(10),
+    ));
+    let mut scratch = Vec::new();
+    assert!(queue
+        .pop_timeout(&mut scratch, Duration::from_millis(5))
+        .is_some());
+    let summary = queue.timing.take_summary().unwrap();
+    let capture = summary.capture_interval.unwrap();
+    assert_eq!(capture.count, 1);
+    assert!((10_000..12_000).contains(&capture.p50_us));
+    assert_eq!(summary.queue_wait.unwrap().count, 1);
+    assert!(summary.send.is_none());
 }

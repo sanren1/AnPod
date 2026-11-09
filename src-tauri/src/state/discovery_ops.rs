@@ -28,7 +28,10 @@ impl AppState {
         .map_err(|_| "网络发现任务已停止。".to_string())??;
         let now = Instant::now();
         let unix = unix_seconds();
-        let mut presence = self.presence.lock().expect("presence lock");
+        let mut presence = self
+            .presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for candidate in &found {
             if let (Some(binding), SocketAddr::V4(endpoint)) =
                 (&candidate.binding_reference, candidate.endpoint)
@@ -46,12 +49,10 @@ impl AppState {
         else {
             return;
         };
-        self.presence.lock().expect("presence lock").observe(
-            binding,
-            *endpoint.ip(),
-            Instant::now(),
-            unix_seconds(),
-        );
+        self.presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(binding, *endpoint.ip(), Instant::now(), unix_seconds());
     }
 
     /// Probes bindings whose backoff has elapsed. Skipped while a session or an
@@ -61,7 +62,10 @@ impl AppState {
             return;
         }
         {
-            let view = self.view.lock().expect("app view lock");
+            let view = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if view.busy
                 || view.session_active
                 || selected_connection_transport(&view.settings.preferred_transport) != "wireless"
@@ -77,7 +81,10 @@ impl AppState {
         let cached_default = self.last_receiver_address();
         let now = Instant::now();
         let due: Vec<String> = {
-            let mut presence = self.presence.lock().expect("presence lock");
+            let mut presence = self
+                .presence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for binding in &bindings {
                 presence.register(&binding.reference, cached_default, now);
             }
@@ -112,7 +119,10 @@ impl AppState {
         .await;
         let now = Instant::now();
         let unix = unix_seconds();
-        let mut presence = self.presence.lock().expect("presence lock");
+        let mut presence = self
+            .presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let candidates = outcome.ok().and_then(Result::ok).unwrap_or_default();
         for reference in &due {
             match candidates.iter().find(|candidate| {
@@ -155,7 +165,10 @@ impl AppState {
 
     /// Address of the Receiver that last accepted a session, if it is a usable IPv4 literal.
     pub(crate) fn last_receiver_address(&self) -> Option<Ipv4Addr> {
-        let view = self.view.lock().expect("app view lock");
+        let view = self
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let endpoint = view.settings.last_receiver_endpoint.as_deref()?;
         match endpoint.parse::<SocketAddr>().ok()?.ip() {
             IpAddr::V4(address) if !address.is_unspecified() && !address.is_loopback() => {
@@ -173,7 +186,10 @@ impl AppState {
             return;
         }
         let settings = {
-            let mut view = self.view.lock().expect("app view lock");
+            let mut view = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if view.settings.last_receiver_endpoint.as_deref() == Some(peer) {
                 return;
             }
@@ -363,7 +379,10 @@ impl AppState {
         if let Err(error) = self.audio.restore_muted() {
             errors.push(format!("恢复电脑输出失败：{error}"));
         }
-        let mut view = self.view.lock().expect("view lock");
+        let mut view = self
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         view.session_active = false;
         view.session_generation = None;
         view.session_serial = None;
@@ -390,7 +409,10 @@ impl AppState {
         }
         view.busy = false;
         drop(view);
-        *self.pcm_rate_sample.lock().expect("PCM rate sample lock") = None;
+        *self
+            .pcm_rate_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.emit(app);
         if errors.is_empty() {
             Ok(())
@@ -407,16 +429,20 @@ impl AppState {
         local_address: &str,
         allowed: bool,
         selected_binding: Option<&str>,
+        on_change: impl Fn() + Send + 'static,
     ) -> Result<HostDiscoverySnapshot, String> {
         if !allowed {
             self.host_offer_listener
                 .lock()
-                .expect("offer listener lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             return Ok(HostDiscoverySnapshot::default());
         }
         let (interface, settings, active, busy) = {
-            let view = self.view.lock().expect("app view lock");
+            let view = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 self.network_interfaces()?
                     .into_iter()
@@ -437,7 +463,12 @@ impl AppState {
         if busy {
             return Err("AnPod 正在处理连接操作；请稍后再更改连接请求监听。".into());
         }
-        if self.operation.lock().expect("operation lock").is_some() {
+        if self
+            .operation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
             return Err("连接操作尚未结束；请稍后再允许手机连接。".into());
         }
         let references = self.receiver_binding_references()?;
@@ -447,7 +478,7 @@ impl AppState {
         let mut listener = self
             .host_offer_listener
             .lock()
-            .expect("offer listener lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(current) = listener.as_ref() {
             let snapshot = current.snapshot();
             if snapshot.active
@@ -462,7 +493,7 @@ impl AppState {
             }
             listener.take();
         }
-        *listener = Some(HostOfferListener::start(&interface)?);
+        *listener = Some(HostOfferListener::start(&interface, on_change)?);
         listener
             .as_mut()
             .expect("listener was just installed")
@@ -477,7 +508,7 @@ impl AppState {
         let Some((Some(address), Some(prefix))) = self
             .host_offer_listener
             .lock()
-            .expect("offer listener lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|listener| {
                 (
@@ -497,13 +528,13 @@ impl AppState {
         if !active_interface_valid {
             self.host_offer_listener
                 .lock()
-                .expect("offer listener lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             return HostDiscoverySnapshot::default();
         }
         self.host_offer_listener
             .lock()
-            .expect("offer listener lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(HostOfferListener::snapshot)
             .unwrap_or_default()
@@ -523,7 +554,10 @@ impl AppState {
             return Err("必须明确选择已保存的 Receiver 绑定。".into());
         }
         {
-            let view = self.view.lock().expect("app view lock");
+            let view = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !view
                 .settings
                 .preferred_transport
@@ -550,7 +584,7 @@ impl AppState {
             let listener = self
                 .host_offer_listener
                 .lock()
-                .expect("offer listener lock");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let listener = listener
                 .as_ref()
                 .ok_or_else(|| "无线连接请求监听已关闭。".to_string())?;

@@ -90,9 +90,15 @@ impl PcUpdater {
         let current = env!("CARGO_PKG_VERSION").to_owned();
         let available =
             compare_versions(&release.version, &current)? == std::cmp::Ordering::Greater;
-        *self.release.lock().expect("PC updater release lock") = Some(release.clone());
+        *self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release.clone());
         if !available {
-            *self.prepared.lock().expect("PC updater prepared lock") = None;
+            *self
+                .prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
         Ok(UpdateCheck {
             current_version: current,
@@ -109,7 +115,7 @@ impl PcUpdater {
         let release = self
             .release
             .lock()
-            .expect("PC updater release lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or("请先检查正式更新。")?;
         let current = env!("CARGO_PKG_VERSION");
@@ -150,7 +156,10 @@ impl PcUpdater {
             let _ = fs::remove_dir_all(&stage);
             return Err(error);
         }
-        *self.prepared.lock().expect("PC updater prepared lock") = Some(stage);
+        *self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stage);
         Ok(PreparedUpdate { status: "prepared" })
     }
 
@@ -162,7 +171,7 @@ impl PcUpdater {
         let stage = self
             .prepared
             .lock()
-            .expect("PC updater prepared lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or("请先下载并验证更新包。")?;
         let executable = std::env::current_exe().map_err(|e| format!("无法定位当前程序：{e}"))?;
@@ -262,7 +271,7 @@ impl PcUpdater {
         let stage = self
             .prepared
             .lock()
-            .expect("PC updater prepared lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or("请先下载并验证更新包。")?;
         if !stage.join("manifest.json").is_file() || !stage.join("package").is_dir() {
@@ -275,7 +284,7 @@ impl PcUpdater {
         let path = self
             .prepared
             .lock()
-            .expect("PC updater prepared lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or("当前没有已准备的更新包。")?
             .join("package");
@@ -286,7 +295,7 @@ impl PcUpdater {
         let url = self
             .release
             .lock()
-            .expect("PC updater release lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|r| r.release_url.clone())
             .ok_or("请先检查正式更新。")?;
@@ -565,7 +574,7 @@ mod tests {
     #[test]
     fn download_command_refuses_the_older_official_release() {
         let updater = PcUpdater::new();
-        *updater.release.lock().unwrap() = Some(Release {
+        *updater.release.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Release {
             version: "1.18.0".into(),
             release_url: "https://github.com/sanren1/AnPod/releases/tag/v1.18.0-main".into(),
             asset_name: "AnPod-1.18.0-tauri-win-x64-portable.zip".into(),
@@ -579,7 +588,11 @@ mod tests {
             .unwrap();
         let error = runtime.block_on(updater.download()).unwrap_err();
         assert_eq!(error, "当前没有可下载的新版本。");
-        assert!(updater.prepared.lock().unwrap().is_none());
+        assert!(updater
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
     }
 
     #[test]

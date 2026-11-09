@@ -26,8 +26,15 @@ export const connectionLabel = (transport: Snapshot["connectionTransport"] | Sna
 export const intendedConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.connectionTransport,
   snapshot.connectionTransport === "wireless" ? snapshot.settings.wirelessProtocol : null);
 export const actualConnectionLabel = (snapshot: Snapshot) => connectionLabel(snapshot.sessionConnectionTransport, snapshot.sessionWirelessProtocol);
-export const bindingLabel = (_reference: string | null | undefined) => strings.connection.pairedReceiver;
-export const bindingReferenceLabel = (reference: string | null | undefined) => reference ? strings.connection.pairedReceiverWithReference(reference) : strings.connection.pairedReceiver;
+// Phone model per binding reference, from receiver_binding_profiles; bindings saved before models were recorded have none.
+const bindingModels = new Map<string, string>();
+export const rememberBindingModels = (profiles: Record<string, { model?: string | null }>) => {
+  bindingModels.clear();
+  for (const [reference, profile] of Object.entries(profiles)) if (profile.model) bindingModels.set(reference, profile.model);
+};
+export const bindingLabel = (reference: string | null | undefined) => (reference && bindingModels.get(reference)) || strings.connection.pairedReceiver;
+export const bindingReferenceLabel = (reference: string | null | undefined) => !reference ? strings.connection.pairedReceiver
+  : bindingModels.has(reference) ? `${bindingModels.get(reference)} · ${reference.slice(0, 8)}` : strings.connection.pairedReceiverWithReference(reference);
 export const resetPhoneStateLabel = (state: string) => ({ empty: strings.network.resetPhoneEmpty, pending: strings.network.resetPhonePending, saved: strings.network.resetPhoneSaved, failed: strings.network.resetPhoneFailed, unknown: strings.network.resetPhoneUnknown } as Record<string, string>)[state] ?? state;
 export const resetPcStateLabel = (state: string) => ({ missing: strings.network.resetPcMissing, saved: strings.network.resetPcSaved, unknown: strings.network.resetPcUnknown } as Record<string, string>)[state] ?? state;
 export const resetOutcomeLabel = (outcome: string) => ({ reset: strings.network.resetOutcomeReset, alreadyEmpty: strings.network.resetOutcomeAlreadyEmpty, phoneStateUnknown: strings.network.resetOutcomePhoneUnknown, phoneRetained: strings.network.resetOutcomePhoneRetained, phoneClearedPcUnknown: strings.network.resetOutcomePhoneClearedPcUnknown, phoneClearedPcRetained: strings.network.resetOutcomePhoneClearedPcRetained, phoneClearedPcChanged: strings.network.resetOutcomePhoneClearedPcChanged, pcClearedPhoneEmpty: strings.network.resetOutcomePcClearedPhoneEmpty, pcClearedPhoneUnknown: strings.network.resetOutcomePcClearedPhoneUnknown, pcClearedPhoneChanged: strings.network.resetOutcomePcClearedPhoneChanged, targetChanged: strings.network.resetOutcomeTargetChanged } as Record<string, string>)[outcome] ?? strings.network.resetOutcomeReview;

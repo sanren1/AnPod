@@ -1,4 +1,4 @@
-.app-shell { width: 100%; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) 42px; background: var(--bg); color: var(--text); }
+.app-shell { width: 100%; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) auto 42px; background: var(--bg); color: var(--text); }
 .topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand img { display: block; width: 30px; height: 30px; object-fit: contain; }
@@ -17,6 +17,14 @@
 .footer > span { color: var(--muted); font-size: 10px; }
 
 @media (max-width: 390px) {
-  .app-shell { grid-template-rows: 48px minmax(0, 1fr) 42px; }
+  .app-shell { grid-template-rows: 48px minmax(0, 1fr) auto 42px; }
   .main-scroll { padding: 7px 12px 16px; }
+  .app-shell .action-dock { margin-inline: 12px; }
 }
+
+/* Status and the main action stay at the bottom; settings scroll above them. */
+.action-dock { margin: 0 16px 8px; }
+.action-dock > .text-button { justify-self: center; min-height: 36px; }
+.update-banner { min-height: 36px; padding: 6px 10px; border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--line)); border-radius: 8px; color: var(--warning); background: color-mix(in srgb, var(--warning) 9%, var(--surface)); font-weight: 600; text-align: left; cursor: pointer; }
+.update-banner:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 15%, var(--surface)); }
+.update-banner:disabled { opacity: .55; cursor: default; }

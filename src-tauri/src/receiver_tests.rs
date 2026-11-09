@@ -2400,3 +2400,17 @@ async fn p1_real_usb_installed_receiver_health_start_stop_when_explicitly_reques
             .service_active
     );
 }
+
+#[test]
+fn listed_version_code_matches_only_the_exact_receiver_package() {
+    assert_eq!(
+        listed_version_code("package:app.anpod.receiver versionCode:50\r\n"),
+        Some(50)
+    );
+    assert_eq!(
+        listed_version_code("package:app.anpod.receiver.debug versionCode:99\npackage:app.anpod.receiver versionCode:47\n"),
+        Some(47)
+    );
+    assert_eq!(listed_version_code("package:app.anpod.receiver\n"), None);
+    assert_eq!(listed_version_code(""), None);
+}

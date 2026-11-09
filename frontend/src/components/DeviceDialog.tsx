@@ -4,7 +4,7 @@ import type { Device } from "../appTypes";
 import { bindingLabel } from "../appRuntime";
 import { Modal } from "./Modal";
 
-export function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onConnectOnly, onAddPhone, onFirstSetup, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onConnectOnly: () => void; onAddPhone: (() => void) | null; onFirstSetup: (() => void) | null; onClose: () => void }) {
+export function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onConnectOnly, onAddPhone, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onConnectOnly: () => void; onAddPhone: (() => void) | null; onClose: () => void }) {
   return <Modal title={strings.deviceDialog.title} onClose={onClose} className="device-dialog">
     <div className="dialog-tools"><span>{strings.deviceDialog.onlyCurrentTransport}</span><button className="text-button" onClick={onRefresh} disabled={busy}><Search size={15} />{strings.deviceDialog.refresh}</button></div>
     {activeBinding && <div className="network-active-card"><strong>{bindingLabel(activeBinding)}</strong><span>{strings.deviceDialog.activeDirectUdp}</span></div>}
@@ -15,7 +15,6 @@ export function DeviceDialog({ devices, selected, activeSerial, activeBinding, b
     <div className="network-entry-actions">
       {devices.some(device => device.serial === selected && device.connectable) && <button className="text-button" type="button" disabled={busy} onClick={onConnectOnly}>{strings.app.connectOnly}</button>}
       {onAddPhone && <button className="text-button" type="button" disabled={busy} onClick={onAddPhone}>{strings.app.addPhone}</button>}
-      {onFirstSetup && <button className="text-button" type="button" disabled={busy} onClick={onFirstSetup}>{strings.app.firstSetup}</button>}
     </div>
     <button className="dialog-secondary" onClick={onClose}>{strings.deviceDialog.finish}</button>
   </Modal>;

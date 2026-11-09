@@ -32,6 +32,10 @@ impl AppState {
         Ok((generation, token, guard))
     }
 
+    pub async fn receiver_installed_version(&self, serial: &str) -> Result<Option<u32>, String> {
+        receiver::installed_version_code(&self.adb_path, serial, &CancellationToken::new()).await
+    }
+
     pub async fn receiver_status(&self, serial: &str) -> Result<ReceiverStatus, String> {
         let (generation, token, _guard) = self.begin_receiver_operation(false).await?;
         let result = receiver::status(
@@ -266,6 +270,19 @@ impl AppState {
         .await;
         self.finish_operation(generation);
         result
+    }
+
+    pub fn receiver_binding_profiles(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, BindingProfile>, String> {
+        Ok(self
+            .receiver_binding_references()?
+            .into_iter()
+            .map(|reference| {
+                let profile = load_binding_profile(&self.data_dir, &reference);
+                (reference, profile)
+            })
+            .collect())
     }
 
     pub fn receiver_binding_references(&self) -> Result<Vec<String>, String> {

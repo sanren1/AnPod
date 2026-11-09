@@ -1,5 +1,4 @@
-import { useId, type CSSProperties, type ReactNode } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import type { CSSProperties, ReactNode } from "react";
 import "../../design/components.css";
 
 export type SegmentOption<T extends string> = {
@@ -13,43 +12,31 @@ export function FluidSegmentedControl<T extends string>({
   value,
   options,
   onValueChange,
-  columns = options.length,
   className,
 }: {
   label: string;
   value: T;
   options: SegmentOption<T>[];
   onValueChange: (value: T) => void;
-  columns?: number;
   className?: string;
 }) {
-  const id = useId().replaceAll(":", "");
-  const reduceMotion = useReducedMotion();
+  const selectedIndex = options.findIndex(option => option.value === value);
 
   return <div
     className={`fluid-segmented-control${className ? ` ${className}` : ""}`}
     role="group"
     aria-label={label}
-    style={{ "--segment-count": columns } as CSSProperties}
+    style={{ "--segment-count": options.length, "--segment-index": selectedIndex } as CSSProperties}
   >
-    {options.map(option => {
-      const selected = option.value === value;
-      return <button
-        key={option.value}
-        type="button"
-        aria-pressed={selected}
-        disabled={option.disabled}
-        onClick={() => onValueChange(option.value)}
-      >
-        {selected && <motion.span
-          className="fluid-segmented-control__selection"
-          layoutId={`fluid-segment-${id}`}
-          initial={false}
-          transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
-          aria-hidden="true"
-        />}
-        <span>{option.label}</span>
-      </button>;
-    })}
+    {selectedIndex >= 0 && <span className="fluid-segmented-control__selection" aria-hidden="true" />}
+    {options.map(option => <button
+      key={option.value}
+      type="button"
+      aria-pressed={option.value === value}
+      disabled={option.disabled}
+      onClick={() => onValueChange(option.value)}
+    >
+      <span>{option.label}</span>
+    </button>)}
   </div>;
 }

@@ -91,3 +91,6 @@ export type BackgroundTrustStatus = {
   persistence: "none" | "process" | "binding"; remainingMs: number | null;
 };
 export type OperationResult = { success: boolean; message: string; snapshot: Snapshot };
+
+export type Panel = "device" | "settings" | "pair" | "network" | "receiver" | "setup" | "aoa" | "help" | "diagnostics";
+export type ConfirmRequest = { kind: "transport" | "wirelessProtocol" | "audioBackend" | "playback" | "wiredMode" | "device" | "network" | "receiverUsb" | "aoa"; value: string };

@@ -80,7 +80,7 @@ function PreviewWindow({ theme, view }: { theme: Theme; view: "main" | "settings
       <div className="gallery-settings-title"><h2>{t("设置", "Settings")}</h2><p>{t("管理连接、音频与界面偏好", "Manage connection, audio and appearance")}</p></div>
       <section className="gallery-settings-group">
         <h3>{t("界面", "Appearance")}</h3>
-        <div className="gallery-setting-row"><strong>{t("主题", "Theme")}</strong><FluidSegmentedControl label={t("主题", "Theme")} value={appearanceChoice} options={themeOptions} columns={3} onValueChange={setAppearanceChoice} /></div>
+        <div className="gallery-setting-row"><strong>{t("主题", "Theme")}</strong><FluidSegmentedControl label={t("主题", "Theme")} value={appearanceChoice} options={themeOptions} onValueChange={setAppearanceChoice} /></div>
         <label className="gallery-toggle-row"><span>{t("放大文字", "Large text")}</span><input type="checkbox" disabled /></label>
         <label className="gallery-toggle-row"><span>{t("最小化到托盘", "Minimize to tray")}</span><input type="checkbox" checked readOnly /></label>
       </section>

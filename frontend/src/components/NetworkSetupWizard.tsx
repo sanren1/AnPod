@@ -11,7 +11,7 @@ export function NetworkSetupWizard({
   receiverAction, receiverError, receiverStatus, receiverNeedsUpgrade, receiverOperationResult, updateCandidate,
   candidateLoading, updateCandidateError, canRequestUsbInstall, audioSessionActive, checkReceiver, serialRef,
   error, alertRef, interfaces, localAddress, setLocalAddress, receiverAddress, setReceiverAddress, receiverInterfaces,
-  compatibleReceiverInterfaces, hasValidBootstrapPairs, localError, loadNetworkInfo, canStart,
+  compatibleReceiverInterfaces, hasValidBootstrapPairs, singleBootstrapPair, localError, loadNetworkInfo, canStart,
   onInstallOrUpgrade, onClearErrors,
 }: {
   step: Step; stepRef: Ref<HTMLDivElement>; setStep: (step: Step) => void; busy: boolean; serial: string;
@@ -23,7 +23,7 @@ export function NetworkSetupWizard({
   serialRef: { current: string }; error: string; alertRef: Ref<HTMLParagraphElement>; interfaces: PrivateIpv4Interface[];
   localAddress: string; setLocalAddress: (address: string) => void; receiverAddress: string;
   setReceiverAddress: (address: string) => void; receiverInterfaces: ReceiverIpv4Interface[];
-  compatibleReceiverInterfaces: ReceiverIpv4Interface[]; hasValidBootstrapPairs: boolean; localError: string;
+  compatibleReceiverInterfaces: ReceiverIpv4Interface[]; hasValidBootstrapPairs: boolean; singleBootstrapPair: boolean; localError: string;
   loadNetworkInfo: () => Promise<void>; canStart: boolean; onInstallOrUpgrade: (kind: "install" | "upgrade") => void;
   onClearErrors: () => void;
 }) {
@@ -76,6 +76,8 @@ export function NetworkSetupWizard({
       <div className="setup-wizard-actions"><button className="dialog-secondary" type="button" disabled={busy} onClick={() => setUpStep(1)}>{strings.network.back}</button><button className="primary-button" type="button" disabled={busy || receiverStatus?.installed !== true || !!receiverError || !!error} onClick={async () => { const checkedSerial = serial; const checked = await checkReceiver(checkedSerial); if (checked?.installed === true && serialRef.current === checkedSerial) setUpStep(3); }}>{strings.network.next}</button></div>
     </div>}
     {step === 3 && <div ref={stepRef} className="setup-wizard-step">
+      {/* The dialog already selects the only matching pair; show the lists only when there is a choice. */}
+      {singleBootstrapPair && localAddress && receiverAddress ? <p className="network-note">{strings.network.computerInterface}: {localAddress} · {strings.network.phoneCurrentIpv4}: {receiverAddress}</p> : <>
       <p>{strings.network.chooseMatchingInterfaces}</p>
       <label className="network-field">{strings.network.computerInterface}
         <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); onClearErrors(); }}>
@@ -89,6 +91,7 @@ export function NetworkSetupWizard({
           {compatibleReceiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
         </select>
       </label>
+      </>}
       {interfaces.length > 0 && receiverInterfaces.length > 0 && !hasValidBootstrapPairs && <div className="network-recovery" role="status"><span>{strings.network.noSameSubnet}</span></div>}
       {(interfaces.length === 0 || receiverInterfaces.length === 0) && <p className="network-note">{strings.network.requiresComputerAndPhoneIp}</p>}
       <button type="button" className="text-button network-refresh" disabled={busy || !serial} onClick={() => { void Promise.all([loadNetworkInfo(), checkReceiver(serial)]); }}>{strings.network.recheckNetworkInterfaces}</button>

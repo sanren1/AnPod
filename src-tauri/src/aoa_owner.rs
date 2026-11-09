@@ -358,10 +358,10 @@ impl AoaOwner {
                     != required_audio_capabilities
             {
                 return Err(if format.profile >= 4 {
-                    "RECEIVER_UPDATE_REQUIRED: Receiver does not advertise authenticated Float32 audio for this transport."
+                    crate::receiver::receiver_update_required(" Receiver does not advertise authenticated Float32 audio for this transport.")
                 } else {
-                    "AOA Receiver does not support authenticated ANPD v2 audio."
-                }.into());
+                    "AOA Receiver does not support authenticated ANPD v2 audio.".into()
+                });
             }
             let mut command_sequence = 1;
             let mut ack_sequence = 1;
@@ -596,7 +596,10 @@ impl AoaOwner {
         self.audio_queue.clone()
     }
     pub(crate) fn snapshot(&self) -> AoaSnapshot {
-        self.snapshot.lock().expect("AOA snapshot poisoned").clone()
+        self.snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     fn join_worker(&mut self) -> Result<(), String> {
         self.worker
@@ -1196,7 +1199,9 @@ fn run_owner_loop<W: RecordWriter>(
         let packet = encoder
             .encode_next(PacketType::Audio, frame_index, &payload)
             .map_err(|e| e.to_string())?;
+        let started = Instant::now();
         write_record(writer, RecordType::Audio, packet)?;
+        queue.timing().record_send(started.elapsed());
         note_audio_sent(queue, segment_generation, frame_index, frames as u64);
         if send_loss_ledger {
             maybe_send_aoa_loss_ledger(writer, queue, encoder, &mut loss_ledger_tx)?;
@@ -1264,7 +1269,9 @@ fn startup_window_is_active(
     snapshot: &Mutex<AoaSnapshot>,
 ) -> bool {
     diagnostics.is_some_and(|recorder| {
-        let snapshot = snapshot.lock().expect("AOA snapshot lock");
+        let snapshot = snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let progress = snapshot.playback_progress.as_ref();
         recorder.should_poll_fast(
             progress.and_then(|progress| progress.receiver_generation),

@@ -527,15 +527,21 @@ fn float_udp_sender_preserves_float32_le_for_profiles_4_and_5() {
 
         let mut samples = vec![0.0f32; 150 * 2];
         samples[..6].copy_from_slice(&[0.25, -0.5, -0.0, f32::MIN_POSITIVE, 1.0, -1.0]);
-        assert!(queue.push_raw(samples.as_ptr(), 150, rate, 2, 900));
+        // Capture drops a callback while the sender briefly holds the queue lock; the next
+        // callback carries the following frame index, so retry the way capture would.
+        let mut frame_index = 900;
+        while !queue.push_raw(samples.as_ptr(), 150, rate, 2, frame_index) {
+            frame_index += 150;
+            assert!(frame_index < 900 + 150 * 100, "queue stayed locked");
+        }
         let (length, _) = receiver.recv_from(&mut datagram).unwrap();
         let first = decoder.open(&datagram[..length]).unwrap();
         decoder.commit(first.header.sequence);
         let (length, _) = receiver.recv_from(&mut datagram).unwrap();
         let second = decoder.open(&datagram[..length]).unwrap();
         decoder.commit(second.header.sequence);
-        assert_eq!(first.header.sample_frame_index, 900);
-        assert_eq!(second.header.sample_frame_index, 900 + 1150 / 8);
+        assert_eq!(first.header.sample_frame_index, frame_index);
+        assert_eq!(second.header.sample_frame_index, frame_index + 1150 / 8);
         assert_eq!(first.payload.len(), (1150 / 8) * 8);
         assert_eq!(second.payload.len(), (150 - 1150 / 8) * 8);
         let expected = samples

@@ -6,7 +6,12 @@ fn selected_interface_listener_correlates_single_use_connection_offers() {
     let host_address = Ipv4Addr::new(127, 0, 0, 2);
     let receiver_address = Ipv4Addr::new(127, 0, 0, 1);
     let interface = interface_for_test(host_address, 24);
-    let mut listener = HostOfferListener::start_loopback_for_test(&interface).unwrap();
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = changes.clone();
+    let mut listener = HostOfferListener::start_loopback_for_test(&interface, move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })
+    .unwrap();
     let receiver = UdpSocket::bind(SocketAddr::from((receiver_address, DISCOVERY_PORT))).unwrap();
     receiver
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -61,6 +66,11 @@ fn selected_interface_listener_correlates_single_use_connection_offers() {
         thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(offer.endpoint, SocketAddr::from((receiver_address, 41_001)));
+    assert_eq!(
+        changes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the correlated offer notifies the UI"
+    );
     assert_eq!(HOST_OFFER_TTL, Duration::from_secs(30));
     assert!(offer.expires_at.duration_since(Instant::now()) > HOST_REQUEST_TTL,
             "the offer window starts when CONNECT_OFFER arrives, separately from the search nonce window");
