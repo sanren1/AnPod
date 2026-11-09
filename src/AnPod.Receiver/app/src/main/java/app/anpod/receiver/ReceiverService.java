@@ -3035,6 +3035,13 @@ public final class ReceiverService extends Service {
     boolean writeV2Frames(AudioSession session, PlaybackOutput output, float[] samples,
             int frameCount, int sourceFrameCount, byte[] packed, long generation, long sourceFrameStart,
             boolean sourceSynthetic, boolean sourceMappingValid) throws IOException {
+        return writeV2Frames(session, output, samples, frameCount, sourceFrameCount, packed, generation,
+                sourceFrameStart, sourceSynthetic, sourceMappingValid, false);
+    }
+
+    boolean writeV2Frames(AudioSession session, PlaybackOutput output, float[] samples,
+            int frameCount, int sourceFrameCount, byte[] packed, long generation, long sourceFrameStart,
+            boolean sourceSynthetic, boolean sourceMappingValid, boolean driftAdjusted) throws IOException {
         if (frameCount <= 0) return true;
         accountSettledPcDropGaps(session);
         if (output instanceof OboePlaybackOutput) {
@@ -3058,6 +3065,8 @@ public final class ReceiverService extends Service {
                     int sourceEnd = sourceFramesThroughOutput(sourceFrameCount, frameCount, offset + written);
                     if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
                             sourceFrameStart + offset, written, sourceSynthetic);
+                    else if (driftAdjusted) session.sourceFrameOutputMap.recordDriftAdjustedWrite(
+                            sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, written, sourceSynthetic);
                     else if (sourceEnd > sourceOffset) session.sourceFrameOutputMap.recordUnknownWrite(
                             sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, written);
                     else session.sourceFrameOutputMap.recordUnknownOutput(written);
@@ -3083,6 +3092,9 @@ public final class ReceiverService extends Service {
                         offsetFrames + writtenFrames);
                 if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
                         sourceFrameStart + offsetFrames, writtenFrames, sourceSynthetic);
+                else if (driftAdjusted) session.sourceFrameOutputMap.recordDriftAdjustedWrite(
+                        sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, writtenFrames,
+                        sourceSynthetic);
                 else if (sourceEnd > sourceOffset) session.sourceFrameOutputMap.recordUnknownWrite(
                         sourceFrameStart + sourceOffset, sourceEnd - sourceOffset, writtenFrames);
                 else session.sourceFrameOutputMap.recordUnknownOutput(writtenFrames);
@@ -3710,9 +3722,11 @@ public final class ReceiverService extends Service {
             FloatPcmFrameQueue queue, float[] samples, int outputFrames, byte[] packed,
             long generation, int adjustment) throws IOException {
         int sourceFrames = queue.lastReadFrames();
-        boolean sourceMappingValid = adjustment == 0 && outputFrames == sourceFrames;
+        // A requested adjustment may be skipped for a short block; only a changed frame count needs remapping.
+        boolean sourceMappingValid = outputFrames == sourceFrames;
         return writeV2Frames(session, output, samples, outputFrames, sourceFrames, packed, generation,
-                queue.lastReadFrameIndex(), queue.lastReadSynthetic(), sourceMappingValid);
+                queue.lastReadFrameIndex(), queue.lastReadSynthetic(), sourceMappingValid,
+                adjustment != 0 && !sourceMappingValid);
     }
 
     boolean writePcmDriftAdjustedFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,

@@ -7,7 +7,9 @@ final class SourceFrameOutputMap {
     static final int CAPACITY = 64;
     private final long[] outputStarts = new long[CAPACITY];
     private final long[] sourceStarts = new long[CAPACITY];
+    /** Output frames per entry; {@link #sourceFrames} differ only after drift correction. */
     private final int[] frames = new int[CAPACITY];
+    private final int[] sourceFrames = new int[CAPACITY];
     private final boolean[] synthetic = new boolean[CAPACITY];
     private final boolean[] unknownMapping = new boolean[CAPACITY];
     private final long[] gapStarts = new long[CAPACITY];
@@ -80,7 +82,7 @@ final class SourceFrameOutputMap {
             int mapped = Math.min(remaining, rangeFrames - offset);
             if (mapped > 0) {
                 append(writtenOutputFrames + writtenFrames - remaining, rangeStart + offset, mapped,
-                        input.sourceRangeSynthetic(i));
+                        mapped, input.sourceRangeSynthetic(i));
                 remaining -= mapped;
             }
             skipped += rangeFrames;
@@ -91,11 +93,26 @@ final class SourceFrameOutputMap {
 
     synchronized void recordWrite(long sourceStart, int count, boolean isSynthetic) {
         if (count <= 0) return;
-        append(writtenOutputFrames, sourceStart, count, isSynthetic);
+        append(writtenOutputFrames, sourceStart, count, count, isSynthetic);
         writtenOutputFrames += count;
     }
 
-    private void append(long outputStart, long sourceStart, int count, boolean isSynthetic) {
+    /**
+     * Drift correction removed or inserted output frames: the source range was still consumed in
+     * full, so it settles like a normal write instead of becoming unknown.
+     */
+    synchronized void recordDriftAdjustedWrite(long sourceStart, int sourceCount, int outputCount,
+            boolean isSynthetic) {
+        if (outputCount <= 0) return;
+        if (sourceCount <= 0) appendUnknownOutput(outputCount);
+        else {
+            append(writtenOutputFrames, sourceStart, outputCount, sourceCount, isSynthetic);
+            writtenOutputFrames += outputCount;
+        }
+    }
+
+    private void append(long outputStart, long sourceStart, int count, int sourceCount,
+            boolean isSynthetic) {
         observeEligibleSource(sourceStart);
         if (size == CAPACITY) {
             markSegmentUnknown();
@@ -104,12 +121,13 @@ final class SourceFrameOutputMap {
         if (size > 0) {
             int last = (head + size - 1) % CAPACITY;
             long outputEnd = outputStarts[last] + frames[last];
-            long sourceEnd = sourceStarts[last] + frames[last];
+            long sourceEnd = sourceStarts[last] + sourceFrames[last];
             if (Long.compareUnsigned(sourceStart, sourceEnd) < 0) markSegmentUnknown();
             if (outputEnd != outputStart) markSegmentUnknown();
             if (outputEnd == outputStart && sourceEnd == sourceStart && synthetic[last] == isSynthetic
                     && !unknownMapping[last]) {
                 frames[last] += count;
+                sourceFrames[last] += sourceCount;
                 return;
             }
         }
@@ -117,6 +135,7 @@ final class SourceFrameOutputMap {
         outputStarts[at] = outputStart;
         sourceStarts[at] = sourceStart;
         frames[at] = count;
+        sourceFrames[at] = sourceCount;
         synthetic[at] = isSynthetic;
         unknownMapping[at] = false;
     }
@@ -138,8 +157,10 @@ final class SourceFrameOutputMap {
                 }
                 continue;
             }
+            int sourceConsumed = consumed == frames[head] ? sourceFrames[head]
+                    : (int) ((long) sourceFrames[head] * consumed / frames[head]);
             long sourceStart = sourceStarts[head];
-            long sourceEnd = sourceStart + consumed;
+            long sourceEnd = sourceStart + sourceConsumed;
             if (hasSettledSourceThrough) {
                 int order = Long.compareUnsigned(sourceStart, settledSourceThrough);
                 if (order > 0) recordGap(settledSourceThrough, sourceStart);
@@ -147,17 +168,18 @@ final class SourceFrameOutputMap {
             }
             settledSourceThrough = sourceEnd;
             hasSettledSourceThrough = true;
-            settledSourceFrames += consumed;
+            settledSourceFrames += sourceConsumed;
             if (synthetic[head]) {
-                settledSyntheticFrames += consumed;
+                settledSyntheticFrames += sourceConsumed;
                 recordGap(sourceStart, sourceEnd);
-            } else {
-                settledGoodSourceFrames += consumed;
-                if (!settledGoodRanges.add(sourceStart, consumed)) markSegmentUnknown();
-                reclassifyLowerPriority(sourceStart, consumed, 0);
+            } else if (sourceConsumed > 0) {
+                settledGoodSourceFrames += sourceConsumed;
+                if (!settledGoodRanges.add(sourceStart, sourceConsumed)) markSegmentUnknown();
+                reclassifyLowerPriority(sourceStart, sourceConsumed, 0);
             }
             outputStarts[head] += consumed;
-            sourceStarts[head] += consumed;
+            sourceStarts[head] += sourceConsumed;
+            sourceFrames[head] -= sourceConsumed;
             frames[head] -= consumed;
             if (frames[head] == 0) {
                 head = (head + 1) % CAPACITY;
@@ -405,7 +427,7 @@ final class SourceFrameOutputMap {
     private boolean containsPendingOutput(long sourceFrame) {
         for (int i = 0; i < size; i++) {
             int at = (head + i) % CAPACITY;
-            long end = sourceStarts[at] + frames[at];
+            long end = sourceStarts[at] + sourceFrames[at];
             if (Long.compareUnsigned(sourceStarts[at], sourceFrame) <= 0
                     && Long.compareUnsigned(end, sourceFrame) > 0) return true;
         }
@@ -416,7 +438,7 @@ final class SourceFrameOutputMap {
         long boundary = -1L;
         for (int i = 0; i < size; i++) {
             int at = (head + i) % CAPACITY;
-            long candidate = inside ? sourceStarts[at] + frames[at] : sourceStarts[at];
+            long candidate = inside ? sourceStarts[at] + sourceFrames[at] : sourceStarts[at];
             if (Long.compareUnsigned(candidate, sourceFrame) > 0
                     && (boundary == -1L || Long.compareUnsigned(candidate, boundary) < 0))
                 boundary = candidate;
@@ -618,7 +640,7 @@ final class SourceFrameOutputMap {
                     int at = (head + i) % CAPACITY;
                     mappedPendingFrames += frames[at];
                     if (!synthetic[at] && !unknownMapping[at]) {
-                        if (!pendingOutputDropRanges.add(sourceStarts[at], frames[at])) markSegmentUnknown();
+                        if (!pendingOutputDropRanges.add(sourceStarts[at], sourceFrames[at])) markSegmentUnknown();
                     }
 
                 }
@@ -687,6 +709,7 @@ final class SourceFrameOutputMap {
         outputStarts[at] = writtenOutputFrames;
         sourceStarts[at] = 0;
         frames[at] = outputFrames;
+        sourceFrames[at] = 0;
         synthetic[at] = false;
         unknownMapping[at] = true;
         writtenOutputFrames += outputFrames;

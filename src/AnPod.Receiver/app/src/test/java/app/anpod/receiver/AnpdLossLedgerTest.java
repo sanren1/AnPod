@@ -597,7 +597,36 @@ public final class AnpdLossLedgerTest {
         assertEquals(0f, map.lossPercent(), 0.0001f);
     }
 
-    @Test public void driftSourceFramesStayUnknownInsteadOfBecomingTransportLossAndAgeOut() {
+    @Test public void driftAdjustedWritesSettleTheirWholeSourceRangeAsOutput() {
+        SourceFrameOutputMap map = new SourceFrameOutputMap();
+        map.beginSourceSegment(0);
+        map.recordWrite(0, 100, false);
+        map.recordDriftAdjustedWrite(100, 100, 99, false);
+        map.recordDriftAdjustedWrite(200, 100, 101, false);
+        map.recordWrite(300, 100, false);
+        map.advancePlayed(150);
+        map.advancePlayed(400);
+        map.accountSourceGaps(new AnpdLossLedger.Interval[0],
+                new com.anpod.server.SourceFrameRanges.Range[0],
+                new com.anpod.server.SourceFrameRanges.Range[0], 400, true, true, true);
+
+        assertEquals(400, map.settledGoodSourceFrames());
+        assertEquals(0, map.settledTransportMissingFrames());
+        assertEquals(400, map.settledEligibleSourceThrough());
+        assertTrue(map.rollingComplete());
+        assertTrue(map.complete());
+        assertEquals(0f, map.lossPercent(), 0.0001f);
+
+        AodMetricsSampler sampler = new AodMetricsSampler();
+        sampler.recordSourceLossSnapshot(map.sourceSegmentId(), map.sourceSegmentLogicalStart(),
+                map.sourceSegmentOrigin(), map.settledEligibleSourceThrough(), 100,
+                map.settledLossRanges(), map.rollingComplete(), map.settledUnknownRanges());
+        AodMetricsSampler.LossWindow window = sampler.recentSourceLossWindow(60_000_000_000L, 100);
+        assertEquals(400, window.eligibleFrames);
+        assertEquals(0, window.lossFrames);
+    }
+
+    @Test public void unknownWriteSourceFramesStayUnknownInsteadOfBecomingTransportLossAndAgeOut() {
         SourceFrameOutputMap map = new SourceFrameOutputMap();
         map.beginSourceSegment(0);
         map.recordWrite(0, 100, false);
