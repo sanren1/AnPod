@@ -880,13 +880,23 @@ mod tests {
             );
         }
 
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("artifacts/pc-update-20261030")
-            .join(format!("embedded-helper-{}", std::process::id()));
+        // Earlier runs' fake apps have exited by now, so their directories can be removed.
+        let temp = std::env::temp_dir();
+        for entry in fs::read_dir(&temp).into_iter().flatten().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("anpod-pc-update-helper-")
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+        let root = temp.join(format!("anpod-pc-update-helper-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         run_case(&root, "success", false, false);
         run_case(&root, "rollback", true, false);
         run_case(&root, "retry", false, true);
+        // The restarted fake app may still hold its directory; the next run removes it.
+        let _ = fs::remove_dir_all(&root);
     }
 }
