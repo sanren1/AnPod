@@ -15,6 +15,9 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const KEEP_ROTATED: usize = 4;
 const TIMELINE_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const TIMELINE_KEEP_ROTATED: usize = 2;
+/// Session openings at a 2 s interval take about 0.5 MiB for ten minutes, so this keeps the
+/// starts of roughly the last eight sessions even after hours of playback.
+const SESSION_START_KEEP_ROTATED: usize = 3;
 /// Events whose detail is built only from numbers and enum values; any other
 /// event is exported without its free-text detail.
 const STRUCTURED_EVENTS: &[&str] = &[
@@ -58,6 +61,7 @@ const MAX_LEVEL: Level = if cfg!(debug_assertions) {
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 static TIMELINE: Mutex<Option<Sink>> = Mutex::new(None);
+static SESSION_START: Mutex<Option<Sink>> = Mutex::new(None);
 
 pub(crate) fn init(directory: &Path) {
     *SINK
@@ -78,6 +82,27 @@ pub(crate) fn init(directory: &Path) {
         TIMELINE_MAX_FILE_BYTES,
         TIMELINE_KEEP_ROTATED,
     ));
+    *SESSION_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Sink::new(
+        directory.to_path_buf(),
+        "timeline-session-start",
+        "jsonl",
+        TIMELINE_MAX_FILE_BYTES,
+        SESSION_START_KEEP_ROTATED,
+    ));
+}
+
+/// Copies a timeline sample from the first minutes of a session into its own file, so startup
+/// evidence is not rotated away by a long playback.
+pub(crate) fn session_start_timeline(json: &str) {
+    if let Some(sink) = SESSION_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        sink.write_line(&format!("{json}\r\n"));
+    }
 }
 
 /// Appends one diagnostics timeline sample (a JSON object) so it survives a

@@ -66,7 +66,7 @@ impl AppState {
                 .view
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if view.busy
+            if view.is_busy()
                 || view.session_active
                 || selected_connection_transport(&view.settings.preferred_transport) != "wireless"
                 || view.settings.wireless_protocol != "udp"
@@ -449,7 +449,7 @@ impl AppState {
                     .find(|item| item.address.to_string() == local_address),
                 view.settings.clone(),
                 view.session_active,
-                view.busy,
+                view.is_busy(),
             )
         };
         if !settings.preferred_transport.eq_ignore_ascii_case("wifi")
@@ -569,7 +569,7 @@ impl AppState {
             if view.session_active {
                 return Err("已有活动会话；请先断开后再接受连接请求。".into());
             }
-            if view.busy {
+            if view.is_busy() {
                 return Err("AnPod 正在处理连接操作；请稍后再接受连接请求。".into());
             }
         }

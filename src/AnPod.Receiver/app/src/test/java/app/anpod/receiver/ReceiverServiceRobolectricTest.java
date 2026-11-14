@@ -1139,7 +1139,7 @@ public final class ReceiverServiceRobolectricTest {
     }
 
     @Test(timeout = 15000)
-    public void pcm16DriftUnknownKeepsRollingLossValidAndAgesOutThroughAodSnapshot() throws Exception {
+    public void pcm16DriftAdjustedRangeSettlesAsOutputThroughAodSnapshot() throws Exception {
         ReceiverService service = Robolectric.buildService(ReceiverService.class).create().get();
         byte[] key = new byte[32];
         AoaSessionContext context = new AoaSessionContext(852, key,
@@ -1186,11 +1186,11 @@ public final class ReceiverServiceRobolectricTest {
 
             session.sourceFrameOutputMap.advancePlayed(5_921);
             settleSourceThrough(session.sourceFrameOutputMap, 6_021);
-            assertTrue("a bounded drift range must not invalidate the whole rolling segment",
+            assertTrue("a drift-corrected range must not invalidate the rolling segment",
                     session.sourceFrameOutputMap.rollingComplete());
-            AodTelemetrySnapshot duringUnknown = service.uiState.aodSnapshot();
-            assertEquals(priorLoss, duringUnknown.lossPercent, 0.001f);
-            assertEquals(20, duringUnknown.lossUnknownFrames);
+            AodTelemetrySnapshot afterDrift = service.uiState.aodSnapshot();
+            assertEquals(100f * 100 / 6_021, afterDrift.lossPercent, 0.001f);
+            assertEquals("drift correction is not unknown source", 0, afterDrift.lossUnknownFrames);
 
             ageOutDriftUnknown(service, session, output, 6_021, 5_921);
             AodTelemetrySnapshot agedOut = service.uiState.aodSnapshot();

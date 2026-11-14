@@ -111,6 +111,42 @@ final class SourceFrameOutputMap {
         }
     }
 
+    /**
+     * PCM16 drift correction: {@code writtenFrames} of a block whose {@code outputTotal} output
+     * frames came from the batch's source ranges. The written slice maps proportionally onto
+     * those ranges; output with no source frame (an inserted frame) is output-only.
+     */
+    synchronized void recordDriftAdjustedWrite(UdpPcmQueue.QueueInputStream input, int outputOffset,
+            int writtenFrames, int outputTotal) {
+        if (writtenFrames <= 0) return;
+        long sourceTotal = input == null ? 0 : input.sourceRangeFramesTotal();
+        if (input == null || !input.sourceRangeBatchComplete() || sourceTotal <= 0 || outputTotal <= 0
+                || outputOffset < 0 || outputOffset + writtenFrames > outputTotal) {
+            markSegmentUnknown();
+            appendUnknownOutput(writtenFrames);
+            return;
+        }
+        long sourceFrom = sourceTotal * outputOffset / outputTotal;
+        long sourceTo = sourceTotal * (outputOffset + writtenFrames) / outputTotal;
+        int outputDone = 0;
+        long skipped = 0;
+        for (int i = 0; i < input.sourceRangeCount() && skipped < sourceTo; i++) {
+            int rangeFrames = input.sourceRangeFrames(i);
+            long from = Math.max(sourceFrom, skipped);
+            long to = Math.min(sourceTo, skipped + rangeFrames);
+            if (to > from) {
+                int outputEnd = to == sourceTo ? writtenFrames
+                        : (int) ((to - sourceFrom) * writtenFrames / (sourceTo - sourceFrom));
+                append(writtenOutputFrames + outputDone, input.sourceRangeStart(i) + (from - skipped),
+                        outputEnd - outputDone, (int) (to - from), input.sourceRangeSynthetic(i));
+                outputDone = outputEnd;
+            }
+            skipped += rangeFrames;
+        }
+        writtenOutputFrames += outputDone;
+        if (outputDone < writtenFrames) appendUnknownOutput(writtenFrames - outputDone);
+    }
+
     private void append(long outputStart, long sourceStart, int count, int sourceCount,
             boolean isSynthetic) {
         observeEligibleSource(sourceStart);

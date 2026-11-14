@@ -932,7 +932,7 @@ impl AppState {
         if view.session_transport.as_deref() == Some("aoa") {
             return Err("USB Direct 会话没有 ADB serial；请先断开后再选择 ADB 设备。".into());
         }
-        if view.busy {
+        if view.is_busy() {
             return Err("连接期间无法更换手机。请先断开连接。".into());
         }
         if let Some(active) = view.session_serial.as_deref() {

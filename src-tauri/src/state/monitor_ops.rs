@@ -456,6 +456,7 @@ impl AppState {
         if self.recovering.swap(true, Ordering::AcqRel) {
             return;
         }
+        crate::applog::warn("session", "recovery.started", &reason);
         let Some((generation, token)) = self.start_preemptible_background_operation() else {
             self.recovering.store(false, Ordering::Release);
             return;
@@ -620,6 +621,7 @@ impl AppState {
                 || "重连失败，请手动连接。".to_string(),
                 |error| format!("ADB 旧会话清理失败，未启动新流：{error}"),
             );
+            crate::applog::warn("session", "recovery.failed", &message);
             self.set_state(app, "error", message, device_name);
         }
         self.recovering.store(false, Ordering::Release);

@@ -3674,6 +3674,14 @@ public final class ReceiverService extends Service {
     private boolean writeFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
             byte[] buffer, int count, int frameBytes, long writeGeneration,
             UdpPcmQueue.QueueInputStream sourceRanges, boolean sourceMappingValid) throws IOException {
+        return writeFrames(session, output, pcm, buffer, count, frameBytes, writeGeneration,
+                sourceRanges, sourceMappingValid, false);
+    }
+
+    private boolean writeFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
+            byte[] buffer, int count, int frameBytes, long writeGeneration,
+            UdpPcmQueue.QueueInputStream sourceRanges, boolean sourceMappingValid,
+            boolean driftAdjusted) throws IOException {
         accountSettledPcDropGaps(session);
         boolean[] completed = {true};
         pcm.writeFramesForChannels((data, offset, length) -> {
@@ -3702,6 +3710,8 @@ public final class ReceiverService extends Service {
                 if (session.udpQueue != null) {
                     if (sourceMappingValid) session.sourceFrameOutputMap.recordWrite(
                             sourceRanges, offset / frameBytes, written / frameBytes);
+                    else if (driftAdjusted) session.sourceFrameOutputMap.recordDriftAdjustedWrite(
+                            sourceRanges, offset / frameBytes, written / frameBytes, count / frameBytes);
                     else session.sourceFrameOutputMap.recordUnknownWrite(
                             sourceRanges, written / frameBytes);
                 }
@@ -3732,11 +3742,12 @@ public final class ReceiverService extends Service {
     boolean writePcmDriftAdjustedFrames(AudioSession session, PlaybackOutput output, Pcm16FrameStream pcm,
             byte[] buffer, int count, int outputBytes, int frameBytes, long generation,
             UdpPcmQueue.QueueInputStream sourceRanges, int sourceReadAdjustmentFrames) throws IOException {
-        boolean sourceMappingValid = sourceRanges != null && outputBytes == count
-                && sourceReadAdjustmentFrames == 0 && sourceRanges.sourceRangeBatchComplete()
+        boolean sourceKnown = sourceRanges != null && sourceRanges.sourceRangeBatchComplete()
                 && sourceRanges.sourceRangeFramesTotal() == count / frameBytes;
+        boolean sourceMappingValid = sourceKnown && outputBytes == count && sourceReadAdjustmentFrames == 0;
+        // Drift correction changed the frame count: the known source ranges still map onto the output.
         return writeFrames(session, output, pcm, buffer, outputBytes, frameBytes, generation,
-                sourceRanges, sourceMappingValid);
+                sourceRanges, sourceMappingValid, sourceKnown && !sourceMappingValid);
     }
 
     private void handleAudioFocusChange(AudioSession session, PlaybackOutput output, int change) {

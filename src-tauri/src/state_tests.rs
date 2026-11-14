@@ -1750,3 +1750,33 @@ fn binding_profile_sidecar_merges_fields_and_skips_unchanged_writes() {
     assert!(update_binding_profile(&data_dir, "../escape", |_| {}).is_err());
     let _ = fs::remove_dir_all(&data_dir);
 }
+
+#[test]
+fn stale_busy_flag_clears_once_the_state_leaves_connecting_or_reconnecting() {
+    let state = AppState::new();
+    {
+        let mut view = state.view.lock().unwrap();
+        view.busy = true;
+        view.state = "reconnecting".into();
+    }
+    assert!(state.snapshot().busy);
+    // USB Direct recovery failure sets the state directly and used to leave the flag set.
+    state.view.lock().unwrap().state = "ready".into();
+    let snapshot = state.snapshot();
+    assert!(!snapshot.busy);
+    assert!(snapshot.can_change_modes);
+}
+
+#[test]
+fn session_start_window_covers_the_first_ten_minutes_of_each_generation() {
+    let mut buffer = DiagnosticsTimelineBuffer::new();
+    let start = Instant::now();
+    assert!(!buffer.in_session_opening(None, start));
+    assert!(buffer.in_session_opening(Some(1), start));
+    assert!(buffer.in_session_opening(Some(1), start + Duration::from_secs(599)));
+    assert!(!buffer.in_session_opening(Some(1), start + Duration::from_secs(600)));
+    // A recovered session has a new generation and its own opening window.
+    assert!(buffer.in_session_opening(Some(2), start + Duration::from_secs(700)));
+    assert!(!buffer.in_session_opening(None, start + Duration::from_secs(710)));
+    assert!(buffer.in_session_opening(Some(2), start + Duration::from_secs(720)));
+}

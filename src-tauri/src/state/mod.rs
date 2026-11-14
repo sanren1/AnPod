@@ -427,12 +427,15 @@ pub struct DiagnosticsTimeline {
 struct DiagnosticsTimelineBuffer {
     started_at: Instant,
     last_sample_at: Option<Instant>,
+    /// Generation and first sample time of the current session, for the session-start file.
+    session_start: Option<(u64, Instant)>,
     truncated: bool,
     samples_omitted: u64,
     samples: VecDeque<DiagnosticsTimelineSample>,
 }
 
 const DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(2);
+const SESSION_START_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DIAGNOSTICS_RETENTION: Duration = Duration::from_secs(60 * 60);
 const DIAGNOSTICS_MAX_SAMPLES: usize = 1800;
 const DIAGNOSTICS_EXPORT_LOG_LINES: usize = 500;
@@ -442,6 +445,7 @@ impl DiagnosticsTimelineBuffer {
         Self {
             started_at: Instant::now(),
             last_sample_at: None,
+            session_start: None,
             truncated: false,
             samples_omitted: 0,
             samples: VecDeque::with_capacity(DIAGNOSTICS_MAX_SAMPLES),
@@ -474,10 +478,28 @@ impl DiagnosticsTimelineBuffer {
         for event in diagnostics_log::timeline_events(self.samples.back(), &sample) {
             crate::applog::write(event.level, event.module, event.event, event.detail);
         }
+        let session_opening = self.in_session_opening(sample.session_generation, now);
         if let Ok(json) = serde_json::to_string(&sample) {
             crate::applog::timeline(&json);
+            if session_opening {
+                crate::applog::session_start_timeline(&json);
+            }
         }
         self.samples.push_back(sample);
+    }
+
+    /// True for samples in the first ten minutes of a session; a recovered session gets a new
+    /// generation and therefore its own opening.
+    fn in_session_opening(&mut self, generation: Option<u64>, now: Instant) -> bool {
+        let Some(generation) = generation else {
+            self.session_start = None;
+            return false;
+        };
+        if self.session_start.map(|(current, _)| current) != Some(generation) {
+            self.session_start = Some((generation, now));
+        }
+        self.session_start
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) < SESSION_START_WINDOW)
     }
 
     fn export(&self) -> DiagnosticsTimeline {
@@ -847,6 +869,14 @@ pub(crate) struct ActiveOperation {
 pub(crate) struct ActiveQrOperation {
     generation: u64,
     token: CancellationToken,
+}
+
+impl ViewState {
+    /// `busy` only counts while connecting or reconnecting, so a terminal path that sets the
+    /// state directly cannot leave the UI stuck in "processing" with every action refused.
+    fn is_busy(&self) -> bool {
+        self.busy && matches!(self.state.as_str(), "connecting" | "reconnecting")
+    }
 }
 
 pub(crate) struct ViewState {
@@ -1263,12 +1293,12 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let transport = view.settings.preferred_transport.to_ascii_lowercase();
-        let can_disconnect = view.busy
+        let can_disconnect = view.is_busy()
             || view.session_active
             || (view.state == "error" && view.device_name.is_some());
-        let can_change_modes = !view.busy && !can_disconnect;
+        let can_change_modes = !view.is_busy() && !can_disconnect;
         let can_change_playback_mode = view.session_active
-            && !view.busy
+            && !view.is_busy()
             && match view.session_transport.as_deref() {
                 Some("usb" | "wifi" | "lan") => true,
                 Some("aoa") => view
@@ -1321,7 +1351,7 @@ impl AppState {
             transport,
             output: view.output.clone(),
             settings: view.settings.clone(),
-            busy: view.busy,
+            busy: view.is_busy(),
             can_disconnect,
             can_change_modes,
             can_change_playback_mode,
@@ -1944,7 +1974,7 @@ impl AppState {
             .view
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if view.busy {
+        if view.is_busy() {
             return Err("正在连接期间无法更改设置。".into());
         }
         if matches!(

@@ -73,7 +73,7 @@ impl AppState {
                 .view
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if view.busy || view.session_active {
+            if view.is_busy() || view.session_active {
                 return Err(
                     "AnPod 正在连接或已有活动会话；请先结束操作后再配置 USB Direct。".into(),
                 );
@@ -161,7 +161,7 @@ impl AppState {
             }
             {
                 let mut view = self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if view.busy || view.session_active {
+                if view.is_busy() || view.session_active {
                     return Err(
                         "AnPod 正在连接或已有活动会话；请先结束操作后再切换 USB 模式。".into(),
                     );
@@ -720,6 +720,7 @@ impl AppState {
         } else {
             format!("{error}；{}", cleanup.join("；"))
         };
+        crate::applog::warn("aoa", "session.restart_failed", &detail);
         let mut view = self
             .view
             .lock()
@@ -843,6 +844,7 @@ impl AppState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 return true;
             }
+            crate::applog::warn("aoa", "session.failed", &error);
             let _ = self.audio.stop_and_cleanup();
             let _ = self.audio.restore_muted();
             if let Some(owner) = active
@@ -989,6 +991,7 @@ impl AppState {
         } else {
             format!("{message}；清理失败：{}", cleanup.join("；"))
         };
+        crate::applog::warn("aoa", "session.ended", &detail);
         let mut view = self
             .view
             .lock()
@@ -1091,6 +1094,7 @@ impl AppState {
             return;
         }
         drop(session);
+        crate::applog::warn("aoa", "recovery.started", &reason);
         for attempt in 0..3 {
             if token.is_cancelled() || !self.session_generation_is_current(session_generation) {
                 break;
@@ -1121,11 +1125,19 @@ impl AppState {
             {
                 break;
             }
-            let Ok((owner, queue, mix_format)) = self
+            let (owner, queue, mix_format) = match self
                 .create_aoa_owner(&target_id, &binding, format, &token)
                 .await
-            else {
-                continue;
+            {
+                Ok(created) => created,
+                Err(error) => {
+                    crate::applog::warn(
+                        "aoa",
+                        "recovery.attempt_failed",
+                        format_args!("attempt={} {error}", attempt + 1),
+                    );
+                    continue;
+                }
             };
             let playback_result = if output == "phone" {
                 self.start_session_audio_sink(&queue)
@@ -1214,6 +1226,11 @@ impl AppState {
             .into();
             view.status_detail = "USB Direct 已在同一目标和格式上重新认证。".into();
             drop(view);
+            crate::applog::info(
+                "aoa",
+                "recovery.succeeded",
+                format_args!("attempt={}", attempt + 1),
+            );
             drop(session);
             self.finish_operation(operation_generation);
             self.emit(app);
