@@ -1508,6 +1508,8 @@ impl FloatUdpSender {
         let worker = thread::Builder::new()
             .name("AnPod local Float32 UDP audio".into())
             .spawn(move || {
+                let _pro_audio =
+                    crate::audio::ProAudioThread::join("AnPod local Float32 UDP audio");
                 send_float_loop(
                     socket,
                     remote,
@@ -1876,6 +1878,7 @@ impl UdpSender {
         let worker = thread::Builder::new()
             .name("AnPod local UDP audio".into())
             .spawn(move || {
+                let _pro_audio = crate::audio::ProAudioThread::join("AnPod local UDP audio");
                 send_loop(
                     socket,
                     remote,

@@ -982,3 +982,48 @@ fn write_marker(path: &PathBuf, ids: &[String]) -> Result<(), String> {
 #[cfg(test)]
 #[path = "audio_tests.rs"]
 mod tests;
+
+/// Puts the calling thread in the MMCSS "Pro Audio" class for as long as the guard lives, like
+/// the native capture thread, so sending keeps its deadline when games load the CPU.
+/// Failure (service disabled) only loses the boost and is logged.
+pub(crate) struct ProAudioThread(#[cfg(windows)] Option<windows::Win32::Foundation::HANDLE>);
+
+impl ProAudioThread {
+    pub(crate) fn join(thread: &str) -> Self {
+        #[cfg(windows)]
+        {
+            use windows::core::w;
+            use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+            let mut task_index = 0u32;
+            // SAFETY: the task name is a static wide string and task_index outlives the call.
+            match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
+                Ok(handle) => Self(Some(handle)),
+                Err(error) => {
+                    crate::applog::warn(
+                        "audio",
+                        "mmcss.failed",
+                        format_args!("thread={thread} {error}"),
+                    );
+                    Self(None)
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = thread;
+            Self()
+        }
+    }
+}
+
+impl Drop for ProAudioThread {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(handle) = self.0.take() {
+            // SAFETY: the handle came from AvSetMmThreadCharacteristicsW on this same thread.
+            let _ = unsafe {
+                windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
+            };
+        }
+    }
+}

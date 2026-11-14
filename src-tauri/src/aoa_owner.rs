@@ -301,7 +301,10 @@ impl AoaOwner {
         let (records_tx, records_rx) = mpsc::sync_channel(READER_MAILBOX_CAPACITY);
         let reader_thread = thread::Builder::new()
             .name("aoa-owner-reader".into())
-            .spawn(move || read_records(reader, records_tx, read_cancel))
+            .spawn(move || {
+                let _pro_audio = crate::audio::ProAudioThread::join("aoa-owner-reader");
+                read_records(reader, records_tx, read_cancel)
+            })
             .map_err(|e| e.to_string())?;
 
         let setup = (|| {
@@ -449,6 +452,7 @@ impl AoaOwner {
         let worker = thread::Builder::new()
             .name("aoa-owner-control-audio".into())
             .spawn(move || {
+                let _pro_audio = crate::audio::ProAudioThread::join("aoa-owner-control-audio");
                 let reader_thread = reader_slot_for_worker
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -166,3 +166,15 @@ async fn cancelled_handshake_wait_returns_without_a_new_callback() {
     .await;
     assert_eq!(result.unwrap_err(), "连接已取消。");
 }
+
+#[cfg(windows)]
+#[test]
+fn pro_audio_thread_joins_mmcss_and_reverts_on_drop() {
+    std::thread::spawn(|| {
+        let guard = crate::audio::ProAudioThread::join("test");
+        assert!(guard.0.is_some(), "MMCSS Pro Audio class was not available");
+        drop(guard);
+    })
+    .join()
+    .unwrap();
+}
