@@ -29,6 +29,7 @@ Receiver；PC 端 `AnPod.exe` 是免安装便携程序，不做代码签名。
 
 | Receiver | APK SHA-256 | 说明 |
 | --- | --- | --- |
+| 0.26.3-v3-flow-candidate / code 56 | `d27db6156da3bacb2fac48d225cd375461d0ea0f0171b6b65ac7fb92b8c5e533` | PC 1.20.2 配套本地发布签名候选，PCM16 漂移校正不再让 Loss 统计失效；source `8d884a17f1f185342851ed9c9256583f712cf321`（sourceModified=false，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.26.2-v3-flow-candidate / code 55 | `53ac26d80b81d7e9bd2efd4b49c74a103e15d98401f2c608041c1ec9d30eefeb` | PC 1.20.1 配套本地发布签名候选，漂移校正不再让 Loss 统计失效；source `05cedc09ab1b1859f12b6a90718255f3d94b1e79`（sourceModified=false，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.26.1-v3-flow-candidate / code 54 | `57cffda3e3bd27910348b458447cdb1405cfd1bbd09fdcaffefa3e528b1aaf6e` | PC 1.18.0 配套本地发布签名候选；source `881e2103bbd4e0e3db33dd891c6fb1707587f4b6`（sourceModified=false，sourceInputs `09cd1c4b6633520840c23f534d9bd0424505fb00ec5ab8ae46f2a5c5af60dc39`，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
 | 0.26.0-v3-flow-candidate / code 53 | `199e3781ae97ed41fca998b0061006b016b6e5be050957686592547114bbad3c` | PC 1.17.3 配套本地发布签名候选；source `664928d580ad21530183548642c7d3167d9117ff`（sourceModified=false，sourceInputs `260dba520b3f3bda0c354de8a5e31419889105bbc314632a3b6af520ecdb7842`，signer `f7782237850a0a84b44bf66b53514238fb83a43e0d7e737c58369bfd72574573`）；实机验证由用户完成 |
