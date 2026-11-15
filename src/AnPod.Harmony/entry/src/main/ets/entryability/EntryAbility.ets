@@ -16,7 +16,12 @@ export default class EntryAbility extends UIAbility {
   private background: Promise<void> = Promise.resolve();
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
-    this.launch(want);
+    ReceiverSession.initialize(this.context, { live: () => this.setLive(true), ended: () => this.setLive(false) });
+    if (parseLaunchParams(want.parameters) === undefined) {
+      ReceiverSession.restore();
+    } else {
+      this.launch(want);
+    }
   }
 
   onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
@@ -38,7 +43,7 @@ export default class EntryAbility extends UIAbility {
     if (params === undefined) {
       return;
     }
-    ReceiverSession.start(params, { live: () => this.setLive(true), ended: () => this.setLive(false) });
+    ReceiverSession.start(params);
   }
 
   private setLive(live: boolean): void {

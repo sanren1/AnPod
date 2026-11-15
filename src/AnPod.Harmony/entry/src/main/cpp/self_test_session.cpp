@@ -1,3 +1,6 @@
+#include "wireless_listener.h"
+#include <sys/socket.h>
+#include <unistd.h>
 // Task 4 self-tests: TabletBootstrap and StreamSession against a simulated PC over an in-memory duplex pipe,
 // and BindingStore against the real Asset Store of the device. The simulated PC follows host_pair /
 // host_proceed (src-tauri/src/hdc_bootstrap.rs) and the host half of the P5-A v2 handshake as written in
@@ -576,6 +579,23 @@ bool sessionReportsLowLatencyUnsupported() {
     return ok && message && *message == expected && sink.closes == 0;
 }
 
+bool wirelessHelloSelectsHostWithoutConsumingBytes() {
+    int fds[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return false;
+    Bytes hello(96);
+    const uint8_t header[] = {'A', 'N', 'P', '5', 2, 1, 0, 96};
+    std::copy_n(header, 8, hello.begin());
+    Id16 host{};
+    host[15] = 99;
+    std::copy(host.begin(), host.end(), hello.begin() + 8);
+    bool ok = ::send(fds[0], hello.data(), hello.size(), 0) == 96 && wirelessHelloHost(fds[1]) == host;
+    uint8_t first = 0;
+    ok = ok && ::recv(fds[1], &first, 1, 0) == 1 && first == 'A';
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return ok;
+}
+
 bool sessionRejectsReplayedCommand() {
     Pipe pipe = makePipe();
     PipeEnd& pc = *pipe.pc;
@@ -623,6 +643,7 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"bootstrap_store_error_sends_no_hello", bootstrapStoreErrorSendsNoHello},
         {"bootstrap_failed_pair_saved_send_removes_binding", bootstrapFailedPairSavedSendRemovesBinding},
         {"session_user_stop_sends_result_user_stopped", sessionUserStopSendsResultUserStopped},
+        {"wireless_hello_selects_host", wirelessHelloSelectsHostWithoutConsumingBytes},
         {"session_rejects_replayed_command", sessionRejectsReplayedCommand},
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},
         {"session_pause_resume_stop_reach_sink", sessionPauseResumeStopReachSink},

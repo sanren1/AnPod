@@ -62,6 +62,9 @@ class StreamSession {
 public:
     static std::unique_ptr<StreamSession> start(std::unique_ptr<ByteStream> stream, BindingMaterial saved,
                                                 PlaybackSink& sink, SessionCallbacks callbacks);
+    static std::unique_ptr<StreamSession> startWireless(int acceptedTcpFd, BindingMaterial saved,
+                                                        std::optional<Id16> intentNonce, PlaybackSink& sink,
+                                                        SessionCallbacks callbacks);
     // Stops (as stop(false)) and joins the session threads.
     ~StreamSession();
     StreamSession(const StreamSession&) = delete;
@@ -74,6 +77,17 @@ public:
 private:
     StreamSession(std::unique_ptr<ByteStream> stream, BindingMaterial derived, PlaybackSink& sink,
                   SessionCallbacks callbacks);
+    void launch();
+    std::optional<AnpuRecord> readRecord(AnpuType expected, size_t wirelessHandshakeLength = 0);
+    uint16_t bindUdp(uint16_t hostPort);
+    void receiveUdp();
+    int wirelessFd_ = -1;  // owned by stream_
+    int udpFd_ = -1;       // opened and closed by the reader
+    std::optional<Id16> intentNonce_;
+    std::atomic<bool> udpStopping_{false};
+    std::thread udpThread_;
+    std::mutex udpOutputMutex_;
+    bool udpPaused_ = false;
     std::string runReader();
     std::string authenticate();
     std::string controlLoop();

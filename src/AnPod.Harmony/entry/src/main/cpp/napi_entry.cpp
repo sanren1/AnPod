@@ -7,6 +7,9 @@
 #include "ohaudio_output.h"
 #include "socket_stream.h"
 #include "stream_session.h"
+#include "wireless_discovery.h"
+#include "wireless_listener.h"
+#include <unistd.h>
 
 #include <napi/native_api.h>
 
@@ -46,7 +49,8 @@ struct Run {
     ByteStream* stream = nullptr;         // set while the worker or session owns an open stream
     TabletBootstrap* bootstrap = nullptr;  // set while the bootstrap runs
     StreamSession* session = nullptr;      // set while the session runs
-    bool stopRequested = false, userStop = false;
+    std::atomic<bool> stopRequested{false};
+    bool userStop = false;
     bool sessionEnded = false;
     std::string endMessage;
     std::condition_variable ended;
@@ -134,6 +138,36 @@ void callJs(napi_env env, napi_value callback, void*, void* data) {
     napi_call_function(env, undefined, callback, 1, &object, &result);
 }
 
+OhAudioOutput audioOutput(const std::shared_ptr<Run>& run) {
+    return OhAudioOutput([run](bool interrupted) {
+        run->interrupted = interrupted;
+        if (run->sessionState >= 0) emitState(run, mapState(run->sessionState, interrupted));
+    });
+}
+
+SessionCallbacks sessionCallbacks(const std::shared_ptr<Run>& run, OhAudioOutput& sink) {
+    SessionCallbacks callbacks;
+    callbacks.onState = [run](SessionState state) {
+        run->sessionState = static_cast<int>(state);
+        emitState(run, mapState(run->sessionState, run->interrupted));
+    };
+    callbacks.onFormat = [run, &sink](const AudioFormatV2& format) {
+        Event e;
+        e.kind = "format";
+        e.sampleRate = format.sampleRate;
+        e.channels = format.channels;
+        e.fast = sink.fast();
+        emit(run, std::move(e));
+    };
+    callbacks.onEnded = [run](const std::string& message) {
+        std::lock_guard<std::mutex> lock(run->mutex);
+        run->sessionEnded = true;
+        run->endMessage = message;
+        run->ended.notify_all();
+    };
+    return callbacks;
+}
+
 void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 token) {
     emitState(run, "connecting");
     std::unique_ptr<SocketStream> stream = SocketStream::connectLoopback(port);
@@ -175,29 +209,8 @@ void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 toke
         if (auto* failed = std::get_if<BootstrapFailed>(&outcome)) {
             if (!userStop) error = failed->message;
         } else if (auto* proceed = std::get_if<BootstrapProceed>(&outcome)) {
-            OhAudioOutput sink([run](bool interrupted) {
-                run->interrupted = interrupted;
-                if (run->sessionState >= 0) emitState(run, mapState(run->sessionState, interrupted));
-            });
-            SessionCallbacks callbacks;
-            callbacks.onState = [run](SessionState state) {
-                run->sessionState = static_cast<int>(state);
-                emitState(run, mapState(run->sessionState, run->interrupted));
-            };
-            callbacks.onFormat = [run, &sink](const AudioFormatV2& format) {
-                Event e;
-                e.kind = "format";
-                e.sampleRate = format.sampleRate;
-                e.channels = format.channels;
-                e.fast = sink.fast();
-                emit(run, std::move(e));
-            };
-            callbacks.onEnded = [run](const std::string& message) {
-                std::lock_guard<std::mutex> lock(run->mutex);
-                run->sessionEnded = true;
-                run->endMessage = message;
-                run->ended.notify_all();
-            };
+            auto sink = audioOutput(run);
+            auto callbacks = sessionCallbacks(run, sink);
             std::unique_ptr<StreamSession> session =
                 StreamSession::start(std::move(stream), std::move(proceed->binding), sink, std::move(callbacks));
             std::unique_lock<std::mutex> lock(run->mutex);
@@ -217,6 +230,70 @@ void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 toke
     }
     stream.reset();
     emitEnd(run, error);
+    napi_release_threadsafe_function(run->events, napi_tsfn_release);
+}
+
+// Serialize the lifetime of the fixed discovery port during mode changes.
+std::mutex wirelessOwner;
+
+std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<Id16>& selected) {
+    std::unique_lock owner(wirelessOwner);
+    if (run->stopRequested) return {};
+    auto listener = WirelessListener::open();
+    WirelessDiscovery discovery;
+    if (!listener || !discovery.start(listener->port())) return "Cannot start wireless discovery";
+    std::optional<Nonce16> intent;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    if (selected) {
+        secureRandom(intent.emplace());
+        if (!discovery.request(*selected, *intent)) return "Cannot send wireless discovery on the LAN";
+    }
+    emitState(run, selected ? "searching" : "listening");
+    bool established = false;
+    while (!run->stopRequested) {
+        if (selected && !established && std::chrono::steady_clock::now() >= deadline)
+            return "Paired PC did not respond";
+        int fd = listener->accept(150);
+        if (fd < 0) continue;
+        auto host = wirelessHelloHost(fd);
+        std::optional<BindingMaterial> binding;
+        if (!host || (selected && *host != *selected) || run->stopRequested) {
+            close(fd);
+            continue;
+        }
+        if (!BindingStore::find(*host, binding)) {
+            close(fd);
+            return "Binding store unavailable";
+        }
+        if (!binding) { close(fd); continue; }
+        auto sink = audioOutput(run);
+        auto callbacks = sessionCallbacks(run, sink);
+        std::unique_lock lock(run->mutex);
+        run->sessionState = -1;
+        run->sessionEnded = false;
+        run->interrupted = false;
+        auto session = StreamSession::startWireless(fd, std::move(*binding), intent, sink, std::move(callbacks));
+        run->session = session.get();
+        if (run->stopRequested) session->stop(run->userStop);
+        run->ended.wait(lock, [&] { return run->sessionEnded; });
+        run->session = nullptr;
+        auto error = run->endMessage;
+        lock.unlock();
+        session.reset();
+        if (run->stopRequested || error.empty()) return {};
+        if (run->sessionState >= static_cast<int>(SessionState::Authenticated)) {
+            established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
+            if (error.find("output") != std::string::npos || error.find("low latency") != std::string::npos)
+                return error;
+            emitState(run, "listening");
+        }
+    }
+    return {};
+}
+
+void runWireless(std::shared_ptr<Run> run, std::optional<Id16> selected) {
+    auto error = listenWireless(run, selected);
+    emitEnd(run, run->stopRequested ? "" : error);
     napi_release_threadsafe_function(run->events, napi_tsfn_release);
 }
 
@@ -293,6 +370,39 @@ void stopCurrent(bool userInitiated) {
 
 // ---- exports ---------------------------------------------------------------------------------------------
 
+std::shared_ptr<Run> replaceRun(napi_env env, napi_value callback) {
+    auto run = std::make_shared<Run>();
+    napi_value name;
+    napi_create_string_utf8(env, "anpodEvents", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_threadsafe_function(env, callback, nullptr, name, 0, 1, nullptr, nullptr, nullptr, callJs,
+                                        &run->events) != napi_ok) {
+        napi_throw_error(env, nullptr, "cannot create the event channel");
+        return nullptr;
+    }
+    stopCurrent(false);  // a new launch from the PC replaces the old run
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        gRun = run;
+    }
+    return run;
+}
+
+napi_value StartWireless(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 2);
+    std::string hex;
+    std::optional<Id16> host;
+    napi_valuetype callbackType = napi_undefined;
+    if (argv.empty() || !stringArg(env, argv[0], hex) || (!hex.empty() && !parseHex(hex, host.emplace())) ||
+        napi_typeof(env, argv[1], &callbackType) != napi_ok || callbackType != napi_function) {
+        napi_throw_type_error(env, nullptr, "startWireless: invalid host or callback");
+        return nullptr;
+    }
+    auto run = replaceRun(env, argv[1]);
+    if (!run) return nullptr;
+    std::thread(runWireless, run, host).detach();
+    return undefinedValue(env);
+}
+
 napi_value StartHdcSession(napi_env env, napi_callback_info info) {
     auto argv = args(env, info, 4);
     double port = 0;
@@ -308,19 +418,8 @@ napi_value StartHdcSession(napi_env env, napi_callback_info info) {
         napi_throw_type_error(env, nullptr, "startHdcSession: invalid port, hostId, launchToken or callback");
         return nullptr;
     }
-    auto run = std::make_shared<Run>();
-    napi_value name;
-    napi_create_string_utf8(env, "anpodEvents", NAPI_AUTO_LENGTH, &name);
-    if (napi_create_threadsafe_function(env, argv[3], nullptr, name, 0, 1, nullptr, nullptr, nullptr, callJs,
-                                        &run->events) != napi_ok) {
-        napi_throw_error(env, nullptr, "startHdcSession: cannot create the event channel");
-        return nullptr;
-    }
-    stopCurrent(false);  // a new launch from the PC replaces the old run
-    {
-        std::lock_guard<std::mutex> lock(gMutex);
-        gRun = run;
-    }
+    auto run = replaceRun(env, argv[3]);
+    if (!run) return nullptr;
     std::thread(runWired, run, static_cast<uint16_t>(port), hostId, token).detach();
     return undefinedValue(env);
 }
@@ -457,6 +556,7 @@ napi_value SelfTestLoopback(napi_env env, napi_callback_info info) {
 
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
+        {"startWireless", nullptr, StartWireless, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startHdcSession", nullptr, StartHdcSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"answerPairing", nullptr, AnswerPairing, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stopSession", nullptr, StopSession, nullptr, nullptr, nullptr, napi_default, nullptr},

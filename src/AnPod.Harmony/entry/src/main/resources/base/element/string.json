@@ -91,6 +91,18 @@
     {
       "name": "error_low_latency",
       "value": "Low latency is not supported on this device"
+    },
+    {
+      "name": "tab_wireless",
+      "value": "Wireless"
+    },
+    {
+      "name": "wireless_ready",
+      "value": "Ready for a paired PC"
+    },
+    {
+      "name": "wireless_searching",
+      "value": "Searching for PC"
     }
   ]
 }

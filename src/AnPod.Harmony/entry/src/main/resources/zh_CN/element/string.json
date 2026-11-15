@@ -91,6 +91,18 @@
     {
       "name": "error_low_latency",
       "value": "此设备不支持低延迟"
+    },
+    {
+      "name": "tab_wireless",
+      "value": "无线"
+    },
+    {
+      "name": "wireless_ready",
+      "value": "等待已配对电脑连接"
+    },
+    {
+      "name": "wireless_searching",
+      "value": "正在查找电脑"
     }
   ]
 }

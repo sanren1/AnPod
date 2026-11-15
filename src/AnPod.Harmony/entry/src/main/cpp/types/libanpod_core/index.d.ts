@@ -1,4 +1,4 @@
-export type CoreState = 'connecting' | 'pairing' | 'connected' | 'playing' | 'paused' | 'stopped' | 'failed';
+export type CoreState = 'listening' | 'searching' | 'connecting' | 'pairing' | 'connected' | 'playing' | 'paused' | 'stopped' | 'failed';
 // pairingCode is sent when the code shows and again with pcConfirmed: true once the PC user confirmed it.
 export interface CoreEvent { kind: 'state' | 'pairingCode' | 'format' | 'error'; state?: CoreState; code?: string;
   sampleRate?: number; channels?: number; encoding?: 'float32'; latencyMode?: 'normal' | 'fast'; message?: string;
@@ -10,3 +10,4 @@ export function listBindings(): string[];      // hostIdHex
 export function forgetBinding(hostIdHex: string): boolean;
 export function selfTest(): string[];
 export function selfTestLoopback(port: number): string[];  // for Task 9
+export function startWireless(hostIdHex: string, onEvent: (e: CoreEvent) => void): void;

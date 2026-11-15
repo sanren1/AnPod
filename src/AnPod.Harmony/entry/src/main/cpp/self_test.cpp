@@ -7,6 +7,7 @@
 #include "buffer_budget.h"
 #include "crypto.h"
 #include "float_ring.h"
+#include "wireless_discovery.h"
 #include "p5c_control.h"
 #include "pairing_protocol.h"
 
@@ -42,6 +43,32 @@ template <size_t N> std::array<uint8_t, N> filled(uint8_t v) {
 }
 
 std::span<const uint8_t> str(const char* s) { return {reinterpret_cast<const uint8_t*>(s), std::strlen(s)}; }
+
+bool discoveryMatchesAndroid() {
+    Key32 secret{};
+    for (size_t i = 0; i < secret.size(); ++i) secret[i] = static_cast<uint8_t>(i);
+    BindingMaterial material({}, {}, secret);
+    auto probe = fromHex("414e504403060000000102030405060708090a0b0c0d0e0f000026414e36e4dc63e683ec229f58b0088dd60051cb736e6db8");
+    auto reply = authenticatedCandidate(material, probe, 0x1234);
+    BindingMaterial unrelated({}, {}, Key32{});
+    if (authenticatedCandidate(unrelated, probe, 0x1234)) return false;
+    probe.back() ^= 1;
+    return reply && eqHex(*reply, "414e504403070000000102030405060708090a0b0c0d0e0f123426414e36e4dc63e6cc22b8c876869dc9aabbd5b84d90c466") &&
+           !authenticatedCandidate(material, probe, 0x1234);
+}
+
+bool offerMatchesDesktop() {
+    Nonce16 intent{};
+    for (size_t i = 0; i < intent.size(); ++i) intent[i] = static_cast<uint8_t>(i);
+    auto candidate = fromHex("414e504402040000000102030405060708090a0b0c0d0e0fc26c");
+    auto offer = connectionOffer(candidate, intent, 0x1234);
+    if (!offer || !eqHex(*offer, "414e504402050000000102030405060708090a0b0c0d0e0f1234")) return false;
+    candidate[8] ^= 1;
+    if (connectionOffer(candidate, intent, 0x1234)) return false;
+    candidate[8] ^= 1;
+    candidate.pop_back();
+    return !connectionOffer(candidate, intent, 0x1234);
+}
 
 bool hmacRfc4231Case2() {
     return eqHex(hmacSha256(str("Jefe"), str("what do ya want for nothing?")),
@@ -626,6 +653,8 @@ std::vector<std::string> runSelfTests() {
         bool (*fn)();
     };
     static constexpr Case cases[] = {
+        {"discovery_offer_matches_desktop", offerMatchesDesktop},
+        {"discovery_matches_android", discoveryMatchesAndroid},
         {"hmac_rfc4231_case2", hmacRfc4231Case2},
         {"aes256gcm_roundtrip_and_tamper", aes256GcmRoundtripAndTamper},
         {"derive_adb_stream_vector", deriveAdbStreamVector},

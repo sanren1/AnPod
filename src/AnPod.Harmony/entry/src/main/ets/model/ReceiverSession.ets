@@ -1,4 +1,6 @@
 // Single source of UI state for the wired session: native events land in AppStorage keys that the pages read.
+import { preferences } from '@kit.ArkData';
+import { common } from '@kit.AbilityKit';
 import anpod, { CoreEvent } from 'libanpod_core.so';
 import { LaunchParams } from './LaunchParams';
 
@@ -24,21 +26,79 @@ function set(key: string, value: string | boolean): void {
 }
 
 export class ReceiverSession {
-  static start(params: LaunchParams, hooks: SessionHooks): void {
-    set(KEY_STATE, 'connecting');
+  private static prefs?: preferences.Preferences;
+  private static hooks: SessionHooks;
+  private static generation: number = 0;
+
+  static initialize(context: common.UIAbilityContext, hooks: SessionHooks): void {
+    ReceiverSession.hooks = hooks;
+    ReceiverSession.prefs = preferences.getPreferencesSync(context, { name: 'receiver' });
+  }
+
+  static restore(): void {
+    const wireless = ReceiverSession.prefs?.getSync('wireless', false) === true;
+    if (wireless) {
+      ReceiverSession.wireless('');
+    } else {
+      ReceiverSession.reset('wired', 'idle');
+    }
+  }
+
+  private static reset(mode: string, state: string): number {
+    ReceiverSession.generation++;
+    set('transportPage', mode);
+    set(KEY_STATE, state);
     set(KEY_FORMAT, '');
     set(KEY_CODE, '');
     set(KEY_PC_CONFIRMED, false);
     set(KEY_ERROR, '');
-    hooks.live();
+    return ReceiverSession.generation;
+  }
+
+  static selectMode(wireless: boolean): void {
+    ReceiverSession.disconnect();
+    const prefs = ReceiverSession.prefs;
+    if (prefs !== undefined) {
+      prefs.putSync('wireless', wireless);
+      prefs.flushSync();
+    }
+    if (wireless) {
+      ReceiverSession.wireless('');
+    } else {
+      ReceiverSession.reset('wired', 'idle');
+    }
+  }
+
+  static wireless(hostId: string): void {
+    const generation = ReceiverSession.reset('wireless', hostId === '' ? 'listening' : 'searching');
+    try {
+      anpod.startWireless(hostId, (e: CoreEvent) => ReceiverSession.deliver(generation, e));
+    } catch (e) {
+      ReceiverSession.failed(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  static start(params: LaunchParams): void {
+    const generation = ReceiverSession.reset('wired', 'connecting');
+    ReceiverSession.hooks.live();
     try {
       anpod.startHdcSession(params.port, params.hostId, params.launchToken,
-        (e: CoreEvent) => ReceiverSession.onEvent(e, hooks));
+        (e: CoreEvent) => ReceiverSession.deliver(generation, e));
     } catch (e) {
-      set(KEY_ERROR, e instanceof Error ? e.message : String(e));
-      set(KEY_STATE, 'failed');
-      hooks.ended();
+      ReceiverSession.failed(e instanceof Error ? e.message : String(e));
     }
+  }
+
+  private static deliver(generation: number, e: CoreEvent): void {
+    if (generation === ReceiverSession.generation) {
+      ReceiverSession.onEvent(e, ReceiverSession.hooks);
+    }
+  }
+
+  private static failed(message: string): void {
+    set(KEY_ERROR, message);
+    set(KEY_STATE, 'failed');
+    ReceiverSession.hooks.ended();
   }
 
   static answerPairing(accept: boolean): void {
@@ -49,11 +109,18 @@ export class ReceiverSession {
   // USER_STOPPED: the PC drops its reconnect intent.
   static disconnect(): void {
     anpod.stopSession(true);
+    ReceiverSession.hooks.ended();
   }
 
   private static onEvent(e: CoreEvent, hooks: SessionHooks): void {
     if (e.kind === 'state' && e.state !== undefined) {
       set(KEY_STATE, e.state);
+      if (e.state === 'connected' || e.state === 'playing') {
+        hooks.live();
+      } else if (e.state === 'listening' || e.state === 'searching') {
+        set(KEY_FORMAT, '');
+        hooks.ended();
+      }
       if (e.state !== 'pairing') {
         set(KEY_CODE, '');
       }

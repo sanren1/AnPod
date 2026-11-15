@@ -1,3 +1,4 @@
+import anpod from 'libanpod_core.so';
 import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
 
 const CARD_RADIUS = 24;
@@ -51,6 +52,9 @@ struct Index {
   @StorageProp(KEY_FORMAT) formatText: string = '';
   @StorageProp(KEY_ERROR) errorMessage: string = '';
   @StorageProp(KEY_CODE) @Watch('onPairingCode') pairingCode: string = '';
+  @StorageProp('transportPage') @Watch('reloadBindings') transport: string = 'wired';
+  @State hosts: string[] = [];
+  @State bindingError: boolean = false;
   @State wide: boolean = true;
   private dialogOpen: boolean = false;
   private dialog: CustomDialogController = new CustomDialogController({
@@ -74,12 +78,32 @@ struct Index {
     this.onPairingCode();
   }
 
+  onPageShow(): void {
+    this.reloadBindings();
+  }
+
+  reloadBindings(): void {
+    if (this.transport === 'wireless') {
+      try {
+        this.hosts = anpod.listBindings();
+        this.bindingError = false;
+      } catch (e) {
+        this.hosts = [];
+        this.bindingError = true;
+      }
+    }
+  }
+
   live(): boolean {
-    return this.coreState !== 'idle' && this.coreState !== 'stopped' && this.coreState !== 'failed';
+    return this.coreState !== 'listening' && this.coreState !== 'idle' && this.coreState !== 'stopped' && this.coreState !== 'failed';
   }
 
   statusText(): Resource {
     switch (this.coreState) {
+      case 'listening':
+        return $r('app.string.wireless_ready');
+      case 'searching':
+        return $r('app.string.wireless_searching');
       case 'connecting':
         return $r('app.string.state_connecting');
       case 'pairing':
@@ -113,14 +137,17 @@ struct Index {
   @Builder
   statusCard() {
     Column({ space: 24 }) {
-      Text($r('app.string.tab_wired'))
-        .fontSize(16)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('sys.color.ohos_id_color_text_primary_contrary'))
-        .backgroundColor($r('sys.color.ohos_id_color_emphasize'))
-        .borderRadius(18)
-        .height(36)
-        .padding({ left: 20, right: 20 })
+      Row({ space: 8 }) {
+        Button($r('app.string.tab_wired'))
+          .buttonStyle(this.transport === 'wired' ? ButtonStyleMode.EMPHASIZED : ButtonStyleMode.NORMAL)
+          .height(48)
+          .onClick(() => { if (this.transport !== 'wired') ReceiverSession.selectMode(false); })
+        Button($r('app.string.tab_wireless'))
+          .buttonStyle(this.transport === 'wireless' ? ButtonStyleMode.EMPHASIZED : ButtonStyleMode.NORMAL)
+          .height(48)
+          .onClick(() => { if (this.transport !== 'wireless' || this.coreState === 'stopped' ||
+            this.coreState === 'failed') ReceiverSession.selectMode(true); })
+      }
       Row({ space: 12 }) {
         Circle().width(12).height(12).fill(this.statusColor())
         Text(this.statusText())
@@ -134,6 +161,18 @@ struct Index {
       }
       .width('100%')
 
+      if (this.transport === 'wireless' && !this.live()) {
+        if (this.hosts.length === 0) {
+          Text(this.bindingError ? $r('app.string.store_unavailable') : $r('app.string.no_paired_pcs'))
+            .fontColor($r('sys.color.ohos_id_color_text_secondary'))
+        } else {
+          ForEach(this.hosts, (id: string) => {
+            Button(id.slice(0, 8))
+              .height(48)
+              .onClick(() => ReceiverSession.wireless(id))
+          }, (id: string) => id)
+        }
+      }
       if (this.coreState === 'failed' && this.errorMessage !== '') {
         Text(this.errorText())
           .fontSize(14)
