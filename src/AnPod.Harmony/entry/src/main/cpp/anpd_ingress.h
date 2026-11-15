@@ -80,7 +80,8 @@ public:
     AnpdIngress(const AnpdIngress&) = delete;
     AnpdIngress& operator=(const AnpdIngress&) = delete;
 
-    // One reader thread; the counters below are safe to read from others.
+    // One reader thread: accept() calls the FloatSink synchronously on that same thread, so the sink must not
+    // block (write into a ring and return). The counters below are safe to read from other threads.
     Result accept(std::span<const uint8_t> packet);
 
     uint64_t authenticatedAudioFrames() const { return authenticatedAudioFrames_; }

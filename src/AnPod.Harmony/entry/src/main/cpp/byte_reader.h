@@ -15,6 +15,15 @@ public:
     virtual bool readExact(uint8_t* out, size_t count) = 0;
 };
 
+// Full-duplex byte transport of the wired session (the rport TCP socket; an in-memory pipe in the self-tests).
+// Timeouts are enforced by the owner calling close(), which must be thread-safe, idempotent and make every
+// pending and later readExact / writeAll on any thread return false.
+class ByteStream : public ByteReader {
+public:
+    virtual bool writeAll(std::span<const uint8_t> data) = 0;
+    virtual void close() = 0;
+};
+
 // Reads from a fixed buffer; used by the self-tests.
 class SpanReader final : public ByteReader {
 public:

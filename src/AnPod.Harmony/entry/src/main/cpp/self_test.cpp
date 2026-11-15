@@ -18,6 +18,9 @@
 #include <vector>
 
 namespace anpod {
+
+void runSessionSelfTests(std::vector<std::string>& failures);  // self_test_session.cpp
+
 namespace {
 
 Bytes fromHex(const char* h) {
@@ -641,6 +644,7 @@ std::vector<std::string> runSelfTests() {
     std::vector<std::string> failures;
     for (const Case& c : cases)
         if (!c.fn()) failures.emplace_back(c.name);
+    runSessionSelfTests(failures);
     return failures;
 }
 
