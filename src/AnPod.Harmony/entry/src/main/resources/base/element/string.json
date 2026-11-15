@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "AnPod receiver" },
+    { "name": "EntryAbility_desc", "value": "AnPod receiver" },
+    { "name": "EntryAbility_label", "value": "AnPod" }
+  ]
+}

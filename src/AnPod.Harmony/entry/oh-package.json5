@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "AnPod receiver entry module",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "libanpod_core.so": "file:./src/main/cpp/types/libanpod_core"
+  }
+}

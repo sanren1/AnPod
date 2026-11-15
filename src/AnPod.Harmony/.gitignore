@@ -1,0 +1,14 @@
+**/node_modules
+**/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+**/.test
+/.appanalyzer
+*.p12
+*.cer
+*.p7b
+*.csr
