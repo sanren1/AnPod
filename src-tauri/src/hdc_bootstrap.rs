@@ -66,9 +66,11 @@ fn read_exact_until(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
         stream.set_read_timeout(Some(remaining))?;
-        match stream.read(&mut buf[filled..])? {
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-            read => filled += read,
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
