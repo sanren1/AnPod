@@ -1,6 +1,24 @@
+// NAPI bridge of libanpod_core.so (types: types/libanpod_core/index.d.ts). One wired run at a time: a worker
+// thread connects to the rport loopback port, runs the ANHB bootstrap, then the StreamSession into OHAudio,
+// and reports to ArkTS through a thread-safe function. Session callbacks only signal the worker; the worker
+// destroys the session (never inside a callback).
+#include "binding_store.h"
+#include "hdc_bootstrap.h"
+#include "ohaudio_output.h"
+#include "socket_stream.h"
+#include "stream_session.h"
+
 #include <napi/native_api.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace anpod {
@@ -9,22 +27,443 @@ std::vector<std::string> runSelfTests();
 
 namespace {
 
-napi_value SelfTest(napi_env env, napi_callback_info) {
-    std::vector<std::string> failures = anpod::runSelfTests();
+using namespace anpod;
+
+struct Event {
+    const char* kind = "state";
+    const char* state = nullptr;
+    std::string code, message;
+    uint32_t sampleRate = 0;
+    uint32_t channels = 0;
+    bool fast = false;
+    bool pcConfirmed = false;
+};
+
+struct Run {
+    napi_threadsafe_function events = nullptr;
+    std::mutex mutex;
+    ByteStream* stream = nullptr;         // set while the worker or session owns an open stream
+    TabletBootstrap* bootstrap = nullptr;  // set while the bootstrap runs
+    StreamSession* session = nullptr;      // set while the session runs
+    bool stopRequested = false, userStop = false;
+    bool sessionEnded = false;
+    std::string endMessage;
+    std::condition_variable ended;
+    std::atomic<bool> interrupted{false};
+    std::atomic<int> sessionState{-1};
+};
+
+std::mutex gMutex;
+std::shared_ptr<Run> gRun;
+
+// Events of a replaced run are dropped, so a late "stopped" never overwrites the new run's state.
+void emit(const std::shared_ptr<Run>& run, Event event) {
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        if (run != gRun) return;
+    }
+    auto* heap = new Event(std::move(event));
+    if (napi_call_threadsafe_function(run->events, heap, napi_tsfn_nonblocking) != napi_ok) delete heap;
+}
+
+void emitState(const std::shared_ptr<Run>& run, const char* state) {
+    Event e;
+    e.state = state;
+    emit(run, std::move(e));
+}
+
+void emitEnd(const std::shared_ptr<Run>& run, const std::string& error) {
+    if (!error.empty()) {
+        Event e;
+        e.kind = "error";
+        e.message = error;
+        emit(run, std::move(e));
+    }
+    emitState(run, error.empty() ? "stopped" : "failed");
+}
+
+// An audio interrupt shows as paused while the PC still streams.
+const char* mapState(int state, bool interrupted) {
+    switch (static_cast<SessionState>(state)) {
+    case SessionState::Streaming: return interrupted ? "paused" : "playing";
+    case SessionState::ReceiverRunning: return interrupted ? "paused" : "connected";
+    case SessionState::Paused: return "paused";
+    case SessionState::Stopped: return "stopped";
+    default: return "connected";
+    }
+}
+
+void setValue(napi_env env, napi_value object, const char* name, napi_value value) {
+    napi_set_named_property(env, object, name, value);
+}
+
+void callJs(napi_env env, napi_value callback, void*, void* data) {
+    std::unique_ptr<Event> e(static_cast<Event*>(data));
+    if (!env || !callback) return;
+    napi_value object, value;
+    napi_create_object(env, &object);
+    napi_create_string_utf8(env, e->kind, NAPI_AUTO_LENGTH, &value);
+    setValue(env, object, "kind", value);
+    if (e->state) {
+        napi_create_string_utf8(env, e->state, NAPI_AUTO_LENGTH, &value);
+        setValue(env, object, "state", value);
+    }
+    if (!e->code.empty()) {
+        napi_create_string_utf8(env, e->code.c_str(), e->code.size(), &value);
+        setValue(env, object, "code", value);
+        napi_get_boolean(env, e->pcConfirmed, &value);
+        setValue(env, object, "pcConfirmed", value);
+    }
+    if (!e->message.empty()) {
+        napi_create_string_utf8(env, e->message.c_str(), e->message.size(), &value);
+        setValue(env, object, "message", value);
+    }
+    if (e->sampleRate) {
+        napi_create_uint32(env, e->sampleRate, &value);
+        setValue(env, object, "sampleRate", value);
+        napi_create_uint32(env, e->channels, &value);
+        setValue(env, object, "channels", value);
+        napi_create_string_utf8(env, "float32", NAPI_AUTO_LENGTH, &value);
+        setValue(env, object, "encoding", value);
+        napi_create_string_utf8(env, e->fast ? "fast" : "normal", NAPI_AUTO_LENGTH, &value);
+        setValue(env, object, "latencyMode", value);
+    }
+    napi_value undefined, result;
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, callback, 1, &object, &result);
+}
+
+void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 token) {
+    emitState(run, "connecting");
+    std::unique_ptr<SocketStream> stream = SocketStream::connectLoopback(port);
+    std::string error;
+    if (!stream) {
+        error = "cannot reach the PC on the hdc forward";
+    } else {
+        std::string code;
+        BootstrapUi ui;
+        ui.showCode = [&](const std::string& shown) {
+            code = shown;
+            Event e;
+            e.kind = "pairingCode";
+            e.code = shown;
+            emit(run, e);
+            emitState(run, "pairing");
+        };
+        ui.codeConfirmedByPc = [&] {
+            Event e;
+            e.kind = "pairingCode";
+            e.code = code;
+            e.pcConfirmed = true;
+            emit(run, std::move(e));
+        };
+        TabletBootstrap bootstrap(*stream, token, hostId, ui);
+        {
+            std::lock_guard<std::mutex> lock(run->mutex);
+            run->stream = stream.get();
+            run->bootstrap = &bootstrap;
+            if (run->stopRequested) stream->close();
+        }
+        BootstrapOutcome outcome = bootstrap.run();
+        bool userStop;
+        {
+            std::lock_guard<std::mutex> lock(run->mutex);
+            run->bootstrap = nullptr;
+            userStop = run->userStop;
+        }
+        if (auto* failed = std::get_if<BootstrapFailed>(&outcome)) {
+            if (!userStop) error = failed->message;
+        } else if (auto* proceed = std::get_if<BootstrapProceed>(&outcome)) {
+            OhAudioOutput sink([run](bool interrupted) {
+                run->interrupted = interrupted;
+                if (run->sessionState >= 0) emitState(run, mapState(run->sessionState, interrupted));
+            });
+            SessionCallbacks callbacks;
+            callbacks.onState = [run](SessionState state) {
+                run->sessionState = static_cast<int>(state);
+                emitState(run, mapState(run->sessionState, run->interrupted));
+            };
+            callbacks.onFormat = [run, &sink](const AudioFormatV2& format) {
+                Event e;
+                e.kind = "format";
+                e.sampleRate = format.sampleRate;
+                e.channels = format.channels;
+                e.fast = sink.fast();
+                emit(run, std::move(e));
+            };
+            callbacks.onEnded = [run](const std::string& message) {
+                std::lock_guard<std::mutex> lock(run->mutex);
+                run->sessionEnded = true;
+                run->endMessage = message;
+                run->ended.notify_all();
+            };
+            std::unique_ptr<StreamSession> session =
+                StreamSession::start(std::move(stream), std::move(proceed->binding), sink, std::move(callbacks));
+            std::unique_lock<std::mutex> lock(run->mutex);
+            run->stream = nullptr;
+            run->session = session.get();
+            if (run->stopRequested) session->stop(run->userStop);
+            run->ended.wait(lock, [&] { return run->sessionEnded; });
+            run->session = nullptr;
+            error = run->endMessage;
+            lock.unlock();
+            session.reset();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(run->mutex);
+        run->stream = nullptr;
+    }
+    stream.reset();
+    emitEnd(run, error);
+    napi_release_threadsafe_function(run->events, napi_tsfn_release);
+}
+
+// ---- argument helpers ------------------------------------------------------------------------------------
+
+std::vector<napi_value> args(napi_env env, napi_callback_info info, size_t count) {
+    std::vector<napi_value> argv(count);
+    size_t argc = count;
+    napi_get_cb_info(env, info, &argc, argv.data(), nullptr, nullptr);
+    if (argc < count) argv.clear();
+    return argv;
+}
+
+bool stringArg(napi_env env, napi_value value, std::string& out) {
+    char buffer[80];
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, value, buffer, sizeof buffer, &length) != napi_ok || length >= 79)
+        return false;
+    out.assign(buffer, length);
+    return true;
+}
+
+template <size_t N> bool parseHex(const std::string& hex, std::array<uint8_t, N>& out) {
+    if (hex.size() != N * 2) return false;
+    auto nibble = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    for (size_t i = 0; i < N; i++) {
+        int hi = nibble(hex[i * 2]), lo = nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>(hi << 4 | lo);
+    }
+    return true;
+}
+
+std::string toHex(const Id16& id) {
+    static const char* digits = "0123456789abcdef";
+    std::string hex;
+    for (uint8_t b : id) {
+        hex.push_back(digits[b >> 4]);
+        hex.push_back(digits[b & 15]);
+    }
+    return hex;
+}
+
+napi_value undefinedValue(napi_env env) {
+    napi_value value;
+    napi_get_undefined(env, &value);
+    return value;
+}
+
+napi_value stringArray(napi_env env, const std::vector<std::string>& items) {
     napi_value out;
-    napi_create_array_with_length(env, failures.size(), &out);
-    for (size_t i = 0; i < failures.size(); i++) {
-        napi_value name;
-        napi_create_string_utf8(env, failures[i].c_str(), failures[i].size(), &name);
-        napi_set_element(env, out, static_cast<uint32_t>(i), name);
+    napi_create_array_with_length(env, items.size(), &out);
+    for (size_t i = 0; i < items.size(); i++) {
+        napi_value item;
+        napi_create_string_utf8(env, items[i].c_str(), items[i].size(), &item);
+        napi_set_element(env, out, static_cast<uint32_t>(i), item);
     }
     return out;
 }
 
+void stopCurrent(bool userInitiated) {
+    std::shared_ptr<Run> run;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        run = gRun;
+    }
+    if (!run) return;
+    std::lock_guard<std::mutex> lock(run->mutex);
+    run->stopRequested = true;
+    run->userStop = run->userStop || userInitiated;
+    if (run->session) run->session->stop(userInitiated);
+    else if (run->stream) run->stream->close();
+}
+
+// ---- exports ---------------------------------------------------------------------------------------------
+
+napi_value StartHdcSession(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 4);
+    int32_t port = 0;
+    std::string hostHex, tokenHex;
+    Id16 hostId;
+    Token16 token;
+    napi_valuetype callbackType = napi_undefined;
+    if (argv.empty() || napi_get_value_int32(env, argv[0], &port) != napi_ok || port < 40000 || port > 49999 ||
+        !stringArg(env, argv[1], hostHex) || !parseHex(hostHex, hostId) || !stringArg(env, argv[2], tokenHex) ||
+        !parseHex(tokenHex, token) || napi_typeof(env, argv[3], &callbackType) != napi_ok ||
+        callbackType != napi_function) {
+        napi_throw_type_error(env, nullptr, "startHdcSession: invalid port, hostId, launchToken or callback");
+        return nullptr;
+    }
+    auto run = std::make_shared<Run>();
+    napi_value name;
+    napi_create_string_utf8(env, "anpodEvents", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_threadsafe_function(env, argv[3], nullptr, name, 0, 1, nullptr, nullptr, nullptr, callJs,
+                                        &run->events) != napi_ok) {
+        napi_throw_error(env, nullptr, "startHdcSession: cannot create the event channel");
+        return nullptr;
+    }
+    stopCurrent(false);  // a new launch from the PC replaces the old run
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        gRun = run;
+    }
+    std::thread(runWired, run, static_cast<uint16_t>(port), hostId, token).detach();
+    return undefinedValue(env);
+}
+
+napi_value AnswerPairing(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 1);
+    bool accept = false;
+    if (argv.empty() || napi_get_value_bool(env, argv[0], &accept) != napi_ok) return undefinedValue(env);
+    std::shared_ptr<Run> run;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        run = gRun;
+    }
+    if (run) {
+        std::lock_guard<std::mutex> lock(run->mutex);
+        if (run->bootstrap) run->bootstrap->answerPairing(accept);
+    }
+    return undefinedValue(env);
+}
+
+napi_value StopSession(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 1);
+    bool userInitiated = false;
+    if (!argv.empty()) napi_get_value_bool(env, argv[0], &userInitiated);
+    stopCurrent(userInitiated);
+    return undefinedValue(env);
+}
+
+napi_value ListBindings(napi_env env, napi_callback_info) {
+    auto ids = BindingStore::list();
+    if (!ids) {
+        napi_throw_error(env, nullptr, "binding store unavailable");
+        return nullptr;
+    }
+    std::vector<std::string> hex;
+    for (const Id16& id : *ids) hex.push_back(toHex(id));
+    return stringArray(env, hex);
+}
+
+napi_value ForgetBinding(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 1);
+    std::string hex;
+    Id16 id;
+    bool removed = !argv.empty() && stringArg(env, argv[0], hex) && parseHex(hex, id) && BindingStore::remove(id);
+    napi_value out;
+    napi_get_boolean(env, removed, &out);
+    return out;
+}
+
+napi_value SelfTest(napi_env env, napi_callback_info) { return stringArray(env, runSelfTests()); }
+
+// ---- selfTestLoopback (Task 9) ---------------------------------------------------------------------------
+
+// Checks the Float32 pattern of adb_record_stream_production_coordinator_loopback (src-tauri/src/p5c_tests.rs):
+// every 143-frame packet repeats FLOAT_BITS per interleaved stereo sample, 14 packets, then PAUSE, RESUME, STOP.
+class VerifyingSink final : public PlaybackSink {
+public:
+    static constexpr uint32_t kBits[8] = {0x3f800000, 0xbf000000, 0x00000001, 0x80000000,
+                                          0x7f7fffff, 0x80000001, 0x3eaaaaab, 0x00800000};
+    static constexpr uint64_t kFramesPerPacket = 143, kPackets = 14;
+
+    bool open(const AudioFormatV2& format) override {
+        opened = format.sampleFormat == 3 && format.channels == 2;
+        return opened;
+    }
+    bool write(const float* samples, size_t frames) override {
+        for (size_t f = 0; f < frames; f++, frameIndex++) {
+            for (size_t c = 0; c < 2; c++) {
+                uint32_t bits;
+                std::memcpy(&bits, &samples[f * 2 + c], sizeof bits);
+                if (bits != kBits[((frameIndex % kFramesPerPacket) * 2 + c) % 8] && mismatchAt < 0)
+                    mismatchAt = static_cast<int64_t>(frameIndex);
+            }
+        }
+        return true;
+    }
+    void pause() override { pauses++; }
+    void resume() override { resumes++; }
+    void close() override { closes++; }
+    PlaybackStats stats() const override {
+        PlaybackStats s;
+        s.playbackAdvancing = opened && frameIndex > 0;
+        return s;
+    }
+
+    bool opened = false;
+    uint64_t frameIndex = 0;  // frames received in order (the reader thread is the only writer)
+    int64_t mismatchAt = -1;
+    int pauses = 0, resumes = 0, closes = 0;
+};
+
+// shortcut: blocks the calling JS thread (up to 60 s) and runs one session per call; fine for aa test, make it
+// async before any UI calls it.
+napi_value SelfTestLoopback(napi_env env, napi_callback_info info) {
+    auto argv = args(env, info, 1);
+    int32_t port = 0;
+    if (argv.empty() || napi_get_value_int32(env, argv[0], &port) != napi_ok || port <= 0 || port > 65535)
+        return stringArray(env, {"loopback_invalid_port"});
+    auto stream = SocketStream::connectLoopback(static_cast<uint16_t>(port));
+    if (!stream) return stringArray(env, {"loopback_connect_failed"});
+    Id16 hostId, receiverId;
+    Key32 secret;
+    hostId.fill(0x01);
+    receiverId.fill(0x02);
+    secret.fill(0x03);
+    VerifyingSink sink;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::optional<std::string> message;
+    SessionCallbacks callbacks;
+    callbacks.onEnded = [&](const std::string& m) {
+        std::lock_guard<std::mutex> lock(mutex);
+        message = m;
+        changed.notify_all();
+    };
+    auto session = StreamSession::start(std::move(stream), BindingMaterial(hostId, receiverId, secret), sink, callbacks);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait_for(lock, std::chrono::seconds(60), [&] { return message.has_value(); });
+    }
+    session.reset();  // joins the reader: the sink fields are stable from here
+    std::vector<std::string> failures;
+    if (!message) failures.push_back("loopback_timeout");
+    else if (!message->empty()) failures.push_back("loopback_session_error: " + *message);
+    if (!sink.opened) failures.push_back("loopback_not_opened");
+    if (sink.frameIndex != VerifyingSink::kFramesPerPacket * VerifyingSink::kPackets)
+        failures.push_back("loopback_frames " + std::to_string(sink.frameIndex));
+    if (sink.mismatchAt >= 0) failures.push_back("loopback_sample_mismatch at frame " + std::to_string(sink.mismatchAt));
+    if (sink.pauses != 1 || sink.resumes != 1 || sink.closes != 1)
+        failures.push_back("loopback_pause_resume_close " + std::to_string(sink.pauses) + "/" +
+                           std::to_string(sink.resumes) + "/" + std::to_string(sink.closes));
+    return stringArray(env, failures);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
-        {"selfTest", nullptr, SelfTest, nullptr, nullptr, nullptr, napi_default, nullptr}};
-    napi_define_properties(env, exports, 1, desc);
+        {"startHdcSession", nullptr, StartHdcSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"answerPairing", nullptr, AnswerPairing, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"stopSession", nullptr, StopSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"listBindings", nullptr, ListBindings, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"forgetBinding", nullptr, ForgetBinding, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"selfTest", nullptr, SelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"selfTestLoopback", nullptr, SelfTestLoopback, nullptr, nullptr, nullptr, napi_default, nullptr},
+    };
+    napi_define_properties(env, exports, sizeof desc / sizeof desc[0], desc);
     return exports;
 }
 

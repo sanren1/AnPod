@@ -28,8 +28,13 @@ public:
     virtual ~PlaybackSink() = default;
     // Opens exactly this format; false when the output cannot (no fallback to another format or mode).
     virtual bool open(const AudioFormatV2& format) = 0;
-    // Called on the session reader thread; must not block.
-    virtual void write(const float* interleaved, size_t frames) = 0;
+    // Called on the session reader thread; must not block. false: the frames were dropped (counted by the ingress).
+    virtual bool write(const float* interleaved, size_t frames) = 0;
+    // P5-C PAUSE / RESUME after an open (AoaReceiverCoordinator calls playback.pause / resume).
+    virtual void pause() = 0;
+    virtual void resume() = 0;
+    // STOP or session end after an open; called once, on the reader thread.
+    virtual void close() = 0;
     // playbackAdvancing == true reports the STREAMING state.
     virtual PlaybackStats stats() const = 0;
 };
@@ -81,6 +86,7 @@ private:
     SessionKeys keys_;
     AudioFormatV2 format_;
     uint64_t sessionId_ = 0;
+    bool playbackStarted_ = false;  // reader thread only
     std::unique_ptr<AnpdIngress> ingress_;
 
     std::mutex mutex_;

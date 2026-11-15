@@ -7,10 +7,12 @@
 #include "binding_store.h"
 #include "crypto.h"
 #include "hdc_bootstrap.h"
+#include "ohaudio_output.h"
 #include "p5c_control.h"
 #include "stream_session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -288,6 +290,19 @@ bool bootstrapRejectsOfferForOtherHost() {
            !stored(other);
 }
 
+bool bootstrapFailedPairSavedSendRemovesBinding() {
+    Id16 id = filled<16>(0xb8);
+    BindingStore::remove(id);
+    BindingMaterial material(id, filled<16>(0x22), filled<32>(0x33));
+    Pipe pipe = makePipe();
+    // Accepted locally first; the PC confirms and drops the stream before PairSaved can be written.
+    BootstrapRun run(*pipe.tablet, *pipe.pc, id, [](TabletBootstrap& b) { b.answerPairing(true); }, nullptr);
+    bool ok = helloIs(*pipe.pc, 0) && offer(*pipe.pc, material, filled<16>(4)) &&
+              sendAnhb(*pipe.pc, AnhbKind::PairConfirmed);
+    pipe.pc->close();
+    return std::holds_alternative<BootstrapFailed>(run.join()) && ok && !stored(id);
+}
+
 bool bindingStoreSaveFindRemove() {
     Id16 id = filled<16>(0xb6);
     BindingStore::remove(id);
@@ -299,7 +314,8 @@ bool bindingStoreSaveFindRemove() {
     };
     bool ok = !stored(id) && !listed() && BindingStore::save(first);
     auto found = findOk(id);
-    ok = ok && BindingStore::list().has_value() && found && sameBinding(*found, first) && listed() && BindingStore::save(second);
+    ok = ok && BindingStore::list().has_value() && found && sameBinding(*found, first) && listed() &&
+         BindingStore::save(second);
     found = findOk(id);  // a second save for the same PC overwrites
     ok = ok && found && sameBinding(*found, second);
     return BindingStore::remove(id) && ok && !stored(id) && !listed() && BindingStore::remove(id);
@@ -314,11 +330,16 @@ public:
         opened_ = format;
         return true;
     }
-    void write(const float*, size_t frames) override {
+    bool write(const float*, size_t frames) override {
         std::lock_guard<std::mutex> lock(mutex_);
         frames_ += frames;
+        return true;
     }
+    void pause() override { pauses++; }
+    void resume() override { resumes++; }
+    void close() override { closes++; }
     PlaybackStats stats() const override { return {}; }
+    std::atomic<int> pauses{0}, resumes{0}, closes{0};
     std::optional<AudioFormatV2> opened() {
         std::lock_guard<std::mutex> lock(mutex_);
         return opened_;
@@ -473,6 +494,48 @@ bool sessionUserStopSendsResultUserStopped() {
            message->empty() && !readAnpu(pc);
 }
 
+bool sessionPauseResumeStopReachSink() {
+    Pipe pipe = makePipe();
+    PipeEnd& pc = *pipe.pc;
+    MemorySink sink;
+    Ended ended;
+    auto session = StreamSession::start(std::move(pipe.tablet), sessionBinding(), sink, ended.callbacks());
+    Host host{pc};
+    auto format = *AudioFormatV2::forProfile(5, 1);
+    if (!host.handshake(sessionBinding().deriveAdbStream(), format)) return false;
+    const uint8_t zeroPort[2] = {0, 0};
+    const uint8_t mode[1] = {format.mode};
+    bool ok = host.capabilities().size() == 20 && host.exchange(p5c::kBind, zeroPort).size() == 13 &&
+              host.exchange(p5c::kSelectMode, mode).size() == 13 && host.exchange(p5c::kStart).size() == 13;
+    ok = ok && host.exchange(p5c::kPause).size() == 13 && host.exchange(p5c::kPause).size() == 13 && sink.pauses == 1;
+    ok = ok && host.exchange(p5c::kResume).size() == 13 && host.exchange(p5c::kResume).size() == 13 &&
+         sink.resumes == 1 && sink.closes == 0;
+    Bytes stop = host.exchange(p5c::kStop);
+    auto message = ended.wait();
+    return ok && stop.size() == 13 && message && message->empty() && sink.closes == 1;
+}
+
+// OHAudio itself accepts 384 kHz (it resamples to the device), so the rejected cases are a rate the builder refuses
+// and a non-Float32 descriptor: both fail, and no other format is tried.
+bool ohaudioRejectsUnsupportedWithoutFallback() {
+    AudioFormatV2 tooFast = *AudioFormatV2::forProfile(5, 0);
+    tooFast.sampleRate = 1'000'000;
+    OhAudioOutput a, b;
+    return !a.open(tooFast) && !a.isOpen() && !b.open(*AudioFormatV2::forProfile(2, 0)) && !b.isOpen();
+}
+
+bool ohaudioOpensNegotiatedFloat32() {
+    for (auto [profile, mode] : {std::pair{4, 0}, std::pair{5, 0}, std::pair{4, 1}}) {
+        OhAudioOutput output;
+        if (!output.open(*AudioFormatV2::forProfile(profile, mode)) || !output.isOpen()) return false;
+        const float silence[16] = {};
+        bool wrote = output.write(silence, 8);
+        output.close();
+        if (!wrote || output.isOpen()) return false;
+    }
+    return true;
+}
+
 bool sessionRejectsReplayedCommand() {
     Pipe pipe = makePipe();
     PipeEnd& pc = *pipe.pc;
@@ -518,9 +581,13 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"bootstrap_cancel_leaves_no_binding", bootstrapCancelLeavesNoBinding},
         {"bootstrap_rejects_offer_for_other_host", bootstrapRejectsOfferForOtherHost},
         {"bootstrap_store_error_sends_no_hello", bootstrapStoreErrorSendsNoHello},
+        {"bootstrap_failed_pair_saved_send_removes_binding", bootstrapFailedPairSavedSendRemovesBinding},
         {"session_user_stop_sends_result_user_stopped", sessionUserStopSendsResultUserStopped},
         {"session_rejects_replayed_command", sessionRejectsReplayedCommand},
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},
+        {"session_pause_resume_stop_reach_sink", sessionPauseResumeStopReachSink},
+        {"ohaudio_rejects_unsupported_without_fallback", ohaudioRejectsUnsupportedWithoutFallback},
+        {"ohaudio_opens_negotiated_float32", ohaudioOpensNegotiatedFloat32},
     };
     for (const Case& c : cases)
         if (!c.fn()) failures.emplace_back(c.name);

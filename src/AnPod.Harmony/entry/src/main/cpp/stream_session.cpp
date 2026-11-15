@@ -38,6 +38,7 @@ std::unique_ptr<StreamSession> StreamSession::start(std::unique_ptr<ByteStream> 
     session->reader_ = std::thread([self] {
         std::string error = self->runReader();
         self->end(error);
+        if (self->playbackStarted_) self->sink_.close();
         std::string message;
         {
             std::lock_guard<std::mutex> lock(self->mutex_);
@@ -139,7 +140,8 @@ std::string StreamSession::authenticate() {
 std::string StreamSession::controlLoop() {
     uint64_t expectedCommand = 0;
     uint64_t ackSequence = 0;
-    bool capabilitiesAccepted = false, bound = false, modeSelected = false, playbackStarted = false;
+    bool capabilitiesAccepted = false, bound = false, modeSelected = false;
+    bool& playbackStarted = playbackStarted_;
     SessionState state = SessionState::Authenticated;
     auto setState = [&](SessionState next) {
         if (next == state) return;
@@ -220,13 +222,12 @@ std::string StreamSession::controlLoop() {
                 if (!bound || !modeSelected || !payload.empty() || playbackStarted) return "invalid START state";
                 ingress_ = AnpdIngress::create(sessionId_, keys_.hostToReceiverAudio, format_,
                                                [this](uint64_t, std::span<const float> samples, uint32_t frames) {
-                                                   sink_.write(samples.data(), frames);
-                                                   return true;
+                                                   return sink_.write(samples.data(), frames);
                                                });
                 if (!ingress_) return "audio ingress refused the negotiated format";
                 if (!sink_.open(format_))
                     return "audio output cannot open " + std::to_string(format_.sampleRate) + " Hz Float32 " +
-                           std::to_string(format_.channels) + "ch";
+                           std::to_string(format_.channels) + "ch " + (format_.mode == 1 ? "fast" : "normal");
                 playbackStarted = true;
                 if (callbacks_.onFormat) callbacks_.onFormat(format_);
                 setState(SessionState::ReceiverRunning);
@@ -236,6 +237,7 @@ std::string StreamSession::controlLoop() {
                     (state != SessionState::ReceiverRunning && state != SessionState::Streaming &&
                      state != SessionState::Paused))
                     return "invalid PAUSE state";
+                if (state != SessionState::Paused) sink_.pause();
                 setState(SessionState::Paused);
                 break;
             case p5c::kResume:
@@ -243,6 +245,7 @@ std::string StreamSession::controlLoop() {
                     (state != SessionState::Paused && state != SessionState::ReceiverRunning &&
                      state != SessionState::Streaming))
                     return "invalid RESUME state";
+                if (state == SessionState::Paused) sink_.resume();
                 setState(SessionState::ReceiverRunning);
                 break;
             case p5c::kHeartbeat: {

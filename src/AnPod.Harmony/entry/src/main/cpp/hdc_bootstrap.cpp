@@ -5,6 +5,7 @@
 #include "crypto.h"
 
 #include <cstring>
+#include <hilog/log.h>
 #include <deque>
 #include <optional>
 #include <thread>
@@ -41,7 +42,8 @@ BootstrapOutcome TabletBootstrap::run() {
         if (!std::holds_alternative<BootstrapProceed>(outcome)) {
             stream_.close();
             // Saved, but the PC may not have stored its side: leave no half pairing behind.
-            if (phase == Phase::AwaitProceed) BindingStore::remove(hostId_);
+            if (phase == Phase::AwaitProceed && !BindingStore::remove(hostId_))
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xA0D0, "AnPod", "unconfirmed pairing could not be removed");
         }
         if (reader.joinable()) reader.join();
         return outcome;
@@ -144,9 +146,9 @@ BootstrapOutcome TabletBootstrap::run() {
                 cancel(kCancelUser);
                 return finish(BootstrapFailed{"binding could not be saved"});
             }
+            phase = Phase::AwaitProceed;  // from here any failure removes the saved binding again
             if (!send(AnhbKind::PairSaved, offered->commitment()))
                 return finish(BootstrapFailed{"bootstrap write failed"});
-            phase = Phase::AwaitProceed;
         }
     }
 }
