@@ -62,7 +62,7 @@ fn registry_key_with_value(text: &str, wanted: &str) -> Option<String> {
             key = Some(line.trim().to_owned());
         } else if line
             .split_once("REG_SZ")
-            .is_some_and(|(_, value)| value.trim() == wanted)
+            .is_some_and(|(head, value)| head.trim() == "DisplayName" && value.trim() == wanted)
         {
             return key;
         }
@@ -228,6 +228,7 @@ pub(crate) fn kill_hdc_server(hdc: &Path) {
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]

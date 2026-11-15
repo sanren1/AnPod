@@ -53,6 +53,18 @@ impl AppState {
                     snapshot: self.snapshot(),
                 });
             }
+            // Reject before teardown so the current session stays untouched.
+            let target = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .devices
+                .iter()
+                .find(|device| device.serial == serial)
+                .cloned();
+            if let Some(target) = &target {
+                ensure_android_device(target)?;
+            }
             let (device_available, cleanup_pending) = {
                 let view = self
                     .view
