@@ -36,9 +36,7 @@ pub(crate) fn encode_anhb(kind: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
-pub(crate) fn read_anhb(stream: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
-    let mut header = [0u8; 8];
-    stream.read_exact(&mut header)?;
+fn parse_header(header: &[u8; 8]) -> io::Result<(u8, usize)> {
     if &header[..4] != MAGIC || header[4] != VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "引导帧格式错误"));
     }
@@ -46,9 +44,46 @@ pub(crate) fn read_anhb(stream: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     if length > MAX_BODY {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "引导帧过长"));
     }
+    Ok((header[5], length))
+}
+
+pub(crate) fn read_anhb(stream: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 8];
+    stream.read_exact(&mut header)?;
+    let (kind, length) = parse_header(&header)?;
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body)?;
-    Ok((header[5], body))
+    Ok((kind, body))
+}
+
+/// read_exact under one overall deadline: the socket timeout is re-armed with the
+/// remaining time before every read, so a slow-drip peer cannot extend it.
+fn read_exact_until(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut buf[filled..])? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            read => filled += read,
+        }
+    }
+    Ok(())
+}
+
+/// Returns the has-binding flag only for a well-formed TabletHello carrying `token`.
+fn read_hello(stream: &mut TcpStream, token: &[u8; 16], deadline: Instant) -> Option<bool> {
+    let mut header = [0u8; 8];
+    read_exact_until(stream, &mut header, deadline).ok()?;
+    if parse_header(&header).ok()? != (TABLET_HELLO, 17) {
+        return None;
+    }
+    let mut body = [0u8; 17];
+    read_exact_until(stream, &mut body, deadline).ok()?;
+    (equal(&body[..16], token) && body[16] <= 1).then_some(body[16] == 1)
 }
 
 fn equal(left: &[u8], right: &[u8]) -> bool {
@@ -82,11 +117,10 @@ pub(crate) fn accept_with_token(
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT.min(deadline - now)));
-                if let Ok((TABLET_HELLO, body)) = read_anhb(&mut stream) {
-                    if body.len() == 17 && equal(&body[..16], &token) && body[16] <= 1 {
-                        return Ok((stream, body[16] == 1));
-                    }
+                if let Some(has_binding) =
+                    read_hello(&mut stream, &token, (now + HELLO_TIMEOUT).min(deadline))
+                {
+                    return Ok((stream, has_binding));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
