@@ -60,7 +60,10 @@ fn registry_key_with_value(text: &str, wanted: &str) -> Option<String> {
     for line in text.lines() {
         if line.starts_with("HK") {
             key = Some(line.trim().to_owned());
-        } else if line.contains("REG_SZ") && line.contains(wanted) {
+        } else if line
+            .split_once("REG_SZ")
+            .is_some_and(|(_, value)| value.trim() == wanted)
+        {
             return key;
         }
     }
@@ -153,9 +156,21 @@ pub(crate) async fn hdc_device(
     harmony_device(key, &version, &model)
 }
 
-// shortcut: probes only hdc's default server port, upgrade if OHOS_HDC_SERVER_PORT must be honoured.
+/// Port hdc will use: OHOS_HDC_SERVER_PORT when set, else the default. `None`
+/// when the variable is set but unusable, so we never claim the server.
+pub(crate) fn hdc_server_port(env_value: Option<&str>) -> Option<u16> {
+    match env_value {
+        None => Some(HDC_SERVER_PORT),
+        Some(value) => value.trim().parse().ok().filter(|port| *port != 0),
+    }
+}
+
 fn hdc_server_listening() -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], HDC_SERVER_PORT));
+    let env = std::env::var("OHOS_HDC_SERVER_PORT").ok();
+    let Some(port) = hdc_server_port(env.as_deref()) else {
+        return true;
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
@@ -203,7 +218,16 @@ pub(crate) fn kill_hdc_server(hdc: &Path) {
     command.arg("kill");
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x08000000);
-    let _ = command.status();
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    for _ in 0..30 {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
 }
 
 #[cfg(test)]

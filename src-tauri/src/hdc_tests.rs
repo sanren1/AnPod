@@ -116,3 +116,18 @@ HKEY_X
         Some(r"E:\Software\DevEco Studio")
     );
 }
+
+#[test]
+fn hdc_server_port_honours_env() {
+    assert_eq!(hdc_server_port(None), Some(8710));
+    assert_eq!(hdc_server_port(Some("9000")), Some(9000));
+    assert_eq!(hdc_server_port(Some("abc")), None);
+    assert_eq!(hdc_server_port(Some("")), None);
+}
+
+#[test]
+fn harmony_device_is_rejected_by_android_connect_path() {
+    use crate::state::ensure_android_device;
+    assert!(ensure_android_device(&harmony("HW1")).is_err());
+    assert!(ensure_android_device(&parse_devices(ADB_TEXT)[0]).is_ok());
+}

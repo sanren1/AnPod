@@ -180,6 +180,7 @@ impl AppState {
                 .cloned()
                 .ok_or_else(|| "此手机当前不可连接，请刷新设备列表。".to_string())?
         };
+        ensure_android_device(&device)?;
         self.view
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
