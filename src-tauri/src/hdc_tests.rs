@@ -131,3 +131,167 @@ fn harmony_device_routes_to_hdc_connect_path() {
     assert!(connects_over_hdc(&harmony("HW1")));
     assert!(!connects_over_hdc(&parse_devices(ADB_TEXT)[0]));
 }
+
+/// Real PC production owner against the HarmonyOS emulator's native StreamSession over `hdc rport`.
+/// Needs a running emulator and the built+installed HAPs (see findings.md); opt in with ANPOD_HDC_EMULATOR=1.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs the HarmonyOS emulator at 127.0.0.1:5555"]
+fn hdc_record_stream_harmony_emulator_loopback() {
+    use crate::{
+        aoa_owner::AoaOwner, network::FloatPcmQueue, p5c::SessionAudioQueue,
+        protocol::AudioFormatV2, security::test_adb_binding_material,
+    };
+    use std::{
+        net::{Ipv4Addr, TcpListener},
+        process::{Command, Stdio},
+        sync::Arc,
+        thread,
+        time::Instant,
+    };
+
+    if std::env::var("ANPOD_HDC_EMULATOR").as_deref() != Ok("1") {
+        return;
+    }
+    const KEY: &str = "127.0.0.1:5555";
+    const TABLET_PORT: &str = "47000";
+    const FLOAT_BITS: [u32; 8] = [
+        0x3f80_0000,
+        0xbf00_0000,
+        0x0000_0001,
+        0x8000_0000,
+        0x7f7f_ffff,
+        0x8000_0001,
+        0x3eaa_aaab,
+        0x0080_0000,
+    ];
+    const PACKETS: usize = 14;
+    const FRAMES_PER_PACKET: usize = 143;
+
+    let hdc = locate_hdc(
+        std::env::var_os("PATH").as_deref(),
+        deveco_install_location(),
+    )
+    .expect("hdc not found");
+    let run = |args: &[&str]| {
+        let output = Command::new(&hdc)
+            .args(["-t", KEY])
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let pc_port = listener.local_addr().unwrap().port().to_string();
+    let tablet = format!("tcp:{TABLET_PORT}");
+    let pc = format!("tcp:{pc_port}");
+    let _ = run(&["fport", "rm", &tablet, &pc]);
+    let forward = run(&["rport", &tablet, &pc]);
+    assert!(forward.contains("OK"), "hdc rport failed: {forward}");
+
+    for profile in [4u8, 5] {
+        let mut test = Command::new(&hdc)
+            .args([
+                "-t",
+                KEY,
+                "shell",
+                "aa",
+                "test",
+                "-b",
+                "app.anpod.harmony",
+                "-m",
+                "entry_test",
+            ])
+            .args([
+                "-s",
+                "unittest",
+                "OpenHarmonyTestRunner",
+                "-s",
+                "class",
+                "HdcLoopback",
+            ])
+            .args(["-s", "port", TABLET_PORT, "-s", "timeout", "90000"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn aa test");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "tablet never connected (profile {profile})"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        stream.set_nodelay(true).unwrap();
+        let format = AudioFormatV2::for_profile(profile, 1).unwrap();
+        let queue = Arc::new(FloatPcmQueue::new(true));
+        queue.set_expected_format(format.sample_rate, 4096).unwrap();
+        let owner = AoaOwner::connect_adb_stream(
+            stream,
+            test_adb_binding_material(),
+            format,
+            SessionAudioQueue::Float32(queue.clone(), format),
+            "hdc",
+            None,
+        )
+        .unwrap_or_else(|e| panic!("owner profile {profile}: {e}"));
+        let snapshot = owner.snapshot();
+        assert!(
+            snapshot.capabilities.compatible,
+            "incompatible, profile {profile}"
+        );
+        assert_eq!(snapshot.format, format);
+
+        let block: Vec<f32> = (0..FRAMES_PER_PACKET * 2)
+            .map(|s| f32::from_bits(FLOAT_BITS[s % FLOAT_BITS.len()]))
+            .collect();
+        for packet in 0..PACKETS {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !queue.push_raw(
+                block.as_ptr(),
+                FRAMES_PER_PACKET as u32,
+                format.sample_rate,
+                2,
+                (packet * FRAMES_PER_PACKET) as u64,
+            ) {
+                assert!(Instant::now() < deadline, "queue refused packet {packet}");
+                thread::yield_now();
+            }
+            let expected = ((packet + 1) * FRAMES_PER_PACKET * 8) as u64;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while owner.snapshot().pcm_payload_bytes_sent < expected {
+                let s = owner.snapshot();
+                assert!(
+                    s.state != crate::p5c::ReceiverState::Stopped && Instant::now() < deadline,
+                    "stalled at packet {packet} profile {profile}: sent={} err={:?}",
+                    s.pcm_payload_bytes_sent,
+                    s.last_error
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        owner.pause().unwrap();
+        owner.resume().unwrap();
+        owner.stop().unwrap();
+        queue.stop_and_clear();
+
+        let mut out = String::new();
+        std::io::Read::read_to_string(test.stdout.as_mut().unwrap(), &mut out).unwrap();
+        test.wait().unwrap();
+        println!("aa test profile {profile}:\n{out}");
+        assert!(
+            out.contains("OHOS_REPORT_CODE: 0") && out.contains("Failure: 0, Error: 0, Pass: 1"),
+            "tablet side failed for profile {profile}: {out}"
+        );
+    }
+    let removed = run(&["fport", "rm", &tablet, &pc]);
+    assert!(removed.contains("success"), "fport rm: {removed}");
+}
