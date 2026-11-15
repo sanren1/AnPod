@@ -293,6 +293,25 @@ bool bootstrapRejectsOfferForOtherHost() {
            !stored(other);
 }
 
+// A local app can launch AnPod with its own port and a known hostId: an offer must never replace a stored binding.
+bool bootstrapRejectsOfferWhenAlreadyBound() {
+    Id16 id = filled<16>(0xb9);
+    BindingMaterial saved(id, filled<16>(0x02), filled<32>(0x03)), forged(id, filled<16>(0x22), filled<32>(0x33));
+    Pipe pipe = makePipe();
+    BootstrapRun run(*pipe.tablet, *pipe.pc, id, [](TabletBootstrap& b) { b.answerPairing(true); }, nullptr,
+                     [saved](const Id16&, std::optional<BindingMaterial>& out) {
+                         out = saved;
+                         return true;
+                     });
+    auto record = forged.encode();
+    Bytes body(record.begin(), record.end());
+    append(body, filled<16>(4));
+    // No PairNonce and no code: the stream is closed with nothing more written.
+    if (!helloIs(*pipe.pc, 1) || !sendAnhb(*pipe.pc, AnhbKind::PairOffer, body) || readAnhb(*pipe.pc)) return false;
+    auto* failed = std::get_if<BootstrapFailed>(&run.join());
+    return failed && failed->message == "pairing offer for an already paired PC" && run.shownCode().empty();
+}
+
 bool bootstrapFailedPairSavedSendRemovesBinding() {
     Id16 id = filled<16>(0xb8);
     BindingStore::remove(id);
@@ -641,6 +660,7 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"bootstrap_cancel_leaves_no_binding", bootstrapCancelLeavesNoBinding},
         {"bootstrap_rejects_offer_for_other_host", bootstrapRejectsOfferForOtherHost},
         {"bootstrap_store_error_sends_no_hello", bootstrapStoreErrorSendsNoHello},
+        {"bootstrap_rejects_offer_when_already_bound", bootstrapRejectsOfferWhenAlreadyBound},
         {"bootstrap_failed_pair_saved_send_removes_binding", bootstrapFailedPairSavedSendRemovesBinding},
         {"session_user_stop_sends_result_user_stopped", sessionUserStopSendsResultUserStopped},
         {"wireless_hello_selects_host", wirelessHelloSelectsHostWithoutConsumingBytes},

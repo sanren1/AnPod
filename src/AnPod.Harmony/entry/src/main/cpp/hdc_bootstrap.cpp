@@ -106,6 +106,8 @@ BootstrapOutcome TabletBootstrap::run() {
                 if (!saved) return finish(BootstrapFailed{"proceed without a stored binding"});
                 return finish(BootstrapProceed{std::move(*saved)});
             } else if (phase == Phase::AwaitFirst && frame->kind == AnhbKind::PairOffer) {
+                // The ability is exported: never let an offer replace a stored binding (the PC re-pairs under a new hostId).
+                if (saved) return finish(BootstrapFailed{"pairing offer for an already paired PC"});
                 std::span<const uint8_t> body = frame->body;
                 Nonce16 pcNonce, tabletNonce;
                 std::memcpy(pcNonce.data(), body.data() + BindingMaterial::kBytes, 16);

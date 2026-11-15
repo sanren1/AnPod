@@ -61,9 +61,8 @@ struct PairedPcs {
           ForEach(this.hostIds, (hostId: string) => {
             ListItem() {
               Row() {
-                Text(hostId.slice(0, 8))
+                Text($r('app.string.pc_label', hostId.slice(0, 4)))
                   .fontSize(18)
-                  .fontFamily('monospace')
                   .fontColor($r('sys.color.ohos_id_color_text_primary'))
                 Blank()
                 Button($r('app.string.forget'))

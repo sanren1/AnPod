@@ -3,7 +3,6 @@ import { avSession } from '@kit.AVSessionKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import anpod from 'libanpod_core.so';
 import { parseLaunchParams } from '../model/LaunchParams';
 import { ReceiverSession } from '../model/ReceiverSession';
 
@@ -28,9 +27,9 @@ export default class EntryAbility extends UIAbility {
     this.launch(want);
   }
 
+  // Closing the app is a manual disconnect: USER_STOPPED, the PC does not reconnect (wired or wireless).
   onDestroy(): void {
-    anpod.stopSession(false);
-    this.setLive(false);
+    ReceiverSession.disconnect();
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

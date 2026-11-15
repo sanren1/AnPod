@@ -11,6 +11,7 @@
 #include "p5c_control.h"
 #include "pairing_protocol.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -366,6 +367,21 @@ bool progressSchemasMatchJava() {
     return p5c::playbackProgressPayloadSchema4(schema2, 1).empty() && p5c::playbackProgressPayloadSchema6(schema4, 1, 2, 3, 4, 5, 6).empty();
 }
 
+// Java's default progress (P5cReceiverCoordinator) sends -1 / null for every unknown field: all ones on the wire,
+// which the PC reads as unknown (src-tauri p5c/wire.rs metric_u32 / metric_u64).
+bool progressUnknownFieldsAreAllOnes() {
+    Bytes unknown = p5c::playbackProgressPayload(p5c::ProgressBase{});
+    if (unknown.size() != 70 || std::any_of(unknown.begin(), unknown.end(), [](uint8_t b) { return b != 0xff; }))
+        return false;
+    p5c::ProgressBase known;
+    known.sampleRate = 48000;
+    known.channels = 2;
+    known.pendingFrames = 7;
+    Bytes b = p5c::playbackProgressPayload(known);
+    return be32(b, 0) == 48000 && b[4] == 2 && be64(b, 25) == 7 && be32(b, 5) == 0xffffffffu &&
+           be64(b, 9) == UINT64_MAX && be32(b, 46) == 0xffffffffu && be32(b, 66) == 0xffffffffu;
+}
+
 // Fixed frames: HMAC computed by Python hmac/hashlib over the layout in P5cControlProtocol.java.
 bool p5cControlMatchesJavaVectors() {
     Key32 key = filled<32>(0x0a);
@@ -665,6 +681,7 @@ std::vector<std::string> runSelfTests() {
         {"anhb_roundtrip_all_kinds", anhbRoundtripAllKinds},
         {"anhb_rejects_unknown_kind_and_oversize", anhbRejectsUnknownKindAndOversize},
         {"p5c_control_matches_java_vectors", p5cControlMatchesJavaVectors},
+        {"progress_unknown_fields_are_all_ones", progressUnknownFieldsAreAllOnes},
         {"anpd_float32_bits_exact", anpdFloat32BitsExact},
         {"anpd_rejects_replay_and_wrong_key", anpdRejectsReplayAndWrongKey},
         {"anpd_loss_ledger_applies_in_order", lossLedgerAppliesInOrder},

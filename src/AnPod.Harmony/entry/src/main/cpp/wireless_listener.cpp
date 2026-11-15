@@ -1,6 +1,7 @@
 #include "wireless_listener.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <netinet/in.h>
@@ -13,12 +14,16 @@ namespace anpod {
 
 std::unique_ptr<WirelessListener> WirelessListener::open() {
     int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return {};
+    if (fd < 0) {
+        ANPOD_WIRELESS_LOG("listener socket failed", errno);
+        return {};
+    }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     socklen_t size = sizeof addr;
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), size) != 0 || ::listen(fd, 8) != 0 ||
         ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &size) != 0) {
+        ANPOD_WIRELESS_LOG("listener open failed", errno);
         ::close(fd);
         return {};
     }
@@ -39,8 +44,14 @@ std::optional<Id16> wirelessHelloHost(int fd) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     do {
         ssize_t n = ::recv(fd, bytes, sizeof bytes, MSG_PEEK | MSG_DONTWAIT);
-        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return {};
-        if (n > 0 && std::memcmp(bytes, header, std::min<size_t>(n, sizeof header))) return {};
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            ANPOD_WIRELESS_LOG("hello read failed", n < 0 ? errno : 0);
+            return {};
+        }
+        if (n > 0 && std::memcmp(bytes, header, std::min<size_t>(n, sizeof header))) {
+            ANPOD_WIRELESS_LOG("hello rejected", n);
+            return {};
+        }
         if (n == sizeof bytes) {
             Id16 id{};
             std::copy_n(bytes + 8, id.size(), id.begin());
@@ -48,6 +59,7 @@ std::optional<Id16> wirelessHelloHost(int fd) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (std::chrono::steady_clock::now() < deadline);
+    ANPOD_WIRELESS_LOG("hello timed out", 0);
     return {};
 }
 

@@ -1,5 +1,5 @@
 import anpod from 'libanpod_core.so';
-import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
+import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_HOST, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
 
 const CARD_RADIUS = 24;
 
@@ -51,6 +51,7 @@ struct Index {
   @StorageProp(KEY_STATE) coreState: string = 'idle';
   @StorageProp(KEY_FORMAT) formatText: string = '';
   @StorageProp(KEY_ERROR) errorMessage: string = '';
+  @StorageProp(KEY_HOST) activeHost: string = '';
   @StorageProp(KEY_CODE) @Watch('onPairingCode') pairingCode: string = '';
   @StorageProp('transportPage') @Watch('reloadBindings') transport: string = 'wired';
   @State hosts: string[] = [];
@@ -114,6 +115,8 @@ struct Index {
         return $r('app.string.state_playing');
       case 'paused':
         return $r('app.string.state_paused');
+      case 'reconnecting':
+        return $r('app.string.state_reconnecting');
       case 'failed':
         return $r('app.string.state_failed');
       default:
@@ -123,8 +126,48 @@ struct Index {
 
   // Known causes get localized copy; anything else shows the native message as is.
   errorText(): ResourceStr {
-    return this.errorMessage.endsWith('low latency unsupported') ? $r('app.string.error_low_latency') :
-      this.errorMessage;
+    if (this.errorMessage.endsWith('low latency unsupported')) {
+      return $r('app.string.error_low_latency');
+    }
+    switch (this.errorMessage) {
+      case 'wireless discovery unavailable':
+        return $r('app.string.error_discovery_unavailable');
+      case 'wireless discovery send failed':
+        return $r('app.string.error_discovery_send');
+      case 'paired PC did not respond':
+        return $r('app.string.error_pc_no_response');
+      case 'binding store unavailable':
+        return $r('app.string.store_unavailable');
+      case 'cannot reach the PC on the hdc forward':
+        return $r('app.string.error_hdc_unreachable');
+      case 'pairing timed out':
+        return $r('app.string.error_pairing_timeout');
+      case 'pairing offer for an already paired PC':
+        return $r('app.string.error_already_paired');
+      default:
+        return this.errorMessage;
+    }
+  }
+
+  // Real state of one paired PC: only the session's own peer is ever connecting, reconnecting or connected.
+  hostState(id: string): ResourceStr {
+    if (id !== this.activeHost) {
+      return this.live() ? '' : $r('app.string.pc_available');
+    }
+    switch (this.coreState) {
+      case 'searching':
+      case 'connecting':
+      case 'pairing':
+        return $r('app.string.state_connecting');
+      case 'reconnecting':
+        return $r('app.string.state_reconnecting');
+      case 'connected':
+      case 'playing':
+      case 'paused':
+        return $r('app.string.state_connected');
+      default:
+        return $r('app.string.pc_available');
+    }
   }
 
   statusColor(): Resource {
@@ -161,15 +204,31 @@ struct Index {
       }
       .width('100%')
 
-      if (this.transport === 'wireless' && !this.live()) {
+      if (this.transport === 'wireless') {
         if (this.hosts.length === 0) {
           Text(this.bindingError ? $r('app.string.store_unavailable') : $r('app.string.no_paired_pcs'))
             .fontColor($r('sys.color.ohos_id_color_text_secondary'))
         } else {
+          // A live session is ended with Disconnect first, so a tap never drops it silently.
           ForEach(this.hosts, (id: string) => {
-            Button(id.slice(0, 8))
-              .height(48)
-              .onClick(() => ReceiverSession.wireless(id))
+            Button() {
+              Row() {
+                Text($r('app.string.pc_label', id.slice(0, 4)))
+                  .fontSize(16)
+                  .fontColor($r('sys.color.ohos_id_color_text_primary'))
+                Blank()
+                Text(this.hostState(id))
+                  .fontSize(14)
+                  .fontColor($r('sys.color.ohos_id_color_text_secondary'))
+              }
+              .width('100%')
+              .padding({ left: 16, right: 16 })
+            }
+            .buttonStyle(ButtonStyleMode.NORMAL)
+            .width('100%')
+            .height(48)
+            .enabled(!this.live() || id === this.activeHost)
+            .onClick(() => { if (!this.live()) ReceiverSession.wireless(id); })
           }, (id: string) => id)
         }
       }

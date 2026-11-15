@@ -9,6 +9,7 @@ export const KEY_FORMAT = 'formatText';    // actual opened format, '' when none
 export const KEY_CODE = 'pairingCode';     // '' when no pairing dialog should show
 export const KEY_PC_CONFIRMED = 'pcConfirmed';
 export const KEY_ERROR = 'errorMessage';
+export const KEY_HOST = 'activeHost';     // hostIdHex of the wireless peer, '' when none
 
 export interface SessionHooks {
   live: () => void;   // a session started: hold the continuous task and AVSession
@@ -52,6 +53,7 @@ export class ReceiverSession {
     set(KEY_CODE, '');
     set(KEY_PC_CONFIRMED, false);
     set(KEY_ERROR, '');
+    set(KEY_HOST, '');
     return ReceiverSession.generation;
   }
 
@@ -71,6 +73,7 @@ export class ReceiverSession {
 
   static wireless(hostId: string): void {
     const generation = ReceiverSession.reset('wireless', hostId === '' ? 'listening' : 'searching');
+    set(KEY_HOST, hostId);
     try {
       anpod.startWireless(hostId, (e: CoreEvent) => ReceiverSession.deliver(generation, e));
     } catch (e) {
@@ -115,6 +118,14 @@ export class ReceiverSession {
   private static onEvent(e: CoreEvent, hooks: SessionHooks): void {
     if (e.kind === 'state' && e.state !== undefined) {
       set(KEY_STATE, e.state);
+      if (e.host !== undefined) {
+        set(KEY_HOST, e.host);
+      } else if (e.state === 'listening') {
+        set(KEY_HOST, '');
+      }
+      if (e.state === 'reconnecting') {
+        set(KEY_FORMAT, '');
+      }
       if (e.state === 'connected' || e.state === 'playing') {
         hooks.live();
       } else if (e.state === 'listening' || e.state === 'searching') {

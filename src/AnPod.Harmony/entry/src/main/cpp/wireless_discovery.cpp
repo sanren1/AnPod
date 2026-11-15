@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "binding_store.h"
+#include "wireless_listener.h"
 
 namespace anpod {
 namespace {
@@ -28,7 +29,10 @@ struct Lan { uint32_t address, mask; };
 std::vector<Lan> networks() {
     ifaddrs* interfaces = nullptr;
     std::vector<Lan> result;
-    if (getifaddrs(&interfaces) != 0) return result;
+    if (getifaddrs(&interfaces) != 0) {
+        ANPOD_WIRELESS_LOG("getifaddrs failed", errno);
+        return result;
+    }
     for (auto* it = interfaces; it; it = it->ifa_next) {
         if (!it->ifa_addr || !it->ifa_netmask || it->ifa_addr->sa_family != AF_INET ||
             !(it->ifa_flags & IFF_UP) || !(it->ifa_flags & IFF_BROADCAST)) continue;
@@ -118,12 +122,16 @@ bool WirelessDiscovery::start(uint16_t controlPort) {
     }
     if (bindings.empty()) return false;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        ANPOD_WIRELESS_LOG("discovery socket failed", errno);
+        return false;
+    }
     int enabled = 1;
     auto address = endpoint(INADDR_ANY, kPort);
     if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) < 0 ||
         setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &enabled, sizeof(enabled)) < 0 ||
         bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        ANPOD_WIRELESS_LOG("discovery bind failed", errno);
         close(fd);
         return false;
     }
@@ -132,6 +140,7 @@ bool WirelessDiscovery::start(uint16_t controlPort) {
     bindings_ = std::move(bindings);
     running_ = true;
     worker_ = std::thread(&WirelessDiscovery::serve, this);
+    ANPOD_WIRELESS_LOG("discovery started, bindings", bindings_.size());
     return true;
 }
 
@@ -146,7 +155,9 @@ bool WirelessDiscovery::request(const Id16& selectedHost, const Nonce16& intent)
     searchAddresses_.clear();
     for (auto lan : networks()) {
         if (sendPacket(socket_, probe, endpoint(lan.address | ~lan.mask, kPort))) searchAddresses_.push_back(lan.address);
+        else ANPOD_WIRELESS_LOG("intent probe send failed", errno);
     }
+    ANPOD_WIRELESS_LOG("intent probe sent, networks", searchAddresses_.size());
     if (!searchAddresses_.empty()) {
         intent_ = intent;
         expires_ = Clock::now() + std::chrono::seconds(10);
@@ -160,7 +171,10 @@ void WirelessDiscovery::serve() {
     while (running_) {
         int ready = poll(&input, 1, 100);
         if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0 || (input.revents & (POLLNVAL | POLLERR | POLLHUP))) break;
+        if (ready < 0 || (input.revents & (POLLNVAL | POLLERR | POLLHUP))) {
+            ANPOD_WIRELESS_LOG("discovery poll failed", ready < 0 ? errno : input.revents);
+            break;
+        }
         if (!ready) continue;
         std::array<uint8_t, 64> buffer{};
         sockaddr_in peer{};
@@ -177,7 +191,10 @@ void WirelessDiscovery::serve() {
         if (size != 26 && size != 50) continue;
         auto* info = CMSG_FIRSTHDR(&message);
         if (!info || info->cmsg_level != IPPROTO_IP || info->cmsg_type != IP_PKTINFO ||
-            info->cmsg_len < CMSG_LEN(sizeof(in_pktinfo))) continue;
+            info->cmsg_len < CMSG_LEN(sizeof(in_pktinfo))) {
+            ANPOD_WIRELESS_LOG("datagram without pktinfo", size);
+            continue;
+        }
         in_pktinfo incoming{};
         std::memcpy(&incoming, CMSG_DATA(info), sizeof(incoming));
         auto local = incoming.ipi_spec_dst.s_addr;
@@ -185,12 +202,15 @@ void WirelessDiscovery::serve() {
         auto lans = networks();
         if (std::none_of(lans.begin(), lans.end(), [&](Lan lan) {
             return lan.address == local && ((local ^ peer.sin_addr.s_addr) & lan.mask) == 0;
-        })) continue;
+        })) {
+            ANPOD_WIRELESS_LOG("datagram off the local subnet", size);
+            continue;
+        }
         if (size == 50 && Clock::now() >= nextAuth) {
             for (const auto& binding : bindings_) {
                 auto response = authenticatedCandidate(binding, packet, port_);
                 if (!response) continue;
-                sendPacket(socket_, *response, peer);
+                ANPOD_WIRELESS_LOG("presence answered", sendPacket(socket_, *response, peer) ? 0 : errno);
                 nextAuth = Clock::now() + std::chrono::milliseconds(200);
                 break;
             }
@@ -200,8 +220,10 @@ void WirelessDiscovery::serve() {
                 std::find(searchAddresses_.begin(), searchAddresses_.end(), local) == searchAddresses_.end() ||
                 std::find(offered_.begin(), offered_.end(), peer.sin_addr.s_addr) != offered_.end()) continue;
             auto offer = connectionOffer(packet, intent_, port_);
-            if (offer && sendPacket(socket_, *offer, endpoint(peer.sin_addr.s_addr, kPort)))
+            if (offer && sendPacket(socket_, *offer, endpoint(peer.sin_addr.s_addr, kPort))) {
                 offered_.push_back(peer.sin_addr.s_addr);
+                ANPOD_WIRELESS_LOG("offer sent", offered_.size());
+            }
         }
     }
     running_ = false;

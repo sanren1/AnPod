@@ -103,6 +103,42 @@
     {
       "name": "wireless_searching",
       "value": "正在查找电脑"
+    },
+    {
+      "name": "state_reconnecting",
+      "value": "重连中"
+    },
+    {
+      "name": "pc_label",
+      "value": "电脑 · %s"
+    },
+    {
+      "name": "pc_available",
+      "value": "可连接"
+    },
+    {
+      "name": "error_discovery_unavailable",
+      "value": "无法启动无线发现"
+    },
+    {
+      "name": "error_discovery_send",
+      "value": "无法在局域网中查找电脑"
+    },
+    {
+      "name": "error_pc_no_response",
+      "value": "电脑无响应"
+    },
+    {
+      "name": "error_hdc_unreachable",
+      "value": "无法通过 hdc 连接电脑"
+    },
+    {
+      "name": "error_pairing_timeout",
+      "value": "配对超时"
+    },
+    {
+      "name": "error_already_paired",
+      "value": "已拒绝配对：此电脑已配对"
     }
   ]
 }

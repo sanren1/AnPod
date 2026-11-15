@@ -36,7 +36,7 @@ using namespace anpod;
 struct Event {
     const char* kind = "state";
     const char* state = nullptr;
-    std::string code, message;
+    std::string code, message, host;  // host: hex hostId of the wireless peer, on state events
     uint32_t sampleRate = 0;
     uint32_t channels = 0;
     bool fast = false;
@@ -122,6 +122,10 @@ void callJs(napi_env env, napi_value callback, void*, void* data) {
     if (!e->message.empty()) {
         napi_create_string_utf8(env, e->message.c_str(), e->message.size(), &value);
         setValue(env, object, "message", value);
+    }
+    if (!e->host.empty()) {
+        napi_create_string_utf8(env, e->host.c_str(), e->host.size(), &value);
+        setValue(env, object, "host", value);
     }
     if (e->sampleRate) {
         napi_create_uint32(env, e->sampleRate, &value);
@@ -236,23 +240,25 @@ void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 toke
 // Serialize the lifetime of the fixed discovery port during mode changes.
 std::mutex wirelessOwner;
 
+std::string toHex(const Id16& id);
+
 std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<Id16>& selected) {
     std::unique_lock owner(wirelessOwner);
     if (run->stopRequested) return {};
     auto listener = WirelessListener::open();
     WirelessDiscovery discovery;
-    if (!listener || !discovery.start(listener->port())) return "Cannot start wireless discovery";
+    if (!listener || !discovery.start(listener->port())) return "wireless discovery unavailable";
     std::optional<Nonce16> intent;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     if (selected) {
         secureRandom(intent.emplace());
-        if (!discovery.request(*selected, *intent)) return "Cannot send wireless discovery on the LAN";
+        if (!discovery.request(*selected, *intent)) return "wireless discovery send failed";
     }
     emitState(run, selected ? "searching" : "listening");
     bool established = false;
     while (!run->stopRequested) {
         if (selected && !established && std::chrono::steady_clock::now() >= deadline)
-            return "Paired PC did not respond";
+            return "paired PC did not respond";
         int fd = listener->accept(150);
         if (fd < 0) continue;
         auto host = wirelessHelloHost(fd);
@@ -263,9 +269,13 @@ std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<
         }
         if (!BindingStore::find(*host, binding)) {
             close(fd);
-            return "Binding store unavailable";
+            return "binding store unavailable";
         }
         if (!binding) { close(fd); continue; }
+        Event connecting;
+        connecting.state = "connecting";
+        connecting.host = toHex(*host);
+        emit(run, std::move(connecting));
         auto sink = audioOutput(run);
         auto callbacks = sessionCallbacks(run, sink);
         std::unique_lock lock(run->mutex);
@@ -285,8 +295,9 @@ std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<
             established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
             if (error.find("output") != std::string::npos || error.find("low latency") != std::string::npos)
                 return error;
-            emitState(run, "listening");
         }
+        // After an unexpected drop the PC reconnects the way it was connected; before that, keep waiting.
+        emitState(run, established ? "reconnecting" : selected ? "searching" : "listening");
     }
     return {};
 }

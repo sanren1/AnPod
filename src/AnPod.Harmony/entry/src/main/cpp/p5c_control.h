@@ -62,16 +62,17 @@ Bytes backgroundTrustAckExtra(std::span<const uint8_t> commitment, uint8_t kind,
 bool validBackgroundTrust(uint8_t kind, uint8_t persistence, int64_t remainingMs);
 
 // Playback progress: base (70) -> v2 (78) -> schema2..6 extensions. "Unknown" is -1 / 0xff as in Java.
+// Unknown is all ones on the wire (Java -1 / null), which the PC shows as unknown; a sink sets what it knows.
 struct ProgressBase {
-    uint32_t sampleRate = 0;
-    uint8_t channels = 0;
-    uint32_t jitterTargetFrames = 0;
-    int64_t expiredFrames = 0, queuedFrames = 0, pendingFrames = 0;
-    uint32_t underrunCount = 0;
-    int64_t tcpDroppedFrames = 0;
+    uint32_t sampleRate = UINT32_MAX;
+    uint8_t channels = 0xff;
+    uint32_t jitterTargetFrames = UINT32_MAX;
+    int64_t expiredFrames = -1, queuedFrames = -1, pendingFrames = -1;
+    uint32_t underrunCount = UINT32_MAX;
+    int64_t tcpDroppedFrames = -1;
     std::optional<bool> playbackAdvancing;  // nullopt -> 0xff
-    uint32_t requestedFrames = 0, acceptedFrames = 0, effectiveFrames = 0, capacityFrames = 0,
-             startThresholdFrames = 0, preRollFrames = 0;
+    uint32_t requestedFrames = UINT32_MAX, acceptedFrames = UINT32_MAX, effectiveFrames = UINT32_MAX,
+             capacityFrames = UINT32_MAX, startThresholdFrames = UINT32_MAX, preRollFrames = UINT32_MAX;
 };
 struct LossWindow {
     int64_t lossFrames = 0;

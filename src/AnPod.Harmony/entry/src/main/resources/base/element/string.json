@@ -103,6 +103,42 @@
     {
       "name": "wireless_searching",
       "value": "Searching for PC"
+    },
+    {
+      "name": "state_reconnecting",
+      "value": "Reconnecting"
+    },
+    {
+      "name": "pc_label",
+      "value": "PC · %s"
+    },
+    {
+      "name": "pc_available",
+      "value": "Available"
+    },
+    {
+      "name": "error_discovery_unavailable",
+      "value": "Cannot start wireless discovery"
+    },
+    {
+      "name": "error_discovery_send",
+      "value": "Cannot search the local network"
+    },
+    {
+      "name": "error_pc_no_response",
+      "value": "Paired PC did not respond"
+    },
+    {
+      "name": "error_hdc_unreachable",
+      "value": "Cannot reach the PC over hdc"
+    },
+    {
+      "name": "error_pairing_timeout",
+      "value": "Pairing timed out"
+    },
+    {
+      "name": "error_already_paired",
+      "value": "Pairing refused: this PC is already paired"
     }
   ]
 }
