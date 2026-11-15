@@ -183,13 +183,14 @@ impl AppState {
             let parameters = AudioParameters { sample_rate: capture_format.sample_rate, channels: capture_format.channels as u8,
                 mode: if self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).settings.playback_mode.eq_ignore_ascii_case("lowlatency") { 1 } else { 0 } };
             let connection_intent = intent.as_ref().map(|(nonce, required, _)| (*nonce, *required));
+            let harmony = load_binding_profile(&self.data_dir, &binding_ref).platform == "harmony";
             let mut owner = SessionOwner::start_on_interface_with_profile(
                 &interface,
                 peer,
                 binding,
                 parameters,
                 profile,
-                load_binding_profile(&self.data_dir, &binding_ref).platform == "harmony",
+                harmony,
                 initial_float_queue,
                 token.clone(),
                 connection_intent,
@@ -207,7 +208,8 @@ impl AppState {
                 }
                 if snapshot.state == SessionLifecycleState::Stopped || tokio::time::Instant::now() >= deadline {
                     owner.stop();
-                    return Err(snapshot.last_error.unwrap_or_else(|| "手机未在认证窗口内确认接收；请在手机重新开始接收。".into()));
+                    let error = snapshot.last_error.unwrap_or_else(|| "手机未在认证窗口内确认接收；请在手机重新开始接收。".into());
+                    return Err(if harmony { hdc_ops::harmony_start_error(error) } else { error });
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };

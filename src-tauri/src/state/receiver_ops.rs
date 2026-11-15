@@ -311,6 +311,15 @@ impl AppState {
         Ok(references)
     }
 
+    /// USB Direct (AOA) runs only on Android phones; the UDP pickers also list tablets.
+    pub fn receiver_binding_choices(&self, usb_direct: bool) -> Result<Vec<String>, String> {
+        let mut references = self.receiver_binding_references()?;
+        if usb_direct {
+            references.retain(|r| load_binding_profile(&self.data_dir, r).platform == "android");
+        }
+        Ok(references)
+    }
+
     pub async fn receiver_binding_reset_preview(
         &self,
         serial: &str,

@@ -175,3 +175,16 @@ it("selects UDP for a paired Harmony target while preserving the saved Android p
   expect(runtime.bindingWirelessProtocol(saved.wirelessProtocol, profiles, null)).toBe("adb");
   expect(saved.wirelessProtocol).toBe("adb");
 });
+
+it("offers the PC-side forget entry only for tablet bindings", () => {
+  const profiles = { phone: { platform: "android" }, legacy: {}, tablet: { platform: "harmony" } };
+  expect(runtime.harmonyBindingReferences(profiles)).toEqual(["tablet"]);
+  expect(runtime.harmonyBindingReferences({})).toEqual([]);
+});
+
+it("explains a tablet START rejection instead of the generic failure", () => {
+  expect(runtime.noticeSummary("HARMONY_START_REJECTED:平板拒绝了此档位，详情见平板。")).toBe(strings.app.harmonyStartRejected);
+  expect(runtime.noticeSummary("RECEIVER_UPDATE_REQUIRED: x")).toBe(strings.app.receiverUpdateRequired);
+  expect(runtime.noticeSummary("FORMAT_RATE_MISMATCH: actualHz=48000")).toBe(strings.app.hiresRateMismatch(48000));
+  expect(runtime.noticeSummary("other")).toBe(strings.app.operationNotCompleted);
+});

@@ -339,3 +339,70 @@ fn harmony_material_read_error_aborts_and_deletes_nothing() {
     assert!(path.exists() && path.with_extension("json").exists());
     let _ = fs::remove_dir_all(&data_dir);
 }
+
+/// A phone and a tablet binding on disk (fake material; only the files matter here).
+fn state_with_phone_and_tablet(name: &str) -> (AppState, String, String) {
+    let mut state = AppState::new();
+    state.data_dir = temp_data_dir(name);
+    let phone = "b".repeat(64);
+    let tablet = BindingMaterial::harmony_binding_reference("HW1");
+    for (reference, platform) in [(&phone, "android"), (&tablet, "harmony")] {
+        let path = binding_store_path(&state.data_dir, reference).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"material").unwrap();
+        update_binding_profile(&state.data_dir, reference, |p| p.platform = platform.into())
+            .unwrap();
+    }
+    (state, phone, tablet)
+}
+
+#[test]
+fn aoa_binding_choices_exclude_harmony() {
+    let (state, phone, _tablet) = state_with_phone_and_tablet("aoa-choices");
+    assert_eq!(state.receiver_binding_choices(true).unwrap(), vec![phone]);
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
+#[test]
+fn udp_binding_choices_include_harmony() {
+    let (state, phone, tablet) = state_with_phone_and_tablet("udp-choices");
+    let mut expected = vec![phone, tablet];
+    expected.sort();
+    assert_eq!(state.receiver_binding_choices(false).unwrap(), expected);
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
+#[tokio::test]
+async fn pc_side_forget_removes_tablet_material_and_profile_only() {
+    let (state, phone, tablet) = state_with_phone_and_tablet("pc-forget");
+    // A phone binding is never deleted through the tablet path.
+    assert!(state.forget_harmony_binding(&phone).await.is_err());
+    let phone_path = binding_store_path(&state.data_dir, &phone).unwrap();
+    assert!(phone_path.exists());
+
+    // Refused while an audio session holds the session slot.
+    {
+        let _session = state.session.lock().await;
+        assert!(state.forget_harmony_binding(&tablet).await.is_err());
+    }
+    let tablet_path = binding_store_path(&state.data_dir, &tablet).unwrap();
+    assert!(tablet_path.exists());
+
+    state.forget_harmony_binding(&tablet).await.unwrap();
+    assert!(!tablet_path.exists() && !tablet_path.with_extension("json").exists());
+    assert_eq!(state.receiver_binding_choices(false).unwrap(), vec![phone]);
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
+#[test]
+fn harmony_start_rejection_points_to_the_tablet() {
+    for rejected in [
+        "AOA P5-C START was rejected.",
+        "P5-C receiver did not confirm playback start.",
+    ] {
+        let message = harmony_start_error(rejected.into());
+        assert!(message.starts_with(HARMONY_START_REJECTED), "{message}");
+        assert!(message.contains("平板拒绝了此档位，详情见平板"));
+    }
+    assert_eq!(harmony_start_error("other".into()), "other");
+}

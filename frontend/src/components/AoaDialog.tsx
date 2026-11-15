@@ -71,7 +71,7 @@ export function AoaDialog({ disabled, lastUsbDirectTargetId, lastUsbDirectBindin
     }
     const [targetsResult, bindingsResult, switchTargetsResult] = await Promise.allSettled([
       invokeApp<AoaTarget[]>("list_aoa_targets"),
-      invokeApp<string[]>("receiver_binding_references"),
+      invokeApp<string[]>("receiver_binding_references", { usbDirect: true }),
       invokeApp<AoaTarget[]>("list_aoa_switch_targets"),
     ]);
     if (mounted.current) {

@@ -43,6 +43,8 @@ export const rememberBindingModels = (profiles: Record<string, { model?: string 
 };
 export const bindingWirelessProtocol = (saved: Snapshot["settings"]["wirelessProtocol"], profiles: Record<string, { platform?: string }>, reference: string | null | undefined) =>
   reference && profiles[reference]?.platform === "harmony" ? "udp" : saved;
+export const harmonyBindingReferences = (profiles: Record<string, { platform?: string }>) =>
+  Object.keys(profiles).filter(reference => profiles[reference].platform === "harmony");
 export const bindingLabel = (reference: string | null | undefined) => (reference && bindingModels.get(reference)) || strings.connection.pairedReceiver;
 export const bindingReferenceLabel = (reference: string | null | undefined) => !reference ? strings.connection.pairedReceiver
   : bindingModels.has(reference) ? `${bindingModels.get(reference)} · ${reference.slice(0, 8)}` : strings.connection.pairedReceiverWithReference(reference);
@@ -84,6 +86,10 @@ export const windowsRateMismatchHz = (message: string) => {
   const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];
   return rate ? Number(rate) : null;
 };
+// Toast headline for a failed operation; the raw message stays in the details.
+export const noticeSummary = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired
+  : message.includes("HARMONY_START_REJECTED:") ? strings.app.harmonyStartRejected
+  : message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted;
 export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());

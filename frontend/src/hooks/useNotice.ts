@@ -1,6 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { needsReceiverUpdate, windowsRateMismatchHz } from "../appRuntime";
-import { strings } from "../strings";
+import { noticeSummary } from "../appRuntime";
 
 /** Toast state. A newer notice cancels the older timer; errors stay until dismissed. */
 export function useNotice() {
@@ -16,8 +15,7 @@ export function useNotice() {
     if (!persist) timer.current = window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
   }, []);
   const dismissNotice = () => { window.clearTimeout(timer.current); setNotice(""); setNoticeDetail(""); };
-  const notify = (message: string) => announce(needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired
-    : message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted, message, true);
+  const notify = (message: string) => announce(noticeSummary(message), message, true);
 
   return { notice, noticeDetail, announce, dismissNotice, notify };
 }

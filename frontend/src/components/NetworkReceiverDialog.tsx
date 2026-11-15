@@ -2,13 +2,14 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Search } from "lucide-react";
 import { strings } from "../strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
-import { invokeApp, bindingWirelessProtocol, hasActiveSession, bindingLabel, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
+import { invokeApp, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
 import { NetworkConnectionEntry } from "./NetworkConnectionEntry";
 import { NetworkSetupWizard } from "./NetworkSetupWizard";
 import { ReceiverAppManager } from "./ReceiverAppManager";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, networkRecoveryMode, onNetworkRecoveryChange, onConnect, preferredBindingReference, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, bindingProfiles, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
   snapshot: Snapshot;
@@ -78,7 +79,10 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const methodManuallySelected = useRef(receiverManagerOnly || setupWizard);
   const peerManuallyEdited = useRef(false);
   const peerSelectionSource = useRef<"candidate" | "manual" | null>(null);
-  const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy || backgroundTrustBusy;
+  const [forgetTablet, setForgetTablet] = useState<string | null>(null);
+  const [forgetTabletBusy, setForgetTabletBusy] = useState(false);
+  const tabletBindings = harmonyBindingReferences(bindingProfiles).filter(reference => bindings.includes(reference));
+  const busy = disabled || loading || receiverAction !== null || receiverOperationBusy || candidateLoading || bindingResetLoading || bindingResetBusy || backgroundTrustBusy || forgetTabletBusy;
   const selectedOffer = offers.offers.find(offer => offer.id === selectedOfferId) ?? (offers.offers.length === 1 ? offers.offers[0] : null);
   const receiverProgressStage = receiverOperationProgress?.serial === serial ? receiverOperationProgress.stage : null;
   const receiverProgressLabel = receiverProgressStage === "checking" ? strings.network.receiverProgressChecking
@@ -153,6 +157,14 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     } else errors.push(String(bindingsResult.reason));
     setLocalError(errors.join("；"));
     if (networkInfoGeneration.current === generation) setLoading(false);
+  };
+  const confirmForgetTablet = async () => {
+    if (!forgetTablet) return;
+    setForgetTabletBusy(true);
+    const failure = await invokeApp("forget_harmony_binding", { reference: forgetTablet }).then(() => "", reason => String(reason));
+    setForgetTabletBusy(false); setForgetTablet(null);
+    if (failure) setLocalError(failure);
+    else await loadNetworkInfo();
   };
   const invalidateBindingReset = () => {
     bindingResetGeneration.current++;
@@ -494,7 +506,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     : selectedReceiverDevice?.displayName ?? strings.network.chooseUsbPhone;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
-  return <Modal title={setupWizard ? strings.network.dialogSetup : receiverManagerOnly ? strings.network.dialogReceiverManager : strings.network.dialogWirelessReceiver} onClose={onClose} className={`network-dialog${setupWizard ? " setup-wizard-dialog" : ""}`}>
+  return <><Modal title={setupWizard ? strings.network.dialogSetup : receiverManagerOnly ? strings.network.dialogReceiverManager : strings.network.dialogWirelessReceiver} onClose={onClose} className={`network-dialog${setupWizard ? " setup-wizard-dialog" : ""}`}>
     <form className="network-pane" onSubmit={submit}>
       {setupWizard && <NetworkSetupWizard
         step={setupStep} stepRef={setupStepRef} setStep={setSetupStep} busy={busy} serial={serial} setSerial={setSerial}
@@ -523,11 +535,11 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           usbDevices={usbDevices} unauthorizedUsb={unauthorizedUsb} updateCandidate={updateCandidate} checkReceiver={checkReceiver}
           canRequestUsbInstall={canRequestUsbInstall} canRequestUsbMaintenance={canRequestUsbMaintenance} canRequestUsbUpgrade={canRequestUsbUpgrade}
           requestUsbOperation={requestUsbOperation} onRefreshDevices={onRefreshDevices} receiverOperationResult={receiverOperationResult}
-          currentVersionLabel={currentVersionLabel} bindings={bindings} bindingReference={bindingReference} setBindingReference={setBindingReference}
+          currentVersionLabel={currentVersionLabel} bindings={bindings.filter(reference => !tabletBindings.includes(reference))} bindingReference={bindingReference} setBindingReference={setBindingReference}
           onClearErrors={() => { setLocalError(""); onError(""); }} bindingResetPreview={bindingResetPreview}
           bindingResetResult={bindingResetResult} bindingResetError={bindingResetError} bindingResetLoading={bindingResetLoading}
           bindingResetBusy={bindingResetBusy} previewBindingReset={previewBindingReset} invalidateBindingReset={invalidateBindingReset}
-          confirmBindingReset={confirmBindingReset}
+          confirmBindingReset={confirmBindingReset} tabletBindings={tabletBindings} forgetTabletDisabled={busy || audioSessionActive} onForgetTablet={setForgetTablet}
         />}
         {pairedServiceStopped && <div className="network-recovery" role="status">
           <span>{strings.network.receiverServiceStopped}</span>
@@ -682,5 +694,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       </div>}
       {!receiverManagerOnly && needsReceiverUpdate([shownError, receiverError, bindingResetError].join(" ")) && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.app.upgradePhone}</button>}
     </form>
-  </Modal>;
+  </Modal>
+    {forgetTablet && <ConfirmDialog title={strings.network.forgetTabletTitle} body={`${bindingReferenceLabel(forgetTablet)} · ${strings.network.forgetTabletBody}`} confirmLabel={strings.network.forgetTablet} busyLabel={strings.network.forgetTabletBusy} busy={forgetTabletBusy} onConfirm={() => void confirmForgetTablet()} onCancel={() => setForgetTablet(null)} />}
+  </>;
 }

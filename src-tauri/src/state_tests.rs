@@ -1732,6 +1732,60 @@ fn harmony_wireless_prefers_udp_only_for_its_saved_binding() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Phone-only data dir: one binding with a profile sidecar, one saved before profiles existed.
+fn phone_only_state(name: &str) -> (AppState, String, String) {
+    let mut state = AppState::new();
+    state.data_dir = std::env::temp_dir().join(format!("anpod-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&state.data_dir);
+    let phone = "a".repeat(64);
+    let legacy = "c".repeat(64);
+    for reference in [&phone, &legacy] {
+        let path = binding_store_path(&state.data_dir, reference).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"material").unwrap();
+    }
+    update_binding_profile(&state.data_dir, &phone, |p| p.model = Some("Pixel".into())).unwrap();
+    (state, phone, legacy)
+}
+
+#[test]
+fn android_bindings_keep_the_saved_udp_gate_for_presence_and_offers() {
+    // Presence, offer listener and offer accept all ask `binding_uses_udp`; without a tablet
+    // binding it must equal the old `wireless_protocol == "udp"` check for every input.
+    let (state, phone, legacy) = phone_only_state("android-udp-gate");
+    let missing = "d".repeat(64);
+    for saved in ["udp", "adb", "UDP", ""] {
+        for reference in [None, Some(&phone), Some(&legacy), Some(&missing)] {
+            assert_eq!(
+                binding_uses_udp(&state.data_dir, saved, reference.map(String::as_str)),
+                saved == "udp",
+                "saved={saved:?} reference={reference:?}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
+#[test]
+fn android_offer_listener_rejects_adb_and_passes_udp_gate() {
+    let (state, phone, _legacy) = phone_only_state("android-offer-gate");
+    state.view.lock().unwrap().settings.preferred_transport = "Wifi".into();
+    state.view.lock().unwrap().settings.wireless_protocol = "adb".into();
+    let error = state
+        .set_wireless_connection_offers("203.0.113.9", true, Some(&phone), || {})
+        .err()
+        .unwrap();
+    assert!(error.contains("请先将无线连接方式明确设为 UDP"), "{error}");
+    // With UDP the gate passes; the documentation-range address then fails as before.
+    state.view.lock().unwrap().settings.wireless_protocol = "udp".into();
+    let error = state
+        .set_wireless_connection_offers("203.0.113.9", true, Some(&phone), || {})
+        .err()
+        .unwrap();
+    assert!(error.contains("所选 IPv4 接口已不可用"), "{error}");
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
 #[test]
 fn binding_profile_sidecar_merges_fields_and_skips_unchanged_writes() {
     let data_dir =

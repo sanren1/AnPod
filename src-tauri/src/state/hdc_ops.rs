@@ -76,6 +76,19 @@ pub(crate) fn forget_harmony_binding(data_dir: &Path, reference: &str) -> Result
     Ok(())
 }
 
+pub(crate) const HARMONY_START_REJECTED: &str = "HARMONY_START_REJECTED:";
+
+/// The tablet shows why it refused START (OHAudio could not open that format) on its own screen.
+pub(crate) fn harmony_start_error(error: String) -> String {
+    if error == "AOA P5-C START was rejected."
+        || error == "P5-C receiver did not confirm playback start."
+    {
+        format!("{HARMONY_START_REJECTED}平板拒绝了此档位，详情见平板。")
+    } else {
+        error
+    }
+}
+
 /// Runs pairing and stores material + profile only after both sides confirmed (PairSaved checked).
 pub(crate) fn pair_and_store(
     stream: &mut TcpStream,
@@ -154,6 +167,21 @@ impl AppState {
             .harmony_pairing_code = None;
         let _ = answer.send(accept);
         Ok(self.snapshot())
+    }
+
+    /// PC-side "forget this tablet" (spec 15.5): the next connect pairs afresh and the old
+    /// wireless trust goes with the material. Refused while connecting or playing.
+    pub async fn forget_harmony_binding(&self, reference: &str) -> Result<(), String> {
+        if load_binding_profile(&self.data_dir, reference).platform != "harmony" {
+            return Err("这不是平板配对。".into());
+        }
+        let (generation, _token, _guard) = self
+            .begin_receiver_operation(true)
+            .await
+            .map_err(|_| "请先断开连接，再删除平板配对。".to_string())?;
+        let result = forget_harmony_binding(&self.data_dir, reference);
+        self.finish_operation(generation);
+        result
     }
 
     pub(super) async fn remove_hdc_forward(&self, forward: &HdcForward) -> Result<(), String> {
@@ -349,7 +377,8 @@ impl AppState {
             )
         })
         .await
-        .map_err(|error| format!("hdc record owner failed: {error}"))??;
+        .map_err(|error| format!("hdc record owner failed: {error}"))?
+        .map_err(harmony_start_error)?;
         token_check(token)?;
         // No `content query` health here: HarmonyOS health comes from the stream itself.
         self.finish_record_stream_session(

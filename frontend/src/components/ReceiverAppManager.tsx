@@ -1,7 +1,7 @@
 import { LoaderCircle } from "lucide-react";
 import { strings } from "../strings";
 import type { BindingResetPreview, BindingResetResult, Device, ReceiverPackageCandidate, ReceiverStatus, ReceiverUsbOperation, ReceiverUsbOperationResult, Snapshot } from "../appTypes";
-import { commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
+import { bindingReferenceLabel, commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
 import { BindingReferenceList } from "./BindingReferenceList";
 import { ErrorDetails } from "./Modal";
 
@@ -11,7 +11,7 @@ export function ReceiverAppManager({
   canRequestUsbInstall, canRequestUsbMaintenance, canRequestUsbUpgrade, requestUsbOperation, onRefreshDevices,
   receiverOperationResult, currentVersionLabel, bindings, bindingReference, setBindingReference, onClearErrors,
   bindingResetPreview, bindingResetResult, bindingResetError, bindingResetLoading, bindingResetBusy,
-  previewBindingReset, invalidateBindingReset, confirmBindingReset,
+  previewBindingReset, invalidateBindingReset, confirmBindingReset, tabletBindings, forgetTabletDisabled, onForgetTablet,
 }: {
   snapshot: Snapshot; busy: boolean; candidateLoading: boolean; receiverAction: "checking" | null; receiverError: string;
   serial: string; setSerial: (serial: string) => void; onReceiverSerialChange: (serial: string) => void;
@@ -26,6 +26,7 @@ export function ReceiverAppManager({
   bindingResetLoading: boolean; bindingResetBusy: boolean;
   previewBindingReset: (serial: string, recheck?: boolean) => Promise<void>;
   invalidateBindingReset: () => void; confirmBindingReset: () => Promise<void>;
+  tabletBindings: string[]; forgetTabletDisabled: boolean; onForgetTablet: (reference: string) => void;
 }) {
   return <section className="receiver-manager receiver-usb-card" aria-label={strings.network.receiverUsbManagementLabel}>
     <label className="network-field">{strings.network.authorizedOnlineUsb}
@@ -116,6 +117,12 @@ export function ReceiverAppManager({
           <button className="dialog-secondary" type="button" disabled={busy || !serial} onClick={() => void previewBindingReset(serial, true)}>{strings.network.recheck}</button>
         </div>}
       </section>
+      {tabletBindings.length > 0 && <section className="binding-reset" aria-label={strings.network.forgetTablet}>
+        {tabletBindings.map(reference => <div className="binding-reset-heading" key={reference}>
+          <strong>{bindingReferenceLabel(reference)}</strong>
+          <button className="dialog-secondary" type="button" disabled={forgetTabletDisabled} onClick={() => onForgetTablet(reference)}>{strings.network.forgetTablet}</button>
+        </div>)}
+      </section>}
     </details>
   </section>;
 }

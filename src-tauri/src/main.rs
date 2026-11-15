@@ -327,8 +327,19 @@ async fn receiver_network_interfaces(
 }
 
 #[tauri::command]
-fn receiver_binding_references(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.receiver_binding_references()
+fn receiver_binding_references(
+    state: State<'_, AppState>,
+    usb_direct: Option<bool>,
+) -> Result<Vec<String>, String> {
+    state.receiver_binding_choices(usb_direct.unwrap_or(false))
+}
+
+#[tauri::command]
+async fn forget_harmony_binding(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<(), String> {
+    state.forget_harmony_binding(&reference).await
 }
 
 #[tauri::command]
@@ -665,6 +676,7 @@ fn main() {
             network_interfaces,
             receiver_network_interfaces,
             receiver_binding_references,
+            forget_harmony_binding,
             receiver_binding_reset_preview,
             receiver_reset_binding,
             discover_network_receivers,
