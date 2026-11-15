@@ -10,9 +10,9 @@ namespace {
 constexpr int64_t kHelloTimeoutNanos = 30'000'000'000;   // AoaReceiverCoordinator helloTimeoutMillis
 constexpr int64_t kFinishTimeoutNanos = 3'000'000'000;   // FINISH_TIMEOUT_NANOS
 constexpr int64_t kHeartbeatTimeoutNanos = 5'000'000'000;  // HEARTBEAT_TIMEOUT_NANOS
-// The PC sends a command at least every second (heartbeat), so the terminal ACK normally goes out well
-// within this grace; afterwards the stream is closed without it.
-constexpr int64_t kUserStopGraceNanos = 2'000'000'000;
+// The PC sends a command at least every second (heartbeat), so the terminal ACK normally goes out at once;
+// the grace matches the heartbeat timeout, after which the stream is closed without it.
+constexpr int64_t kUserStopGraceNanos = kHeartbeatTimeoutNanos;
 constexpr uint8_t kResultOk = 0, kResultRejected = 1;
 constexpr uint32_t kVersionCode = 1000000;  // AppScope/app.json5 versionCode
 
@@ -243,7 +243,7 @@ std::string StreamSession::controlLoop() {
                     (state != SessionState::Paused && state != SessionState::ReceiverRunning &&
                      state != SessionState::Streaming))
                     return "invalid RESUME state";
-                if (state == SessionState::Paused) setState(SessionState::ReceiverRunning);
+                setState(SessionState::ReceiverRunning);
                 break;
             case p5c::kHeartbeat: {
                 if (!payload.empty()) return "invalid HEARTBEAT";

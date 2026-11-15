@@ -1,9 +1,13 @@
 // Tablet side of the ANHB bootstrap on the hdc rport stream (peer: host_* in src-tauri/src/hdc_bootstrap.rs).
 // TabletHello{launchToken, hasBinding} -> Proceed (stored binding), or the first-time pairing:
 // PairOffer -> PairNonce, show the 6-digit code -> PairConfirmed from the PC AND a local answerPairing(true)
-// -> BindingStore::save -> PairSaved{commitment} -> Proceed. Any cancel (either side) stores nothing.
+// -> BindingStore::save -> PairSaved{commitment} -> Proceed. Any cancel (either side) stores nothing, and a
+// binding saved in this run is removed again when anything but Proceed follows PairSaved. An Asset Store error
+// on the initial lookup fails the run before TabletHello: reporting hasBinding=0 would make the PC drop its
+// own material (spec section 15.5).
 #pragma once
 
+#include "binding_store.h"
 #include "byte_reader.h"
 #include "pairing_protocol.h"
 
@@ -11,6 +15,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -37,7 +42,11 @@ class TabletBootstrap {
 public:
     static constexpr std::chrono::seconds kTimeout{120};
 
-    TabletBootstrap(ByteStream& stream, Token16 launchToken, Id16 hostId, BootstrapUi ui);
+    using FindBinding = std::function<bool(const Id16&, std::optional<BindingMaterial>&)>;
+
+    // findBinding is a test seam (defaults to BindingStore::find).
+    TabletBootstrap(ByteStream& stream, Token16 launchToken, Id16 hostId, BootstrapUi ui,
+                    FindBinding findBinding = BindingStore::find);
     // Blocks until the outcome; the whole bootstrap (pairing included) is bounded by kTimeout. On Proceed the
     // stream is positioned at the first ANPU record; otherwise it has been closed.
     BootstrapOutcome run();
@@ -49,6 +58,7 @@ private:
     const Token16 token_;
     const Id16 hostId_;
     const BootstrapUi ui_;
+    const FindBinding findBinding_;
     std::mutex mutex_;
     std::condition_variable changed_;
     bool codeShown_ = false;

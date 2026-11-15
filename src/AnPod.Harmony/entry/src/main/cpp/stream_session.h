@@ -61,7 +61,7 @@ public:
     StreamSession& operator=(const StreamSession&) = delete;
 
     // Non-blocking. userInitiated: the ACK of the PC's next command carries RESULT_USER_STOPPED (the PC then
-    // drops its reconnect intent); the stream is closed anyway after kUserStopGrace. Otherwise closes now.
+    // drops its reconnect intent); the stream is closed anyway after the 5 s heartbeat timeout. Otherwise closes now.
     void stop(bool userInitiated);
 
 private:

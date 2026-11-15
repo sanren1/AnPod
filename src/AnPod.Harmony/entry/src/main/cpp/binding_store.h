@@ -12,12 +12,15 @@ namespace anpod {
 
 class BindingStore {
 public:
-    static std::optional<BindingMaterial> find(const Id16& hostId);
+    // false on an Asset Store error (locked, service unavailable...): the caller must not treat that as
+    // "not paired". true with an empty out means no binding is stored for hostId.
+    static bool find(const Id16& hostId, std::optional<BindingMaterial>& out);
     // Adds or overwrites the binding stored for material.hostId().
     static bool save(const BindingMaterial& material);
     // True when the binding is gone afterwards (removed now or never stored).
     static bool remove(const Id16& hostId);
-    static std::vector<Id16> list();
+    // nullopt on an Asset Store error.
+    static std::optional<std::vector<Id16>> list();
 };
 
 }  // namespace anpod

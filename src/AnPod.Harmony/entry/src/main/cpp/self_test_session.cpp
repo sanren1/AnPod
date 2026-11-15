@@ -104,7 +104,8 @@ struct BootstrapRun {
 
     // onCode / onPcConfirmed run on the bootstrap thread and may call answerPairing.
     BootstrapRun(PipeEnd& tablet, PipeEnd& pcEnd, const Id16& hostId, std::function<void(TabletBootstrap&)> onCode,
-                 std::function<void(TabletBootstrap&)> onPcConfirmed)
+                 std::function<void(TabletBootstrap&)> onPcConfirmed,
+                 TabletBootstrap::FindBinding find = BindingStore::find)
         : pc(pcEnd) {
         BootstrapUi ui;
         ui.showCode = [this, onCode](const std::string& c) {
@@ -121,7 +122,7 @@ struct BootstrapRun {
             }
             if (onPcConfirmed) onPcConfirmed(*bootstrap);
         };
-        bootstrap = std::make_unique<TabletBootstrap>(tablet, filled<16>(0x7a), hostId, ui);
+        bootstrap = std::make_unique<TabletBootstrap>(tablet, filled<16>(0x7a), hostId, ui, std::move(find));
         thread = std::thread([this] { outcome.emplace(bootstrap->run()); });
     }
     ~BootstrapRun() {
@@ -167,7 +168,16 @@ bool frameIs(PipeEnd& pc, AnhbKind kind, std::span<const uint8_t> body) {
 
 bool sameBinding(const BindingMaterial& a, const BindingMaterial& b) { return a.encode() == b.encode(); }
 
-bool stored(const Id16& id) { return BindingStore::find(id).has_value(); }
+// A store error counts as "stored" so that it can never make a no-binding assertion pass.
+bool stored(const Id16& id) {
+    std::optional<BindingMaterial> found;
+    return !BindingStore::find(id, found) || found.has_value();
+}
+
+std::optional<BindingMaterial> findOk(const Id16& id) {
+    std::optional<BindingMaterial> found;
+    return BindingStore::find(id, found) ? std::move(found) : std::nullopt;
+}
 
 bool bootstrapWithBindingProceedsWithoutCode() {
     Id16 id = filled<16>(0xb1);
@@ -207,7 +217,7 @@ bool bootstrapPairsOnlyAfterPcConfirmAndLocalAccept() {
         ok = ok && !stored(id) && run.shownCode() == material.pairingCode(pcNonce, *tabletNonce);
         ok = ok && sendAnhb(*pipe.pc, AnhbKind::PairConfirmed) &&
              frameIs(*pipe.pc, AnhbKind::PairSaved, material.commitment());
-        auto saved = BindingStore::find(id);
+        auto saved = findOk(id);
         ok = ok && saved && sameBinding(*saved, material) && sendAnhb(*pipe.pc, AnhbKind::Proceed);
         auto& outcome = run.join();
         auto* proceed = std::get_if<BootstrapProceed>(&outcome);
@@ -238,7 +248,27 @@ bool bootstrapCancelLeavesNoBinding() {
              sendAnhb(*pipe.pc, AnhbKind::PairCancel, user) && ok;
         ok = std::holds_alternative<BootstrapCancelled>(run.join()) && ok && !stored(id);
     }
+    {
+        // Saved and PairSaved sent, then the PC cancels instead of Proceed: the saved binding is removed.
+        Pipe pipe = makePipe();
+        BootstrapRun run(*pipe.tablet, *pipe.pc, id, [](TabletBootstrap& b) { b.answerPairing(true); }, nullptr);
+        ok = helloIs(*pipe.pc, 0) && offer(*pipe.pc, material, filled<16>(4)) &&
+             sendAnhb(*pipe.pc, AnhbKind::PairConfirmed) &&
+             frameIs(*pipe.pc, AnhbKind::PairSaved, material.commitment()) && findOk(id).has_value() &&
+             sendAnhb(*pipe.pc, AnhbKind::PairCancel, user) && ok;
+        ok = std::holds_alternative<BootstrapCancelled>(run.join()) && ok && !stored(id);
+    }
     return ok;
+}
+
+bool bootstrapStoreErrorSendsNoHello() {
+    Pipe pipe = makePipe();
+    BootstrapRun run(*pipe.tablet, *pipe.pc, filled<16>(0xb7), nullptr, nullptr,
+                     [](const Id16&, std::optional<BindingMaterial>&) { return false; });
+    auto& outcome = run.join();
+    auto* failed = std::get_if<BootstrapFailed>(&outcome);
+    // No TabletHello{hasBinding=0}: the stream is closed with nothing written.
+    return failed && failed->message == "binding store unavailable" && !readAnhb(*pipe.pc);
 }
 
 bool bootstrapRejectsOfferForOtherHost() {
@@ -265,12 +295,12 @@ bool bindingStoreSaveFindRemove() {
     BindingMaterial second(id, filled<16>(0x44), filled<32>(0x55));
     auto listed = [&] {
         auto ids = BindingStore::list();
-        return std::find(ids.begin(), ids.end(), id) != ids.end();
+        return ids && std::find(ids->begin(), ids->end(), id) != ids->end();
     };
     bool ok = !stored(id) && !listed() && BindingStore::save(first);
-    auto found = BindingStore::find(id);
-    ok = ok && found && sameBinding(*found, first) && listed() && BindingStore::save(second);
-    found = BindingStore::find(id);  // a second save for the same PC overwrites
+    auto found = findOk(id);
+    ok = ok && BindingStore::list().has_value() && found && sameBinding(*found, first) && listed() && BindingStore::save(second);
+    found = findOk(id);  // a second save for the same PC overwrites
     ok = ok && found && sameBinding(*found, second);
     return BindingStore::remove(id) && ok && !stored(id) && !listed() && BindingStore::remove(id);
 }
@@ -487,6 +517,7 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"bootstrap_pairs_only_after_pc_confirm_and_local_accept", bootstrapPairsOnlyAfterPcConfirmAndLocalAccept},
         {"bootstrap_cancel_leaves_no_binding", bootstrapCancelLeavesNoBinding},
         {"bootstrap_rejects_offer_for_other_host", bootstrapRejectsOfferForOtherHost},
+        {"bootstrap_store_error_sends_no_hello", bootstrapStoreErrorSendsNoHello},
         {"session_user_stop_sends_result_user_stopped", sessionUserStopSendsResultUserStopped},
         {"session_rejects_replayed_command", sessionRejectsReplayedCommand},
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},

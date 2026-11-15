@@ -16,8 +16,9 @@ constexpr uint8_t kCancelUser = 1, kCancelTimeout = 2;
 
 }  // namespace
 
-TabletBootstrap::TabletBootstrap(ByteStream& stream, Token16 launchToken, Id16 hostId, BootstrapUi ui)
-    : stream_(stream), token_(launchToken), hostId_(hostId), ui_(std::move(ui)) {}
+TabletBootstrap::TabletBootstrap(ByteStream& stream, Token16 launchToken, Id16 hostId, BootstrapUi ui,
+                                 FindBinding findBinding)
+    : stream_(stream), token_(launchToken), hostId_(hostId), ui_(std::move(ui)), findBinding_(std::move(findBinding)) {}
 
 void TabletBootstrap::answerPairing(bool accept) {
     {
@@ -30,20 +31,26 @@ void TabletBootstrap::answerPairing(bool accept) {
 
 BootstrapOutcome TabletBootstrap::run() {
     const auto deadline = std::chrono::steady_clock::now() + kTimeout;
-    std::optional<BindingMaterial> saved = BindingStore::find(hostId_);
+    enum class Phase { AwaitFirst, Pairing, AwaitProceed } phase = Phase::AwaitFirst;
 
     // PC frames arrive through one reader thread so a local answer or the deadline can interrupt the wait.
     // It stops after Proceed / PairCancel / a read failure, so it never consumes the ANPU records that follow.
     std::deque<std::optional<AnhbFrame>> frames;
     std::thread reader;
     auto finish = [&](BootstrapOutcome outcome) {
-        if (!std::holds_alternative<BootstrapProceed>(outcome)) stream_.close();
+        if (!std::holds_alternative<BootstrapProceed>(outcome)) {
+            stream_.close();
+            // Saved, but the PC may not have stored its side: leave no half pairing behind.
+            if (phase == Phase::AwaitProceed) BindingStore::remove(hostId_);
+        }
         if (reader.joinable()) reader.join();
         return outcome;
     };
     auto send = [&](AnhbKind kind, std::span<const uint8_t> body) { return stream_.writeAll(encodeAnhb(kind, body)); };
     auto cancel = [&](uint8_t reason) { send(AnhbKind::PairCancel, std::span<const uint8_t>(&reason, 1)); };
 
+    std::optional<BindingMaterial> saved;
+    if (!findBinding_(hostId_, saved)) return finish(BootstrapFailed{"binding store unavailable"});
     uint8_t hello[17];
     std::memcpy(hello, token_.data(), 16);
     hello[16] = saved ? 1 : 0;
@@ -61,7 +68,6 @@ BootstrapOutcome TabletBootstrap::run() {
         }
     });
 
-    enum class Phase { AwaitFirst, Pairing, AwaitProceed } phase = Phase::AwaitFirst;
     std::optional<BindingMaterial> offered;
     bool pcConfirmed = false;
     for (;;) {

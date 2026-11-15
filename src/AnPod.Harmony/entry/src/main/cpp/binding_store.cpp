@@ -55,13 +55,15 @@ Asset_Attr numberAttr(uint32_t tag, uint32_t value) {
 
 }  // namespace
 
-std::optional<BindingMaterial> BindingStore::find(const Id16& hostId) {
+bool BindingStore::find(const Id16& hostId, std::optional<BindingMaterial>& found) {
+    found.reset();
     std::string name = alias(hostId);
     Asset_Attr query[] = {bytesAttr(ASSET_TAG_ALIAS, name.data(), name.size()),
                           numberAttr(ASSET_TAG_RETURN_TYPE, ASSET_RETURN_ALL)};
     Asset_ResultSet results{};
-    if (OH_Asset_Query(query, 2, &results) != ASSET_SUCCESS) return std::nullopt;
-    std::optional<BindingMaterial> found;
+    int32_t rc = OH_Asset_Query(query, 2, &results);
+    if (rc == ASSET_NOT_FOUND) return true;
+    if (rc != ASSET_SUCCESS) return false;
     for (uint32_t i = 0; i < results.count; i++) {
         Asset_Attr* secret = OH_Asset_ParseAttr(&results.results[i], ASSET_TAG_SECRET);
         if (!secret) continue;
@@ -73,7 +75,7 @@ std::optional<BindingMaterial> BindingStore::find(const Id16& hostId) {
         secureZero(blob.data, blob.size);
     }
     OH_Asset_FreeResultSet(&results);
-    return found;
+    return true;
 }
 
 bool BindingStore::save(const BindingMaterial& material) {
@@ -95,11 +97,13 @@ bool BindingStore::remove(const Id16& hostId) {
     return rc == ASSET_SUCCESS || rc == ASSET_NOT_FOUND;
 }
 
-std::vector<Id16> BindingStore::list() {
+std::optional<std::vector<Id16>> BindingStore::list() {
     Asset_Attr query[] = {numberAttr(ASSET_TAG_RETURN_TYPE, ASSET_RETURN_ATTRIBUTES)};
     Asset_ResultSet results{};
     std::vector<Id16> ids;
-    if (OH_Asset_Query(query, 1, &results) != ASSET_SUCCESS) return ids;
+    int32_t rc = OH_Asset_Query(query, 1, &results);
+    if (rc == ASSET_NOT_FOUND) return ids;
+    if (rc != ASSET_SUCCESS) return std::nullopt;
     for (uint32_t i = 0; i < results.count; i++) {
         Asset_Attr* name = OH_Asset_ParseAttr(&results.results[i], ASSET_TAG_ALIAS);
         if (!name) continue;
