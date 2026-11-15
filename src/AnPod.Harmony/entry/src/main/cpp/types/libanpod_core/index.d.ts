@@ -1,2 +1,2 @@
-// Task 1 probe: port 0 skips the rport connect test.
-export const probe: (port: number) => string;
+// Runs the native self-tests; returns the names of failing cases (empty = all pass).
+export const selfTest: () => string[];
