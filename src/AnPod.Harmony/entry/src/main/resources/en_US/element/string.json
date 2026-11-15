@@ -113,8 +113,8 @@
       "value": "PC · %s"
     },
     {
-      "name": "pc_available",
-      "value": "Available"
+      "name": "pc_paired",
+      "value": "Paired"
     },
     {
       "name": "error_discovery_unavailable",

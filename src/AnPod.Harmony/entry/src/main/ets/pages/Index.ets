@@ -155,7 +155,7 @@ struct Index {
   // Real state of one paired PC: only the session's own peer is ever connecting, reconnecting or connected.
   hostState(id: string): ResourceStr {
     if (id !== this.activeHost) {
-      return this.live() ? '' : $r('app.string.pc_available');
+      return this.live() ? '' : $r('app.string.pc_paired');
     }
     switch (this.coreState) {
       case 'searching':
@@ -169,7 +169,7 @@ struct Index {
       case 'paused':
         return $r('app.string.state_connected');
       default:
-        return $r('app.string.pc_available');
+        return $r('app.string.pc_paired');
     }
   }
 

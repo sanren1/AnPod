@@ -23,6 +23,9 @@ namespace anpod {
 
 using PlaybackStats = p5c::ProgressBase;
 
+// Start of the end message when START cannot open the audio output: terminal, waiting cannot fix it.
+inline constexpr char kOutputOpenError[] = "audio output cannot open ";
+
 class PlaybackSink {
 public:
     virtual ~PlaybackSink() = default;

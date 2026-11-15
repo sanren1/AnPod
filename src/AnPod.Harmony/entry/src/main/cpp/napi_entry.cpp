@@ -19,6 +19,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,6 +30,8 @@
 
 namespace anpod {
 std::vector<std::string> runSelfTests();
+bool selfTestWirelessPeer(const BindingMaterial& binding, const std::function<void(int)>& deliver,
+                          const std::function<void()>& ready, int command, uint32_t& capabilities, int& result);
 }
 
 namespace {
@@ -249,33 +253,26 @@ std::mutex wirelessOwner;
 
 std::string toHex(const Id16& id);
 
-std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<Id16>& selected) {
+// The session loop of a wireless run: `accept(timeoutMs)` yields the next connection (< 0 when none), `alive()`
+// whether discovery still runs. Returns the run's terminal error, "" on a local stop.
+std::string serveWireless(const std::shared_ptr<Run>& run, std::optional<Id16> selected,
+                          std::optional<Nonce16> intent, const std::function<int(int)>& accept,
+                          const std::function<bool()>& alive) {
     using Clock = std::chrono::steady_clock;
-    std::unique_lock owner(wirelessOwner);
-    if (run->stopRequested) return {};
-    auto ids = BindingStore::list();
-    if (!ids) return "binding store unavailable";
-    if (ids->empty()) return {};  // nothing to listen for: the page shows that no PC is paired
-    auto listener = WirelessListener::open();
-    WirelessDiscovery discovery;
-    if (!listener || !discovery.start(listener->port())) return "wireless discovery unavailable";
-    std::optional<Nonce16> intent;
     const auto deadline = Clock::now() + std::chrono::seconds(10);
-    if (selected) {
-        secureRandom(intent.emplace());
-        if (!discovery.request(*selected, *intent)) return "wireless discovery send failed";
-    }
-    emitState(run, selected ? "searching" : "listening");
     bool established = false;
     std::optional<Clock::time_point> reconnectUntil;
     while (!run->stopRequested) {
-        if (!discovery.running()) return "wireless discovery unavailable";
+        if (!alive()) return "wireless discovery unavailable";
         if (selected && !established && Clock::now() >= deadline) return "paired PC did not respond";
         if (reconnectUntil && Clock::now() >= *reconnectUntil) {
+            // The PC gave up: stop showing reconnecting, release the continuous task, and the intent is spent.
             reconnectUntil.reset();
-            emitState(run, "listening");  // the PC gave up: stop showing reconnecting, release the continuous task
+            selected.reset();
+            intent.reset();
+            emitState(run, "listening");
         }
-        int fd = listener->accept(150);
+        int fd = accept(150);
         if (fd < 0) continue;
         auto host = wirelessHelloHost(fd);
         std::optional<BindingMaterial> binding;
@@ -311,15 +308,44 @@ std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<
         auto error = run->endMessage;
         lock.unlock();
         session.reset();
-        if (run->stopRequested || error.empty()) return {};
+        if (run->stopRequested) return {};
+        if (error.empty()) {
+            // The PC stopped (a manual disconnect, or the stop before a quality / mode change reconnect): keep
+            // listening like Java's standby, but the old intent is spent (spec section 9).
+            selected.reset();
+            intent.reset();
+            reconnectUntil.reset();
+            emitState(run, "listening");
+            continue;
+        }
         if (run->sessionState < static_cast<int>(SessionState::Authenticated)) continue;  // UI never left waiting
         established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
-        if (error.find("output") != std::string::npos || error.find("low latency") != std::string::npos) return error;
+        if (error.starts_with(kOutputOpenError)) return error;
         // After an unexpected drop the PC reconnects the way it was connected; before that, keep waiting.
         if (established) reconnectUntil = Clock::now() + std::chrono::seconds(30);
         emitState(run, established ? "reconnecting" : selected ? "searching" : "listening");
     }
     return {};
+}
+
+std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<Id16>& selected) {
+    std::unique_lock owner(wirelessOwner);
+    if (run->stopRequested) return {};
+    auto ids = BindingStore::list();
+    if (!ids) return "binding store unavailable";
+    if (ids->empty()) return {};  // nothing to listen for: the page shows that no PC is paired
+    auto listener = WirelessListener::open();
+    WirelessDiscovery discovery;
+    if (!listener || !discovery.start(listener->port())) return "wireless discovery unavailable";
+    std::optional<Nonce16> intent;
+    if (selected) {
+        secureRandom(intent.emplace());
+        if (!discovery.request(*selected, *intent)) return "wireless discovery send failed";
+    }
+    emitState(run, selected ? "searching" : "listening");
+    return serveWireless(
+        run, selected, intent, [&](int timeoutMs) { return listener->accept(timeoutMs); },
+        [&] { return discovery.running(); });
 }
 
 void runWireless(std::shared_ptr<Run> run, std::optional<Id16> selected) {
@@ -387,19 +413,23 @@ napi_value stringArray(napi_env env, const std::vector<std::string>& items) {
 
 // waitMs > 0: blocks until the run ended (a user stop ends after the ACK carrying USER_STOPPED was written)
 // or the time is up.
+void stopRun(const std::shared_ptr<Run>& run, bool userInitiated, int waitMs = 0) {
+    std::unique_lock<std::mutex> lock(run->mutex);
+    run->stopRequested = true;
+    run->userStop = run->userStop || userInitiated;
+    // A user stop stays one when the run is then replaced: the PC still gets USER_STOPPED with its next command.
+    if (run->session) run->session->stop(run->userStop);
+    else if (run->stream) run->stream->close();
+    if (waitMs > 0) run->ended.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return run->finished; });
+}
+
 void stopCurrent(bool userInitiated, int waitMs = 0) {
     std::shared_ptr<Run> run;
     {
         std::lock_guard<std::mutex> lock(gMutex);
         run = gRun;
     }
-    if (!run) return;
-    std::unique_lock<std::mutex> lock(run->mutex);
-    run->stopRequested = true;
-    run->userStop = run->userStop || userInitiated;
-    if (run->session) run->session->stop(userInitiated);
-    else if (run->stream) run->stream->close();
-    if (waitMs > 0) run->ended.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return run->finished; });
+    if (run) stopRun(run, userInitiated, waitMs);
 }
 
 // ---- exports ---------------------------------------------------------------------------------------------
@@ -507,7 +537,102 @@ napi_value ForgetBinding(napi_env env, napi_callback_info info) {
     return out;
 }
 
-napi_value SelfTest(napi_env env, napi_callback_info) { return stringArray(env, runSelfTests()); }
+// ---- run-loop self-tests: serveWireless against simulated PCs over loopback TCP ----------------------------
+
+struct LoopTest {
+    static BindingMaterial testBinding() {
+        Id16 host, receiver;
+        Key32 secret;
+        host.fill(0xc5);
+        receiver.fill(0xc6);
+        secret.fill(0xc7);
+        return {host, receiver, secret};
+    }
+
+    BindingMaterial binding = testBinding();
+    std::shared_ptr<Run> run = std::make_shared<Run>();  // never gRun: its events go nowhere
+    std::mutex mutex;
+    std::deque<int> pending;
+    std::string error = "running";
+    std::thread loop;
+
+    explicit LoopTest(std::optional<Nonce16> intent) {
+        BindingStore::remove(binding.hostId());
+        if (!BindingStore::save(binding)) return;
+        std::optional<Id16> selected;
+        if (intent) selected = binding.hostId();
+        loop = std::thread([this, selected, intent] {
+            error = serveWireless(
+                run, selected, intent,
+                [this](int timeoutMs) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (!pending.empty()) {
+                            int fd = pending.front();
+                            pending.pop_front();
+                            return fd;
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(std::min(timeoutMs, 20)));
+                    return -1;
+                },
+                [] { return true; });
+        });
+    }
+    // One PC session; false when it never authenticated.
+    bool peer(int command, uint32_t& capabilities, int& result, const std::function<void()>& ready = [] {}) {
+        return loop.joinable() && selfTestWirelessPeer(
+                                      binding,
+                                      [this](int fd) {
+                                          std::lock_guard<std::mutex> lock(mutex);
+                                          pending.push_back(fd);
+                                      },
+                                      ready, command, capabilities, result);
+    }
+    // Stops the run like the UI does and returns the loop's end error.
+    std::string finish() {
+        stopRun(run, false);
+        if (loop.joinable()) loop.join();
+        for (int fd : pending) close(fd);
+        BindingStore::remove(binding.hostId());
+        return error;
+    }
+};
+
+// R-M2-4: a PC STOP (manual disconnect, or the stop before a quality / mode change reconnect) ends only that
+// session. The run keeps listening, and the tablet-selected intent is spent: the next session offers none.
+bool wirelessPcStopKeepsListening() {
+    Nonce16 intent;
+    intent.fill(0x5a);
+    LoopTest test(intent);
+    uint32_t first = 0, second = 0;
+    int stopped = -1, none = -1;
+    bool ok = test.peer(p5c::kStop, first, stopped) && test.peer(-1, second, none);
+    std::string error = test.finish();
+    return ok && stopped == 0 && (first & p5c::kCapConnectionIntent) && !(second & p5c::kCapConnectionIntent) &&
+           error.empty();
+}
+
+// Switching wired -> wireless stops the old run as a user stop, then replaceRun stops it again as a replacement:
+// the PC must still get USER_STOPPED with its next command, or it reconnects the old way.
+bool replacedUserStopStillSendsUserStopped() {
+    LoopTest test(std::nullopt);
+    uint32_t capabilities = 0;
+    int result = -1;
+    bool ok = test.peer(p5c::kHeartbeat, capabilities, result, [&] {
+        stopRun(test.run, true);
+        stopRun(test.run, false);
+    });
+    test.finish();
+    return ok && result == p5c::kResultUserStopped;
+}
+
+napi_value SelfTest(napi_env env, napi_callback_info) {
+    auto failures = runSelfTests();
+    if (!wirelessPcStopKeepsListening()) failures.emplace_back("wireless_pc_stop_keeps_listening");
+    if (!replacedUserStopStillSendsUserStopped()) failures.emplace_back("replaced_user_stop_still_sends_user_stopped");
+    return stringArray(env, failures);
+}
 
 // ---- selfTestLoopback (Task 9) ---------------------------------------------------------------------------
 

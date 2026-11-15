@@ -113,8 +113,8 @@
       "value": "电脑 · %s"
     },
     {
-      "name": "pc_available",
-      "value": "可连接"
+      "name": "pc_paired",
+      "value": "已配对"
     },
     {
       "name": "error_discovery_unavailable",

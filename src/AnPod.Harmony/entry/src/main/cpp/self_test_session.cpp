@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 // Task 4 self-tests: TabletBootstrap and StreamSession against a simulated PC over an in-memory duplex pipe,
 // and BindingStore against the real Asset Store of the device. The simulated PC follows host_pair /
@@ -23,6 +24,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -593,9 +595,15 @@ std::optional<WirelessPair> wirelessPair() {
     std::optional<WirelessPair> pair;
     if (listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&address), size) == 0 &&
         ::listen(listener, 1) == 0 && ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0) {
-        auto pc = SocketStream::connectLoopback(ntohs(address.sin_port));
-        int tablet = pc ? ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC) : -1;
-        if (tablet >= 0) pair = WirelessPair{std::move(pc), tablet};
+        int pc = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // A tablet end nobody serves fails the test instead of hanging it.
+        timeval timeout{5, 0};
+        int tablet = pc >= 0 && ::setsockopt(pc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) == 0 &&
+                             ::connect(pc, reinterpret_cast<sockaddr*>(&address), size) == 0
+                         ? ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC)
+                         : -1;
+        if (tablet >= 0) pair = WirelessPair{std::make_unique<SocketStream>(pc), tablet};
+        else if (pc >= 0) ::close(pc);
     }
     if (listener >= 0) ::close(listener);
     return pair;
@@ -787,10 +795,14 @@ bool sessionReportsLowLatencyUnsupported() {
     const uint8_t zeroPort[2] = {0, 0};
     const uint8_t mode[1] = {format.mode};
     bool ok = host.capabilities().size() == 20 && host.exchange(p5c::kBind, zeroPort).size() == 13 &&
-              host.exchange(p5c::kSelectMode, mode).size() == 13 && host.exchange(p5c::kStart).empty();
+              host.exchange(p5c::kSelectMode, mode).size() == 13;
+    // Like Java, START is answered with RESULT_FAILED before the session ends, so the PC reports a START
+    // failure instead of a dropped connection.
+    Bytes start = ok ? host.exchange(p5c::kStart) : Bytes{};
     auto message = ended.wait();
     const char* expected = "audio output cannot open 48000 Hz Float32 2ch fast: low latency unsupported";
-    return ok && message && *message == expected && sink.closes == 0;
+    return ok && start.size() == 13 && start[9] == 2 && message && *message == expected && sink.closes == 0 &&
+           !readAnpu(pc);
 }
 
 bool wirelessHelloSelectsHostWithoutConsumingBytes() {
@@ -842,6 +854,29 @@ bool sessionRejectsNonFloat32Profile() {
 }
 
 }  // namespace
+
+// PC half of one wireless session for the run-loop tests in napi_entry.cpp: hands the tablet end of a fresh
+// loopback connection to `deliver`, authenticates on `binding`, reads the capabilities, calls `ready`, then sends
+// `command` (when >= 0) and reports its ACK result (-1 when none came).
+bool selfTestWirelessPeer(const BindingMaterial& binding, const std::function<void(int)>& deliver,
+                          const std::function<void()>& ready, int command, uint32_t& capabilities, int& result) {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    deliver(pair->tabletFd);
+    Host host{*pair->pc};
+    host.wireless = true;
+    if (!host.handshake(binding, *AudioFormatV2::forProfile(5, 0))) return false;
+    Bytes info = host.capabilities();
+    if (info.size() != 20) return false;
+    capabilities = capabilityBits(info);
+    ready();
+    result = -1;
+    if (command >= 0) {
+        Bytes ack = host.exchange(static_cast<uint8_t>(command));
+        if (ack.size() == 13) result = ack[9];
+    }
+    return true;
+}
 
 void runSessionSelfTests(std::vector<std::string>& failures) {
     struct Case {

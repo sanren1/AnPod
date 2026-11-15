@@ -19,7 +19,7 @@ constexpr int64_t kHeartbeatTimeoutNanos = 5'000'000'000;  // HEARTBEAT_TIMEOUT_
 // The PC sends a command at least every second (heartbeat), so the terminal ACK normally goes out at once;
 // the grace matches the heartbeat timeout, after which the stream is closed without it.
 constexpr int64_t kUserStopGraceNanos = kHeartbeatTimeoutNanos;
-constexpr uint8_t kResultOk = 0, kResultRejected = 1;
+constexpr uint8_t kResultOk = 0, kResultRejected = 1, kResultFailed = 2;
 constexpr uint32_t kVersionCode = 1000000;  // AppScope/app.json5 versionCode
 
 int64_t nowNanos() {
@@ -278,6 +278,7 @@ std::string StreamSession::controlLoop() {
         uint8_t result = kResultOk;
         uint16_t responsePort = 0;
         bool terminate = false;
+        std::string endError;  // the end message after a terminal ACK ("" for STOP)
         if (userStopRequested_) {
             result = p5c::kResultUserStopped;
             setState(SessionState::Stopped);
@@ -322,10 +323,14 @@ std::string StreamSession::controlLoop() {
                                                });
                 if (!ingress_) return "audio ingress refused the negotiated format";
                 if (!sink_.open(format_)) {
+                    // Answered RESULT_FAILED like Java, so the PC reports a START failure, then the session ends.
                     std::string reason = sink_.failureReason();
-                    return "audio output cannot open " + std::to_string(format_.sampleRate) + " Hz Float32 " +
-                           std::to_string(format_.channels) + "ch " + (format_.mode == 1 ? "fast" : "normal") +
-                           (reason.empty() ? "" : ": " + reason);
+                    endError = kOutputOpenError + std::to_string(format_.sampleRate) + " Hz Float32 " +
+                               std::to_string(format_.channels) + "ch " + (format_.mode == 1 ? "fast" : "normal") +
+                               (reason.empty() ? "" : ": " + reason);
+                    result = kResultFailed;
+                    terminate = true;
+                    break;
                 }
                 playbackStarted = true;
                 if (wireless) udpThread_ = std::thread([this] { receiveUdp(); });
@@ -389,7 +394,7 @@ std::string StreamSession::controlLoop() {
                                 p5c::ackPayload(command->type, command->sequence, result,
                                                 static_cast<uint8_t>(state), responsePort, extra));
         if (!writeRecord(AnpuType::Control, ack)) return "control write failed";
-        if (terminate) return "";
+        if (terminate) return endError;
     }
 }
 
