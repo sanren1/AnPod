@@ -9,6 +9,8 @@ mod aoa_winusb;
 mod applog;
 mod audio;
 mod hdc;
+#[allow(dead_code)] // wired in by the hdc connect path (Task 7)
+mod hdc_bootstrap;
 mod receiver;
 mod startup;
 mod state;

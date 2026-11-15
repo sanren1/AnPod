@@ -1733,6 +1733,7 @@ fn binding_profile_sidecar_merges_fields_and_skips_unchanged_writes() {
     assert_eq!(
         load_binding_profile(&data_dir, &reference),
         BindingProfile {
+            platform: "android".into(),
             model: Some("Pixel 8".into()),
             version_code: Some(50)
         }

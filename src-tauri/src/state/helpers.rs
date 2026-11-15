@@ -344,13 +344,29 @@ pub(crate) fn binding_store_path(data_dir: &Path, reference: &str) -> Result<Pat
 
 /// Phone model and last confirmed Receiver version for one binding. Stored as plain JSON
 /// beside the DPAPI key file; it holds no secret and is not part of diagnostics exports.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BindingProfile {
+    #[serde(default = "android_platform")]
+    pub platform: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_code: Option<u32>,
+}
+
+fn android_platform() -> String {
+    "android".into()
+}
+
+impl Default for BindingProfile {
+    fn default() -> Self {
+        Self {
+            platform: android_platform(),
+            model: None,
+            version_code: None,
+        }
+    }
 }
 
 pub(crate) fn load_binding_profile(data_dir: &Path, reference: &str) -> BindingProfile {

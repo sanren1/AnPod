@@ -165,6 +165,30 @@ impl BindingMaterial {
         Sha256::digest(&record.0).into()
     }
 
+    /// Six-digit code both screens show during HarmonyOS pairing. Uses the raw secret.
+    pub(crate) fn pairing_code(&self, pc_nonce: &[u8; 16], tablet_nonce: &[u8; 16]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("HMAC accepts any key");
+        mac.update(b"AnPod Harmony pairing code v1");
+        mac.update(pc_nonce);
+        mac.update(tablet_nonce);
+        let tag = mac.finalize().into_bytes();
+        let value = u32::from_be_bytes([tag[0], tag[1], tag[2], tag[3]]) % 1_000_000;
+        format!("{value:06}")
+    }
+
+    /// Binding-store reference for a HarmonyOS device; never equals the Android one for the same key.
+    pub(crate) fn harmony_binding_reference(connect_key: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"AnPod receiver binding reference v1\0");
+        digest.update(connect_key.as_bytes());
+        digest.update(b"\0harmony");
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// Copy of the binding secret, for authenticated discovery MACs only.
     pub(crate) fn discovery_secret(&self) -> [u8; 32] {
         self.secret

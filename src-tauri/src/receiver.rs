@@ -1034,7 +1034,7 @@ async fn adb_binding_material_with(
 }
 
 #[cfg(windows)]
-fn binding_reference_for(serial: &str, android_user: &str) -> String {
+pub(crate) fn binding_reference_for(serial: &str, android_user: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"AnPod receiver binding reference v1\0");
     digest.update(serial.as_bytes());
