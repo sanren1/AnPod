@@ -1,0 +1,9 @@
+{
+  "color": [
+    { "name": "start_window_background", "value": "#000000" },
+    { "name": "status_ok", "value": "#3CCB7F" },
+    { "name": "status_error", "value": "#F26B55" },
+    { "name": "status_idle", "value": "#99FFFFFF" },
+    { "name": "card_bg", "value": "#202224" }
+  ]
+}

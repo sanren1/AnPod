@@ -1,7 +1,92 @@
 {
   "string": [
-    { "name": "module_desc", "value": "AnPod receiver" },
-    { "name": "EntryAbility_desc", "value": "AnPod receiver" },
-    { "name": "EntryAbility_label", "value": "AnPod" }
+    {
+      "name": "module_desc",
+      "value": "AnPod receiver"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "AnPod receiver"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "AnPod"
+    },
+    {
+      "name": "tab_wired",
+      "value": "Wired"
+    },
+    {
+      "name": "state_idle",
+      "value": "Waiting for PC"
+    },
+    {
+      "name": "state_connecting",
+      "value": "Connecting"
+    },
+    {
+      "name": "state_pairing",
+      "value": "Pairing"
+    },
+    {
+      "name": "state_connected",
+      "value": "Connected"
+    },
+    {
+      "name": "state_playing",
+      "value": "Playing"
+    },
+    {
+      "name": "state_paused",
+      "value": "Paused"
+    },
+    {
+      "name": "state_failed",
+      "value": "Connection failed"
+    },
+    {
+      "name": "disconnect",
+      "value": "Disconnect"
+    },
+    {
+      "name": "settings",
+      "value": "Settings"
+    },
+    {
+      "name": "pairing_title",
+      "value": "Pairing code"
+    },
+    {
+      "name": "pairing_wait_pc",
+      "value": "Confirm on the PC first"
+    },
+    {
+      "name": "confirm",
+      "value": "Confirm"
+    },
+    {
+      "name": "cancel",
+      "value": "Cancel"
+    },
+    {
+      "name": "back",
+      "value": "Back"
+    },
+    {
+      "name": "paired_pcs",
+      "value": "Paired PCs"
+    },
+    {
+      "name": "no_paired_pcs",
+      "value": "No paired PCs"
+    },
+    {
+      "name": "forget",
+      "value": "Forget"
+    },
+    {
+      "name": "store_unavailable",
+      "value": "Paired PCs unavailable"
+    }
   ]
 }

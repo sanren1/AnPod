@@ -1,0 +1,92 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "AnPod 接收端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "AnPod 接收端"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "AnPod"
+    },
+    {
+      "name": "tab_wired",
+      "value": "有线"
+    },
+    {
+      "name": "state_idle",
+      "value": "等待电脑连接"
+    },
+    {
+      "name": "state_connecting",
+      "value": "正在连接"
+    },
+    {
+      "name": "state_pairing",
+      "value": "正在配对"
+    },
+    {
+      "name": "state_connected",
+      "value": "已连接"
+    },
+    {
+      "name": "state_playing",
+      "value": "正在播放"
+    },
+    {
+      "name": "state_paused",
+      "value": "已暂停"
+    },
+    {
+      "name": "state_failed",
+      "value": "连接失败"
+    },
+    {
+      "name": "disconnect",
+      "value": "断开"
+    },
+    {
+      "name": "settings",
+      "value": "设置"
+    },
+    {
+      "name": "pairing_title",
+      "value": "配对码"
+    },
+    {
+      "name": "pairing_wait_pc",
+      "value": "请先在电脑上确认"
+    },
+    {
+      "name": "confirm",
+      "value": "确认"
+    },
+    {
+      "name": "cancel",
+      "value": "取消"
+    },
+    {
+      "name": "back",
+      "value": "返回"
+    },
+    {
+      "name": "paired_pcs",
+      "value": "已配对的电脑"
+    },
+    {
+      "name": "no_paired_pcs",
+      "value": "没有已配对的电脑"
+    },
+    {
+      "name": "forget",
+      "value": "忘记"
+    },
+    {
+      "name": "store_unavailable",
+      "value": "无法读取已配对的电脑"
+    }
+  ]
+}
