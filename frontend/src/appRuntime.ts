@@ -41,6 +41,8 @@ export const rememberBindingModels = (profiles: Record<string, { model?: string 
   bindingModels.clear();
   for (const [reference, profile] of Object.entries(profiles)) if (profile.model) bindingModels.set(reference, profile.model);
 };
+export const bindingWirelessProtocol = (saved: Snapshot["settings"]["wirelessProtocol"], profiles: Record<string, { platform?: string }>, reference: string | null | undefined) =>
+  reference && profiles[reference]?.platform === "harmony" ? "udp" : saved;
 export const bindingLabel = (reference: string | null | undefined) => (reference && bindingModels.get(reference)) || strings.connection.pairedReceiver;
 export const bindingReferenceLabel = (reference: string | null | undefined) => !reference ? strings.connection.pairedReceiver
   : bindingModels.has(reference) ? `${bindingModels.get(reference)} · ${reference.slice(0, 8)}` : strings.connection.pairedReceiverWithReference(reference);

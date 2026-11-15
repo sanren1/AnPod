@@ -54,7 +54,7 @@ export function useMainAction({ active, apply, cancelNetworkStart, cancelOperati
     if (!snapshot) return;
     if (working || snapshot.busy || cleanupPending || receiverOperationBusy) return;
     if (output === "phone" && snapshot.state === "managementOnly") return;
-    if (output === "phone" && !active && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
+    if (output === "phone" && !active && wirelessUdpMode) {
       openNetworkDialog(); return;
     }
     if (output === "phone" && !active && !selected) {
@@ -125,7 +125,7 @@ export function useMainAction({ active, apply, cancelNetworkStart, cancelOperati
 
   const connectOnly = async () => {
     if (!snapshot) return;
-    if (snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "udp") {
+    if (wirelessUdpMode) {
       openNetworkDialog(); return;
     }
     if (!selected?.connectable) return;

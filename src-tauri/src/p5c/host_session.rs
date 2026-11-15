@@ -264,6 +264,9 @@ impl HostSession {
         cancellation: CancellationToken,
     ) -> Result<Self, String> {
         let HostAudioProfile::AudioV2(format) = profile else {
+            if endpoint.harmony {
+                return Err("鸿蒙无线播放需要 HiFi 或 Hi-Res。".into());
+            }
             return Self::authenticate_on_network(
                 endpoint,
                 binding.duplicate_for_session(),
@@ -284,33 +287,34 @@ impl HostSession {
             );
         }
 
-        let mut probe = Self::authenticate_on_network(
-            endpoint,
-            binding.duplicate_for_session(),
-            AudioParameters {
-                sample_rate: 48_000,
-                channels: 2,
-                mode: format.mode,
-            },
-            cancellation.clone(),
-        )?;
-        probe.negotiate_capabilities_probe()?;
-        let supports_v2 = probe.capabilities().is_some_and(|capabilities| {
-            capabilities.compatible && capabilities.capability_bits & CAP_AUDIO_V2 != 0
-        });
-        let close_result = probe.close_probe_after_peer_eof();
-        if let Err(error) = close_result {
-            probe.close_local();
-            return Err(error);
-        }
-        if !supports_v2 {
-            return Err(if format.profile >= 4 {
-                crate::receiver::receiver_update_required(" Receiver does not advertise authenticated Float32 audio; update the Receiver or select Standard.")
-            } else {
-                "Receiver does not support authenticated PCM24 audio; update the Receiver or select Standard.".into()
+        if !endpoint.harmony {
+            let mut probe = Self::authenticate_on_network(
+                endpoint,
+                binding.duplicate_for_session(),
+                AudioParameters {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    mode: format.mode,
+                },
+                cancellation.clone(),
+            )?;
+            probe.negotiate_capabilities_probe()?;
+            let supports_v2 = probe.capabilities().is_some_and(|capabilities| {
+                capabilities.compatible && capabilities.capability_bits & CAP_AUDIO_V2 != 0
             });
+            let close_result = probe.close_probe_after_peer_eof();
+            if let Err(error) = close_result {
+                probe.close_local();
+                return Err(error);
+            }
+            if !supports_v2 {
+                return Err(if format.profile >= 4 {
+                    crate::receiver::receiver_update_required(" Receiver does not advertise authenticated Float32 audio; update the Receiver or select Standard.")
+                } else {
+                    "Receiver does not support authenticated PCM24 audio; update the Receiver or select Standard.".into()
+                });
+            }
         }
-
         let queue = initial_float_queue
             .take()
             .unwrap_or_else(|| Arc::new(FloatPcmQueue::new(format.mode == 1)));

@@ -1712,6 +1712,27 @@ fn receiver_reset_preflight_rejects_pending_or_failed_phone_state_before_stop() 
 }
 
 #[test]
+fn harmony_wireless_prefers_udp_only_for_its_saved_binding() {
+    let dir = std::env::temp_dir().join(format!("anpod-wireless-profile-{}", std::process::id()));
+    fs::create_dir_all(dir.join("receiver-bindings")).unwrap();
+    let tablet = "a".repeat(64);
+    let android = "b".repeat(64);
+    update_binding_profile(&dir, &tablet, |p| p.platform = "harmony".into()).unwrap();
+    fs::write(
+        binding_store_path(&dir, &android)
+            .unwrap()
+            .with_extension("json"),
+        "{}",
+    )
+    .unwrap();
+    assert!(binding_uses_udp(&dir, "adb", Some(&tablet)));
+    assert!(!binding_uses_udp(&dir, "adb", Some(&android)));
+    assert!(!binding_uses_udp(&dir, "adb", None));
+    assert!(binding_uses_udp(&dir, "udp", Some(&android)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn binding_profile_sidecar_merges_fields_and_skips_unchanged_writes() {
     let data_dir =
         std::env::temp_dir().join(format!("anpod-binding-profile-{}", std::process::id()));

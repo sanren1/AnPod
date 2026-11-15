@@ -227,7 +227,7 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
       }
       const local = choice.availableInterfaces.find(value => value.address === choices.localAddress);
       const candidates = (await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress: choices.localAddress }))
-        .filter(candidate => endpointFitsInterface(candidate.endpoint, local));
+        .filter(candidate => (!candidate.bindingReference || candidate.bindingReference === choices.bindingReference) && endpointFitsInterface(candidate.endpoint, local));
       if (candidates.length !== 1) {
         openNetworkDialog(true, choices, true);
         return;
@@ -364,7 +364,7 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
       try {
         const local = choice.availableInterfaces.find(value => value.address === choice.selectedAddress);
         candidates = (await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress: choice.selectedAddress }))
-          .filter(candidate => endpointFitsInterface(candidate.endpoint, local));
+          .filter(candidate => (!candidate.bindingReference || candidate.bindingReference === choice.selectedBinding) && endpointFitsInterface(candidate.endpoint, local));
       } catch (error) {
         if (generation !== mainListenerGenerationRef.current) return;
         openNetworkDialog(true, { localAddress: choice.selectedAddress, bindingReference: choice.selectedBinding }, true);

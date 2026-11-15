@@ -138,6 +138,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SessionEndpoint {
+    harmony: bool,
     interface_index: u32,
     local_address: Ipv4Addr,
     prefix_length: u8,
@@ -156,6 +157,7 @@ impl SessionEndpoint {
             peer,
             connection_intent: None,
             background_request_id: None,
+            harmony: false,
             background_authorization_required: false,
         }
     }
@@ -168,6 +170,7 @@ impl SessionEndpoint {
             peer,
             connection_intent: None,
             background_request_id: None,
+            harmony: false,
             background_authorization_required: false,
         }
     }

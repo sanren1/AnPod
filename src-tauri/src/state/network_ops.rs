@@ -189,6 +189,7 @@ impl AppState {
                 binding,
                 parameters,
                 profile,
+                load_binding_profile(&self.data_dir, &binding_ref).platform == "harmony",
                 initial_float_queue,
                 token.clone(),
                 connection_intent,

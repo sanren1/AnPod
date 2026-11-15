@@ -61,7 +61,7 @@ impl AppState {
         if self.session.lock().await.is_some() {
             return;
         }
-        {
+        let protocol = {
             let view = self
                 .view
                 .lock()
@@ -69,12 +69,13 @@ impl AppState {
             if view.is_busy()
                 || view.session_active
                 || selected_connection_transport(&view.settings.preferred_transport) != "wireless"
-                || view.settings.wireless_protocol != "udp"
             {
                 return;
             }
-        }
-        let bindings = self.discovery_bindings();
+            view.settings.wireless_protocol.clone()
+        };
+        let mut bindings = self.discovery_bindings();
+        bindings.retain(|b| binding_uses_udp(&self.data_dir, &protocol, Some(&b.reference)));
         if bindings.is_empty() {
             return;
         }
@@ -92,6 +93,7 @@ impl AppState {
                 .due(now)
                 .into_iter()
                 .map(|(reference, _)| reference)
+                .filter(|r| bindings.iter().any(|b| &b.reference == r))
                 .collect()
         };
         if due.is_empty() {
@@ -452,8 +454,14 @@ impl AppState {
                 view.is_busy(),
             )
         };
+        let references = self.receiver_binding_references()?;
+        let binding = automatic_reception_binding(&references, selected_binding)?;
         if !settings.preferred_transport.eq_ignore_ascii_case("wifi")
-            || settings.wireless_protocol != "udp"
+            || !binding_uses_udp(
+                &self.data_dir,
+                &settings.wireless_protocol,
+                binding.as_deref(),
+            )
         {
             return Err("请先将无线连接方式明确设为 UDP，再允许 Receiver 发起连接请求。".into());
         }
@@ -471,8 +479,6 @@ impl AppState {
         {
             return Err("连接操作尚未结束；请稍后再允许手机连接。".into());
         }
-        let references = self.receiver_binding_references()?;
-        let binding = automatic_reception_binding(&references, selected_binding)?;
         let interface =
             interface.ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
         let mut listener = self
@@ -482,13 +488,10 @@ impl AppState {
         if let Some(current) = listener.as_ref() {
             let snapshot = current.snapshot();
             if snapshot.active
+                && current.automatic_binding == binding
                 && snapshot.interface_address == Some(interface.address)
                 && snapshot.interface_prefix_length == Some(interface.prefix_length)
             {
-                listener
-                    .as_mut()
-                    .expect("current listener")
-                    .automatic_binding = binding;
                 return Ok(snapshot);
             }
             listener.take();
@@ -562,7 +565,11 @@ impl AppState {
                 .settings
                 .preferred_transport
                 .eq_ignore_ascii_case("wifi")
-                || view.settings.wireless_protocol != "udp"
+                || !binding_uses_udp(
+                    &self.data_dir,
+                    &view.settings.wireless_protocol,
+                    Some(binding_ref),
+                )
             {
                 return Err("无线连接方式已更改；请先明确选择 UDP 并重新允许连接。".into());
             }
@@ -597,6 +604,13 @@ impl AppState {
                     && Some(item.prefix_length) == snapshot.interface_prefix_length
             }) {
                 return Err("监听接口已变化；旧连接请求已失效，请重新选择接口并允许连接。".into());
+            }
+            if listener
+                .automatic_binding
+                .as_deref()
+                .is_some_and(|r| r != binding_ref)
+            {
+                return Err("连接请求对应的绑定已更改，请重新搜索。".into());
             }
             let offer = listener
                 .take_offer(offer_id)

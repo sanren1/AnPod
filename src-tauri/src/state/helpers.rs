@@ -377,6 +377,11 @@ pub(crate) fn load_binding_profile(data_dir: &Path, reference: &str) -> BindingP
         .unwrap_or_default()
 }
 
+pub(crate) fn binding_uses_udp(data_dir: &Path, saved: &str, reference: Option<&str>) -> bool {
+    saved == "udp"
+        || reference.is_some_and(|r| load_binding_profile(data_dir, r).platform == "harmony")
+}
+
 /// Applies `change` and writes the profile only when it differs from what is stored.
 pub(crate) fn update_binding_profile(
     data_dir: &Path,

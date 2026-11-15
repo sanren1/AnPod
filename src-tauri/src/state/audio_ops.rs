@@ -84,6 +84,13 @@ impl AppState {
                     let active = session
                         .as_ref()
                         .ok_or_else(|| "无线接收会话已结束。".to_string())?;
+                    if candidate.audio_quality == "standard"
+                        && active.network_binding_ref.as_deref().is_some_and(|r| {
+                            load_binding_profile(&self.data_dir, r).platform == "harmony"
+                        })
+                    {
+                        return Err("鸿蒙无线播放需要 HiFi 或 Hi-Res。".into());
+                    }
                     let owner = active
                         .network_owner
                         .as_ref()

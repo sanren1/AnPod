@@ -48,6 +48,7 @@ impl SessionOwner {
         binding: BindingMaterial,
         parameters: AudioParameters,
         profile: HostAudioProfile,
+        harmony: bool,
         initial_float_queue: Option<Arc<FloatPcmQueue>>,
         caller_cancel: CancellationToken,
         connection_intent: Option<([u8; 16], bool)>,
@@ -55,6 +56,7 @@ impl SessionOwner {
         diagnostics: Option<StartupDiagnosticsCapture>,
     ) -> Result<Self, String> {
         let mut endpoint = SessionEndpoint::on_interface(interface, peer);
+        endpoint.harmony = harmony;
         endpoint.connection_intent = connection_intent;
         endpoint.background_authorization_required = background_authorization_required;
         Self::start_with_endpoint_and_profile(

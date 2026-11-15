@@ -166,3 +166,12 @@ describe("HarmonyOS wired mode", () => {
     expect(runtime.pickerOpensUsbDirect(snapshot({ devices: [android, harmony] }, { wiredMode: "aoa" }), "aoa")).toBe(false);
   });
 });
+
+it("selects UDP for a paired Harmony target while preserving the saved Android preference", () => {
+  const saved = snapshot({}, { wirelessProtocol: "adb" }).settings;
+  const profiles = { tablet: { platform: "harmony" }, legacy: {} };
+  expect(runtime.bindingWirelessProtocol(saved.wirelessProtocol, profiles, "tablet")).toBe("udp");
+  expect(runtime.bindingWirelessProtocol(saved.wirelessProtocol, profiles, "legacy")).toBe("adb");
+  expect(runtime.bindingWirelessProtocol(saved.wirelessProtocol, profiles, null)).toBe("adb");
+  expect(saved.wirelessProtocol).toBe("adb");
+});

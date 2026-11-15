@@ -4067,6 +4067,39 @@ fn hires96_upgrade_authenticates_profile3_and_sends_q23_without_resampling() {
 }
 
 #[test]
+fn harmony_wireless_first_hello_authenticates_requested_float_profile() {
+    for profile in [4, 5] {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut endpoint = SessionEndpoint::loopback(listener.local_addr().unwrap());
+        endpoint.harmony = true;
+        let format = AudioFormatV2::for_profile(profile, 0).unwrap();
+        let receiver = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut header = [0; 8];
+            std::io::Read::read_exact(&mut tcp, &mut header).unwrap();
+            assert_eq!(&header[4..8], &[2, 1, 0, 96]);
+            let mut body = [0; 88];
+            std::io::Read::read_exact(&mut tcp, &mut body).unwrap();
+            assert_eq!(&body[72..], &format.encode().unwrap());
+        });
+        let result = HostSession::authenticate_for_profile(
+            endpoint,
+            &test_binding_material(),
+            AudioParameters {
+                sample_rate: format.sample_rate,
+                channels: 2,
+                mode: 0,
+            },
+            HostAudioProfile::AudioV2(format),
+            &mut None,
+            CancellationToken::new(),
+        );
+        assert!(result.is_err());
+        receiver.join().unwrap();
+    }
+}
+
+#[test]
 fn float32_profiles_authenticate_udp_and_preserve_sample_bits() {
     let classes = compile_java_endpoint();
     for (profile, rate) in [(4, 48_000), (5, 96_000)] {
@@ -5120,4 +5153,82 @@ fn start_handoff_failure_closes_session(classes: &Path) {
         result.starts_with("session_failed,1,0,0,1,"),
         "failed START handoff did not stop remote playback: {result}"
     );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "build the offline Linux fixture in tests/harmony-m2-interop first"]
+fn harmony_wireless_production_session_loopback() {
+    use crate::protocol::{PacketEncoder, PacketType};
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut child = ChildGuard::new(
+        Command::new("wsl")
+            .args([
+                "-d",
+                "Ubuntu",
+                "--",
+                "tests/harmony-m2-interop/build/receiver",
+            ])
+            .current_dir(repo)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut port = String::new();
+    BufReader::new(child.child_mut().stdout.take().unwrap())
+        .read_line(&mut port)
+        .unwrap();
+    let mut old_audio = None;
+    for profile in [4, 5] {
+        let format = AudioFormatV2::for_profile(profile, 0).unwrap();
+        let mut endpoint =
+            SessionEndpoint::loopback(format!("127.0.0.1:{}", port.trim()).parse().unwrap());
+        endpoint.harmony = true;
+        endpoint.connection_intent = (profile == 5).then_some(([0x5a; 16], true));
+        let queue = Arc::new(FloatPcmQueue::new(false));
+        queue.set_expected_format(format.sample_rate, 4096).unwrap();
+        let mut session = HostSession::authenticate_for_profile(
+            endpoint,
+            &test_binding_material(),
+            AudioParameters {
+                sample_rate: format.sample_rate,
+                channels: 2,
+                mode: 0,
+            },
+            HostAudioProfile::AudioV2(format),
+            &mut Some(queue.clone()),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        session.negotiate_capabilities().unwrap();
+        session.bind_audio().unwrap();
+        session.select_mode().unwrap();
+        session.start().unwrap();
+        let samples = [0.125f32, -0.25].repeat(143);
+        assert!(queue.push_raw(samples.as_ptr(), 143, format.sample_rate, 2, 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.heartbeat().unwrap() != ReceiverState::Streaming {
+            assert!(Instant::now() < deadline, "UDP audio did not reach sink");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let encoder =
+            PacketEncoder::new_v2(&session.keys.audio, session.session_id, 0x414e5048, format)
+                .unwrap();
+        let valid = encoder
+            .encode_at(42, PacketType::Audio, 143, &[0; 8])
+            .unwrap();
+        let mut damaged = valid.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        let socket = session.udp_socket.as_ref().unwrap();
+        let remote = session.remote_udp.unwrap();
+        socket.send_to(&damaged, remote).unwrap();
+        if let Some(old) = old_audio.replace(valid) {
+            socket.send_to(&old, remote).unwrap();
+        }
+        thread::sleep(Duration::from_millis(100));
+        session.pause().unwrap();
+        session.resume().unwrap();
+        session.stop().unwrap();
+    }
+    assert!(child.wait_until_exit(Duration::from_secs(8)).success());
 }
