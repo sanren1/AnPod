@@ -189,33 +189,57 @@ fn hdc_record_stream_harmony_emulator_loopback() {
     let _ = run(&["fport", "rm", &tablet, &pc]);
     let forward = run(&["rport", &tablet, &pc]);
     assert!(forward.contains("OK"), "hdc rport failed: {forward}");
+    // Removes the rport and reaps `aa test` on every exit path, panics included.
+    struct Cleanup {
+        hdc: PathBuf,
+        specs: [String; 2],
+        child: Option<std::process::Child>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = Command::new(&self.hdc)
+                .args(["-t", KEY, "fport", "rm", &self.specs[0], &self.specs[1]])
+                .output();
+        }
+    }
+    let mut cleanup = Cleanup {
+        hdc: hdc.clone(),
+        specs: [tablet.clone(), pc.clone()],
+        child: None,
+    };
 
     for profile in [4u8, 5] {
-        let mut test = Command::new(&hdc)
-            .args([
-                "-t",
-                KEY,
-                "shell",
-                "aa",
-                "test",
-                "-b",
-                "app.anpod.harmony",
-                "-m",
-                "entry_test",
-            ])
-            .args([
-                "-s",
-                "unittest",
-                "OpenHarmonyTestRunner",
-                "-s",
-                "class",
-                "HdcLoopback",
-            ])
-            .args(["-s", "port", TABLET_PORT, "-s", "timeout", "90000"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn aa test");
+        cleanup.child = Some(
+            Command::new(&hdc)
+                .args([
+                    "-t",
+                    KEY,
+                    "shell",
+                    "aa",
+                    "test",
+                    "-b",
+                    "app.anpod.harmony",
+                    "-m",
+                    "entry_test",
+                ])
+                .args([
+                    "-s",
+                    "unittest",
+                    "OpenHarmonyTestRunner",
+                    "-s",
+                    "class",
+                    "HdcLoopback",
+                ])
+                .args(["-s", "port", TABLET_PORT, "-s", "timeout", "90000"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn aa test"),
+        );
         let deadline = Instant::now() + Duration::from_secs(120);
         let stream = loop {
             match listener.accept() {
@@ -284,6 +308,7 @@ fn hdc_record_stream_harmony_emulator_loopback() {
         queue.stop_and_clear();
 
         let mut out = String::new();
+        let mut test = cleanup.child.take().unwrap();
         std::io::Read::read_to_string(test.stdout.as_mut().unwrap(), &mut out).unwrap();
         test.wait().unwrap();
         println!("aa test profile {profile}:\n{out}");

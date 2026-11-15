@@ -6,7 +6,12 @@ import anpod from 'libanpod_core.so';
 export default function hdcLoopbackTest() {
   describe('HdcLoopback', () => {
     it('hdc_loopback_session', 0, () => {
-      const port = Number(abilityDelegatorRegistry.getArguments().parameters['-s port']);
+      // hypium internals expose `aa test -s port N` as parameters['-s port'] (verified on the emulator).
+      const raw = abilityDelegatorRegistry.getArguments().parameters['-s port'];
+      if (raw === undefined) {
+        return;  // driven only by the PC e2e test; a plain full run has no port
+      }
+      const port = Number(raw);
       expect(Number.isInteger(port) && port > 0).assertTrue();
       expect(anpod.selfTestLoopback(port).join(',')).assertEqual('');
     });
