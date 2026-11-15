@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi, X } from "lucide-react";
 import { strings } from "./strings";
 import type { Device, Snapshot, OperationResult, Panel, ConfirmRequest } from "./appTypes";
-import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, rememberBindingModels, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, CAP_AOA_SESSION_RESTART, isHarmony, wiredModeChoice, effectiveWiredMode } from "./appRuntime";
+import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, rememberBindingModels, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, CAP_AOA_SESSION_RESTART, isHarmony, wiredModeChoice, effectiveWiredMode, pickerOpensUsbDirect } from "./appRuntime";
 import { DeviceDialog } from "./components/DeviceDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { HarmonyPairingDialog } from "./components/HarmonyPairingDialog";
@@ -137,6 +137,8 @@ function App() {
   const cardDevice = active ? activeDevice : cleanupPending ? undefined : selected;
   const wiredChoice = wiredModeChoice(snapshot?.settings.wiredMode ?? "adb", cardDevice);
   const wiredMode = effectiveWiredMode(snapshot?.settings.wiredMode ?? "adb", cardDevice);
+  const usbDirectPicker = !!snapshot && pickerOpensUsbDirect(snapshot, wiredMode);
+  const [pairingAnswerPending, setPairingAnswerPending] = useState(false);
   const { acceptOffer, backgroundChoicePrefill, backgroundStartMode, cancelNetworkStart, lastOfferListenerChoice, mainListenerGenerationRef, mainListenerPending, networkChoiceNeedsConfirmation, networkRecoveryMode, networkStartPending, networkStartPendingRef, offerListenerChoice, offerListenerGeneration, openConnectionFlow, openNetworkDialog, pendingNetworkStart, retainOfferListenerOnClose, setBackgroundStartMode, setMainListenerPending, setNetworkRecoveryMode, setOfferListener, setPendingNetworkStart, startBackgroundConnection, startMainScreenWaiting, startNetwork, startNetworkAudio, stopOfferListener } = useNetworkWizard({ active, apply, cancelOperationLockRef, cleanupPending, notify, panel, panelRef, setCancelPending, setConfirm, setNetworkDialogError, setPanel, setSnapshot, setWorking, snapshot, snapshotRefreshGenerationRef, wirelessUdpMode, working });
   const deviceChoices = useMemo(() => {
     if (snapshot?.sessionTransport === "aoa" || !snapshot?.sessionSerial || devices.some(device => device.serial === snapshot.sessionSerial)) return devices;
@@ -461,10 +463,10 @@ function App() {
       <section className="device-section" aria-label={strings.app.targetPhone}>
         <div className="section-title"><h1>{strings.app.targetPhone}</h1></div>
         <div className="device-card">
-          <button className="device-select" onClick={() => snapshot.connectionTransport === "usb" && wiredMode === "aoa" && !active ? void openAoaDialog() : wirelessUdpMode ? openConnectionFlow() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup" || panel === "aoa"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.connectUsbDirect : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
+          <button className="device-select" onClick={() => usbDirectPicker && !active ? void openAoaDialog() : wirelessUdpMode ? openConnectionFlow() : setPanel("device")} disabled={controlsDisabled} aria-haspopup="dialog" aria-expanded={panel === "device" || panel === "network" || panel === "setup" || panel === "aoa"} aria-label={`${strings.app.chooseTarget}，${active ? `${strings.app.currentConnection}${lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.phone}` : cleanupPending ? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : usbDirectPicker ? strings.app.connectUsbDirect : cardDevice ? `${strings.app.currentSelection}${cardDevice.displayName}` : strings.app.openDeviceList}`}>
             <span className="device-icon"><Smartphone size={18} aria-hidden="true" /></span>
             <span className="device-copy">
-              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : snapshot.connectionTransport === "usb" && wiredMode === "aoa" ? strings.app.chooseUsbDirectPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
+              <strong>{active ? lanSession ? bindingLabel(snapshot.sessionReceiverBinding) : activeDevice?.displayName ?? snapshot.deviceName ?? strings.app.connectedPhone : cleanupPending ? snapshot.deviceName ?? strings.app.awaitingCleanup : wirelessUdpMode ? snapshot.wirelessConnectionOffers.automaticBinding ? strings.app.savedWirelessPhone : strings.app.choosePairedPhone : usbDirectPicker ? strings.app.chooseUsbDirectPhone : selected?.displayName ?? (empty ? strings.app.noPhone : strings.app.choosePhone)}</strong>
               <span>{active ? actualConnectionLabel(snapshot) : cleanupPending ? strings.app.connectionUnavailable : wirelessUdpMode || snapshot.connectionTransport === "wireless" || cardDevice?.transport === "wifi" ? strings.app.wireless : strings.app.usb}</span>
               {cleanupPending && <span className="device-live-state" role="status">{strings.app.retryCleanup}</span>}
             </span>
@@ -570,7 +572,7 @@ function App() {
     {panel === "diagnostics" && <DiagnosticsDialog snapshot={snapshot} onClose={() => setPanel(null)} returnFocusTarget={() => diagnosticsButtonRef.current} />}
     {panel === "aoa" && <AoaDialog disabled={false} lastUsbDirectTargetId={snapshot.settings.lastUsbDirectTargetId} lastUsbDirectBindingReference={snapshot.settings.lastUsbDirectBindingReference} onStart={startAoa} onCancelStart={cancelAoaStart} onClose={() => void closeAoaDialog()} />}
     </Suspense>
-    {snapshot.harmonyPairingCode && <HarmonyPairingDialog code={snapshot.harmonyPairingCode} onAnswer={accept => void invokeApp<Snapshot>("answer_harmony_pairing", { accept }).then(apply).catch(error => notify(String(error)))} />}
+    {snapshot.harmonyPairingCode && <HarmonyPairingDialog code={snapshot.harmonyPairingCode} busy={pairingAnswerPending} onAnswer={accept => { setPairingAnswerPending(true); void invokeApp<Snapshot>("answer_harmony_pairing", { accept }).then(apply).catch(error => notify(String(error))).finally(() => setPairingAnswerPending(false)); }} />}
     {confirm && (() => {
       // Every interrupting switch uses one confirmation: a single consequence line and one primary
       // action, instead of a separate dialog per kind.

@@ -156,4 +156,13 @@ describe("HarmonyOS wired mode", () => {
     expect(runtime.effectiveWiredMode("aoa", harmony)).toBe("adb");
     expect(runtime.effectiveWiredMode("aoa", android)).toBe("aoa");
   });
+  it("lets the picker list a tablet even when USB Direct is saved", () => {
+    const harmony = { ...base, serial: "HW1", platform: "harmony" } as const;
+    const android = { ...base, platform: "android" } as const;
+    // Android only: USB Direct mode keeps opening the USB Direct dialog.
+    expect(runtime.pickerOpensUsbDirect(snapshot({ devices: [android] }, { wiredMode: "aoa" }), "aoa")).toBe(true);
+    expect(runtime.pickerOpensUsbDirect(snapshot({ devices: [android] }, { wiredMode: "adb" }), "adb")).toBe(false);
+    // Android selected by default but a tablet is attached: the device list opens instead.
+    expect(runtime.pickerOpensUsbDirect(snapshot({ devices: [android, harmony] }, { wiredMode: "aoa" }), "aoa")).toBe(false);
+  });
 });

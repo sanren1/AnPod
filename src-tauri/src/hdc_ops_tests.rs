@@ -297,3 +297,45 @@ fn harmony_repair_keeps_the_launched_host_id() {
     assert_eq!(fresh.host_id(), old.host_id());
     assert_ne!(fresh.commitment(), old.commitment());
 }
+
+#[test]
+fn harmony_pairing_answer_times_out_as_decline() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Past deadline and no answer: treated as "no" without waiting.
+    let started = Instant::now();
+    assert!(!wait_pairing_answer(&receiver, started));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // A short deadline still elapses into "no".
+    assert!(!wait_pairing_answer(
+        &receiver,
+        Instant::now() + Duration::from_millis(50)
+    ));
+    sender.send(true).unwrap();
+    assert!(wait_pairing_answer(
+        &receiver,
+        Instant::now() + Duration::from_secs(5)
+    ));
+    // A dismissed prompt (sender dropped) is a decline too.
+    drop(sender);
+    assert!(!wait_pairing_answer(
+        &receiver,
+        Instant::now() + Duration::from_secs(5)
+    ));
+}
+
+#[test]
+fn harmony_material_read_error_aborts_and_deletes_nothing() {
+    let data_dir = temp_data_dir("harmony-unreadable");
+    let reference = BindingMaterial::harmony_binding_reference("HW1");
+    assert!(matches!(
+        load_harmony_material(&data_dir, &reference),
+        Ok(None)
+    ));
+    let path = binding_store_path(&data_dir, &reference).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"not a dpapi blob").unwrap();
+    fs::write(path.with_extension("json"), br#"{"platform":"harmony"}"#).unwrap();
+    assert!(load_harmony_material(&data_dir, &reference).is_err());
+    assert!(path.exists() && path.with_extension("json").exists());
+    let _ = fs::remove_dir_all(&data_dir);
+}

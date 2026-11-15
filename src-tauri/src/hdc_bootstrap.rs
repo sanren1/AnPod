@@ -21,7 +21,7 @@ const PAIR_SAVED: u8 = 5;
 const PAIR_CANCEL: u8 = 6;
 const PROCEED: u8 = 7;
 const CANCEL_USER: u8 = 1;
-const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 /// A foreign connection must show its hello quickly or it is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 

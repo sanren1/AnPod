@@ -4,8 +4,9 @@
 
 use super::*;
 use crate::hdc::hdc_run;
-use crate::hdc_bootstrap::{accept_with_token, host_pair, host_proceed};
+use crate::hdc_bootstrap::{accept_with_token, host_pair, host_proceed, PAIR_TIMEOUT};
 use crate::security::BindingMaterial;
+use crate::security::SecurityError;
 use std::net::{Shutdown, TcpStream};
 
 const HARMONY_BUNDLE: &str = "app.anpod.harmony";
@@ -38,6 +39,28 @@ pub(crate) fn hdc_fport_remove_result(result: AdbResult) -> Result<(), String> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The PC's material for this tablet. Only a missing file means "not paired"; any other
+/// read or DPAPI failure aborts, so valid material and its wireless trust are never discarded.
+pub(crate) fn load_harmony_material(
+    data_dir: &Path,
+    reference: &str,
+) -> Result<Option<BindingMaterial>, String> {
+    match BindingStore::load(&binding_store_path(data_dir, reference)?) {
+        Ok(material) => Ok(Some(material)),
+        Err(SecurityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("无法读取这台平板的本机绑定材料；未做任何更改。".into()),
+    }
+}
+
+/// The user's answer, or "no" once the pairing deadline passes (the tablet gives up then too).
+pub(crate) fn wait_pairing_answer(
+    answer: &std::sync::mpsc::Receiver<bool>,
+    deadline: Instant,
+) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    answer.recv_timeout(remaining).unwrap_or(false)
 }
 
 /// Deletes this tablet's PC material and profile (spec 15.5); missing files are fine.
@@ -195,9 +218,7 @@ impl AppState {
         let (format, native, source) = self.prepare_float32_stream(profile, &settings)?;
 
         let reference = BindingMaterial::harmony_binding_reference(key);
-        let stored = binding_store_path(&self.data_dir, &reference)
-            .ok()
-            .and_then(|path| BindingStore::load(&path).ok());
+        let stored = load_harmony_material(&self.data_dir, &reference)?;
         let pc_has_material = stored.is_some();
         let material = match stored {
             Some(material) => material,
@@ -227,7 +248,11 @@ impl AppState {
         if !hdc_command_ok(&rport) {
             return Err("hdc 端口转发失败。".into());
         }
-        let generation = self
+        let forward = || HdcForward {
+            key: key.into(),
+            task: format!("{tablet_spec} {pc_spec}"),
+        };
+        let registered = self
             .register_record_stream_session(
                 device,
                 operation_generation,
@@ -236,12 +261,17 @@ impl AppState {
                 &source,
                 &reference,
                 native,
-                Some(HdcForward {
-                    key: key.into(),
-                    task: format!("{tablet_spec} {pc_spec}"),
-                }),
+                Some(forward()),
             )
-            .await?;
+            .await;
+        let generation = match registered {
+            Ok(generation) => generation,
+            Err(error) => {
+                // No session owns the forward yet, so remove it here.
+                let _ = self.remove_hdc_forward(&forward()).await;
+                return Err(error);
+            }
+        };
 
         let port_text = tablet_port.to_string();
         let host_id = hex(&material.host_id());
@@ -354,6 +384,7 @@ impl AppState {
         let (answer_sender, answer_receiver) = std::sync::mpsc::channel::<bool>();
         let data_dir = self.data_dir.clone();
         let model = model.to_owned();
+        let deadline = Instant::now() + PAIR_TIMEOUT;
         let mut pairing = tokio::task::spawn_blocking(move || {
             pair_and_store(
                 &mut stream,
@@ -363,7 +394,7 @@ impl AppState {
                 &material,
                 |code| {
                     let _ = code_sender.send(code.to_owned());
-                    answer_receiver.recv().unwrap_or(false)
+                    wait_pairing_answer(&answer_receiver, deadline)
                 },
             )
             .map(|()| (stream, material))
@@ -373,10 +404,14 @@ impl AppState {
         let result = loop {
             tokio::select! {
                 joined = &mut pairing => {
-                    break joined.map_err(|error| format!("hdc pairing worker failed: {error}"))?;
+                    break joined
+                        .map_err(|error| format!("hdc pairing worker failed: {error}"))
+                        .and_then(|result| result);
                 }
                 code = &mut code_receiver, if answer_sender.is_some() => {
-                    if let (Ok(code), Some(answer)) = (code, answer_sender.take()) {
+                    // Either way this branch is done: a dropped sender means the worker ended first.
+                    let answer = answer_sender.take();
+                    if let (Ok(code), Some(answer)) = (code, answer) {
                         self.set_harmony_pairing(code, answer);
                         self.emit(app);
                     }

@@ -13,6 +13,9 @@ export const isHarmony = (device?: Device) => device?.platform === "harmony";
 export const wiredModeChoice = (saved: Snapshot["settings"]["wiredMode"], device?: Device) =>
   isHarmony(device) ? { value: "hdc" as const, options: ["hdc" as const] } : { value: saved, options: ["adb", "aoa"] as const };
 export const effectiveWiredMode = (saved: Snapshot["settings"]["wiredMode"], device?: Device) => isHarmony(device) ? "adb" : saved;
+// With a tablet attached the picker lists devices even in USB Direct mode, so the tablet stays choosable.
+export const pickerOpensUsbDirect = (snapshot: Snapshot, wiredMode: Snapshot["settings"]["wiredMode"]) =>
+  snapshot.connectionTransport === "usb" && wiredMode === "aoa" && !snapshot.devices.some(device => isHarmony(device));
 export const byTransport = (snapshot: Snapshot) => {
   const deviceTransport = snapshot.connectionTransport === "usb" ? "usb" : snapshot.settings.wirelessProtocol === "adb" ? "wifi" : null;
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];

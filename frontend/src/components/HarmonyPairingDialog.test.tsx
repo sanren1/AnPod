@@ -19,7 +19,7 @@ const text = (node: ReactNode): string =>
 describe("HarmonyPairingDialog", () => {
   it("pairing dialog shows code and answers", () => {
     const onAnswer = vi.fn();
-    const dialog = HarmonyPairingDialog({ code: "017647", onAnswer });
+    const dialog = HarmonyPairingDialog({ code: "017647", busy: false, onAnswer });
     const modal = ConfirmDialog(dialog.props as Parameters<typeof ConfirmDialog>[0]) as ReactElement<{ title: string; children: ReactNode }>;
     expect(modal.props.title).toBe(strings.harmonyPairing.title);
     const nodes = flatten(modal.props.children);
@@ -30,5 +30,13 @@ describe("HarmonyPairingDialog", () => {
     confirm.props.onClick?.();
     cancel.props.onClick?.();
     expect(onAnswer.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("disables both answers while one is being sent", () => {
+    const dialog = HarmonyPairingDialog({ code: "017647", busy: true, onAnswer: vi.fn() });
+    const modal = ConfirmDialog(dialog.props as Parameters<typeof ConfirmDialog>[0]) as ReactElement<{ children: ReactNode }>;
+    const buttons = flatten(modal.props.children).filter(node => node.type === "button") as ReactElement<Props & { disabled?: boolean }>[];
+    expect(buttons.map(button => button.props.disabled)).toEqual([true, true]);
+    expect(text(buttons[1])).toBe(strings.harmonyPairing.confirm);
   });
 });
