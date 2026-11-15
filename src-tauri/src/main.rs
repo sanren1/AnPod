@@ -9,7 +9,6 @@ mod aoa_winusb;
 mod applog;
 mod audio;
 mod hdc;
-#[allow(dead_code)] // wired in by the hdc connect path (Task 7)
 mod hdc_bootstrap;
 mod receiver;
 mod startup;
@@ -236,6 +235,11 @@ async fn receiver_status(
     serial: String,
 ) -> Result<receiver::ReceiverStatus, String> {
     state.receiver_status(&serial).await
+}
+
+#[tauri::command]
+fn answer_harmony_pairing(state: State<'_, AppState>, accept: bool) -> Result<AppSnapshot, String> {
+    state.answer_harmony_pairing(accept)
 }
 
 #[tauri::command]
@@ -651,6 +655,7 @@ fn main() {
             receiver_status,
             receiver_installed_version,
             receiver_binding_profiles,
+            answer_harmony_pairing,
             receiver_install,
             receiver_upgrade_usb,
             receiver_start,

@@ -62,8 +62,8 @@ impl AppState {
                 .iter()
                 .find(|device| device.serial == serial)
                 .cloned();
-            if let Some(target) = &target {
-                ensure_android_device(target)?;
+            if target.as_ref().is_some_and(connects_over_hdc) {
+                self.check_hdc_target()?;
             }
             let (device_available, cleanup_pending) = {
                 let view = self
@@ -156,7 +156,15 @@ impl AppState {
         token: &CancellationToken,
         play_on_phone: bool,
     ) -> Result<OperationResult, String> {
-        if play_on_phone {
+        // USB Direct and the legacy backend are Android-only choices; hdc checks its own profile.
+        let harmony = self
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .devices
+            .iter()
+            .any(|device| device.serial == serial && connects_over_hdc(device));
+        if play_on_phone && !harmony {
             let settings = self
                 .view
                 .lock()
@@ -192,7 +200,6 @@ impl AppState {
                 .cloned()
                 .ok_or_else(|| "此手机当前不可连接，请刷新设备列表。".to_string())?
         };
-        ensure_android_device(&device)?;
         self.view
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -203,9 +210,19 @@ impl AppState {
             "正在建立音频连接…",
             Some(device.display_name.clone()),
         );
-        let result = self
-            .connect_inner(app, &device, generation, token, play_on_phone)
-            .await;
+        let result = if connects_over_hdc(&device) {
+            let settings = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .settings
+                .clone();
+            self.connect_hdc_stream_inner(app, &device, generation, token, play_on_phone, settings)
+                .await
+        } else {
+            self.connect_inner(app, &device, generation, token, play_on_phone)
+                .await
+        };
         if !self.operation_is_current(generation, token) {
             let cleanup = self.teardown(Some(app)).await;
             let message = cleanup.as_ref().err().map_or_else(
@@ -268,7 +285,6 @@ impl AppState {
         settings: AppSettings,
     ) -> Result<String, String> {
         use crate::aoa_owner::AoaOwner;
-        use crate::protocol::AudioFormatV2;
 
         let serial = device.serial.as_str();
         token_check(token)?;
@@ -278,18 +294,7 @@ impl AppState {
         let profile = audio_quality_profile(quality)
             .filter(|profile| *profile >= 4)
             .ok_or_else(|| "ADB Float32 audio requires HiFi or Hi-Res quality.".to_string())?;
-        let mode = if settings.playback_mode.eq_ignore_ascii_case("lowlatency") {
-            1
-        } else {
-            0
-        };
-        let format = AudioFormatV2::for_profile(profile, mode)
-            .map_err(|_| "Unable to construct the authenticated Float32 format.".to_string())?;
-        let native = self.audio.probe_float_format()?;
-        crate::audio::validate_float_format_for_session(&native, format)?;
-        let queue = Arc::new(FloatPcmQueue::new(mode == 1));
-        queue.set_expected_format(format.sample_rate, 4096)?;
-        let source = SessionAudioQueue::Float32(queue, format);
+        let (format, native, source) = self.prepare_float32_stream(profile, &settings)?;
         let (binding_reference, material) = receiver::adb_binding_material(
             &self.adb_path,
             serial,
@@ -332,52 +337,18 @@ impl AppState {
         )
         .await?;
 
-        let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if !self.register_session_generation(0, generation, operation_generation, token) {
-            return Err("ADB audio session was cancelled.".into());
-        }
-        *self.session.lock().await = Some(Session {
-            generation,
-            serial: serial.into(),
-            transport: device.transport.clone(),
-            reverse: socket_name.clone(),
-            child: None,
-            installed_receiver: true,
-            receiver_owner_id: None,
-            receiver_generation: None,
-            output: "computer".into(),
-            output_tail: Arc::new(Mutex::new(VecDeque::new())),
-            network_owner: None,
-            aoa_owner: None,
-            adb_stream_owner: None,
-            aoa_target_id: None,
-            network_sink_queue: Some(source.clone()),
-            network_binding_ref: Some(binding_reference.clone()),
-            windows_mix_format: Some(windows_mix_format(native)),
-        });
-        {
-            let mut view = self
-                .view
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            view.session_generation = Some(generation);
-            view.session_active = true;
-            view.session_serial = Some(serial.into());
-            view.session_receiver_binding = Some(binding_reference.clone());
-            view.session_transport = Some(device.transport.clone());
-            view.session_capabilities = None;
-            view.playback_diagnostics = None;
-            view.negotiated_audio_format = None;
-            view.windows_mix_format = None;
-            view.network_recovery_seconds_remaining = None;
-            view.session_android_version =
-                (!device.android_version.is_empty()).then(|| device.android_version.clone());
-            view.audio_bitrate_bps = Some(0);
-        }
-        *self
-            .pcm_rate_sample
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let generation = self
+            .register_record_stream_session(
+                device,
+                operation_generation,
+                token,
+                socket_name.clone(),
+                &source,
+                &binding_reference,
+                native,
+                None,
+            )
+            .await?;
 
         let accept_cancel = token.child_token();
         let mut accepted = tokio::task::spawn_blocking({
@@ -471,9 +442,129 @@ impl AppState {
                 .monitoring_error()
                 .unwrap_or_else(|| "ADB Receiver is not healthy after P5-C startup.".into()));
         }
+        self.finish_record_stream_session(
+            app,
+            device,
+            operation_generation,
+            token,
+            play_on_phone,
+            generation,
+            owner,
+            &source,
+            native,
+            format,
+            Some((receiver_owner_id, receiver_generation)),
+        )
+        .await
+    }
+
+    /// Float32 format, native capture check and queue shared by the ADB and hdc record streams.
+    pub(super) fn prepare_float32_stream(
+        &self,
+        profile: u8,
+        settings: &AppSettings,
+    ) -> Result<(AudioFormatV2, CaptureFormatV2, SessionAudioQueue), String> {
+        let mode = if settings.playback_mode.eq_ignore_ascii_case("lowlatency") {
+            1
+        } else {
+            0
+        };
+        let format = AudioFormatV2::for_profile(profile, mode)
+            .map_err(|_| "Unable to construct the authenticated Float32 format.".to_string())?;
+        let native = self.audio.probe_float_format()?;
+        crate::audio::validate_float_format_for_session(&native, format)?;
+        let queue = Arc::new(FloatPcmQueue::new(mode == 1));
+        queue.set_expected_format(format.sample_rate, 4096)?;
+        Ok((format, native, SessionAudioQueue::Float32(queue, format)))
+    }
+
+    /// Publishes the session before the receiver connects, so teardown can undo the forward.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn register_record_stream_session(
+        &self,
+        device: &Device,
+        operation_generation: u64,
+        token: &CancellationToken,
+        reverse: String,
+        source: &SessionAudioQueue,
+        binding_reference: &str,
+        native: CaptureFormatV2,
+        hdc_forward: Option<HdcForward>,
+    ) -> Result<u64, String> {
+        let serial = device.serial.as_str();
+        let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if !self.register_session_generation(0, generation, operation_generation, token) {
+            return Err("ADB audio session was cancelled.".into());
+        }
+        *self.session.lock().await = Some(Session {
+            generation,
+            serial: serial.into(),
+            transport: device.transport.clone(),
+            reverse,
+            child: None,
+            // Only the Android Receiver runs a remote service that teardown must stop.
+            installed_receiver: hdc_forward.is_none(),
+            receiver_owner_id: None,
+            receiver_generation: None,
+            output: "computer".into(),
+            output_tail: Arc::new(Mutex::new(VecDeque::new())),
+            network_owner: None,
+            aoa_owner: None,
+            adb_stream_owner: None,
+            aoa_target_id: None,
+            network_sink_queue: Some(source.clone()),
+            network_binding_ref: Some(binding_reference.into()),
+            windows_mix_format: Some(windows_mix_format(native)),
+            hdc_forward,
+        });
+        {
+            let mut view = self
+                .view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            view.session_generation = Some(generation);
+            view.session_active = true;
+            view.session_serial = Some(serial.into());
+            view.session_receiver_binding = Some(binding_reference.into());
+            view.session_transport = Some(device.transport.clone());
+            view.session_capabilities = None;
+            view.playback_diagnostics = None;
+            view.negotiated_audio_format = None;
+            view.windows_mix_format = None;
+            view.network_recovery_seconds_remaining = None;
+            view.session_android_version =
+                (!device.android_version.is_empty()).then(|| device.android_version.clone());
+            view.audio_bitrate_bps = Some(0);
+        }
+        *self
+            .pcm_rate_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(generation)
+    }
+
+    /// Installs an authenticated record-stream owner and publishes the ready state.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn finish_record_stream_session(
+        &self,
+        app: &AppHandle,
+        device: &Device,
+        operation_generation: u64,
+        token: &CancellationToken,
+        play_on_phone: bool,
+        generation: u64,
+        owner: crate::aoa_owner::AoaOwner,
+        source: &SessionAudioQueue,
+        native: CaptureFormatV2,
+        format: AudioFormatV2,
+        receiver_identity: Option<(String, u64)>,
+    ) -> Result<String, String> {
+        use crate::aoa_owner::AoaOwner;
+
+        let serial = device.serial.as_str();
         let mut mix_format = Some(windows_mix_format(native));
         if play_on_phone {
-            mix_format = self.start_session_audio_sink(&source)?;
+            mix_format = self.start_session_audio_sink(source)?;
             self.audio.mute_active()?;
         } else {
             owner.pause()?;
@@ -506,8 +597,10 @@ impl AppState {
         }
         if let Some(active) = session.as_mut() {
             active.adb_stream_owner = Some(owner);
-            active.receiver_owner_id = Some(receiver_owner_id);
-            active.receiver_generation = Some(receiver_generation);
+            if let Some((owner_id, receiver_generation)) = receiver_identity {
+                active.receiver_owner_id = Some(owner_id);
+                active.receiver_generation = Some(receiver_generation);
+            }
             active.output = if play_on_phone { "phone" } else { "computer" }.into();
             active.windows_mix_format = mix_format.clone();
         }
@@ -665,6 +758,7 @@ impl AppState {
             network_sink_queue: None,
             network_binding_ref: None,
             windows_mix_format: None,
+            hdc_forward: None,
         });
         self.view
             .lock()

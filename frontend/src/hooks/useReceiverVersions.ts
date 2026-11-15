@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invokeApp, isDesktop } from "../appRuntime";
+import { invokeApp, isDesktop, isHarmony } from "../appRuntime";
 import type { ReceiverPackageCandidate, Snapshot } from "../appTypes";
 
 /**
@@ -14,7 +14,8 @@ export function useReceiverVersions(snapshot: Snapshot | null) {
 
   useEffect(() => {
     if (!isDesktop || !snapshot) return;
-    const usbSerials = snapshot.devices.filter(device => device.transport === "usb" && device.connectable).map(device => device.serial);
+    // HarmonyOS tablets have no Android Receiver to install or upgrade.
+    const usbSerials = snapshot.devices.filter(device => device.transport === "usb" && device.connectable && !isHarmony(device)).map(device => device.serial);
     // A phone that leaves and comes back is checked again; no polling in between.
     for (const serial of checked.current) if (!usbSerials.includes(serial)) checked.current.delete(serial);
     const unchecked = usbSerials.filter(serial => !checked.current.has(serial));
@@ -33,7 +34,7 @@ export function useReceiverVersions(snapshot: Snapshot | null) {
 
   const outdatedReceiverSerial = bundledReceiverVersion === null ? undefined : snapshot?.devices.find(device => {
     const installed = installedReceiverVersions[device.serial];
-    return device.transport === "usb" && device.connectable && typeof installed === "number" && installed < bundledReceiverVersion;
+    return device.transport === "usb" && device.connectable && !isHarmony(device) && typeof installed === "number" && installed < bundledReceiverVersion;
   })?.serial;
   const rememberInstalledVersion = (serial: string, version: number | null) =>
     setInstalledReceiverVersions(current => ({ ...current, [serial]: version }));

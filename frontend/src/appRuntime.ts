@@ -8,6 +8,11 @@ export const invokeApp = <T,>(command: string, args?: Record<string, unknown>) =
   return invoke<T>(command, args);
 };
 export const deviceOsLabel = (device: Device) => device.platform === "harmony" ? device.osVersion : device.androidVersion ? `Android ${device.androidVersion}` : "";
+// A HarmonyOS tablet connects over hdc only; the saved Android wired mode stays as it is.
+export const isHarmony = (device?: Device) => device?.platform === "harmony";
+export const wiredModeChoice = (saved: Snapshot["settings"]["wiredMode"], device?: Device) =>
+  isHarmony(device) ? { value: "hdc" as const, options: ["hdc" as const] } : { value: saved, options: ["adb", "aoa"] as const };
+export const effectiveWiredMode = (saved: Snapshot["settings"]["wiredMode"], device?: Device) => isHarmony(device) ? "adb" : saved;
 export const byTransport = (snapshot: Snapshot) => {
   const deviceTransport = snapshot.connectionTransport === "usb" ? "usb" : snapshot.settings.wirelessProtocol === "adb" ? "wifi" : null;
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];

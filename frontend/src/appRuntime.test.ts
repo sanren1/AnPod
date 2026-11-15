@@ -15,7 +15,7 @@ const snapshot = (overrides: Partial<Snapshot> = {}, settings: Partial<Snapshot[
   wirelessConnectionOffers: { active: false, interfaceAddress: null, interfacePrefixLength: null, offers: [] },
   playbackDiagnostics: null, negotiatedAudioFormat: null, windowsMixFormat: null, androidOutputFormat: null,
   output: "phone", busy: false, canDisconnect: false, canChangeModes: true, canChangePlaybackMode: true,
-  statusDetail: "", audioBitrateBps: null, version: "0.0.0",
+  statusDetail: "", audioBitrateBps: null, version: "0.0.0", harmonyPairingCode: null,
   ...overrides,
   settings: {
     schemaVersion: 1, lastDeviceId: null, minimizeToTray: false, launchAtLogin: false, preferredTransport: "Usb",
@@ -140,5 +140,20 @@ describe("deviceOsLabel", () => {
     expect(runtime.deviceOsLabel({ ...base, platform: "harmony", androidVersion: "", osVersion: "HarmonyOS 7" })).toBe("HarmonyOS 7");
     expect(runtime.deviceOsLabel({ ...base, platform: "android", androidVersion: "15", osVersion: "15" })).toBe("Android 15");
     expect(runtime.deviceOsLabel({ ...base, platform: "android", androidVersion: "", osVersion: "" })).toBe("");
+  });
+});
+
+describe("HarmonyOS wired mode", () => {
+  const base = { serial: "s", transport: "usb", state: "device", manufacturer: "", model: "", apiLevel: "", displayName: "d", statusText: "", connectable: true, androidVersion: "", osVersion: "" } as const;
+  it("harmony device hides adb and usb direct and keeps wiredMode", () => {
+    const harmony = { ...base, platform: "harmony" } as const;
+    const android = { ...base, platform: "android" } as const;
+    expect(runtime.wiredModeChoice("aoa", harmony)).toEqual({ value: "hdc", options: ["hdc"] });
+    expect(runtime.wiredModeChoice("adb", harmony)).toEqual({ value: "hdc", options: ["hdc"] });
+    expect(runtime.wiredModeChoice("aoa", android)).toEqual({ value: "aoa", options: ["adb", "aoa"] });
+    expect(runtime.wiredModeChoice("adb", undefined)).toEqual({ value: "adb", options: ["adb", "aoa"] });
+    // Routing for a tablet never takes the saved USB Direct choice, and the saved value is untouched.
+    expect(runtime.effectiveWiredMode("aoa", harmony)).toBe("adb");
+    expect(runtime.effectiveWiredMode("aoa", android)).toBe("aoa");
   });
 });

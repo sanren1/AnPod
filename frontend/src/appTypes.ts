@@ -40,6 +40,7 @@ export type Snapshot = {
   output: "computer" | "phone"; settings: Settings;
   busy: boolean; canDisconnect: boolean; canChangeModes: boolean; canChangePlaybackMode: boolean; statusDetail: string;
   audioBitrateBps: number | null; networkRecoverySecondsRemaining?: number | null; version: string;
+  harmonyPairingCode: string | null;
 };
 export type Credentials = { instanceName: string; password: string; payload: string };
 export type MdnsResults = { available: boolean; services: { name: string; endpoint: string; kind: "pairing" | "connect" }[] };

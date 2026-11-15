@@ -130,6 +130,14 @@ impl BindingMaterial {
         })
     }
 
+    /// Fresh receiver id and secret under this host id: a HarmonyOS re-pair must keep the
+    /// hostId the tablet was launched with.
+    pub(crate) fn regenerate_keeping_host(&self) -> Result<Self, SecurityError> {
+        let mut fresh = Self::generate()?;
+        fresh.host_id = self.host_id;
+        Ok(fresh)
+    }
+
     pub(crate) fn encode(&self) -> SensitiveBytes {
         let mut bytes = [0u8; BINDING_BYTES];
         bytes[..4].copy_from_slice(BINDING_MAGIC);

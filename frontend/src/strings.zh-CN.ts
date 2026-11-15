@@ -80,6 +80,7 @@ export const zhCN = {
     wiredMode: "连接模式",
     wiredModeAdb: "ADB",
     wiredModeDirect: "USB Direct",
+    wiredModeHdc: "hdc",
     connectUsbDirect: "连接 USB Direct",
     chooseUsbDirectPhone: "选择 USB Direct 手机",
     firstSetup: "首次设置",
@@ -268,6 +269,10 @@ export const zhCN = {
     receiverRestartNote: "安装或通知权限按 Android 提示确认。若应用停止或手机重启，重开 AnPod 并点“连接电脑”；仍不通时用 USB 检查。连接就绪不代表已播放。",
     adbPlaybackNote: "无线调试配对需要在手机系统中明确授权。连接就绪不代表手机已开始播放；播放状态由手机应用报告。",
     finish: "完成",
+  },
+  harmonyPairing: {
+    title: "配对此平板？",
+    confirm: "确认",
   },
   confirmDialog: {
     cancel: "取消",

@@ -217,17 +217,7 @@ impl AppState {
                         && active.adb_stream_owner.is_some()
                 })
                 .ok_or_else(|| "ADB recovery target changed before local cleanup.".to_string())?;
-            let cleanup = PendingAdbCleanup {
-                serial: active.serial.clone(),
-                transport: active.transport.clone(),
-                socket_name: active.reverse.clone(),
-                installed_receiver: active.installed_receiver,
-                receiver_owner_id: active.receiver_owner_id.clone(),
-                receiver_generation: active.receiver_generation,
-                receiver_stopped: !active.installed_receiver,
-                receiver_user_stopped: false,
-                reverse_removed: active.reverse.is_empty(),
-            };
+            let cleanup = pending_adb_cleanup_for(active);
             active.reverse.clear();
             active.installed_receiver = false;
             (cleanup, active.adb_stream_owner.take())
@@ -304,18 +294,13 @@ impl AppState {
             if let Err(error) = self.audio.restore_muted() {
                 errors.push(format!("电脑声音恢复失败：{error}"));
             }
+            if let Some(forward) = session.hdc_forward.take() {
+                if let Err(error) = self.remove_hdc_forward(&forward).await {
+                    errors.push(format!("hdc 端口转发清理失败：{error}"));
+                }
+            }
             if adb_stream {
-                let mut cleanup = PendingAdbCleanup {
-                    serial: session.serial.clone(),
-                    transport: session.transport.clone(),
-                    socket_name: session.reverse.clone(),
-                    installed_receiver: session.installed_receiver,
-                    receiver_owner_id: session.receiver_owner_id.clone(),
-                    receiver_generation: session.receiver_generation,
-                    receiver_stopped: !session.installed_receiver,
-                    receiver_user_stopped: false,
-                    reverse_removed: session.reverse.is_empty(),
-                };
+                let mut cleanup = pending_adb_cleanup_for(&session);
                 if let Err(error) = self
                     .cleanup_adb_remote(&mut cleanup, &CancellationToken::new())
                     .await

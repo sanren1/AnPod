@@ -808,12 +808,9 @@ pub(crate) fn parse_devices(text: &str) -> Vec<Device> {
         .collect()
 }
 
-/// The connect path below is ADB-only until the hdc path lands.
-pub(crate) fn ensure_android_device(device: &Device) -> Result<(), String> {
-    if device.platform == "harmony" {
-        return Err("鸿蒙设备的有线连接暂未开放。".into());
-    }
-    Ok(())
+/// HarmonyOS devices connect over hdc; everything else keeps the ADB paths.
+pub(crate) fn connects_over_hdc(device: &Device) -> bool {
+    device.platform == "harmony"
 }
 
 pub(crate) fn merge_devices(mut adb: Vec<Device>, hdc: Option<Vec<Device>>) -> Vec<Device> {

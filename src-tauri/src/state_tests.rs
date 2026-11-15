@@ -681,6 +681,7 @@ fn sample_snapshot() -> AppSnapshot {
         audio_bitrate_bps: Some(1_536_000),
         presence: Vec::new(),
         version: "1.4.0".into(),
+        harmony_pairing_code: None,
     }
 }
 

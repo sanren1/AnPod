@@ -271,6 +271,7 @@ impl AppState {
                 adb_stream_owner: None,
                 aoa_target_id: None,
                 windows_mix_format: mix_format.clone(),
+                hdc_forward: None,
             });
             if !self.install_session_cancel(0, session_generation, generation, &token, cancel_signal) {
                 failed_install_signal();

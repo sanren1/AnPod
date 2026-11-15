@@ -126,8 +126,8 @@ fn hdc_server_port_honours_env() {
 }
 
 #[test]
-fn harmony_device_is_rejected_by_android_connect_path() {
-    use crate::state::ensure_android_device;
-    assert!(ensure_android_device(&harmony("HW1")).is_err());
-    assert!(ensure_android_device(&parse_devices(ADB_TEXT)[0]).is_ok());
+fn harmony_device_routes_to_hdc_connect_path() {
+    use crate::state::connects_over_hdc;
+    assert!(connects_over_hdc(&harmony("HW1")));
+    assert!(!connects_over_hdc(&parse_devices(ADB_TEXT)[0]));
 }

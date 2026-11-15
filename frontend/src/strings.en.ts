@@ -83,6 +83,7 @@ export const en: typeof zhCN = {
     wiredMode: "Connection mode",
     wiredModeAdb: "ADB",
     wiredModeDirect: "USB Direct",
+    wiredModeHdc: "hdc",
     connectUsbDirect: "Connect USB Direct",
     chooseUsbDirectPhone: "Choose USB Direct phone",
     firstSetup: "First-time setup",
@@ -271,6 +272,10 @@ export const en: typeof zhCN = {
     receiverRestartNote: "Follow Android prompts for installation or notification access. If the app stops or the phone restarts, reopen AnPod and tap “Connect to computer”; if needed, check the app over USB. A ready connection does not mean playback has started.",
     adbPlaybackNote: "Wireless debugging pairing requires explicit authorization in the phone's system. A ready connection does not mean the phone has started playing; playback is reported by the active audio backend.",
     finish: "Done",
+  },
+  harmonyPairing: {
+    title: "Pair this tablet?",
+    confirm: "Confirm",
   },
   confirmDialog: {
     cancel: "Cancel",

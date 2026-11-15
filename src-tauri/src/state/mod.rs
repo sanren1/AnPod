@@ -5,6 +5,7 @@ mod audio_ops;
 mod connect_ops;
 mod diagnostics_log;
 mod discovery_ops;
+mod hdc_ops;
 mod monitor_ops;
 mod network_ops;
 mod receiver_ops;
@@ -341,6 +342,7 @@ pub struct AppSnapshot {
     pub audio_bitrate_bps: Option<u64>,
     pub presence: Vec<PresenceView>,
     pub version: String,
+    pub harmony_pairing_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -638,6 +640,13 @@ pub(crate) struct Session {
     network_sink_queue: Option<SessionAudioQueue>,
     network_binding_ref: Option<String>,
     windows_mix_format: Option<WindowsMixFormat>,
+    hdc_forward: Option<HdcForward>,
+}
+
+/// `hdc rport` rule of a HarmonyOS wired session; `task` is "tcp:<tablet> tcp:<pc>".
+pub(crate) struct HdcForward {
+    key: String,
+    task: String,
 }
 
 #[derive(Clone)]
@@ -822,6 +831,20 @@ impl AdbRecoveryAttemptOps for AppStateAdbRecoveryAttemptOps<'_> {
     }
 }
 
+fn pending_adb_cleanup_for(session: &Session) -> PendingAdbCleanup {
+    PendingAdbCleanup {
+        serial: session.serial.clone(),
+        transport: session.transport.clone(),
+        socket_name: session.reverse.clone(),
+        installed_receiver: session.installed_receiver,
+        receiver_owner_id: session.receiver_owner_id.clone(),
+        receiver_generation: session.receiver_generation,
+        receiver_stopped: !session.installed_receiver,
+        receiver_user_stopped: false,
+        reverse_removed: session.reverse.is_empty(),
+    }
+}
+
 fn record_adb_cleanup_attempt(
     cleanup: &mut PendingAdbCleanup,
     stop: Result<(), String>,
@@ -858,6 +881,31 @@ fn adb_reverse_remove_result(result: AdbResult, socket_name: &str) -> Result<(),
         Ok(())
     } else {
         Err("Unable to remove the ADB audio reverse mapping.".into())
+    }
+}
+
+/// How a record-stream session (USB Direct, ADB or hdc) ends once its owner reports a cause.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordStreamExit {
+    /// Ended on purpose or for an unknown reason: no reconnect.
+    Finish(&'static str),
+    /// Unexpected transport loss: reconnect the same way.
+    Recover,
+}
+
+fn record_stream_exit(
+    cause: Option<TerminalCause>,
+    capability_bits: u32,
+) -> Option<RecordStreamExit> {
+    match cause? {
+        TerminalCause::ReceiverUserStop => Some(RecordStreamExit::Finish("手机已主动停止音频会话")),
+        TerminalCause::TransportFailure if capability_bits & CAP_TERMINAL_CAUSE == 0 => {
+            Some(RecordStreamExit::Finish(
+                "手机 Receiver 无法确认会话终止原因，请更新 Receiver 或手动重新连接。",
+            ))
+        }
+        TerminalCause::TransportFailure => Some(RecordStreamExit::Recover),
+        TerminalCause::HostStop => None,
     }
 }
 
@@ -903,6 +951,7 @@ pub(crate) struct ViewState {
     negotiated_audio_format: Option<NegotiatedAudioFormat>,
     windows_mix_format: Option<WindowsMixFormat>,
     network_recovery_seconds_remaining: Option<u64>,
+    harmony_pairing_code: Option<String>,
 }
 
 pub struct AppState {
@@ -935,6 +984,7 @@ pub struct AppState {
     receiver_apk_path: PathBuf,
     receiver_metadata_path: PathBuf,
     presence: Mutex<PresenceTracker>,
+    harmony_pairing_answer: Mutex<Option<std::sync::mpsc::Sender<bool>>>,
 }
 
 fn prepare_audio_settings(
@@ -1205,6 +1255,7 @@ impl AppState {
                 negotiated_audio_format: None,
                 windows_mix_format: None,
                 network_recovery_seconds_remaining: None,
+                harmony_pairing_code: None,
             }),
             host_offer_listener: Mutex::new(None),
             operation: Mutex::new(None),
@@ -1243,6 +1294,7 @@ impl AppState {
             receiver_apk_path,
             receiver_metadata_path,
             presence: Mutex::new(PresenceTracker::default()),
+            harmony_pairing_answer: Mutex::new(None),
         }
     }
 
@@ -1376,6 +1428,7 @@ impl AppState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .view(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            harmony_pairing_code: view.harmony_pairing_code.clone(),
         }
     }
 

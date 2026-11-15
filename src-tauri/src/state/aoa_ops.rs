@@ -401,6 +401,7 @@ impl AppState {
                 network_sink_queue: None,
                 network_binding_ref: Some(binding_reference.to_owned()),
                 windows_mix_format: mix_format.clone(),
+                hdc_forward: None,
             });
             if !self.install_session_cancel(
                 0,
@@ -768,26 +769,18 @@ impl AppState {
                     .unwrap_or_else(|| "AOA Receiver session stopped".into())
             })
         });
-        match snapshot.terminal_cause {
-            Some(TerminalCause::ReceiverUserStop) => {
+        match record_stream_exit(
+            snapshot.terminal_cause,
+            snapshot.capabilities.capability_bits,
+        ) {
+            Some(RecordStreamExit::Finish(message)) => {
                 let generation = active.generation;
                 drop(session);
-                self.finish_aoa_terminal(generation, app, "手机已主动停止音频会话")
-                    .await;
+                self.finish_aoa_terminal(generation, app, message).await;
                 return true;
             }
-            Some(TerminalCause::TransportFailure) => {
+            Some(RecordStreamExit::Recover) => {
                 let generation = active.generation;
-                if snapshot.capabilities.capability_bits & CAP_TERMINAL_CAUSE == 0 {
-                    drop(session);
-                    self.finish_aoa_terminal(
-                        generation,
-                        app,
-                        "手机 Receiver 无法确认会话终止原因，请更新 Receiver 或手动重新连接。",
-                    )
-                    .await;
-                    return true;
-                }
                 let target_id = active.aoa_target_id.clone();
                 let binding = active.network_binding_ref.clone();
                 let format = snapshot.format;
@@ -826,7 +819,7 @@ impl AppState {
                 }
                 return true;
             }
-            _ => {}
+            None => {}
         }
         if let Some(error) = failure {
             if adb_stream {
