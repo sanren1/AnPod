@@ -776,11 +776,13 @@ pub(crate) fn parse_devices(text: &str) -> Vec<Device> {
             Some(Device {
                 serial,
                 physical_id: None,
+                platform: "android".into(),
                 transport: transport.into(),
                 state: state.into(),
                 manufacturer,
                 model,
                 android_version: String::new(),
+                os_version: String::new(),
                 api_level: String::new(),
                 display_name,
                 status_text: status_text.into(),
@@ -788,6 +790,11 @@ pub(crate) fn parse_devices(text: &str) -> Vec<Device> {
             })
         })
         .collect()
+}
+
+pub(crate) fn merge_devices(mut adb: Vec<Device>, hdc: Option<Vec<Device>>) -> Vec<Device> {
+    adb.extend(hdc.into_iter().flatten());
+    adb
 }
 
 pub(crate) fn parse_getprop(text: &str) -> HashMap<String, String> {

@@ -133,3 +133,12 @@ describe("binding labels", () => {
     expect(runtime.bindingLabel(withModel)).toBe(strings.connection.pairedReceiver);
   });
 });
+
+describe("deviceOsLabel", () => {
+  const base = { serial: "s", transport: "usb", state: "device", manufacturer: "", model: "", apiLevel: "", displayName: "d", statusText: "", connectable: true } as const;
+  it("labels harmony and android devices", () => {
+    expect(runtime.deviceOsLabel({ ...base, platform: "harmony", androidVersion: "", osVersion: "HarmonyOS 7" })).toBe("HarmonyOS 7");
+    expect(runtime.deviceOsLabel({ ...base, platform: "android", androidVersion: "15", osVersion: "15" })).toBe("Android 15");
+    expect(runtime.deviceOsLabel({ ...base, platform: "android", androidVersion: "", osVersion: "" })).toBe("");
+  });
+});

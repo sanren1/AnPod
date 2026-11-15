@@ -1,6 +1,6 @@
 export type Device = {
-  serial: string; transport: "usb" | "wifi" | "unknown"; state: string;
-  manufacturer: string; model: string; androidVersion: string; apiLevel: string;
+  serial: string; platform: "android" | "harmony"; transport: "usb" | "wifi" | "unknown"; state: string;
+  manufacturer: string; model: string; androidVersion: string; osVersion: string; apiLevel: string;
   displayName: string; statusText: string; connectable: boolean;
 };
 export type AoaTarget = { id: string; label: string };

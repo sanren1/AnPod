@@ -214,7 +214,7 @@ export const zhCN = {
     refresh: "刷新",
     activeDirectUdp: "当前连接",
     androidVersion: (version: string) => ` · Android ${version}`,
-    deviceDetails: (connected: boolean, statusText: string, transport: "unknown" | "wifi" | "usb", androidVersion: string) => `${connected ? "当前连接 · " : ""}${statusText}${transport !== "unknown" ? ` · ${transport === "wifi" ? "Wi-Fi · ADB TCP" : "USB · ADB"}` : " · 连接方式未知"}${androidVersion ? ` · Android ${androidVersion}` : ""}`,
+    deviceDetails: (connected: boolean, statusText: string, transport: "unknown" | "wifi" | "usb", osLabel: string, harmony: boolean) => `${connected ? "当前连接 · " : ""}${statusText}${transport !== "unknown" ? ` · ${transport === "wifi" ? "Wi-Fi · ADB TCP" : harmony ? "USB · HDC" : "USB · ADB"}` : " · 连接方式未知"}${osLabel ? ` · ${osLabel}` : ""}`,
     emptyForBinding: "当前是直接网络连接。可添加另一台手机；USB/ADB 设备扫描为空时不影响当前连接。",
     empty: "尚未发现设备。Wi-Fi 下可添加同一网络下的手机；无线调试扫码、配对码或地址连接位于过渡/诊断入口。",
     finish: "完成",

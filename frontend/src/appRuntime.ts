@@ -1,12 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { strings } from "./strings";
-import type { Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, NetworkInterfacePair, BackgroundTrustStatus } from "./appTypes";
+import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, NetworkInterfacePair, BackgroundTrustStatus } from "./appTypes";
 
 export const isDesktop = "__TAURI_INTERNALS__" in window;
 export const invokeApp = <T,>(command: string, args?: Record<string, unknown>) => {
   if (!isDesktop) return Promise.reject(new Error(strings.app.desktopOnly));
   return invoke<T>(command, args);
 };
+export const deviceOsLabel = (device: Device) => device.platform === "harmony" ? device.osVersion : device.androidVersion ? `Android ${device.androidVersion}` : "";
 export const byTransport = (snapshot: Snapshot) => {
   const deviceTransport = snapshot.connectionTransport === "usb" ? "usb" : snapshot.settings.wirelessProtocol === "adb" ? "wifi" : null;
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];

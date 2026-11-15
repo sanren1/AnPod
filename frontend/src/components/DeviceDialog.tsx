@@ -1,7 +1,7 @@
 import { Check, Info, Search, Smartphone } from "lucide-react";
 import { strings } from "../strings";
 import type { Device } from "../appTypes";
-import { bindingLabel } from "../appRuntime";
+import { bindingLabel, deviceOsLabel } from "../appRuntime";
 import { Modal } from "./Modal";
 
 export function DeviceDialog({ devices, selected, activeSerial, activeBinding, busy, onSelect, onRefresh, onConnectOnly, onAddPhone, onClose }: { devices: Device[]; selected: string | null; activeSerial: string | null; activeBinding: string | null; busy: boolean; onSelect: (device: Device) => void; onRefresh: () => void; onConnectOnly: () => void; onAddPhone: (() => void) | null; onClose: () => void }) {
@@ -9,7 +9,7 @@ export function DeviceDialog({ devices, selected, activeSerial, activeBinding, b
     <div className="dialog-tools"><span>{strings.deviceDialog.onlyCurrentTransport}</span><button className="text-button" onClick={onRefresh} disabled={busy}><Search size={15} />{strings.deviceDialog.refresh}</button></div>
     {activeBinding && <div className="network-active-card"><strong>{bindingLabel(activeBinding)}</strong><span>{strings.deviceDialog.activeDirectUdp}</span></div>}
     <div className="device-list">{devices.map(device => { const connected = activeSerial === device.serial; const chosen = (activeSerial ?? selected) === device.serial; return <button className="device-option" key={device.serial} onClick={() => onSelect(device)} disabled={busy || (!connected && !device.connectable)} aria-pressed={chosen}>
-      <Smartphone size={18} aria-hidden="true" /><span><strong>{device.displayName}</strong><small>{strings.deviceDialog.deviceDetails(connected, device.statusText, device.transport, device.androidVersion)}</small></span>{chosen && <Check size={17} aria-hidden="true" />}
+      <Smartphone size={18} aria-hidden="true" /><span><strong>{device.displayName}</strong><small>{strings.deviceDialog.deviceDetails(connected, device.statusText, device.transport, deviceOsLabel(device), device.platform === "harmony")}</small></span>{chosen && <Check size={17} aria-hidden="true" />}
     </button>; })}</div>
     {devices.length === 0 && <div className="empty-note"><Info size={17} /><span>{activeBinding ? strings.deviceDialog.emptyForBinding : strings.deviceDialog.empty}</span></div>}
     <div className="network-entry-actions">

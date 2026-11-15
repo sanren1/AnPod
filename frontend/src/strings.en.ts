@@ -217,7 +217,7 @@ export const en: typeof zhCN = {
     refresh: "Refresh",
     activeDirectUdp: "Current connection",
     androidVersion: (version: string) => ` · Android ${version}`,
-    deviceDetails: (connected: boolean, statusText: string, transport: "unknown" | "wifi" | "usb", androidVersion: string) => `${connected ? "Current connection · " : ""}${statusText}${transport !== "unknown" ? ` · ${transport === "wifi" ? "Wi-Fi · ADB TCP" : "USB · ADB"}` : " · connection type unknown"}${androidVersion ? ` · Android ${androidVersion}` : ""}`,
+    deviceDetails: (connected: boolean, statusText: string, transport: "unknown" | "wifi" | "usb", osLabel: string, harmony: boolean) => `${connected ? "Current connection · " : ""}${statusText}${transport !== "unknown" ? ` · ${transport === "wifi" ? "Wi-Fi · ADB TCP" : harmony ? "USB · HDC" : "USB · ADB"}` : " · connection type unknown"}${osLabel ? ` · ${osLabel}` : ""}`,
     emptyForBinding: "This is a direct network session. Another phone can be added; an empty USB/ADB scan does not affect the current connection.",
     empty: "No devices found yet. On Wi-Fi you can add a phone on the same network; wireless debugging QR pairing, pairing codes, and address connections live under transitional/diagnostic entries.",
     finish: "Done",

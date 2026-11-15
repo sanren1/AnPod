@@ -8,6 +8,7 @@ mod aoa_owner;
 mod aoa_winusb;
 mod applog;
 mod audio;
+mod hdc;
 mod receiver;
 mod startup;
 mod state;
@@ -794,6 +795,13 @@ fn main() {
                 });
             }
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run AnPod");
+        .build(tauri::generate_context!())
+        .expect("failed to build AnPod")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.stop_hdc_server();
+                }
+            }
+        });
 }

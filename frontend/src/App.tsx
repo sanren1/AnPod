@@ -139,8 +139,8 @@ function App() {
   const deviceChoices = useMemo(() => {
     if (snapshot?.sessionTransport === "aoa" || !snapshot?.sessionSerial || devices.some(device => device.serial === snapshot.sessionSerial)) return devices;
     const current = snapshot.devices.find(device => device.serial === snapshot.sessionSerial) ?? {
-      serial: snapshot.sessionSerial, transport: snapshot.sessionTransport === "lan" ? "unknown" : snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
-      androidVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? strings.app.connectedPhone,
+      serial: snapshot.sessionSerial, platform: "android", transport: snapshot.sessionTransport === "lan" ? "unknown" : snapshot.sessionTransport ?? "unknown", state: "device", manufacturer: "", model: "",
+      androidVersion: snapshot.sessionAndroidVersion ?? "", osVersion: snapshot.sessionAndroidVersion ?? "", apiLevel: "", displayName: snapshot.deviceName ?? strings.app.connectedPhone,
       statusText: strings.app.staleDeviceScan, connectable: false,
     };
     return [current, ...devices];

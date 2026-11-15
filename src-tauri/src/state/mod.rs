@@ -62,11 +62,13 @@ static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub struct Device {
     pub serial: String,
     pub physical_id: Option<String>,
+    pub platform: String,
     pub transport: String,
     pub state: String,
     pub manufacturer: String,
     pub model: String,
     pub android_version: String,
+    pub os_version: String,
     pub api_level: String,
     pub display_name: String,
     pub status_text: String,
@@ -927,6 +929,8 @@ pub struct AppState {
     audio: AudioActor,
     data_dir: PathBuf,
     adb_path: PathBuf,
+    hdc_path: Option<PathBuf>,
+    hdc_server_started: AtomicBool,
     server_path: PathBuf,
     receiver_apk_path: PathBuf,
     receiver_metadata_path: PathBuf,
@@ -1226,6 +1230,15 @@ impl AppState {
             audio: AudioActor::new(audio_path, data_dir.join("muted-endpoints.txt")),
             data_dir,
             adb_path,
+            hdc_path: if cfg!(test) {
+                None
+            } else {
+                crate::hdc::locate_hdc(
+                    env::var_os("PATH").as_deref(),
+                    crate::hdc::deveco_install_location(),
+                )
+            },
+            hdc_server_started: AtomicBool::new(false),
             server_path,
             receiver_apk_path,
             receiver_metadata_path,
@@ -1808,6 +1821,7 @@ impl AppState {
                             .get("ro.build.version.release")
                             .cloned()
                             .unwrap_or_default();
+                        device.os_version = device.android_version.clone();
                     }
                     if device.api_level.is_empty() {
                         device.api_level =
@@ -1841,6 +1855,13 @@ impl AppState {
                 }
             }
         }
+        let hdc_devices = match &self.hdc_path {
+            Some(hdc) if !self.usb_direct_configuration_active() => {
+                crate::hdc::scan_hdc(hdc, &self.hdc_server_started, cancel).await
+            }
+            _ => None,
+        };
+        let devices = merge_devices(devices, hdc_devices);
         {
             let mut view = self
                 .view
@@ -1885,6 +1906,17 @@ impl AppState {
             }
         }
         Ok(self.snapshot())
+    }
+
+    /// Stops the hdc server only if this process was the one that started it.
+    pub fn stop_hdc_server(&self) {
+        if let Some(hdc) = self
+            .hdc_path
+            .as_deref()
+            .filter(|_| self.hdc_server_started.load(Ordering::Relaxed))
+        {
+            crate::hdc::kill_hdc_server(hdc);
+        }
     }
 
     pub fn open_logs(&self) -> Result<(), String> {
