@@ -35,6 +35,8 @@ public:
     virtual void resume() = 0;
     // STOP or session end after an open; called once, on the reader thread.
     virtual void close() = 0;
+    // Why the last open() failed, when the sink knows more than "cannot open" (e.g. "low latency unsupported").
+    virtual std::string failureReason() const { return {}; }
     // playbackAdvancing == true reports the STREAMING state.
     virtual PlaybackStats stats() const = 0;
 };

@@ -97,6 +97,12 @@ struct Index {
     }
   }
 
+  // Known causes get localized copy; anything else shows the native message as is.
+  errorText(): ResourceStr {
+    return this.errorMessage.endsWith('low latency unsupported') ? $r('app.string.error_low_latency') :
+      this.errorMessage;
+  }
+
   statusColor(): Resource {
     if (this.coreState === 'playing') {
       return $r('app.color.status_ok');
@@ -129,7 +135,7 @@ struct Index {
       .width('100%')
 
       if (this.coreState === 'failed' && this.errorMessage !== '') {
-        Text(this.errorMessage)
+        Text(this.errorText())
           .fontSize(14)
           .fontColor($r('sys.color.ohos_id_color_text_secondary'))
           .maxLines(3)
@@ -146,20 +152,21 @@ struct Index {
   @Builder
   playbackCard() {
     Column({ space: 24 }) {
-      Text(this.formatText === '' ? '—' : this.formatText)
-        .fontSize(22)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('sys.color.ohos_id_color_text_primary'))
-        .maxLines(1)
-        .minFontSize(14)
-        .maxFontSize(22)
-        .width('100%')
-        .textAlign(TextAlign.Center)
+      if (this.formatText !== '') {
+        Text(this.formatText)
+          .fontSize(22)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.ohos_id_color_text_primary'))
+          .maxLines(1)
+          .minFontSize(14)
+          .maxFontSize(22)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+      }
       Button($r('app.string.disconnect'))
         .buttonStyle(ButtonStyleMode.NORMAL)
         .height(48)
         .width('100%')
-        .enabled(this.live())
         .onClick(() => ReceiverSession.disconnect())
     }
     .width('100%')
@@ -193,6 +200,7 @@ struct Index {
       .height(56)
       .padding({ left: 24, right: 12 })
 
+      // The playback card exists only while a session is live; idle, the status card fills the width.
       if (this.wide) {
         Row({ space: 16 }) {
           Column() {
@@ -200,10 +208,12 @@ struct Index {
           }
           .layoutWeight(3)
 
-          Column() {
-            this.playbackCard()
+          if (this.live()) {
+            Column() {
+              this.playbackCard()
+            }
+            .layoutWeight(2)
           }
-          .layoutWeight(2)
         }
         .width('100%')
         .alignItems(VerticalAlign.Top)
@@ -211,7 +221,9 @@ struct Index {
       } else {
         Column({ space: 16 }) {
           this.statusCard()
-          this.playbackCard()
+          if (this.live()) {
+            this.playbackCard()
+          }
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8 })

@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -16,10 +17,18 @@ std::unique_ptr<SocketStream> SocketStream::connectLoopback(uint16_t port) {
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int result;
-    do {
-        result = ::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof address);
-    } while (result != 0 && errno == EINTR);
+    int result = ::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof address);
+    if (result != 0 && errno == EINTR) {
+        // The connect goes on in the background after EINTR (calling it again fails): wait for its outcome.
+        pollfd waiter{fd, POLLOUT, 0};
+        int ready;
+        do {
+            ready = ::poll(&waiter, 1, 5000);
+        } while (ready < 0 && errno == EINTR);
+        int error = 0;
+        socklen_t length = sizeof error;
+        result = ready == 1 && ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0 ? 0 : -1;
+    }
     if (result != 0) {
         ::close(fd);
         return nullptr;

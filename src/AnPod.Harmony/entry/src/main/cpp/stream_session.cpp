@@ -225,9 +225,12 @@ std::string StreamSession::controlLoop() {
                                                    return sink_.write(samples.data(), frames);
                                                });
                 if (!ingress_) return "audio ingress refused the negotiated format";
-                if (!sink_.open(format_))
+                if (!sink_.open(format_)) {
+                    std::string reason = sink_.failureReason();
                     return "audio output cannot open " + std::to_string(format_.sampleRate) + " Hz Float32 " +
-                           std::to_string(format_.channels) + "ch " + (format_.mode == 1 ? "fast" : "normal");
+                           std::to_string(format_.channels) + "ch " + (format_.mode == 1 ? "fast" : "normal") +
+                           (reason.empty() ? "" : ": " + reason);
+                }
                 playbackStarted = true;
                 if (callbacks_.onFormat) callbacks_.onFormat(format_);
                 setState(SessionState::ReceiverRunning);

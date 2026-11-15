@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
@@ -205,7 +206,7 @@ void runWired(std::shared_ptr<Run> run, uint16_t port, Id16 hostId, Token16 toke
             if (run->stopRequested) session->stop(run->userStop);
             run->ended.wait(lock, [&] { return run->sessionEnded; });
             run->session = nullptr;
-            error = run->endMessage;
+            error = run->userStop ? "" : run->endMessage;  // a local Disconnect is a stop, not a failure
             lock.unlock();
             session.reset();
         }
@@ -294,12 +295,13 @@ void stopCurrent(bool userInitiated) {
 
 napi_value StartHdcSession(napi_env env, napi_callback_info info) {
     auto argv = args(env, info, 4);
-    int32_t port = 0;
+    double port = 0;
     std::string hostHex, tokenHex;
     Id16 hostId;
     Token16 token;
     napi_valuetype callbackType = napi_undefined;
-    if (argv.empty() || napi_get_value_int32(env, argv[0], &port) != napi_ok || port < 40000 || port > 49999 ||
+    if (argv.empty() || napi_get_value_double(env, argv[0], &port) != napi_ok || std::trunc(port) != port ||
+        port < 40000 || port > 49999 ||
         !stringArg(env, argv[1], hostHex) || !parseHex(hostHex, hostId) || !stringArg(env, argv[2], tokenHex) ||
         !parseHex(tokenHex, token) || napi_typeof(env, argv[3], &callbackType) != napi_ok ||
         callbackType != napi_function) {

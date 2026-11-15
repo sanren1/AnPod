@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <string>
 
 struct OH_AudioRendererStruct;
 
@@ -34,6 +36,7 @@ public:
     bool isOpen() const { return renderer_ != nullptr; }
     // The latency path the system actually granted (OH_AudioRenderer_GetFastStatus after start).
     bool fast() const { return fast_; }
+    std::string failureReason() const override { return failure_; }
 
     // OHAudio C callbacks (public so the .cpp can take their address).
     int32_t render(void* data, int32_t bytes);
@@ -45,7 +48,9 @@ private:
     SpscFloatRing ring_;
     uint32_t sampleRate_ = 0, channels_ = 0, startThresholdFrames_ = 0;
     bool fast_ = false;
-    std::atomic<bool> paused_{false}, interrupted_{false}, primed_{false};
+    std::atomic<bool> paused_{false}, interrupted_{false}, primed_{false}, closing_{false};
+    std::mutex interruptMutex_;
+    std::string failure_;
     std::atomic<uint32_t> underruns_{0};
     std::atomic<int64_t> lastAdvanceNanos_{0};
 };

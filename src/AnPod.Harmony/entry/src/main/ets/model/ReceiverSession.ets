@@ -31,8 +31,14 @@ export class ReceiverSession {
     set(KEY_PC_CONFIRMED, false);
     set(KEY_ERROR, '');
     hooks.live();
-    anpod.startHdcSession(params.port, params.hostId, params.launchToken,
-      (e: CoreEvent) => ReceiverSession.onEvent(e, hooks));
+    try {
+      anpod.startHdcSession(params.port, params.hostId, params.launchToken,
+        (e: CoreEvent) => ReceiverSession.onEvent(e, hooks));
+    } catch (e) {
+      set(KEY_ERROR, e instanceof Error ? e.message : String(e));
+      set(KEY_STATE, 'failed');
+      hooks.ended();
+    }
   }
 
   static answerPairing(accept: boolean): void {

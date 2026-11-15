@@ -9,9 +9,9 @@
 namespace anpod {
 namespace {
 
-// Same targets as the Android Float32 path for one mode: FloatPcmFrameQueue start 20 / 40 ms (also the
-// re-prime target after an underrun) and queue max 60 / 150 ms plus the output budget 15 / 50 ms
-// (Pcm16FrameStream.*_AUDIO_TRACK_BUFFER_MS) as the ring capacity. LowLatency / Balanced.
+// Same targets as the Android Float32 path, indexed by the descriptor mode ([0] Balanced, [1] LowLatency):
+// FloatPcmFrameQueue start 40 / 20 ms (also the re-prime target after an underrun) and queue max 150 / 60 ms
+// plus the output budget 50 / 15 ms (Pcm16FrameStream.*_AUDIO_TRACK_BUFFER_MS) as the ring capacity.
 constexpr uint32_t kStartMs[2] = {40, 20};
 constexpr uint32_t kCapacityMs[2] = {200, 75};
 constexpr int64_t kAdvancingWindowNanos = 200'000'000;
@@ -48,7 +48,8 @@ bool OhAudioOutput::open(const AudioFormatV2& format) {
     sampleRate_ = format.sampleRate;
     channels_ = format.channels;
     startThresholdFrames_ = format.sampleRate * kStartMs[mode] / 1000;
-    paused_ = interrupted_ = primed_ = false;
+    paused_ = interrupted_ = primed_ = closing_ = false;
+    failure_.clear();
     underruns_ = 0;
     lastAdvanceNanos_ = 0;
 
@@ -103,6 +104,13 @@ bool OhAudioOutput::open(const AudioFormatV2& format) {
     OH_AudioStream_FastStatus status = AUDIOSTREAM_FASTSTATUS_NORMAL;
     fast_ = OH_AudioRenderer_GetFastStatus(renderer_, &status) == AUDIOSTREAM_SUCCESS &&
             status == AUDIOSTREAM_FASTSTATUS_FAST;
+    // LowLatency is the FAST path or nothing: never continue on the normal path in its name (ruling R10).
+    if (mode == 1 && !fast_) {
+        logFailure("fast path", static_cast<int>(status), format.sampleRate, mode);
+        close();
+        failure_ = "low latency unsupported";
+        return false;
+    }
     return true;
 }
 
@@ -126,20 +134,23 @@ int32_t OhAudioOutput::render(void* data, int32_t bytes) {
     uint32_t consumed = ring_.render(out, frames, false, 1.0f);
     if (consumed > 0) lastAdvanceNanos_ = nowNanos();
     if (consumed < frames) {
-        underruns_++;
+        if (!closing_ && !paused_) underruns_++;  // the drained read while stopping is not an underrun
         primed_ = false;  // refill to the same start target before playing on
     }
     return static_cast<int32_t>(consumed);
 }
 
 void OhAudioOutput::interrupt(int32_t forceType, int32_t hint) {
+    // Held across the Start below so close() cannot release the renderer under it.
+    std::lock_guard<std::mutex> lock(interruptMutex_);
+    if (closing_ || !renderer_) return;
     if (forceType == AUDIOSTREAM_INTERRUPT_FORCE &&
         (hint == AUDIOSTREAM_INTERRUPT_HINT_PAUSE || hint == AUDIOSTREAM_INTERRUPT_HINT_STOP)) {
         interrupted_ = true;
         if (onInterrupt_) onInterrupt_(true);
     } else if (hint == AUDIOSTREAM_INTERRUPT_HINT_RESUME && interrupted_) {
         primed_ = false;
-        if (!paused_ && renderer_) OH_AudioRenderer_Start(renderer_);
+        if (!paused_) OH_AudioRenderer_Start(renderer_);
         interrupted_ = false;
         if (onInterrupt_) onInterrupt_(false);
     }
@@ -158,6 +169,10 @@ void OhAudioOutput::resume() {
 
 void OhAudioOutput::close() {
     if (!renderer_) return;
+    {
+        std::lock_guard<std::mutex> lock(interruptMutex_);
+        closing_ = true;
+    }
     OH_AudioRenderer_Stop(renderer_);
     OH_AudioRenderer_Release(renderer_);
     renderer_ = nullptr;

@@ -525,7 +525,7 @@ bool ohaudioRejectsUnsupportedWithoutFallback() {
 }
 
 bool ohaudioOpensNegotiatedFloat32() {
-    for (auto [profile, mode] : {std::pair{4, 0}, std::pair{5, 0}, std::pair{4, 1}}) {
+    for (auto [profile, mode] : {std::pair{4, 0}, std::pair{5, 0}}) {
         OhAudioOutput output;
         if (!output.open(*AudioFormatV2::forProfile(profile, mode)) || !output.isOpen()) return false;
         const float silence[16] = {};
@@ -534,6 +534,46 @@ bool ohaudioOpensNegotiatedFloat32() {
         if (!wrote || output.isOpen()) return false;
     }
     return true;
+}
+
+// LowLatency either really runs on the FAST path, or fails with nothing open and says why (ruling R10).
+// The emulator never grants FAST, so there this exercises the rejection path.
+bool ohaudioLowLatencyIsFastOrRejected() {
+    OhAudioOutput output;
+    bool opened = output.open(*AudioFormatV2::forProfile(4, 1));
+    if (opened) return output.isOpen() && output.fast() && output.failureReason().empty();
+    return !output.isOpen() && output.failureReason() == "low latency unsupported";
+}
+
+// A sink that cannot open names the reason in the session's end message.
+class RejectingSink final : public PlaybackSink {
+public:
+    bool open(const AudioFormatV2&) override { return false; }
+    bool write(const float*, size_t) override { return false; }
+    void pause() override {}
+    void resume() override {}
+    void close() override { closes++; }
+    std::string failureReason() const override { return "low latency unsupported"; }
+    PlaybackStats stats() const override { return {}; }
+    std::atomic<int> closes{0};
+};
+
+bool sessionReportsLowLatencyUnsupported() {
+    Pipe pipe = makePipe();
+    PipeEnd& pc = *pipe.pc;
+    RejectingSink sink;
+    Ended ended;
+    auto session = StreamSession::start(std::move(pipe.tablet), sessionBinding(), sink, ended.callbacks());
+    Host host{pc};
+    auto format = *AudioFormatV2::forProfile(4, 1);
+    if (!host.handshake(sessionBinding().deriveAdbStream(), format)) return false;
+    const uint8_t zeroPort[2] = {0, 0};
+    const uint8_t mode[1] = {format.mode};
+    bool ok = host.capabilities().size() == 20 && host.exchange(p5c::kBind, zeroPort).size() == 13 &&
+              host.exchange(p5c::kSelectMode, mode).size() == 13 && host.exchange(p5c::kStart).empty();
+    auto message = ended.wait();
+    const char* expected = "audio output cannot open 48000 Hz Float32 2ch fast: low latency unsupported";
+    return ok && message && *message == expected && sink.closes == 0;
 }
 
 bool sessionRejectsReplayedCommand() {
@@ -588,6 +628,8 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"session_pause_resume_stop_reach_sink", sessionPauseResumeStopReachSink},
         {"ohaudio_rejects_unsupported_without_fallback", ohaudioRejectsUnsupportedWithoutFallback},
         {"ohaudio_opens_negotiated_float32", ohaudioOpensNegotiatedFloat32},
+        {"ohaudio_low_latency_is_fast_or_rejected", ohaudioLowLatencyIsFastOrRejected},
+        {"session_reports_low_latency_unsupported", sessionReportsLowLatencyUnsupported},
     };
     for (const Case& c : cases)
         if (!c.fn()) failures.emplace_back(c.name);

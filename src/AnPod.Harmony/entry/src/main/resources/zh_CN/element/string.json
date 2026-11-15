@@ -87,6 +87,10 @@
     {
       "name": "store_unavailable",
       "value": "无法读取已配对的电脑"
+    },
+    {
+      "name": "error_low_latency",
+      "value": "此设备不支持低延迟"
     }
   ]
 }
