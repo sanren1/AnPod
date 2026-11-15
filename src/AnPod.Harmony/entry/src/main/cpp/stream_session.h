@@ -74,6 +74,9 @@ public:
     // drops its reconnect intent); the stream is closed anyway after the 5 s heartbeat timeout. Otherwise closes now.
     void stop(bool userInitiated);
 
+    // Test seam: the UDP socket opened by a wireless BIND, -1 before.
+    int udpSocketForTest() const { return udpFd_; }
+
 private:
     StreamSession(std::unique_ptr<ByteStream> stream, BindingMaterial derived, PlaybackSink& sink,
                   SessionCallbacks callbacks);
@@ -82,7 +85,7 @@ private:
     uint16_t bindUdp(uint16_t hostPort);
     void receiveUdp();
     int wirelessFd_ = -1;  // owned by stream_
-    int udpFd_ = -1;       // opened and closed by the reader
+    std::atomic<int> udpFd_{-1};  // opened and closed by the reader
     std::optional<Id16> intentNonce_;
     std::atomic<bool> udpStopping_{false};
     std::thread udpThread_;

@@ -290,10 +290,15 @@ std::string StreamSession::controlLoop() {
                 intentClaimed = true;
                 break;
             case p5c::kBind:
-                if (bound || !intentClaimed || payload.size() != 2) return "invalid BIND";
+                if (!intentClaimed) {  // as Java: an unclaimed intent is refused, the session stays
+                    result = kResultRejected;
+                    break;
+                }
+                if (bound || payload.size() != 2) return "invalid BIND";
                 if (wireless) {
                     uint16_t hostPort = static_cast<uint16_t>(payload[0] << 8 | payload[1]);
-                    if (!hostPort || !(responsePort = bindUdp(hostPort))) return "UDP bind failed";
+                    if (!hostPort) return "invalid BIND port";
+                    if (!(responsePort = bindUdp(hostPort))) return "UDP bind failed";
                 } else if (payload[0] || payload[1]) return "BIND must contain zero port";
                 bound = true;
                 setState(SessionState::TransportConnected);

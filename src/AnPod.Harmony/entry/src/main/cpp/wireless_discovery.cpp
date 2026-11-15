@@ -26,7 +26,7 @@ bool header(std::span<const uint8_t> bytes, uint8_t version, uint8_t kind) {
 }
 
 struct Lan { uint32_t address, mask; };
-std::vector<Lan> networks() {
+std::vector<Lan> readNetworks() {
     ifaddrs* interfaces = nullptr;
     std::vector<Lan> result;
     if (getifaddrs(&interfaces) != 0) {
@@ -46,6 +46,19 @@ std::vector<Lan> networks() {
     return result;
 }
 
+// Interfaces change rarely; one getifaddrs per second instead of one per datagram or accepted connection.
+std::vector<Lan> networks() {
+    static std::mutex mutex;
+    static std::vector<Lan> cached;
+    static Clock::time_point readAt{};
+    std::lock_guard lock(mutex);
+    if (readAt == Clock::time_point{} || Clock::now() - readAt >= std::chrono::seconds(1)) {
+        cached = readNetworks();
+        readAt = Clock::now();
+    }
+    return cached;
+}
+
 sockaddr_in endpoint(uint32_t address, uint16_t port) {
     sockaddr_in target{};
     target.sin_family = AF_INET;
@@ -59,6 +72,12 @@ bool sendPacket(int fd, std::span<const uint8_t> bytes, const sockaddr_in& dest)
            static_cast<ssize_t>(bytes.size());
 }
 }  // namespace
+
+bool onPrivateLan(uint32_t local, uint32_t peer) {
+    auto lans = networks();
+    return std::any_of(lans.begin(), lans.end(),
+                       [&](Lan lan) { return lan.address == local && ((local ^ peer) & lan.mask) == 0; });
+}
 
 std::optional<std::array<uint8_t, 50>> authenticatedCandidate(const BindingMaterial& binding,
     std::span<const uint8_t> probe, uint16_t controlPort) {
@@ -199,10 +218,7 @@ void WirelessDiscovery::serve() {
         std::memcpy(&incoming, CMSG_DATA(info), sizeof(incoming));
         auto local = incoming.ipi_spec_dst.s_addr;
         auto packet = std::span(buffer).first(static_cast<size_t>(size));
-        auto lans = networks();
-        if (std::none_of(lans.begin(), lans.end(), [&](Lan lan) {
-            return lan.address == local && ((local ^ peer.sin_addr.s_addr) & lan.mask) == 0;
-        })) {
+        if (!onPrivateLan(local, peer.sin_addr.s_addr)) {
             ANPOD_WIRELESS_LOG("datagram off the local subnet", size);
             continue;
         }

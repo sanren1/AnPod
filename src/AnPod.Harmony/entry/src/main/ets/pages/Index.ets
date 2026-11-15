@@ -100,6 +100,9 @@ struct Index {
   }
 
   statusText(): Resource {
+    if (this.transport === 'wireless' && this.hosts.length === 0 && !this.bindingError) {
+      return $r('app.string.no_paired_pcs');
+    }
     switch (this.coreState) {
       case 'listening':
         return $r('app.string.wireless_ready');
@@ -205,8 +208,8 @@ struct Index {
       .width('100%')
 
       if (this.transport === 'wireless') {
-        if (this.hosts.length === 0) {
-          Text(this.bindingError ? $r('app.string.store_unavailable') : $r('app.string.no_paired_pcs'))
+        if (this.bindingError) {
+          Text($r('app.string.store_unavailable'))
             .fontColor($r('sys.color.ohos_id_color_text_secondary'))
         } else {
           // A live session is ended with Disconnect first, so a tap never drops it silently.

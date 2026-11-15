@@ -6,7 +6,8 @@ export interface CoreEvent { kind: 'state' | 'pairingCode' | 'format' | 'error';
   pcConfirmed?: boolean; host?: string; }  // host: hostIdHex of the wireless peer
 export function startHdcSession(port: number, hostIdHex: string, launchTokenHex: string, onEvent: (e: CoreEvent) => void): void;
 export function answerPairing(accept: boolean): void;
-export function stopSession(userInitiated: boolean): void;
+// waitMs > 0 blocks until the run ended (a user stop: after its USER_STOPPED ACK was written), at most waitMs.
+export function stopSession(userInitiated: boolean, waitMs?: number): void;
 export function listBindings(): string[];      // hostIdHex
 export function forgetBinding(hostIdHex: string): boolean;
 export function selfTest(): string[];

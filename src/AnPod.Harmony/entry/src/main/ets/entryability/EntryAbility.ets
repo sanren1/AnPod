@@ -29,7 +29,8 @@ export default class EntryAbility extends UIAbility {
 
   // Closing the app is a manual disconnect: USER_STOPPED, the PC does not reconnect (wired or wireless).
   onDestroy(): void {
-    ReceiverSession.disconnect();
+    ReceiverSession.closeApp();
+    this.setLive(false);
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

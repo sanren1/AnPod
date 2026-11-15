@@ -13,6 +13,7 @@
 
 #include <napi/native_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -56,6 +57,7 @@ struct Run {
     std::condition_variable ended;
     std::atomic<bool> interrupted{false};
     std::atomic<int> sessionState{-1};
+    bool finished = false;  // the worker reported its end (under mutex, signalled on ended)
 };
 
 std::mutex gMutex;
@@ -78,6 +80,11 @@ void emitState(const std::shared_ptr<Run>& run, const char* state) {
 }
 
 void emitEnd(const std::shared_ptr<Run>& run, const std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(run->mutex);
+        run->finished = true;
+    }
+    run->ended.notify_all();
     if (!error.empty()) {
         Event e;
         e.kind = "error";
@@ -243,22 +250,31 @@ std::mutex wirelessOwner;
 std::string toHex(const Id16& id);
 
 std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<Id16>& selected) {
+    using Clock = std::chrono::steady_clock;
     std::unique_lock owner(wirelessOwner);
     if (run->stopRequested) return {};
+    auto ids = BindingStore::list();
+    if (!ids) return "binding store unavailable";
+    if (ids->empty()) return {};  // nothing to listen for: the page shows that no PC is paired
     auto listener = WirelessListener::open();
     WirelessDiscovery discovery;
     if (!listener || !discovery.start(listener->port())) return "wireless discovery unavailable";
     std::optional<Nonce16> intent;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
     if (selected) {
         secureRandom(intent.emplace());
         if (!discovery.request(*selected, *intent)) return "wireless discovery send failed";
     }
     emitState(run, selected ? "searching" : "listening");
     bool established = false;
+    std::optional<Clock::time_point> reconnectUntil;
     while (!run->stopRequested) {
-        if (selected && !established && std::chrono::steady_clock::now() >= deadline)
-            return "paired PC did not respond";
+        if (!discovery.running()) return "wireless discovery unavailable";
+        if (selected && !established && Clock::now() >= deadline) return "paired PC did not respond";
+        if (reconnectUntil && Clock::now() >= *reconnectUntil) {
+            reconnectUntil.reset();
+            emitState(run, "listening");  // the PC gave up: stop showing reconnecting, release the continuous task
+        }
         int fd = listener->accept(150);
         if (fd < 0) continue;
         auto host = wirelessHelloHost(fd);
@@ -272,12 +288,17 @@ std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<
             return "binding store unavailable";
         }
         if (!binding) { close(fd); continue; }
-        Event connecting;
-        connecting.state = "connecting";
-        connecting.host = toHex(*host);
-        emit(run, std::move(connecting));
         auto sink = audioOutput(run);
         auto callbacks = sessionCallbacks(run, sink);
+        // The peer is named only once P5-A has authenticated it (the hello hostId is a routing hint).
+        callbacks.onState = [run, base = callbacks.onState, hex = toHex(*host)](SessionState state) {
+            if (state != SessionState::Authenticated) return base(state);
+            run->sessionState = static_cast<int>(state);
+            Event e;
+            e.state = mapState(run->sessionState, run->interrupted);
+            e.host = hex;
+            emit(run, std::move(e));
+        };
         std::unique_lock lock(run->mutex);
         run->sessionState = -1;
         run->sessionEnded = false;
@@ -291,12 +312,11 @@ std::string listenWireless(const std::shared_ptr<Run>& run, const std::optional<
         lock.unlock();
         session.reset();
         if (run->stopRequested || error.empty()) return {};
-        if (run->sessionState >= static_cast<int>(SessionState::Authenticated)) {
-            established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
-            if (error.find("output") != std::string::npos || error.find("low latency") != std::string::npos)
-                return error;
-        }
+        if (run->sessionState < static_cast<int>(SessionState::Authenticated)) continue;  // UI never left waiting
+        established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
+        if (error.find("output") != std::string::npos || error.find("low latency") != std::string::npos) return error;
         // After an unexpected drop the PC reconnects the way it was connected; before that, keep waiting.
+        if (established) reconnectUntil = Clock::now() + std::chrono::seconds(30);
         emitState(run, established ? "reconnecting" : selected ? "searching" : "listening");
     }
     return {};
@@ -365,18 +385,21 @@ napi_value stringArray(napi_env env, const std::vector<std::string>& items) {
     return out;
 }
 
-void stopCurrent(bool userInitiated) {
+// waitMs > 0: blocks until the run ended (a user stop ends after the ACK carrying USER_STOPPED was written)
+// or the time is up.
+void stopCurrent(bool userInitiated, int waitMs = 0) {
     std::shared_ptr<Run> run;
     {
         std::lock_guard<std::mutex> lock(gMutex);
         run = gRun;
     }
     if (!run) return;
-    std::lock_guard<std::mutex> lock(run->mutex);
+    std::unique_lock<std::mutex> lock(run->mutex);
     run->stopRequested = true;
     run->userStop = run->userStop || userInitiated;
     if (run->session) run->session->stop(userInitiated);
     else if (run->stream) run->stream->close();
+    if (waitMs > 0) run->ended.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return run->finished; });
 }
 
 // ---- exports ---------------------------------------------------------------------------------------------
@@ -452,10 +475,14 @@ napi_value AnswerPairing(napi_env env, napi_callback_info info) {
 }
 
 napi_value StopSession(napi_env env, napi_callback_info info) {
-    auto argv = args(env, info, 1);
+    napi_value argv[2];
+    size_t argc = 2;
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     bool userInitiated = false;
-    if (!argv.empty()) napi_get_value_bool(env, argv[0], &userInitiated);
-    stopCurrent(userInitiated);
+    int32_t waitMs = 0;
+    if (argc >= 1) napi_get_value_bool(env, argv[0], &userInitiated);
+    if (argc >= 2 && napi_get_value_int32(env, argv[1], &waitMs) == napi_ok) waitMs = std::clamp(waitMs, 0, 3000);
+    stopCurrent(userInitiated, waitMs);
     return undefinedValue(env);
 }
 

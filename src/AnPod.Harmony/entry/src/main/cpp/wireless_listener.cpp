@@ -1,4 +1,5 @@
 #include "wireless_listener.h"
+#include "wireless_discovery.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -35,7 +36,19 @@ WirelessListener::~WirelessListener() { ::close(fd_); }
 int WirelessListener::accept(int timeoutMs) const {
     pollfd p{fd_, POLLIN, 0};
     if (::poll(&p, 1, timeoutMs) != 1 || !(p.revents & POLLIN)) return -1;
-    return ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
+    int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
+    if (fd < 0) return -1;
+    // Only peers on a private LAN of this device, like discovery (the listener itself binds all interfaces).
+    sockaddr_in local{}, peer{};
+    socklen_t localSize = sizeof local, peerSize = sizeof peer;
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &localSize) != 0 ||
+        ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peerSize) != 0 || local.sin_family != AF_INET ||
+        !onPrivateLan(local.sin_addr.s_addr, peer.sin_addr.s_addr)) {
+        ANPOD_WIRELESS_LOG("connection off the local subnet", 0);
+        ::close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 std::optional<Id16> wirelessHelloHost(int fd) {

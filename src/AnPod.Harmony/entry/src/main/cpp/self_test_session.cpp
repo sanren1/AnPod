@@ -1,4 +1,6 @@
 #include "wireless_listener.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 // Task 4 self-tests: TabletBootstrap and StreamSession against a simulated PC over an in-memory duplex pipe,
@@ -12,6 +14,7 @@
 #include "hdc_bootstrap.h"
 #include "ohaudio_output.h"
 #include "p5c_control.h"
+#include "socket_stream.h"
 #include "stream_session.h"
 
 #include <algorithm>
@@ -68,6 +71,10 @@ public:
         shared_->toEnd[1 - side_].insert(shared_->toEnd[1 - side_].end(), data.begin(), data.end());
         shared_->changed.notify_all();
         return true;
+    }
+    size_t available() {
+        std::lock_guard<std::mutex> lock(shared_->mutex);
+        return shared_->toEnd[side_].size();
     }
     void close() override {
         std::lock_guard<std::mutex> lock(shared_->mutex);
@@ -395,10 +402,23 @@ struct Ended {
 };
 
 struct Host {
-    PipeEnd& pc;
+    ByteStream& pc;
     uint64_t sessionId = 0x0102030405060708ULL;
     Key32 h2rControl{}, r2hControl{};
     uint64_t command = 0;
+    bool wireless = false;  // P5c framing: raw handshake records, control frames behind a 2-byte length
+
+    bool writeHandshake(const Bytes& body) {
+        return wireless ? pc.writeAll(body) : pc.writeAll(encodeAnpu(AnpuType::Handshake, body));
+    }
+    std::optional<Bytes> readHandshake(size_t size) {
+        if (!wireless) {
+            auto record = readAnpu(pc);
+            return record && record->type == AnpuType::Handshake ? std::optional<Bytes>(record->body) : std::nullopt;
+        }
+        Bytes body(size);
+        return pc.readExact(body.data(), size) ? std::optional<Bytes>(std::move(body)) : std::nullopt;
+    }
 
     // Host half of the P5-A v2 handshake (PairingProtocol.java), on the ADB-stream derived material.
     bool handshake(const BindingMaterial& derived, const AudioFormatV2& format) {
@@ -413,15 +433,15 @@ struct Host {
         append(hello, hostNonce);
         for (int shift = 56; shift >= 0; shift -= 8) hello.push_back(static_cast<uint8_t>(sessionId >> shift));
         append(hello, descriptor);
-        if (!pc.writeAll(encodeAnpu(AnpuType::Handshake, hello))) return false;
-        auto challenge = readAnpu(pc);
-        if (!challenge || challenge->body.size() != 104 || challenge->body[5] != 2) return false;
+        if (!writeHandshake(hello)) return false;
+        auto challenge = readHandshake(104);
+        if (!challenge || challenge->size() != 104 || (*challenge)[5] != 2) return false;
 
         Bytes transcript = {'A', 'N', 'P', '5', 2, 1, 2};
         append(transcript, derived.hostId());
         append(transcript, derived.receiverId());
         append(transcript, hostNonce);
-        append(transcript, std::span<const uint8_t>(challenge->body).subspan(24, 32));
+        append(transcript, std::span<const uint8_t>(*challenge).subspan(24, 32));
         for (int shift = 56; shift >= 0; shift -= 8) transcript.push_back(static_cast<uint8_t>(sessionId >> shift));
         append(transcript, descriptor);
         append(transcript, descriptor);
@@ -431,9 +451,9 @@ struct Host {
         append(proofInput, transcript);
         Bytes finish = {'A', 'N', 'P', '5', 2, 3, 0, 40};
         append(finish, hmacSha256(secret, proofInput));
-        if (!pc.writeAll(encodeAnpu(AnpuType::Handshake, finish))) return false;
-        auto ready = readAnpu(pc);
-        if (!ready || ready->body.size() != 40 || ready->body[5] != 4) return false;
+        if (!writeHandshake(finish)) return false;
+        auto ready = readHandshake(40);
+        if (!ready || ready->size() != 40 || (*ready)[5] != 4) return false;
 
         Bytes saltInput;
         append(saltInput, ascii("AnPod P5-A HKDF-SHA256 salt v2"));
@@ -453,12 +473,23 @@ struct Host {
 
     bool send(uint8_t type, std::span<const uint8_t> payload, uint64_t sequence) {
         Bytes frame = p5c::encode(h2rControl, p5c::kHostToReceiver, sessionId, sequence, type, payload);
-        return pc.writeAll(encodeAnpu(AnpuType::Control, frame));
+        if (!wireless) return pc.writeAll(encodeAnpu(AnpuType::Control, frame));
+        const uint8_t size[] = {static_cast<uint8_t>(frame.size() >> 8), static_cast<uint8_t>(frame.size())};
+        return pc.writeAll(size) && pc.writeAll(frame);
     }
     std::optional<p5c::Frame> reply() {
-        auto record = readAnpu(pc);
-        if (!record || record->type != AnpuType::Control) return std::nullopt;
-        return p5c::decodeRaw(record->body, r2hControl, p5c::kReceiverToHost, sessionId);
+        Bytes body;
+        if (wireless) {
+            uint8_t size[2];
+            if (!pc.readExact(size, 2)) return std::nullopt;
+            body.resize(size_t{size[0]} << 8 | size[1]);
+            if (!pc.readExact(body.data(), body.size())) return std::nullopt;
+        } else {
+            auto record = readAnpu(pc);
+            if (!record || record->type != AnpuType::Control) return std::nullopt;
+            body = std::move(record->body);
+        }
+        return p5c::decodeRaw(body, r2hControl, p5c::kReceiverToHost, sessionId);
     }
     // Sends the next command and returns its ACK payload (empty when there is none or it does not match).
     Bytes exchange(uint8_t type, std::span<const uint8_t> payload = {}) {
@@ -470,10 +501,10 @@ struct Host {
         for (int i = 1; i <= 8; i++) echoed = echoed << 8 | ack->payload[i];
         return echoed == sequence ? ack->payload : Bytes{};
     }
-    // CAPABILITIES_QUERY with the PC's wired requirements; returns the 20-byte info payload.
+    // CAPABILITIES_QUERY with the PC's wired (or wireless) requirements; returns the 20-byte info payload.
     Bytes capabilities() {
-        uint32_t required = 0x82 | p5c::kCapAudioAdbStream | p5c::kCapAudioV2 | p5c::kCapAudioFloat32 |
-                            p5c::kCapTerminalCause;
+        uint32_t required = 0x82 | p5c::kCapAudioV2 | p5c::kCapAudioFloat32 | p5c::kCapTerminalCause |
+                            (wireless ? 0 : p5c::kCapAudioAdbStream);
         Bytes query = p5c::capabilitiesQueryPayload(p5c::kManagementControlMajor, p5c::kAudioProtocolMajor, required);
         if (!send(p5c::kCapabilitiesQuery, query, command++)) return {};
         auto info = reply();
@@ -514,6 +545,170 @@ bool sessionUserStopSendsResultUserStopped() {
     auto message = ended.wait();
     return stopped.size() == 13 && stopped[9] == p5c::kResultUserStopped && stopped[10] == 5 && message &&
            message->empty() && !readAnpu(pc);
+}
+
+// Closing the app waits for the run's end: that end must come after the USER_STOPPED ACK was written.
+bool sessionUserStopAckWrittenBeforeEnd() {
+    Pipe pipe = makePipe();
+    PipeEnd& pc = *pipe.pc;
+    MemorySink sink;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::optional<size_t> waitingAtEnd;
+    SessionCallbacks callbacks;
+    callbacks.onEnded = [&](const std::string&) {
+        std::lock_guard<std::mutex> lock(mutex);
+        waitingAtEnd = pc.available();
+        changed.notify_all();
+    };
+    auto session = StreamSession::start(std::move(pipe.tablet), sessionBinding(), sink, callbacks);
+    Host host{pc};
+    auto format = *AudioFormatV2::forProfile(4, 0);
+    if (!host.handshake(sessionBinding().deriveAdbStream(), format) || host.capabilities().empty()) return false;
+    session->stop(true);
+    if (!host.send(p5c::kHeartbeat, {}, host.command++)) return false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait_for(lock, 5s, [&] { return waitingAtEnd.has_value(); });
+    }
+    // When onEnded ran, the bytes waiting for the PC were exactly the whole USER_STOPPED ACK record.
+    auto ack = host.reply();
+    return waitingAtEnd && *waitingAtEnd > 0 && ack && ack->type == p5c::kAck && ack->payload.size() == 13 &&
+           ack->payload[9] == p5c::kResultUserStopped && !readAnpu(pc);
+}
+
+// ---- wireless (P5c over a loopback TCP connection) ---------------------------------------------------------
+
+struct WirelessPair {
+    std::unique_ptr<SocketStream> pc;
+    int tabletFd = -1;
+};
+
+std::optional<WirelessPair> wirelessPair() {
+    int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t size = sizeof address;
+    std::optional<WirelessPair> pair;
+    if (listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&address), size) == 0 &&
+        ::listen(listener, 1) == 0 && ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0) {
+        auto pc = SocketStream::connectLoopback(ntohs(address.sin_port));
+        int tablet = pc ? ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC) : -1;
+        if (tablet >= 0) pair = WirelessPair{std::move(pc), tablet};
+    }
+    if (listener >= 0) ::close(listener);
+    return pair;
+}
+
+struct WirelessRun {
+    WirelessPair pair;
+    MemorySink sink;
+    Ended ended;
+    std::unique_ptr<StreamSession> session;
+    Host host;
+    explicit WirelessRun(WirelessPair p, std::optional<Nonce16> intent)
+        : pair(std::move(p)), host{*pair.pc} {
+        host.wireless = true;
+        session = StreamSession::startWireless(pair.tabletFd, sessionBinding(), intent, sink, ended.callbacks());
+    }
+    // Handshake on the plain binding (no ADB-stream derivation on P5c) and the capability exchange.
+    Bytes ready() {
+        if (!host.handshake(sessionBinding(), *AudioFormatV2::forProfile(5, 0))) return {};
+        return host.capabilities();
+    }
+};
+
+const Nonce16 kIntent = filled<16>(0x5a);
+
+bool wirelessIntentMismatchEndsSession() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), kIntent);
+    Bytes info = run.ready();
+    if (info.size() != 20 || (capabilityBits(info) & p5c::kCapConnectionIntent) == 0) return false;
+    auto wrong = filled<16>(0x5b);
+    bool ok = run.host.send(p5c::kConnectionIntent, wrong, run.host.command++) && !run.host.reply();
+    auto message = run.ended.wait();
+    return ok && message && *message == "connection intent expired or mismatched";
+}
+
+bool wirelessSecondIntentRejected() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), kIntent);
+    bool ok = run.ready().size() == 20 && run.host.exchange(p5c::kConnectionIntent, kIntent).size() == 13;
+    ok = ok && run.host.send(p5c::kConnectionIntent, kIntent, run.host.command++) && !run.host.reply();
+    auto message = run.ended.wait();
+    return ok && message && *message == "connection intent expired or mismatched";
+}
+
+bool wirelessBindBeforeIntentRejected() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), kIntent);
+    const uint8_t port[2] = {0x12, 0x34};
+    Bytes rejected = run.ready().size() == 20 ? run.host.exchange(p5c::kBind, port) : Bytes{};
+    // Refused with an ACK like Java; the session stays usable and nothing was bound.
+    bool ok = rejected.size() == 13 && rejected[9] == 1 && rejected[10] == 0 && rejected[11] == 0 &&
+              rejected[12] == 0 && run.session->udpSocketForTest() < 0 &&
+              run.host.exchange(p5c::kHeartbeat).size() == 13;
+    run.session->stop(false);
+    return ok;
+}
+
+bool wirelessNoIntentNotAdvertised() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), std::nullopt);
+    Bytes info = run.ready();
+    bool ok = info.size() == 20 && info[11] == 0 && (capabilityBits(info) & p5c::kCapConnectionIntent) == 0 &&
+              (capabilityBits(info) & p5c::kCapAudioAdbStream) == 0;
+    run.session->stop(false);
+    return ok;
+}
+
+bool wirelessBindPortZeroRejected() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), std::nullopt);
+    const uint8_t zero[2] = {0, 0};
+    bool ok = run.ready().size() == 20 && run.host.send(p5c::kBind, zero, run.host.command++) && !run.host.reply();
+    auto message = run.ended.wait();
+    return ok && message && *message == "invalid BIND port";
+}
+
+bool wirelessBindConnectsUdpToPeer() {
+    auto pair = wirelessPair();
+    if (!pair) return false;
+    WirelessRun run(std::move(*pair), kIntent);
+    const uint8_t port[2] = {0xc3, 0x51};  // 50001
+    bool ok = run.ready().size() == 20 && run.host.exchange(p5c::kConnectionIntent, kIntent).size() == 13;
+    Bytes ack = ok ? run.host.exchange(p5c::kBind, port) : Bytes{};
+    int udp = run.session->udpSocketForTest();
+    sockaddr_in local{}, peer{};
+    socklen_t size = sizeof local;
+    ok = ack.size() == 13 && ack[9] == 0 && ack[10] == 1 && udp >= 0 &&
+         ::getsockname(udp, reinterpret_cast<sockaddr*>(&local), &size) == 0 &&
+         (uint16_t{ack[11]} << 8 | ack[12]) == ntohs(local.sin_port) && local.sin_port != 0;
+    size = sizeof peer;
+    ok = ok && ::getpeername(udp, reinterpret_cast<sockaddr*>(&peer), &size) == 0 &&
+         peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && ntohs(peer.sin_port) == 50001;
+    run.session->stop(false);
+    return ok;
+}
+
+bool wirelessControlLengthOutOfBoundsRejected() {
+    for (size_t length : {size_t{1}, p5c::kMaxFrameBytes + 1}) {
+        auto pair = wirelessPair();
+        if (!pair) return false;
+        WirelessRun run(std::move(*pair), std::nullopt);
+        const uint8_t prefix[2] = {static_cast<uint8_t>(length >> 8), static_cast<uint8_t>(length)};
+        bool ok = run.ready().size() == 20 && run.pair.pc->writeAll(prefix);
+        auto message = run.ended.wait();
+        if (!ok || !message || *message != "session stream closed") return false;
+    }
+    return true;
 }
 
 bool sessionPauseResumeStopReachSink() {
@@ -663,6 +858,14 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"bootstrap_rejects_offer_when_already_bound", bootstrapRejectsOfferWhenAlreadyBound},
         {"bootstrap_failed_pair_saved_send_removes_binding", bootstrapFailedPairSavedSendRemovesBinding},
         {"session_user_stop_sends_result_user_stopped", sessionUserStopSendsResultUserStopped},
+        {"session_user_stop_ack_written_before_end", sessionUserStopAckWrittenBeforeEnd},
+        {"wireless_intent_mismatch_ends_session", wirelessIntentMismatchEndsSession},
+        {"wireless_second_intent_rejected", wirelessSecondIntentRejected},
+        {"wireless_bind_before_intent_rejected", wirelessBindBeforeIntentRejected},
+        {"wireless_no_intent_not_advertised", wirelessNoIntentNotAdvertised},
+        {"wireless_bind_port_zero_rejected", wirelessBindPortZeroRejected},
+        {"wireless_bind_connects_udp_to_peer", wirelessBindConnectsUdpToPeer},
+        {"wireless_control_length_out_of_bounds_rejected", wirelessControlLengthOutOfBoundsRejected},
         {"wireless_hello_selects_host", wirelessHelloSelectsHostWithoutConsumingBytes},
         {"session_rejects_replayed_command", sessionRejectsReplayedCommand},
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},

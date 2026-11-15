@@ -59,6 +59,7 @@ export class ReceiverSession {
 
   static selectMode(wireless: boolean): void {
     ReceiverSession.disconnect();
+    ReceiverSession.hooks.ended();  // the old run's own end event is dropped once the page switches
     const prefs = ReceiverSession.prefs;
     if (prefs !== undefined) {
       prefs.putSync('wireless', wireless);
@@ -109,10 +110,16 @@ export class ReceiverSession {
     anpod.answerPairing(accept);
   }
 
-  // USER_STOPPED: the PC drops its reconnect intent.
+  // USER_STOPPED: the PC drops its reconnect intent. The continuous task is released on the run's end event,
+  // after the ACK carrying USER_STOPPED went out.
   static disconnect(): void {
     anpod.stopSession(true);
-    ReceiverSession.hooks.ended();
+  }
+
+  // Closing the app: the ACK goes out with the PC's next command (heartbeat every second), so wait for the
+  // run's end a little longer than one heartbeat before the process may go away.
+  static closeApp(): void {
+    anpod.stopSession(true, 1500);
   }
 
   private static onEvent(e: CoreEvent, hooks: SessionHooks): void {
