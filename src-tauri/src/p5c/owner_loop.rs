@@ -575,12 +575,13 @@ pub(super) fn run_session_owner(
                 Ok(())
             }
         }) {
+            let terminal = harmony_start_failed(endpoint.harmony, &error);
             last_error = Some(error);
             if finish_receiver_user_stop(&mut session, &status) {
                 break 'owner;
             }
             drop(session);
-            if last_active_at.is_none() {
+            if last_active_at.is_none() || terminal {
                 break 'owner;
             }
             publish_session(
@@ -1056,6 +1057,12 @@ pub(super) fn run_session_owner(
         paused,
         last_error,
     );
+}
+
+/// A tablet fails START only when its output cannot open the negotiated format, and its run then ends:
+/// reconnecting with the same format cannot succeed and would replace the reason with a connect error.
+pub(super) fn harmony_start_failed(harmony: bool, error: &str) -> bool {
+    harmony && error == START_NOT_CONFIRMED
 }
 
 pub(super) fn lifecycle_from_receiver(state: ReceiverState) -> SessionLifecycleState {

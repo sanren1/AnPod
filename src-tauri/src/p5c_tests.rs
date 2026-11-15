@@ -5232,3 +5232,10 @@ fn harmony_wireless_production_session_loopback() {
     }
     assert!(child.wait_until_exit(Duration::from_secs(8)).success());
 }
+
+#[test]
+fn harmony_start_failure_ends_the_owner_instead_of_reconnecting() {
+    assert!(harmony_start_failed(true, START_NOT_CONFIRMED));
+    assert!(!harmony_start_failed(false, START_NOT_CONFIRMED));
+    assert!(!harmony_start_failed(true, "P5-C control peer closed."));
+}

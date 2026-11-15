@@ -870,7 +870,7 @@ impl HostSession {
         let ack = self.command(START, &[])?;
         if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
             self.close_local();
-            return Err("P5-C receiver did not confirm playback start.".into());
+            return Err(START_NOT_CONFIRMED.into());
         }
         let result = (|| {
             let socket = self
@@ -925,7 +925,7 @@ impl HostSession {
         let ack = self.command(START, &[])?;
         if ack.result != RESULT_OK || ack.state != ReceiverState::ReceiverRunning {
             self.close_local();
-            return Err("P5-C receiver did not confirm playback start.".into());
+            return Err(START_NOT_CONFIRMED.into());
         }
         let result = (|| {
             let socket = self

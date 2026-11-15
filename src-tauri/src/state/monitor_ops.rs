@@ -241,6 +241,7 @@ impl AppState {
             .as_ref()
             .expect("network session owner");
         let snapshot = owner.snapshot();
+        let harmony = owner.harmony();
         let needs_bootstrap = snapshot.state == SessionLifecycleState::Stopped;
         let management_only = snapshot.state == SessionLifecycleState::Authenticated
             && snapshot
@@ -250,12 +251,10 @@ impl AppState {
         let queue = owner.audio_queue();
         let mut failure = self.audio.take_last_error().ok().flatten();
         if failure.is_none() && needs_bootstrap {
-            failure = Some(
-                snapshot
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "Receiver session stopped".into()),
-            );
+            failure = Some(hdc_ops::stopped_session_error(
+                snapshot.last_error.clone(),
+                harmony,
+            ));
         }
         if failure.is_none() {
             if management_only {
@@ -322,7 +321,8 @@ impl AppState {
             } else {
                 format!("{error}；{}", cleanup_errors.join("；"))
             };
-            if needs_bootstrap {
+            // A tablet restarts from the tablet, not through a phone USB bootstrap.
+            if needs_bootstrap && !harmony {
                 detail.push_str("；请重新通过授权 USB/bootstrap 启动 Receiver");
             }
             let retired_generation = active.generation;

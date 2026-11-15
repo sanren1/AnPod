@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Activity, AudioLines, ChevronDown, CircleHelp, Settings2, Smartphone, Usb, Wifi, X } from "lucide-react";
 import { strings } from "./strings";
 import type { Device, Snapshot, OperationResult, Panel, ConfirmRequest } from "./appTypes";
-import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, rememberBindingModels, bindingWirelessProtocol, harmonyBindingReferences, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, CAP_AOA_SESSION_RESTART, isHarmony, wiredModeChoice, effectiveWiredMode, pickerOpensUsbDirect } from "./appRuntime";
+import { isDesktop, invokeApp, byTransport, hasActiveSession, canSetAudioQuality, bindingLabel, rememberBindingModels, bindingWirelessProtocol, harmonyBindingReferences, actualConnectionLabel, readableStatus, needsReceiverUpdate, windowsRateMismatchHz, harmonyMessage, errorDetail, CAP_AOA_SESSION_RESTART, isHarmony, wiredModeChoice, effectiveWiredMode, pickerOpensUsbDirect } from "./appRuntime";
 import { DeviceDialog } from "./components/DeviceDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { HarmonyPairingDialog } from "./components/HarmonyPairingDialog";
@@ -461,7 +461,7 @@ function App() {
               : mainActionBusyLabel;
   const failureDetail = [snapshot.message, snapshot.statusDetail].filter(Boolean).join("；") || statusDetail;
   const failureSummary = cleanupPending ? strings.app.cleanupRetryHint : receiverUpdateNeeded ? strings.app.receiverUpdateRequired
-    : failureDetail.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(failureDetail)) : strings.app.operationNotCompleted;
+    : harmonyMessage(failureDetail) ?? (failureDetail.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(failureDetail)) : strings.app.operationNotCompleted);
 
   return <div className="app-shell">
     <header className="topbar">
@@ -565,7 +565,7 @@ function App() {
       {snapshot.state === "error" || cleanupPending || snapshot.wirelessConnectionOffers.active ? snapshot.state === "error" || cleanupPending ? <ErrorDetails
         className="status-description actionable-error"
         summary={failureSummary}
-        details={failureDetail}
+        details={errorDetail(failureDetail)}
       /> : <p className="status-description" role="status">{strings.app.waitingForRequest}</p> : null}
       {active && snapshot.output === "phone" && snapshot.state !== "managementOnly" && <button className="text-button" type="button" disabled={controlsDisabled} onClick={() => void setOutput("computer")}>{strings.app.switchToComputer}</button>}
     </section>

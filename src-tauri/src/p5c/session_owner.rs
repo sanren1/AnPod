@@ -222,6 +222,10 @@ impl SessionOwner {
         })
     }
 
+    pub(crate) fn harmony(&self) -> bool {
+        self.harmony
+    }
+
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
         let mut snapshot = self
             .status

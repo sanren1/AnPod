@@ -418,3 +418,21 @@ fn harmony_start_rejection_points_to_the_tablet() {
     assert!(!missing.contains(crate::receiver::RECEIVER_UPDATE_REQUIRED));
     assert_eq!(harmony_start_error("other".into()), "other");
 }
+
+#[test]
+fn stopped_tablet_session_keeps_the_tablet_reason() {
+    let failed = stopped_session_error(Some(crate::p5c::START_NOT_CONFIRMED.into()), true);
+    assert_eq!(
+        failed,
+        format!(
+            "{HARMONY_START_REJECTED} {}",
+            crate::p5c::START_NOT_CONFIRMED
+        )
+    );
+    let phone = stopped_session_error(Some(crate::p5c::START_NOT_CONFIRMED.into()), false);
+    assert_eq!(phone, crate::p5c::START_NOT_CONFIRMED);
+    assert_eq!(
+        stopped_session_error(None, true),
+        "Receiver session stopped"
+    );
+}

@@ -58,6 +58,7 @@ pub(crate) const RESULT_OK: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
 const RESULT_FAILED: u8 = 2;
 pub(crate) const RESULT_USER_STOPPED: u8 = 3;
+pub(crate) const START_NOT_CONFIRMED: &str = "P5-C receiver did not confirm playback start.";
 pub(crate) const MANAGEMENT_CONTROL_MAJOR: u16 = 3;
 pub(crate) const AUDIO_PROTOCOL_MAJOR: u8 = 1;
 const CAP_RECEIVER_UI: u32 = 0x0000_0001;

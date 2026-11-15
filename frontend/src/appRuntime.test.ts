@@ -206,3 +206,9 @@ it("never shows the internal tablet prefixes", () => {
   expect(runtime.errorDetail(unsupported)).toBe("Float32 missing.");
   expect(runtime.errorDetail("RECEIVER_UPDATE_REQUIRED: x")).toBe("RECEIVER_UPDATE_REQUIRED: x");
 });
+
+it("explains a stopped tablet session whose detail carries the tablet prefix", () => {
+  const detail = "LAN 音频会话已停止；本机音频已清理；HARMONY_START_REJECTED: P5-C receiver did not confirm playback start.";
+  expect(runtime.noticeSummary(detail)).toBe(strings.app.harmonyStartRejected);
+  expect(runtime.errorDetail(detail)).toBe("LAN 音频会话已停止；本机音频已清理；P5-C receiver did not confirm playback start.");
+});

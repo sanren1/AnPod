@@ -84,10 +84,18 @@ pub(crate) const HARMONY_UNSUPPORTED: &str = "HARMONY_UNSUPPORTED:";
 pub(crate) fn harmony_start_error(error: String) -> String {
     if let Some(detail) = error.strip_prefix(crate::receiver::RECEIVER_UPDATE_REQUIRED) {
         format!("{HARMONY_UNSUPPORTED} {}", detail.trim())
-    } else if error == "AOA P5-C START was rejected."
-        || error == "P5-C receiver did not confirm playback start."
-    {
+    } else if error == "AOA P5-C START was rejected." || error == crate::p5c::START_NOT_CONFIRMED {
         format!("{HARMONY_START_REJECTED} {error}")
+    } else {
+        error
+    }
+}
+
+/// Why a LAN session owner stopped; a tablet's START failure keeps its tablet-specific prefix.
+pub(crate) fn stopped_session_error(last_error: Option<String>, harmony: bool) -> String {
+    let error = last_error.unwrap_or_else(|| "Receiver session stopped".into());
+    if harmony {
+        harmony_start_error(error)
     } else {
         error
     }

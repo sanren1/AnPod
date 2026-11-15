@@ -87,13 +87,14 @@ export const windowsRateMismatchHz = (message: string) => {
   const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];
   return rate ? Number(rate) : null;
 };
-const harmonyMessage = (message: string) => message.startsWith("HARMONY_START_REJECTED:") ? strings.app.harmonyStartRejected
-  : message.startsWith("HARMONY_UNSUPPORTED:") ? strings.app.harmonyUnsupported : null;
+// The tablet prefix may follow the PC's own context (a stopped session's detail).
+export const harmonyMessage = (message: string) => message.includes("HARMONY_START_REJECTED:") ? strings.app.harmonyStartRejected
+  : message.includes("HARMONY_UNSUPPORTED:") ? strings.app.harmonyUnsupported : null;
 // Headline for a failed operation; the technical message stays in the details.
 export const noticeSummary = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired
   : harmonyMessage(message) ?? (message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted);
 // Details without the internal tablet prefix.
-export const errorDetail = (message: string) => message.replace(/^HARMONY_(START_REJECTED|UNSUPPORTED):\s*/, "");
+export const errorDetail = (message: string) => message.replace(/HARMONY_(START_REJECTED|UNSUPPORTED):\s*/, "");
 export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : harmonyMessage(message) ?? message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
