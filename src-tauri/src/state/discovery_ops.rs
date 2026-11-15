@@ -11,7 +11,7 @@ impl AppState {
             .find(|item| item.address.to_string() == local_address)
             .ok_or_else(|| "所选 IPv4 接口已不可用；请重新读取接口列表。".to_string())?;
         let cached = self.last_receiver_address();
-        let bindings = self.discovery_bindings();
+        let bindings = self.discovery_bindings(|_| true);
         let cancellation = CancellationToken::new();
         let targets = discovery::probe_targets(&interface);
         let found = tokio::task::spawn_blocking(move || {
@@ -74,8 +74,9 @@ impl AppState {
             }
             view.settings.wireless_protocol.clone()
         };
-        let mut bindings = self.discovery_bindings();
-        bindings.retain(|b| binding_uses_udp(&self.data_dir, &protocol, Some(&b.reference)));
+        // Filter before decrypting: ADB-wireless Android mode loads no material here.
+        let bindings =
+            self.discovery_bindings(|r| binding_uses_udp(&self.data_dir, &protocol, Some(r)));
         if bindings.is_empty() {
             return;
         }
@@ -150,10 +151,14 @@ impl AppState {
 
     /// Binding secrets used to authenticate discovery replies. Unreadable bindings are
     /// skipped: they simply cannot produce an authenticated candidate.
-    pub(crate) fn discovery_bindings(&self) -> Vec<discovery::DiscoveryBinding> {
+    pub(crate) fn discovery_bindings(
+        &self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Vec<discovery::DiscoveryBinding> {
         self.receiver_binding_references()
             .unwrap_or_default()
             .into_iter()
+            .filter(|reference| wanted(reference))
             .filter_map(|reference| {
                 let path = binding_store_path(&self.data_dir, &reference).ok()?;
                 let material = crate::security::BindingStore::load(&path).ok()?;

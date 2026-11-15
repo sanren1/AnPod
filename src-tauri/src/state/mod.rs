@@ -139,6 +139,10 @@ pub struct AppSettings {
     pub playback_mode: String,
     #[serde(default = "system")]
     pub appearance_theme: String,
+    /// In memory only: the quality was chosen for a HarmonyOS wireless target, which always
+    /// plays over UDP, so the saved ADB + legacy pair must not force Standard on it.
+    #[serde(skip)]
+    pub harmony_wireless: bool,
 }
 
 fn schema_version() -> u32 {
@@ -188,6 +192,7 @@ impl Default for AppSettings {
             audio_quality: standard(),
             playback_mode: balanced(),
             appearance_theme: system(),
+            harmony_wireless: false,
         }
     }
 }
@@ -999,10 +1004,7 @@ fn prepare_audio_settings(
     let mut candidate = current.clone();
     candidate.audio_quality = audio_quality.into();
     candidate.playback_mode = playback_mode.into();
-    if adb_transport_enabled(&candidate)
-        && candidate.audio_backend == "legacy"
-        && candidate.audio_quality != "standard"
-    {
+    if legacy_standard_only(&candidate) && candidate.audio_quality != "standard" {
         return Err("ADB 连接仅支持标准音质。".into());
     }
     let candidate = normalize_settings(candidate);
@@ -1019,6 +1021,7 @@ fn merge_audio_preferences(current: &AppSettings, requested: &AppSettings) -> Ap
     let mut settings = current.clone();
     settings.audio_quality = requested.audio_quality.clone();
     settings.playback_mode = requested.playback_mode.clone();
+    settings.harmony_wireless = requested.harmony_wireless;
     normalize_settings(settings)
 }
 
@@ -2119,10 +2122,7 @@ impl AppState {
                     .as_str()
                     .ok_or("无效音质设置 / Invalid audio quality")?;
                 validate_audio_quality(quality)?;
-                if adb_transport_enabled(&settings)
-                    && settings.audio_backend == "legacy"
-                    && quality != "standard"
-                {
+                if legacy_standard_only(&settings) && quality != "standard" {
                     return Err("ADB连接仅支持标准音质。".into());
                 }
                 settings.audio_quality = quality.into();
@@ -2137,7 +2137,13 @@ impl AppState {
             }
             _ => return Err("未知设置项。".into()),
         }
-        if adb_transport_enabled(&settings) && settings.audio_backend == "legacy" {
+        if matches!(
+            key,
+            "transport" | "preferredTransport" | "wiredMode" | "wirelessProtocol" | "audioBackend"
+        ) {
+            settings.harmony_wireless = false;
+        }
+        if legacy_standard_only(&settings) {
             settings.audio_quality = "standard".into();
         }
         let settings = normalize_settings(settings);

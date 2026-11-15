@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { noticeSummary } from "../appRuntime";
+import { errorDetail, noticeSummary } from "../appRuntime";
 
 /** Toast state. A newer notice cancels the older timer; errors stay until dismissed. */
 export function useNotice() {
@@ -15,7 +15,7 @@ export function useNotice() {
     if (!persist) timer.current = window.setTimeout(() => { setNotice(""); setNoticeDetail(""); }, 4200);
   }, []);
   const dismissNotice = () => { window.clearTimeout(timer.current); setNotice(""); setNoticeDetail(""); };
-  const notify = (message: string) => announce(noticeSummary(message), message, true);
+  const notify = (message: string) => announce(noticeSummary(message), errorDetail(message), true);
 
   return { notice, noticeDetail, announce, dismissNotice, notify };
 }

@@ -311,6 +311,24 @@ impl AppState {
         Ok(references)
     }
 
+    /// Stops an offer listener that waits on this binding (outside the lock).
+    pub(crate) fn drop_offer_listener_for(&self, reference: &str) {
+        let dropped = {
+            let mut listener = self
+                .host_offer_listener
+                .lock()
+                .expect("offer listener lock");
+            if listener.as_ref().is_some_and(|current| {
+                wireless_listener_matches_binding(current.automatic_binding.as_deref(), reference)
+            }) {
+                listener.take()
+            } else {
+                None
+            }
+        };
+        drop(dropped);
+    }
+
     /// USB Direct (AOA) runs only on Android phones; the UDP pickers also list tablets.
     pub fn receiver_binding_choices(&self, usb_direct: bool) -> Result<Vec<String>, String> {
         let mut references = self.receiver_binding_references()?;
@@ -414,23 +432,7 @@ impl AppState {
                 .expect("presence lock")
                 .forget(&expected.binding_reference);
             if !reset_preserves_wireless_listener(reset, &expected) {
-                let dropped = {
-                    let mut listener = self
-                        .host_offer_listener
-                        .lock()
-                        .expect("offer listener lock");
-                    if listener.as_ref().is_some_and(|current| {
-                        wireless_listener_matches_binding(
-                            current.automatic_binding.as_deref(),
-                            &expected.binding_reference,
-                        )
-                    }) {
-                        listener.take()
-                    } else {
-                        None
-                    }
-                };
-                drop(dropped);
+                self.drop_offer_listener_for(&expected.binding_reference);
             }
         }
         self.finish_operation(generation);

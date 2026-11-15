@@ -899,7 +899,7 @@ pub(crate) fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         normalize_wireless_protocol(&settings.wireless_protocol).into()
     };
     settings.audio_backend = normalize_audio_backend(&settings.audio_backend).into();
-    if adb_transport_enabled(&settings) && settings.audio_backend == "legacy" {
+    if legacy_standard_only(&settings) {
         settings.audio_quality = "standard".into();
     }
     settings.playback_mode = match settings.playback_mode.to_ascii_lowercase().as_str() {
@@ -934,6 +934,12 @@ pub(crate) fn normalize_wired_mode(value: &str) -> &'static str {
     } else {
         "adb"
     }
+}
+/// Legacy ADB playback is Standard only; a HarmonyOS wireless target plays over UDP instead.
+pub(crate) fn legacy_standard_only(settings: &AppSettings) -> bool {
+    !(settings.harmony_wireless && settings.preferred_transport == "Wifi")
+        && adb_transport_enabled(settings)
+        && settings.audio_backend == "legacy"
 }
 pub(crate) fn adb_transport_enabled(settings: &AppSettings) -> bool {
     if settings.preferred_transport == "Wifi" {

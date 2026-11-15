@@ -278,6 +278,9 @@ impl AppState {
         if !valid_binding_reference(binding_reference) {
             return Err("请选择有效的已保存 Receiver 绑定。".into());
         }
+        if load_binding_profile(&self.data_dir, binding_reference).platform != "android" {
+            return Err("USB Direct 只能连接安卓手机绑定。".into());
+        }
         let (generation, token) = self.start_operation();
         crate::applog::info(
             "connect",

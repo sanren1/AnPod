@@ -208,6 +208,7 @@ impl SessionOwner {
             })
             .map_err(|error| format!("Unable to start P5-D session owner: {error}"))?;
         Ok(Self {
+            harmony: endpoint.harmony,
             connection_intent: endpoint.connection_intent,
             background_authorization_required: endpoint.background_authorization_required,
             cancellation,
@@ -404,6 +405,7 @@ impl SessionOwner {
     }
 
     pub(super) fn enqueue_endpoint(&self, mut endpoint: SessionEndpoint) -> Result<(), String> {
+        endpoint.harmony = self.harmony;
         endpoint.connection_intent = self.connection_intent;
         endpoint.background_authorization_required = self.background_authorization_required;
         endpoint.background_request_id = Some(random_request_id()?);

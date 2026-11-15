@@ -185,6 +185,7 @@ export const zhCN = {
     settingsSaveFailed: "设置未能应用，请重试。",
     operationNotCompleted: "操作没有完成。请重试；仍失败时展开详情或查看诊断。",
     harmonyStartRejected: "平板拒绝了此档位，详情见平板。",
+    harmonyUnsupported: "平板应用不支持此档位，请更新平板上的 AnPod。",
     hiresRateMismatch: (rateHz: number | null) => rateHz ? `Hi-Res 需要 96 kHz；当前为 ${rateHz / 1000} kHz。请选高保真或调整 Windows 输出。` : "Hi-Res 需要 Windows 输出为 96 kHz。请选高保真或调整 Windows 输出。",
     connectionNotCompleted: "连接没有完成。请检查所选手机和网络后重试。",
     pairingNotCompleted: "配对没有完成。请检查手机和配对码后重试。",

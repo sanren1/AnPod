@@ -122,6 +122,62 @@ fn audio_settings_batch_validates_without_silent_legacy_downgrade() {
 }
 
 #[test]
+fn harmony_wireless_target_is_not_locked_to_legacy_adb_standard() {
+    // Saved ADB + legacy forces Standard, but a tablet plays over UDP and refuses Standard.
+    let saved = AppSettings {
+        preferred_transport: "Wifi".into(),
+        wireless_protocol: "adb".into(),
+        audio_backend: "legacy".into(),
+        ..AppSettings::default()
+    };
+    assert!(prepare_audio_settings(&saved, "hifi", "Balanced").is_err());
+    let mut target = saved.clone();
+    target.harmony_wireless = true;
+    let chosen = prepare_audio_settings(&target, "hifi", "Balanced").unwrap();
+    assert_eq!(chosen.audio_quality, "hifi");
+    // The saved protocol and backend are not rewritten.
+    assert_eq!(chosen.wireless_protocol, "adb");
+    assert_eq!(chosen.audio_backend, "legacy");
+    // Every save merges and normalizes; the tablet quality survives that.
+    assert_eq!(
+        merge_audio_preferences(&saved, &chosen).audio_quality,
+        "hifi"
+    );
+    // The flag is memory only: a reload keeps the Android rule.
+    let reloaded: AppSettings =
+        serde_json::from_slice(&serde_json::to_vec(&chosen).unwrap()).unwrap();
+    assert_eq!(normalize_settings(reloaded).audio_quality, "standard");
+}
+
+#[test]
+fn changing_transport_settings_drops_the_harmony_quality_exemption() {
+    let mut state = AppState::new();
+    state.data_dir =
+        std::env::temp_dir().join(format!("anpod-harmony-exempt-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&state.data_dir);
+    state.view.lock().unwrap().settings = AppSettings {
+        preferred_transport: "Wifi".into(),
+        wireless_protocol: "adb".into(),
+        audio_backend: "legacy".into(),
+        audio_quality: "hifi".into(),
+        harmony_wireless: true,
+        ..AppSettings::default()
+    };
+    state
+        .update_setting("appearanceTheme", serde_json::json!("Dark"))
+        .unwrap();
+    assert_eq!(state.view.lock().unwrap().settings.audio_quality, "hifi");
+    state
+        .update_setting("wirelessProtocol", serde_json::json!("adb"))
+        .unwrap();
+    assert_eq!(
+        state.view.lock().unwrap().settings.audio_quality,
+        "standard"
+    );
+    let _ = fs::remove_dir_all(&state.data_dir);
+}
+
+#[test]
 fn audio_preferences_commit_preserves_other_settings_and_is_write_atomic() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         ".tmp-audio-settings-commit-{}-{}",

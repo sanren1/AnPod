@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Search } from "lucide-react";
 import { strings } from "../strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
-import { invokeApp, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
+import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
@@ -545,7 +545,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           <span>{strings.network.receiverServiceStopped}</span>
           <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); }}>{strings.network.startSelectedPhoneOverUsb}</button>
         </div>}
-        {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={error} summaryRef={alertRef} />
+        {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={errorDetail(error)} summaryRef={alertRef} />
           : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
         {busy && !receiverOperationBusy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
         {!receiverManagerOnly && udpMode && <p className="network-hint connect-choice-hint">{strings.network.connectChoiceHint}</p>}

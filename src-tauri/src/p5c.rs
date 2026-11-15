@@ -390,6 +390,7 @@ enum OwnerCommand {
 
 /// Single thread owns every HostSession. It is created only by an explicit caller.
 pub(crate) struct SessionOwner {
+    harmony: bool,
     connection_intent: Option<([u8; 16], bool)>,
     background_authorization_required: bool,
     cancellation: CancellationToken,

@@ -188,6 +188,7 @@ export const en: typeof zhCN = {
     settingsSaveFailed: "Could not apply this setting. Try again.",
     operationNotCompleted: "The operation did not finish. Retry; if it still fails, expand details or open diagnostics.",
     harmonyStartRejected: "The tablet rejected this quality. See the tablet for details.",
+    harmonyUnsupported: "The tablet app does not support this quality. Update AnPod on the tablet.",
     hiresRateMismatch: (rateHz: number | null) => rateHz ? `Hi-Res requires 96 kHz; the current mix is ${rateHz / 1000} kHz. Choose Hi-Fi or change Windows output.` : "Hi-Res requires a 96 kHz Windows output. Choose Hi-Fi or change Windows output.",
     connectionNotCompleted: "The connection did not finish. Check the selected phone and network, then retry.",
     pairingNotCompleted: "Pairing did not finish. Check the phone and pairing code, then retry.",

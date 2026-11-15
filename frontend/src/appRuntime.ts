@@ -21,12 +21,13 @@ export const byTransport = (snapshot: Snapshot) => {
   return deviceTransport ? snapshot.devices.filter(device => device.transport === deviceTransport || device.transport === "unknown") : [];
 };
 export const hasActiveSession = (snapshot: Snapshot | null) => !!snapshot && (!!snapshot.sessionSerial || !!snapshot.sessionReceiverBinding || snapshot.sessionConnectionTransport !== null);
-export const canSetAudioQuality = (snapshot: Snapshot, quality: Snapshot["settings"]["audioQuality"]) => {
+// `wirelessProtocol` is the effective one: a tablet target plays over UDP whatever is saved.
+export const canSetAudioQuality = (snapshot: Snapshot, quality: Snapshot["settings"]["audioQuality"], wirelessProtocol = snapshot.settings.wirelessProtocol) => {
   const settings = snapshot.settings;
   const adbQualityOnly = settings.audioBackend === "legacy" && (snapshot.sessionTransport === "aoa" ? false : snapshot.sessionConnectionTransport !== null
     ? snapshot.sessionConnectionTransport === "usb" && settings.wiredMode !== "aoa"
       || snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "adb"
-      : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : settings.wirelessProtocol === "adb");
+      : snapshot.connectionTransport === "usb" ? settings.wiredMode !== "aoa" : wirelessProtocol === "adb");
   return snapshot.canChangeModes && (!adbQualityOnly || quality === "standard");
 };
 export const connectionLabel = (transport: Snapshot["connectionTransport"] | Snapshot["sessionConnectionTransport"], protocol: Snapshot["sessionWirelessProtocol"] | null) =>
@@ -86,11 +87,14 @@ export const windowsRateMismatchHz = (message: string) => {
   const rate = message.match(/FORMAT_RATE_MISMATCH:\s*actualHz=(\d+)/i)?.[1];
   return rate ? Number(rate) : null;
 };
-// Toast headline for a failed operation; the raw message stays in the details.
+const harmonyMessage = (message: string) => message.startsWith("HARMONY_START_REJECTED:") ? strings.app.harmonyStartRejected
+  : message.startsWith("HARMONY_UNSUPPORTED:") ? strings.app.harmonyUnsupported : null;
+// Headline for a failed operation; the technical message stays in the details.
 export const noticeSummary = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired
-  : message.includes("HARMONY_START_REJECTED:") ? strings.app.harmonyStartRejected
-  : message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted;
-export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : message;
+  : harmonyMessage(message) ?? (message.includes("FORMAT_RATE_MISMATCH:") ? strings.app.hiresRateMismatch(windowsRateMismatchHz(message)) : strings.app.operationNotCompleted);
+// Details without the internal tablet prefix.
+export const errorDetail = (message: string) => message.replace(/^HARMONY_(START_REJECTED|UNSUPPORTED):\s*/, "");
+export const receiverErrorMessage = (message: string) => needsReceiverUpdate(message) ? strings.app.receiverUpdateRequired : harmonyMessage(message) ?? message;
 export const isIpv4Endpoint = (value: string) => {
   const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
   return !!match && match[1].split(".").every(part => Number(part) <= 255) && Number(match[2]) > 0 && Number(match[2]) <= 65535;

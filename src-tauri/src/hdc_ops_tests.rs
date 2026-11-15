@@ -388,7 +388,11 @@ async fn pc_side_forget_removes_tablet_material_and_profile_only() {
     let tablet_path = binding_store_path(&state.data_dir, &tablet).unwrap();
     assert!(tablet_path.exists());
 
+    let now = Instant::now();
+    state.presence.lock().unwrap().register(&tablet, None, now);
     state.forget_harmony_binding(&tablet).await.unwrap();
+    // Presence for the forgotten tablet is dropped with it.
+    assert!(state.presence.lock().unwrap().due(now).is_empty());
     assert!(!tablet_path.exists() && !tablet_path.with_extension("json").exists());
     assert_eq!(state.receiver_binding_choices(false).unwrap(), vec![phone]);
     let _ = fs::remove_dir_all(&state.data_dir);
@@ -401,8 +405,16 @@ fn harmony_start_rejection_points_to_the_tablet() {
         "P5-C receiver did not confirm playback start.",
     ] {
         let message = harmony_start_error(rejected.into());
-        assert!(message.starts_with(HARMONY_START_REJECTED), "{message}");
-        assert!(message.contains("平板拒绝了此档位，详情见平板"));
+        assert_eq!(message, format!("{HARMONY_START_REJECTED} {rejected}"));
     }
+    // A missing tablet capability must not ask the user to update a phone app.
+    let missing = harmony_start_error(crate::receiver::receiver_update_required(
+        " Receiver does not advertise authenticated Float32 audio.",
+    ));
+    assert_eq!(
+        missing,
+        format!("{HARMONY_UNSUPPORTED} Receiver does not advertise authenticated Float32 audio.")
+    );
+    assert!(!missing.contains(crate::receiver::RECEIVER_UPDATE_REQUIRED));
     assert_eq!(harmony_start_error("other".into()), "other");
 }

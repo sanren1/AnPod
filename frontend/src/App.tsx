@@ -127,6 +127,8 @@ function App() {
     ?? (!selected?.connectable && references.length === 1 ? references[0] : null);
   const effectiveProtocol = bindingWirelessProtocol(snapshot?.settings.wirelessProtocol ?? "udp", bindingProfiles ?? {}, targetBinding);
   const harmonyTarget = !!targetBinding && bindingProfiles?.[targetBinding]?.platform === "harmony";
+  // Lets the backend apply the tablet's UDP quality rules without rewriting the saved protocol.
+  const audioTarget = harmonyTarget ? targetBinding : null;
   const wirelessUdpMode = !!snapshot && snapshot.connectionTransport === "wireless" && effectiveProtocol === "udp";
   const udpBackendFixed = !!snapshot && (wirelessUdpMode
     || (active && snapshot.sessionConnectionTransport === "wireless" && snapshot.sessionWirelessProtocol === "udp")
@@ -259,6 +261,7 @@ function App() {
         apply(await invokeApp<Snapshot>("apply_audio_settings", {
           audioQuality: snapshot.settings.audioQuality,
           playbackMode: value === "lowLatency" ? "LowLatency" : "Balanced",
+          bindingReference: audioTarget,
         }));
       }
       catch (error) {
@@ -281,6 +284,7 @@ function App() {
       void invokeApp<Snapshot>("apply_audio_settings", {
         audioQuality: snapshot.settings.audioQuality,
         playbackMode: value === "lowLatency" ? "LowLatency" : "Balanced",
+        bindingReference: audioTarget,
       }).then(apply).catch(error => notify(String(error))).finally(() => setWorking(false));
       return;
     }
@@ -310,7 +314,7 @@ function App() {
     if (!snapshot || snapshot.settings[key] === value) return;
     if (key === "audioQuality") {
       try {
-        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: value, playbackMode: snapshot.settings.playbackMode }));
+        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: value, playbackMode: snapshot.settings.playbackMode, bindingReference: audioTarget }));
       } catch (error) {
         try { apply(await invokeApp<Snapshot>("get_snapshot")); }
         catch (refreshError) { notify(`${String(error)}${strings.app.refreshFailureSuffix(String(refreshError))}`); throw error; }
@@ -375,7 +379,7 @@ function App() {
       } else if (confirm.kind === "playback") {
         if (!snapshot) throw new Error(strings.app.desktopOnly);
         const playbackMode = confirm.value === "lowLatency" ? "LowLatency" : "Balanced";
-        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: snapshot.settings.audioQuality, playbackMode }));
+        apply(await invokeApp<Snapshot>("apply_audio_settings", { audioQuality: snapshot.settings.audioQuality, playbackMode, bindingReference: audioTarget }));
       } else {
         const next = await invokeApp<Snapshot>("reconfigure_session", { kind: confirm.kind, value: confirm.value });
         apply(next);
@@ -538,7 +542,7 @@ function App() {
           options={(["standard", "hifi", "hires"] as const).map(quality => ({
             value: quality,
             label: strings.app.audioQualityShortLabels[quality],
-            disabled: controlsDisabled || (snapshot.connectionTransport === "wireless" && harmonyTarget && quality === "standard") || !canSetAudioQuality(snapshot, quality),
+            disabled: controlsDisabled || (snapshot.connectionTransport === "wireless" && harmonyTarget && quality === "standard") || !canSetAudioQuality(snapshot, quality, effectiveProtocol),
           }))}
           onValueChange={quality => {
             if (quality === snapshot.settings.audioQuality) return;
@@ -546,7 +550,7 @@ function App() {
             void saveSetting("audioQuality", quality).catch(() => {}).finally(() => setWorking(false));
           }}
         />
-        {!controlsDisabled && !canSetAudioQuality(snapshot, "hires") && <p className="connection-hint">{!snapshot.canChangeModes ? strings.app.changeAfterDisconnect : strings.app.standardQualityOnly}</p>}
+        {!controlsDisabled && !canSetAudioQuality(snapshot, "hires", effectiveProtocol) && <p className="connection-hint">{!snapshot.canChangeModes ? strings.app.changeAfterDisconnect : strings.app.standardQualityOnly}</p>}
       </section>
     </main>
     <section className="action-dock device-status-actions status-hero" aria-label={strings.app.connectionStatus}>

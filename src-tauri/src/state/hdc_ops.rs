@@ -77,13 +77,17 @@ pub(crate) fn forget_harmony_binding(data_dir: &Path, reference: &str) -> Result
 }
 
 pub(crate) const HARMONY_START_REJECTED: &str = "HARMONY_START_REJECTED:";
+pub(crate) const HARMONY_UNSUPPORTED: &str = "HARMONY_UNSUPPORTED:";
 
-/// The tablet shows why it refused START (OHAudio could not open that format) on its own screen.
+/// Tablet-specific markers the UI turns into its own text: a refused START is explained on the
+/// tablet's screen, and a missing audio capability means the tablet app, not a phone app.
 pub(crate) fn harmony_start_error(error: String) -> String {
-    if error == "AOA P5-C START was rejected."
+    if let Some(detail) = error.strip_prefix(crate::receiver::RECEIVER_UPDATE_REQUIRED) {
+        format!("{HARMONY_UNSUPPORTED} {}", detail.trim())
+    } else if error == "AOA P5-C START was rejected."
         || error == "P5-C receiver did not confirm playback start."
     {
-        format!("{HARMONY_START_REJECTED}平板拒绝了此档位，详情见平板。")
+        format!("{HARMONY_START_REJECTED} {error}")
     } else {
         error
     }
@@ -180,6 +184,13 @@ impl AppState {
             .await
             .map_err(|_| "请先断开连接，再删除平板配对。".to_string())?;
         let result = forget_harmony_binding(&self.data_dir, reference);
+        if result.is_ok() {
+            self.presence
+                .lock()
+                .expect("presence lock")
+                .forget(reference);
+            self.drop_offer_listener_for(reference);
+        }
         self.finish_operation(generation);
         result
     }

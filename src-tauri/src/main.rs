@@ -470,11 +470,17 @@ async fn apply_audio_settings(
     state: State<'_, AppState>,
     audio_quality: String,
     playback_mode: String,
+    binding_reference: Option<String>,
 ) -> Result<AppSnapshot, String> {
     log_command_error(
         "apply_audio_settings",
         state
-            .apply_audio_settings(&app, &audio_quality, &playback_mode)
+            .apply_audio_settings(
+                &app,
+                &audio_quality,
+                &playback_mode,
+                binding_reference.as_deref(),
+            )
             .await,
     )
 }

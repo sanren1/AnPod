@@ -183,8 +183,26 @@ it("offers the PC-side forget entry only for tablet bindings", () => {
 });
 
 it("explains a tablet START rejection instead of the generic failure", () => {
-  expect(runtime.noticeSummary("HARMONY_START_REJECTED:平板拒绝了此档位，详情见平板。")).toBe(strings.app.harmonyStartRejected);
+  expect(runtime.noticeSummary("HARMONY_START_REJECTED: AOA P5-C START was rejected.")).toBe(strings.app.harmonyStartRejected);
   expect(runtime.noticeSummary("RECEIVER_UPDATE_REQUIRED: x")).toBe(strings.app.receiverUpdateRequired);
   expect(runtime.noticeSummary("FORMAT_RATE_MISMATCH: actualHz=48000")).toBe(strings.app.hiresRateMismatch(48000));
   expect(runtime.noticeSummary("other")).toBe(strings.app.operationNotCompleted);
+});
+
+it("lets a tablet target choose Hi-Fi even when ADB + legacy is saved", () => {
+  const saved = snapshot({ connectionTransport: "wireless" }, { preferredTransport: "Wifi", wirelessProtocol: "adb", audioBackend: "legacy" });
+  expect(runtime.canSetAudioQuality(saved, "hifi")).toBe(false);
+  expect(runtime.canSetAudioQuality(saved, "hifi", "udp")).toBe(true);
+  expect(saved.settings.wirelessProtocol).toBe("adb");
+});
+
+it("never shows the internal tablet prefixes", () => {
+  const rejected = "HARMONY_START_REJECTED: AOA P5-C START was rejected.";
+  const unsupported = "HARMONY_UNSUPPORTED: Float32 missing.";
+  expect(runtime.noticeSummary(rejected)).toBe(strings.app.harmonyStartRejected);
+  expect(runtime.noticeSummary(unsupported)).toBe(strings.app.harmonyUnsupported);
+  expect(runtime.receiverErrorMessage(rejected)).toBe(strings.app.harmonyStartRejected);
+  expect(runtime.errorDetail(rejected)).toBe("AOA P5-C START was rejected.");
+  expect(runtime.errorDetail(unsupported)).toBe("Float32 missing.");
+  expect(runtime.errorDetail("RECEIVER_UPDATE_REQUIRED: x")).toBe("RECEIVER_UPDATE_REQUIRED: x");
 });
