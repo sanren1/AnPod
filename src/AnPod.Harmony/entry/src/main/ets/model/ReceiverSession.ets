@@ -16,10 +16,11 @@ export interface SessionHooks {
   ended: () => void;  // it ended: release them
 }
 
-// e.g. "48 kHz | Float32 | 2ch | Fast"
+// e.g. "48 kHz | Float32 | 2ch | Fast"; the latency part is left out while the system has not reported it.
 export function formatText(e: CoreEvent): string {
   const khz = (e.sampleRate ?? 0) / 1000;
-  return `${khz} kHz | Float32 | ${e.channels ?? 0}ch | ${e.latencyMode === 'fast' ? 'Fast' : 'Normal'}`;
+  const latency = e.latencyMode === undefined ? '' : ` | ${e.latencyMode === 'fast' ? 'Fast' : 'Normal'}`;
+  return `${khz} kHz | Float32 | ${e.channels ?? 0}ch${latency}`;
 }
 
 function set(key: string, value: string | boolean): void {

@@ -25,6 +25,8 @@ using PlaybackStats = p5c::ProgressBase;
 
 // Start of the end message when START cannot open the audio output: terminal, waiting cannot fix it.
 inline constexpr char kOutputOpenError[] = "audio output cannot open ";
+// End message when RESUME cannot restart the opened output: terminal as well.
+inline constexpr char kOutputResumeError[] = "audio output cannot resume";
 
 class PlaybackSink {
 public:

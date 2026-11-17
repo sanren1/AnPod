@@ -93,6 +93,10 @@
       "value": "Low latency is not supported on this device"
     },
     {
+      "name": "error_output_resume",
+      "value": "Audio output couldn't resume"
+    },
+    {
       "name": "tab_wireless",
       "value": "Wireless"
     },

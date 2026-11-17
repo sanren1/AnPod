@@ -379,7 +379,7 @@ std::string StreamSession::controlLoop() {
                 if (state == SessionState::Paused) {
                     std::lock_guard lock(udpOutputMutex_);
                     if (!sink_.resume()) {
-                        endError = "audio output cannot resume";
+                        endError = kOutputResumeError;
                         result = kResultFailed;
                         terminate = true;
                         break;

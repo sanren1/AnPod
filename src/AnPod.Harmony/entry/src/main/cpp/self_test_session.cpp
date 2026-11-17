@@ -1,4 +1,5 @@
 #include "wireless_listener.h"
+#include <ohaudio/native_audio_session_manager.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -739,7 +740,7 @@ bool sessionPauseResumeStopReachSink(bool resumeAllowed) {
         auto ack = host.exchange(p5c::kResume);
         auto error = ended.wait();
         return ok && ack.size() == 13 && ack[9] == 2 && ack[10] == static_cast<uint8_t>(SessionState::Paused) &&
-               error && *error == "audio output cannot resume";
+               error && *error == kOutputResumeError;
     }
     ok = ok && host.exchange(p5c::kResume).size() == 13 && host.exchange(p5c::kResume).size() == 13 &&
          sink.resumes == 1 && sink.closes == 0;
@@ -776,6 +777,32 @@ bool ohaudioLowLatencyIsFastOrRejected() {
     bool opened = output.open(*AudioFormatV2::forProfile(4, 1));
     if (opened) return output.isOpen() && output.fast().value_or(false) && output.failureReason().empty();
     return !output.isOpen() && output.failureReason() == "low latency unsupported";
+}
+
+// MIX_WITH_OTHERS only changes how AnPod shares the output with other apps' media. The interrupt callback and its
+// mapping are unchanged: a forced PAUSE still pauses (write refused, not advancing, UI told) and RESUME restarts.
+// The process session stays active while any renderer holds it (a replaced renderer may close after its successor).
+bool ohaudioMixedSessionStillPausesOnInterrupt() {
+    OH_AudioSessionManager* manager = nullptr;
+    if (OH_AudioManager_GetAudioSessionManager(&manager) != AUDIOCOMMON_RESULT_SUCCESS) return false;
+    std::vector<bool> events;
+    OhAudioOutput output([&](bool interrupted) { events.push_back(interrupted); }), successor;
+    const auto format = *AudioFormatV2::forProfile(4, 0);
+    const float silence[16] = {};
+    if (!output.open(format) || !OH_AudioSessionManager_IsAudioSessionActivated(manager)) return false;
+    // A FORCE hint arrives after the system already paused the renderer; pause() stands in for that here, since
+    // Start on a renderer that is still running is an illegal state.
+    output.interrupt(AUDIOSTREAM_INTERRUPT_FORCE, AUDIOSTREAM_INTERRUPT_HINT_PAUSE);
+    bool paused = !output.write(silence, 8) && !output.stats().playbackAdvancing.value_or(true);
+    output.pause();
+    output.interrupt(AUDIOSTREAM_INTERRUPT_SHARE, AUDIOSTREAM_INTERRUPT_HINT_RESUME);
+    bool resumed = output.resume() && output.write(silence, 8);
+    bool shared = successor.open(format);
+    output.close();
+    bool held = OH_AudioSessionManager_IsAudioSessionActivated(manager);
+    successor.close();
+    return paused && resumed && events == std::vector<bool>{true, false} && shared && held &&
+           !OH_AudioSessionManager_IsAudioSessionActivated(manager);
 }
 
 // A sink that cannot open names the reason in the session's end message.
@@ -917,6 +944,7 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"ohaudio_rejects_unsupported_without_fallback", ohaudioRejectsUnsupportedWithoutFallback},
         {"ohaudio_opens_negotiated_float32", ohaudioOpensNegotiatedFloat32},
         {"ohaudio_low_latency_is_fast_or_rejected", ohaudioLowLatencyIsFastOrRejected},
+        {"ohaudio_mixed_session_still_pauses_on_interrupt", ohaudioMixedSessionStillPausesOnInterrupt},
         {"session_reports_low_latency_unsupported", sessionReportsLowLatencyUnsupported},
     };
     for (const Case& c : cases)

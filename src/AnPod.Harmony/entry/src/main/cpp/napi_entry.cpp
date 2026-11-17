@@ -322,7 +322,7 @@ std::string serveWireless(const std::shared_ptr<Run>& run, std::optional<Id16> s
         }
         if (run->sessionState < static_cast<int>(SessionState::Authenticated)) continue;  // UI never left waiting
         established |= run->sessionState >= static_cast<int>(SessionState::TransportConnected);
-        if (error.starts_with(kOutputOpenError)) return error;
+        if (error.starts_with(kOutputOpenError) || error == kOutputResumeError) return error;
         // After an unexpected drop the PC reconnects the way it was connected; before that, keep waiting.
         if (established) reconnectUntil = Clock::now() + std::chrono::seconds(30);
         emitState(run, established ? "reconnecting" : selected ? "searching" : "listening");

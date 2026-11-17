@@ -169,6 +169,8 @@ struct Index {
         return $r('app.string.error_pairing_timeout');
       case 'pairing offer for an already paired PC':
         return $r('app.string.error_already_paired');
+      case 'audio output cannot resume':
+        return $r('app.string.error_output_resume');
       default:
         return this.errorMessage;
     }

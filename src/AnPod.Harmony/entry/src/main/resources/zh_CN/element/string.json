@@ -93,6 +93,10 @@
       "value": "此设备不支持低延迟"
     },
     {
+      "name": "error_output_resume",
+      "value": "音频输出无法恢复"
+    },
+    {
       "name": "tab_wireless",
       "value": "无线"
     },
