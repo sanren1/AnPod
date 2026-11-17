@@ -11,8 +11,12 @@
 
 namespace anpod {
 
+// Spec section 16: 96 points x 25 ms, about 2.4 s of history (Android PcmWaveformTap: 48 x 10 ms).
+inline constexpr size_t kAodPoints = 96;
+inline constexpr int64_t kAodBucketNanos = 25000000;
+
 struct AodSnapshot {
-    std::array<float, 48> left{}, right{};
+    std::array<float, kAodPoints> left{}, right{};
     bool receiving = false;
     std::optional<bool> fast;
     std::optional<double> bitsPerSecond, bufferMs, lossPercent;
@@ -37,7 +41,7 @@ public:
             leftPeak_ = std::max(leftPeak_, std::abs(pcm[i * channels]));
             rightPeak_ = std::max(rightPeak_, std::abs(pcm[i * channels + (channels > 1)]));
         }
-        if (now - bucket_ < 10000000) return;
+        if (now - bucket_ < kAodBucketNanos) return;
         for (auto& side : peaks_) std::move_backward(side.begin(), side.end() - 1, side.end());
         peaks_[0][0] = std::min(1.f, leftPeak_);
         peaks_[1][0] = std::min(1.f, rightPeak_);
@@ -132,7 +136,7 @@ private:
     uint64_t baseline_ = 0;
     std::optional<double> rate_;
     float leftPeak_ = 0, rightPeak_ = 0;
-    std::array<std::array<float, 48>, 2> peaks_{}, published_{};
+    std::array<std::array<float, kAodPoints>, 2> peaks_{}, published_{};
     std::mutex waveMutex_;
 };
 

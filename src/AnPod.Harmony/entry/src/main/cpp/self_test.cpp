@@ -31,9 +31,9 @@ bool aodSamplesAreSessionScoped() {
     const float stereo[]{-0.25f, 0.75f};
     if (session.snapshot(0, 0).bitsPerSecond || session.snapshot(0, 0).receiving) return false;
     session.audio(0, stereo, 2, true, 0);
-    session.audio(2, stereo, 2, false, 10000000);
+    session.audio(2, stereo, 2, false, 25000000);
     session.settlement(0, 3, 48000, true);
-    auto recent = session.snapshot(10000000, 16);
+    auto recent = session.snapshot(25000000, 16);
     if (!recent.receiving || recent.left[0] != .25f || recent.right[0] != .75f ||
         !recent.lossPercent || std::abs(*recent.lossPercent - 200.0 / 3) > .001) return false;
     auto idle = session.snapshot(500000000, 16);
@@ -52,6 +52,29 @@ bool aodSamplesAreSessionScoped() {
     return idle.bitsPerSecond == 256 && idle.left[0] == 0 &&
            !session.snapshot(2700000001LL, 32).receiving &&
            !replacement.snapshot(500000000, 0).lossPercent;
+}
+
+// 96 points x 25 ms: a peak stays visible for about 2.4 s, then ages out; 400 ms of no audio still clears it.
+bool aodWaveformSpans96PointsOf25Ms() {
+    AodSampler s;
+    const float loud[]{0.5f, -0.5f}, quiet[]{0.f, 0.f};
+    if (std::tuple_size_v<decltype(AodSnapshot::left)> != 96) return false;
+    s.audio(0, loud, 2, true, 0);
+    uint64_t frame = 1;
+    int64_t t = 5000000;
+    auto feedUntil = [&](int64_t end) {
+        for (; t <= end; t += 5000000) s.audio(frame++, quiet, 2, true, t);
+    };
+    feedUntil(1000000000);  // 40 buckets
+    auto second = s.snapshot(1000000000, 0);
+    if (second.left[39] != .5f || second.right[39] != .5f || second.left[38] != 0 || second.left[40] != 0) return false;
+    feedUntil(2400000000LL);  // 96 buckets: the oldest point
+    if (s.snapshot(2400000000LL, 0).left[95] != .5f) return false;
+    feedUntil(2425000000LL);
+    if (s.snapshot(2425000000LL, 0).left[95] != 0) return false;
+    s.audio(frame++, loud, 2, true, 2430000000LL);
+    s.audio(frame++, quiet, 2, true, 2450000000LL);
+    return s.snapshot(2849000000LL, 0).left[0] == .5f && s.snapshot(2851000000LL, 0).left[0] == 0;
 }
 
 Bytes fromHex(const char* h) {
@@ -700,6 +723,7 @@ std::vector<std::string> runSelfTests() {
     };
     static constexpr Case cases[] = {
         {"aod_samples_are_session_scoped", aodSamplesAreSessionScoped},
+        {"aod_waveform_spans_96_points_of_25ms", aodWaveformSpans96PointsOf25Ms},
         {"discovery_offer_matches_desktop", offerMatchesDesktop},
         {"discovery_matches_android", discoveryMatchesAndroid},
         {"hmac_rfc4231_case2", hmacRfc4231Case2},
