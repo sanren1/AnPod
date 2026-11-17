@@ -1,5 +1,7 @@
 import { common } from '@kit.AbilityKit';
+import { SettingsSheet } from '../components/SettingsSheet';
 import { loadAodSettings } from '../model/AodSettings';
+import { floatingSheet, isWideWindow } from '../model/SheetLayout';
 import anpod from 'libanpod_core.so';
 import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_HOST, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
 
@@ -58,7 +60,8 @@ struct Index {
   @StorageProp('transportPage') @Watch('reloadBindings') transport: string = 'wired';
   @State hosts: string[] = [];
   @State bindingError: boolean = false;
-  @State wide: boolean = true;
+  @State windowWidth: number = 600;
+  @State settingsOpen: boolean = false;
   @StorageProp('aodForeground') @Watch('maybeEnterAod') foreground: boolean = false;
   private pageVisible: boolean = false;
   private dialogOpen: boolean = false;
@@ -93,6 +96,7 @@ struct Index {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     if (!loadAodSettings(context).enabled) return;
     AppStorage.setOrCreate('aodDismissed', true);
+    this.settingsOpen = false;
     this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' }).catch((error: Error) => {
       AppStorage.setOrCreate('aodDismissed', false);
       console.error('Cannot open AOD: ' + error.message);
@@ -300,6 +304,16 @@ struct Index {
     .backgroundColor($r('app.color.card_bg'))
   }
 
+  @Builder
+  settings() {
+    SettingsSheet({ windowWidth: this.windowWidth,
+      openAod: () => {
+        // An embedded sheet keeps the layout from before AOD hid the system bars, so it closes first.
+        this.settingsOpen = false;
+        this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' });
+      } })
+  }
+
   build() {
     Column() {
       Row() {
@@ -317,16 +331,16 @@ struct Index {
         .height(48)
         .backgroundColor(Color.Transparent)
         .accessibilityText($r('app.string.settings'))
-        .onClick(() => {
-          this.getUIContext().getRouter().pushUrl({ url: 'pages/PairedPcs' });
-        })
+        .onClick(() => { this.settingsOpen = true; })
+        .bindSheet($$this.settingsOpen, this.settings(),
+          floatingSheet($r('app.string.settings'), this.windowWidth, SheetSize.FIT_CONTENT, () => this.reloadBindings()))
       }
       .width('100%')
       .height(56)
       .padding({ left: 24, right: 12 })
 
       // The playback card exists only while a session is live; idle, the status card fills the width.
-      if (this.wide) {
+      if (isWideWindow(this.windowWidth)) {
         Row({ space: 16 }) {
           Column() {
             this.statusCard()
@@ -358,7 +372,7 @@ struct Index {
     .height('100%')
     .backgroundColor($r('sys.color.ohos_id_color_background'))
     .onAreaChange((_old: Area, area: Area) => {
-      this.wide = Number(area.width) >= 600;
+      this.windowWidth = Number(area.width);
     })
   }
 }

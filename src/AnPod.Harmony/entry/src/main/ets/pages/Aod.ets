@@ -150,7 +150,11 @@ struct Aod {
         // A level just requested may not be applied yet; continue from it rather than the stale system value.
         const start = this.volumeLevel >= 0 && uptime() - this.lastVolumeMove < 1000 ?
           this.volumeLevel : volumes.getVolumeByStream(usage);
-        if (max > min) this.drag = new VolumeDrag(start, min, max, height * VOLUME_GESTURE_TRAVEL);
+        if (max > min) {
+          this.drag = new VolumeDrag(start, min, max, height * VOLUME_GESTURE_TRAVEL);
+          // The panel acts only on a changed value: a first step back to the last requested level must still apply.
+          this.volumeLevel = start;
+        }
       } catch (e) {
         console.error('AOD volume: ' + (e instanceof Error ? e.message : String(e)));  // no gesture; volume keys still work
       }
@@ -176,7 +180,7 @@ struct Aod {
           .onTouch((event: TouchEvent) => this.onVolumeTouch(event, event.target.area.height as number))
       }
       .width('33.3%').height('100%').padding({ top: 64, right: 16, bottom: 48 })
-      Button('Close')
+      Button($r('app.string.aod_close'))
         .height(48 * this.k).backgroundColor(Color.Transparent).fontSize(13 * this.k).fontColor('#55FFFFFF')
         .margin({ right: 10 * this.k, top: 6 * this.k }).opacity(this.showClose ? 1 : 0)
         .animation({ duration: 700 }).enabled(this.showClose)

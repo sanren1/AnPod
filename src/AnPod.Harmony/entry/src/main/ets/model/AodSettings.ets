@@ -23,8 +23,13 @@ export function migrateAodSettings(legacy: preferences.Preferences, store: prefe
 
 export function aodStore(context: common.Context): preferences.Preferences {
   const store = preferences.getPreferencesSync(context, { name: STORE });
-  if (migrateAodSettings(preferences.getPreferencesSync(context, { name: LEGACY_STORE }), store)) {
-    preferences.deletePreferences(context, LEGACY_STORE).catch((e: Error) => console.error('AOD prefs: ' + e.message));
+  try {
+    if (migrateAodSettings(preferences.getPreferencesSync(context, { name: LEGACY_STORE }), store)) {
+      preferences.deletePreferences(context, LEGACY_STORE).catch((e: Error) => console.error('AOD prefs: ' + e.message));
+    }
+  } catch (e) {
+    // A failed move leaves the draft file for the next start; settings read from the receiver store meanwhile.
+    console.error('AOD prefs migration: ' + (e instanceof Error ? e.message : String(e)).slice(0, 200));
   }
   return store;
 }
@@ -32,6 +37,9 @@ export function aodStore(context: common.Context): preferences.Preferences {
 export function loadAodSettings(context: common.Context): AodSettings {
   return AodSettings.read(aodStore(context));
 }
+
+// aod_clock_font: 0 Rubik, 1 sans serif, 2 serif, 3 monospace (Android values), 4 HarmonyOS Sans.
+const CLOCK_FONT_MAX = 4;
 
 @Observed
 export class AodSettings {
@@ -52,7 +60,8 @@ export class AodSettings {
     const value = new AodSettings();
     value.enabled = store.getSync('aod_enabled', value.enabled) as boolean;
     value.clockScale = store.getSync('aod_clock_scale', value.clockScale) as number;
-    value.clockFont = store.getSync('aod_clock_font', value.clockFont) as number;
+    const font = store.getSync('aod_clock_font', value.clockFont);
+    value.clockFont = typeof font === 'number' && Number.isInteger(font) && font >= 0 && font <= CLOCK_FONT_MAX ? font : 0;
     value.clockWeightLevel = store.getSync('aod_clock_weight_level', value.clockWeightLevel) as number;
     value.waveformWeightLevel = store.getSync('aod_waveform_weight_level', value.waveformWeightLevel) as number;
     value.showProtocol = store.getSync('aod_show_protocol', value.showProtocol) as boolean;

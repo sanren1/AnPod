@@ -31,6 +31,31 @@ export default function aodSettingsTest() {
         await preferences.deletePreferences(context, name);
       }
     });
+    it('clock_font_keeps_android_values_adds_system_font_and_drops_unknown', 0, async () => {
+      const context = await application.createModuleContext(application.getApplicationContext(), 'entry');
+      const name = 'aod_font_test';
+      const store = preferences.getPreferencesSync(context, { name: name });
+      try {
+        store.clearSync();
+        expect(AodSettings.read(store).clockFont).assertEqual(0);
+        for (const value of [0, 1, 2, 3, 4]) {
+          store.putSync('aod_clock_font', value);
+          expect(AodSettings.read(store).clockFont).assertEqual(value);
+        }
+        const saved = AodSettings.read(store);
+        saved.clockFont = 4;
+        saved.save(store);
+        expect(store.getSync('aod_clock_font', -1)).assertEqual(4);
+        for (const value of [5, -1, 2.5]) {
+          store.putSync('aod_clock_font', value);
+          expect(AodSettings.read(store).clockFont).assertEqual(0);
+        }
+        store.putSync('aod_clock_font', 'serif');
+        expect(AodSettings.read(store).clockFont).assertEqual(0);
+      } finally {
+        await preferences.deletePreferences(context, name);
+      }
+    });
     it('draft_store_moves_into_receiver_store_once', 0, async () => {
       const context = await application.createModuleContext(application.getApplicationContext(), 'entry');
       const legacy = preferences.getPreferencesSync(context, { name: 'aod_legacy_test' });

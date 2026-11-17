@@ -1,11 +1,8 @@
 import { AodSettings } from '../model/AodSettings';
 import {
-  aodScale, baseClockSize, clockLayout, curve, EDGE_FADE_FRACTION, gapBeforeSeparator, GLOW_STROKE_WIDTH,
+  aodScale, baseClockSize, ClockFace, clockFace, clockLayout, curve, EDGE_FADE_FRACTION, gapBeforeSeparator, GLOW_STROKE_WIDTH,
   MAX_DRIFT_X, MAX_DRIFT_Y, STROKE_WIDTH, wrapMetrics
 } from '../model/AodGeometry';
-
-const WEIGHTS = [300, 400, 450, 500, 550, 600, 700, 775, 850];
-const FAMILIES = ['rubik', 'sans', 'serif', 'mono'];
 
 // Written in place by the AOD page every frame; only the waveform canvas reads it, so no page rebuild.
 export class AodWave {
@@ -23,6 +20,7 @@ interface View {
 
 interface ClockText {
   family: string;
+  weight: number;
   size: number;
   spacing: number;
   left: number;
@@ -53,27 +51,23 @@ export struct AodDisplay {
   private text: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private waves: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private frame?: WaveFrame;
-  @State placed: ClockText = { family: '', size: 0, spacing: 0, left: 0, width: 0, top: 0 };
+  @State placed: ClockText = { family: '', weight: 400, size: 0, spacing: 0, left: 0, width: 0, top: 0 };
   private registered: string[] = [];
 
   // Registered before the canvases are ready, so the first frame already measures the real font.
   aboutToAppear(): void {
     this.register('rubik_black');
-    this.fontName();
+    this.face();
   }
 
-  private fontName(): string {
-    const family = FAMILIES[this.settings.clockFont];
-    const weight = WEIGHTS[this.settings.clockWeightLevel - 1];
-    let filename = family + '_w' + weight;
-    if (family === 'rubik' && weight === 400) filename = 'rubik_regular';
-    if (family === 'rubik' && weight === 850) filename = 'rubik_black';
-    this.register(filename);
-    return filename;
+  private face(): ClockFace {
+    const face = clockFace(this.settings.clockFont, this.settings.clockWeightLevel);
+    this.register(face.file);
+    return face;
   }
 
   private register(filename: string): void {
-    if (!this.registered.includes(filename)) {
+    if (filename !== '' && !this.registered.includes(filename)) {
       this.getUIContext().getFont().registerFont({ familyName: filename, familySrc: $rawfile('aod/' + filename + '.ttf') });
       this.registered.push(filename);
     }
@@ -135,9 +129,11 @@ export struct AodDisplay {
     c.letterSpacing = '-5vp';
     c.font = this.px(base) + 'px rubik_black';
     const reference = c.measureText('04:44').height;
-    const name = this.fontName();
-    c.letterSpacing = this.settings.clockFont === 0 ? '-5vp' : '0vp';
-    c.font = this.px(ceiling) + 'px ' + name;
+    const face = this.face();
+    const rubik = face.file !== '';
+    c.letterSpacing = rubik ? '-5vp' : '0vp';
+    const font = (size: number) => face.weight + ' ' + this.px(size) + 'px ' + face.family;
+    c.font = font(ceiling);
     let pairs = 0;
     for (let n = 0; n < 60; n++) pairs = Math.max(pairs, c.measureText(String(n).padStart(2, '0')).width);
     let hours = 0;
@@ -147,10 +143,10 @@ export struct AodDisplay {
     const layout = clockLayout(w, h, footerHeight, reference, widest, this.settings.clockScale);
     const footerTop = layout.footerTop + dy;
     // Canvas fillText ignores registered fonts (measureText honours them), so the clock is a Text on top.
-    c.font = this.px(layout.clockSize) + 'px ' + name;
+    c.font = font(layout.clockSize);
     const clockHeight = c.measureText(this.clock).height;
     const placed: ClockText = {
-      family: name, size: layout.clockSize * v.scale, spacing: this.settings.clockFont === 0 ? -5 * v.scale : 0,
+      family: face.family, weight: face.weight, size: layout.clockSize * v.scale, spacing: rubik ? -5 * v.scale : 0,
       left: v.ox + dx * v.scale, width: w * v.scale, top: v.oy + (layout.clockBottom + dy - clockHeight) * v.scale
     };
     if (JSON.stringify(placed) !== JSON.stringify(this.placed)) this.placed = placed;
@@ -260,7 +256,7 @@ export struct AodDisplay {
         .onReady(() => this.drawWave())
       if (this.placed.size > 0) {
         Text(this.clock)
-          .fontFamily(this.placed.family).fontSize(this.placed.size).letterSpacing(this.placed.spacing)
+          .fontFamily(this.placed.family).fontWeight(this.placed.weight).fontSize(this.placed.size).letterSpacing(this.placed.spacing)
           .fontColor('#F7F7F7').maxLines(1).textAlign(TextAlign.Center).width(this.placed.width)
           .position({ x: this.placed.left, y: this.placed.top })
       }

@@ -69,10 +69,6 @@
       "value": "Cancel"
     },
     {
-      "name": "back",
-      "value": "Back"
-    },
-    {
       "name": "paired_pcs",
       "value": "Paired PCs"
     },
@@ -211,6 +207,18 @@
     {
       "name": "aod_mono",
       "value": "Monospace"
+    },
+    {
+      "name": "aod_font_system",
+      "value": "HarmonyOS Sans"
+    },
+    {
+      "name": "aod_settings_close",
+      "value": "Close settings"
+    },
+    {
+      "name": "aod_close",
+      "value": "Close"
     }
   ]
 }

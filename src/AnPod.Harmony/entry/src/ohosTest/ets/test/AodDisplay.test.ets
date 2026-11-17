@@ -1,6 +1,7 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
-  AodGap, aodScale, clockLayout, curve, fitClockSize, gapBeforeSeparator, VolumeDrag, waveLayout, wrapMetrics
+  AodGap, aodScale, clockFace, clockLayout, curve, fitClockSize, gapBeforeSeparator, VolumeDrag, waveLayout,
+  wrapMetrics
 } from '../../../main/ets/model/AodGeometry';
 
 function near(actual: number, expected: number): boolean {
@@ -77,6 +78,29 @@ export default function aodDisplayTest() {
       expect(aodScale(1600, 2560)).assertEqual(2.2);
       expect(aodScale(390, 844)).assertEqual(1);
       expect(clockLayout(2560, 1600, 80, 600, [1500, 700], 100).k).assertEqual(2.2);
+    });
+    it('aod_clock_face_maps_fonts_and_weights', 0, () => {
+      expect(clockFace(0, 9).family).assertEqual('rubik_black');
+      expect(clockFace(0, 9).file).assertEqual('rubik_black');
+      expect(clockFace(0, 2).family).assertEqual('rubik_regular');
+      expect(clockFace(0, 1).family).assertEqual('rubik_w300');
+      expect(clockFace(0, 5).weight).assertEqual(400);  // the file carries the weight
+      expect(clockFace(1, 1).family).assertEqual('Noto Sans');
+      expect(clockFace(2, 1).family).assertEqual('serif');
+      expect(clockFace(3, 1).family).assertEqual('monospace');
+      expect(clockFace(4, 1).family).assertEqual('HarmonyOS Sans');
+      expect(clockFace(4, 1).file).assertEqual('');
+      // System fonts take the nearest weight the text engine accepts (100..900 in steps of 100).
+      expect(clockFace(4, 1).weight).assertEqual(300);
+      expect(clockFace(4, 3).weight).assertEqual(500);
+      expect(clockFace(4, 8).weight).assertEqual(800);
+      expect(clockFace(4, 9).weight).assertEqual(900);
+      // Unknown stored values fall back to Rubik and the default weight.
+      expect(clockFace(5, 9).family).assertEqual('rubik_black');
+      expect(clockFace(-1, 9).family).assertEqual('rubik_black');
+      expect(clockFace(1.5, 9).family).assertEqual('rubik_black');
+      expect(clockFace(4, 0).weight).assertEqual(900);
+      expect(clockFace(0, 12).family).assertEqual('rubik_black');
     });
     // AodVolumeDragTest vectors.
     it('aod_volume_drag_keeps_sub_steps_and_clamps', 0, () => {

@@ -172,3 +172,25 @@ export class VolumeDrag {
     return target;
   }
 }
+
+// Android AodDisplaySettings clock weights, one per level 1..9.
+const CLOCK_WEIGHTS = [300, 400, 450, 500, 550, 600, 700, 775, 850];
+// Values 1..3 keep Android's meaning on system families (fontconfig on API 26); 4 is the system font itself.
+const SYSTEM_FAMILIES = ['', 'Noto Sans', 'serif', 'monospace', 'HarmonyOS Sans'];
+
+export interface ClockFace {
+  family: string;
+  weight: number;  // font weight to request; a bundled Rubik file already carries its weight
+  file: string;  // rawfile aod/<file>.ttf to register, '' for a system family
+}
+
+// Unknown stored values fall back to Rubik and the default weight level 9.
+export function clockFace(font: number, weightLevel: number): ClockFace {
+  const level = Number.isInteger(weightLevel) && weightLevel >= 1 && weightLevel <= 9 ? weightLevel : 9;
+  const weight = CLOCK_WEIGHTS[level - 1];
+  if (Number.isInteger(font) && font >= 1 && font < SYSTEM_FAMILIES.length) {
+    return { family: SYSTEM_FAMILIES[font], weight: Math.min(900, Math.round(weight / 100) * 100), file: '' };
+  }
+  const file = weight === 400 ? 'rubik_regular' : weight === 850 ? 'rubik_black' : 'rubik_w' + weight;
+  return { family: file, weight: 400, file: file };
+}

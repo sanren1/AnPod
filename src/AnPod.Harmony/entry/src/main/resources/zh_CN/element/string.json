@@ -69,10 +69,6 @@
       "value": "取消"
     },
     {
-      "name": "back",
-      "value": "返回"
-    },
-    {
       "name": "paired_pcs",
       "value": "已配对的电脑"
     },
@@ -211,6 +207,18 @@
     {
       "name": "aod_mono",
       "value": "等宽"
+    },
+    {
+      "name": "aod_font_system",
+      "value": "HarmonyOS Sans"
+    },
+    {
+      "name": "aod_settings_close",
+      "value": "关闭设置"
+    },
+    {
+      "name": "aod_close",
+      "value": "关闭"
     }
   ]
 }
