@@ -95,11 +95,17 @@ struct Index {
       AppStorage.get<boolean>('aodDismissed') === true) return;
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     if (!loadAodSettings(context).enabled) return;
+    this.openAod();
+  }
+
+  // An open settings sheet would cover the AOD page, so it closes first (also on auto-entry at connect).
+  // Marked dismissed before the push so the sheet's onDisappear cannot enter AOD a second time.
+  openAod(): void {
     AppStorage.setOrCreate('aodDismissed', true);
     this.settingsOpen = false;
     this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' }).catch((error: Error) => {
       AppStorage.setOrCreate('aodDismissed', false);
-      console.error('Cannot open AOD: ' + error.message);
+      console.error('Cannot open AOD: ' + error.message.slice(0, 200));
     });
   }
 
@@ -306,12 +312,7 @@ struct Index {
 
   @Builder
   settings() {
-    SettingsSheet({ windowWidth: this.windowWidth,
-      openAod: () => {
-        // An embedded sheet keeps the layout from before AOD hid the system bars, so it closes first.
-        this.settingsOpen = false;
-        this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' });
-      } })
+    SettingsSheet({ windowWidth: this.windowWidth, openAod: () => this.openAod() })
   }
 
   build() {
@@ -333,7 +334,11 @@ struct Index {
         .accessibilityText($r('app.string.settings'))
         .onClick(() => { this.settingsOpen = true; })
         .bindSheet($$this.settingsOpen, this.settings(),
-          floatingSheet($r('app.string.settings'), this.windowWidth, SheetSize.FIT_CONTENT, () => this.reloadBindings()))
+          floatingSheet($r('app.string.settings'), this.windowWidth, SheetSize.FIT_CONTENT, () => {
+            // What onPageShow did when settings were a page: fresh bindings, and auto AOD if just enabled.
+            this.reloadBindings();
+            this.maybeEnterAod();
+          }))
       }
       .width('100%')
       .height(56)

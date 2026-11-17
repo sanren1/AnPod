@@ -53,6 +53,9 @@ export struct AodDisplay {
   private frame?: WaveFrame;
   @State placed: ClockText = { family: '', weight: 400, size: 0, spacing: 0, left: 0, width: 0, top: 0 };
   private registered: string[] = [];
+  private clockKey: string = '';
+  private widest: number[] = [0, 0];
+  private reference: number = 0;
 
   // Registered before the canvases are ready, so the first frame already measures the real font.
   aboutToAppear(): void {
@@ -71,6 +74,16 @@ export struct AodDisplay {
       this.getUIContext().getFont().registerFont({ familyName: filename, familySrc: $rawfile('aod/' + filename + '.ttf') });
       this.registered.push(filename);
     }
+  }
+
+  // [width, height] in vp from the engine that lays out the clock Text, so boxes match what is drawn
+  // (the canvas font string cannot name system families with spaces such as "Noto Sans").
+  private measure(text: string, family: string | undefined, weight: number, size: number, spacing: number): number[] {
+    const ui = this.getUIContext();
+    const box = ui.getMeasureUtils().measureTextSize({
+      textContent: text, fontFamily: family, fontWeight: weight, fontSize: size, letterSpacing: spacing
+    });
+    return [ui.px2vp(Number(box.width)), ui.px2vp(Number(box.height))];
   }
 
   // A "px" canvas font size is physical pixels, while measureText answers in vp.
@@ -112,7 +125,8 @@ export struct AodDisplay {
     c.letterSpacing = '0vp';
     c.font = this.px(14 * k) + 'px sans-serif';
     c.textBaseline = 'middle';
-    const line = Math.max(8 * k, c.measureText('Ag').height);
+    // One text line as Text lays it out (Android Compose Text), not the glyph box.
+    const line = Math.max(8 * k, this.measure('Ag', undefined, 400, 14 * k, 0)[1]);
     const pad = 8 * k;
     const spacing = 2 * k;
     const available = w - 56 * k;
@@ -126,25 +140,26 @@ export struct AodDisplay {
     const base = baseClockSize(w, h);
     const ceiling = base * 1.2;
     this.register('rubik_black');
-    c.letterSpacing = '-5vp';
-    c.font = this.px(base) + 'px rubik_black';
-    const reference = c.measureText('04:44').height;
     const face = this.face();
     const rubik = face.file !== '';
-    c.letterSpacing = rubik ? '-5vp' : '0vp';
-    const font = (size: number) => face.weight + ' ' + this.px(size) + 'px ' + face.family;
-    c.font = font(ceiling);
-    let pairs = 0;
-    for (let n = 0; n < 60; n++) pairs = Math.max(pairs, c.measureText(String(n).padStart(2, '0')).width);
-    let hours = 0;
-    for (let n = 0; n < 24; n++) hours = Math.max(hours, c.measureText(String(n).padStart(2, '0')).width);
-    // shortcut: widest hour + ":" + widest minute ignores kerning around the colon; exact would measure all 1440.
-    const widest = [hours + c.measureText(':').width + pairs, c.measureText('00:00').height];
-    const layout = clockLayout(w, h, footerHeight, reference, widest, this.settings.clockScale);
+    const tracking = rubik ? -5 : 0;
+    const key = [base, face.family, face.weight].join('|');
+    if (key !== this.clockKey) {
+      // Per font and screen size only: 86 measurements, not repeated every drift step.
+      const at = (text: string) => this.measure(text, face.family, face.weight, ceiling, tracking);
+      let pairs = 0;
+      for (let n = 0; n < 60; n++) pairs = Math.max(pairs, at(String(n).padStart(2, '0'))[0]);
+      let hours = 0;
+      for (let n = 0; n < 24; n++) hours = Math.max(hours, at(String(n).padStart(2, '0'))[0]);
+      // shortcut: widest hour + ":" + widest minute ignores kerning around the colon; exact would measure all 1440.
+      this.widest = [hours + at(':')[0] + pairs, at('00:00')[1]];
+      this.reference = this.measure('04:44', 'rubik_black', 400, base, -5)[1];
+      this.clockKey = key;
+    }
+    const layout = clockLayout(w, h, footerHeight, this.reference, this.widest, this.settings.clockScale);
     const footerTop = layout.footerTop + dy;
-    // Canvas fillText ignores registered fonts (measureText honours them), so the clock is a Text on top.
-    c.font = font(layout.clockSize);
-    const clockHeight = c.measureText(this.clock).height;
+    // Canvas fillText ignores registered fonts, so the clock is a Text on top; its bottom sits on clockBottom.
+    const clockHeight = this.measure(this.clock, face.family, face.weight, layout.clockSize, tracking)[1];
     const placed: ClockText = {
       family: face.family, weight: face.weight, size: layout.clockSize * v.scale, spacing: rubik ? -5 * v.scale : 0,
       left: v.ox + dx * v.scale, width: w * v.scale, top: v.oy + (layout.clockBottom + dy - clockHeight) * v.scale

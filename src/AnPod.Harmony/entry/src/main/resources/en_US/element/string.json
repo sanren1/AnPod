@@ -219,6 +219,14 @@
     {
       "name": "aod_close",
       "value": "Close"
+    },
+    {
+      "name": "forget_title",
+      "value": "Forget this PC?"
+    },
+    {
+      "name": "forget_message",
+      "value": "You'll need to pair again to connect."
     }
   ]
 }

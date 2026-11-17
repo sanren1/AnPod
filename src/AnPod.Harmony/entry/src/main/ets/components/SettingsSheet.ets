@@ -176,6 +176,23 @@ export struct SettingsSheet {
     }.width('100%').height('100%')
   }
 
+  // Forgetting cannot be undone (the PC must pair again), so it asks first.
+  confirmForget(hostId: string): void {
+    this.getUIContext().showAlertDialog({
+      title: $r('app.string.forget_title'),
+      message: $r('app.string.forget_message'),
+      autoCancel: true,
+      primaryButton: { value: $r('app.string.cancel'), action: () => {} },
+      secondaryButton: {
+        value: $r('app.string.forget'), fontColor: $r('app.color.status_error'),
+        action: () => {
+          anpod.forgetBinding(hostId);
+          this.load();
+        }
+      }
+    });
+  }
+
   @Builder
   pairedPcs() {
     Scroll() {
@@ -196,10 +213,7 @@ export struct SettingsSheet {
                   .buttonStyle(ButtonStyleMode.NORMAL)
                   .fontColor($r('app.color.status_error'))
                   .height(40)
-                  .onClick(() => {
-                    anpod.forgetBinding(hostId);
-                    this.load();
-                  })
+                  .onClick(() => this.confirmForget(hostId))
               }
               .width('100%')
               .height(64)

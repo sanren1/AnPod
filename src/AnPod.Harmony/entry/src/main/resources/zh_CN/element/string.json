@@ -219,6 +219,14 @@
     {
       "name": "aod_close",
       "value": "关闭"
+    },
+    {
+      "name": "forget_title",
+      "value": "忘记此电脑？"
+    },
+    {
+      "name": "forget_message",
+      "value": "忘记后需重新配对才能连接。"
     }
   ]
 }

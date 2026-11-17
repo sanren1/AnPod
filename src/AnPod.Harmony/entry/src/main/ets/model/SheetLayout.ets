@@ -10,7 +10,7 @@ export function sheetType(width: number): SheetType {
 }
 
 // Secondary menus: a floating sheet with a title, the system close button and a dimmed mask that takes
-// outside taps. EMBEDDED keeps the sheet on its own page, so a pushed page (AOD) covers it.
+// outside taps. Sheets sit above every page, so callers close them before pushing a page (AOD).
 export function floatingSheet(title: ResourceStr, width: number, height: SheetSize, onDisappear?: () => void): SheetOptions {
   return {
     title: { title: title },
@@ -18,7 +18,6 @@ export function floatingSheet(title: ResourceStr, width: number, height: SheetSi
     height: height,
     showClose: true,
     enableOutsideInteractive: false,
-    mode: SheetMode.EMBEDDED,
     onDisappear: onDisappear
   };
 }
