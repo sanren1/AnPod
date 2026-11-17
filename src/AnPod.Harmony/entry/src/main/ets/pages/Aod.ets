@@ -1,36 +1,45 @@
 import { window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { audio, AVVolumePanel } from '@kit.AudioKit';
 import { systemDateTime } from '@kit.BasicServicesKit';
-import anpod, { AodSnapshot } from 'libanpod_core.so';
-import { AodDisplay } from '../components/AodDisplay';
-import { AodSettings, loadAodSettings } from '../model/AodSettings';
-import { AodGap } from '../model/AodGeometry';
+import anpod from 'libanpod_core.so';
+import { AodDisplay, AodWave } from '../components/AodDisplay';
+import { AodSettings, aodMetrics, loadAodSettings } from '../model/AodSettings';
+import { AodGap, aodScale, VolumeDrag } from '../model/AodGeometry';
+import { aodProtocol, aodStatus, KEY_STATE } from '../model/ReceiverSession';
 
 let windowChanges: Promise<void> = Promise.resolve();
 function uptime(): number {
   return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP);
 }
 
+const VOLUME_GESTURE_TRAVEL = 0.60;  // share of the gesture area height spanning the whole media range
+
 @Entry
 @Component
 struct Aod {
   @StorageProp('aodForeground') @Watch('syncVisibility') foreground: boolean = false;
-  @StorageProp('coreState') state: string = 'idle';
+  @StorageProp(KEY_STATE) state: string = 'idle';
   @StorageProp('transportPage') transport: string = 'wired';
   @State settings: AodSettings = new AodSettings();
   @State clock: string = '';
-  @State elapsedMs: number = 0;
-  @State left: number[] = [];
-  @State right: number[] = [];
+  @State frameMs: number = 0;
+  @State driftSeconds: number = 0;
   @State status: string = '';
   @State metrics: string[] = [];
   @State showClose: boolean = true;
+  @State k: number = 1;
+  @State volumeLevel: number = -1;  // AVVolumePanel discards values outside the device range
+  private readonly wave: AodWave = new AodWave();
   private shown: boolean = false;
   private active: boolean = false;
   private timer: number = -1;
   private lastTouch: number = 0;
   private nextDetails: number = 0;
   private gap: AodGap = new AodGap();
+  private drag?: VolumeDrag;
+  private dragY: number = 0;
+  private lastVolumeMove: number = -1;
   private savedWindow?: window.Window;
   private savedBrightness: number = -1;
   private savedKeepOn: boolean = false;
@@ -103,58 +112,78 @@ struct Aod {
     }
   }
 
+  // Per frame only the waveform canvas redraws; text state changes at most every 250 ms.
   private tick(): void {
     const now = uptime();
     const snapshot = anpod.getAodSnapshot();
-    const connected = this.state === 'playing' || this.state === 'paused' || this.state === 'connected';
-    if (this.gap.expired(connected || snapshot.receiving, now)) {
+    const status = aodStatus(this.state, snapshot.receiving);
+    if (this.gap.expired(status !== 'Not connected', now)) {
       clearInterval(this.timer);
       this.getUIContext().getRouter().back();
       return;
     }
-    this.left = snapshot.left;
-    this.right = snapshot.right;
+    this.wave.left = snapshot.left;
+    this.wave.right = snapshot.right;
     if (now >= this.nextDetails) {
       const date = new Date();
       this.clock = String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
-      this.status = snapshot.receiving ? 'Receiving' : connected ? 'Connected' :
-        this.state === 'reconnecting' ? 'Reconnecting' : 'Not connected';
-      const items = this.labels(snapshot, connected);
+      this.status = status;
+      const items = aodMetrics(this.settings, snapshot, aodProtocol(status, this.transport));
       if (items.join('|') !== this.metrics.join('|')) this.metrics = items;
       this.showClose = now - this.lastTouch < 6000;
+      this.driftSeconds = Math.floor(now / 1000);  // Android drifts in 1 s steps
       this.nextDetails = now + 250;
     }
-    this.elapsedMs = now;
+    this.frameMs = now;
   }
 
-  private labels(s: AodSnapshot, connected: boolean): string[] {
-    const items: string[] = [];
-    const cfg = this.settings;
-    if (cfg.showProtocol) items.push('Protocol ' + (connected ? (this.transport === 'wired' ? 'hdc' : 'UDP') : '—'));
-    const bps = s.bitsPerSecond;
-    if (cfg.showReceiveRate) items.push('Recv ' + (bps === undefined ? '—' :
-      bps >= 1000000 ? (bps / 1000000).toFixed(2) + ' Mbps' : (bps / 1000).toFixed(0) + ' kbps'));
-    if (cfg.showBuffer) items.push('Buffer ' + (s.bufferMs === undefined ? '—' : s.bufferMs.toFixed(0) + ' ms'));
-    if (cfg.showLoss) items.push('Loss ' + (s.lossPercent === undefined ? '—' : s.lossPercent.toFixed(1) + '%'));
-    if (cfg.showAudioFormat) items.push('Format ' + (s.sampleRate === undefined || s.channels === undefined ||
-      s.encoding === undefined ? '—' : (s.sampleRate / 1000) + ' kHz Float32 ' + s.channels + 'ch'));
-    if (cfg.showUnderruns) items.push('Underruns ' + (s.underruns ?? '—'));
-    if (cfg.showOutputEngine) items.push('Output ' + (s.latencyMode === undefined ? '—' :
-      s.latencyMode === 'fast' ? 'OHAudio Fast' : 'OHAudio'));
-    return items;
+  private onVolumeTouch(event: TouchEvent, height: number): void {
+    const touch = event.touches[0];
+    if (event.type === TouchType.Down) {
+      this.drag = undefined;
+      this.dragY = touch.y;
+      try {
+        const volumes = audio.getAudioManager().getVolumeManager();
+        const usage = audio.StreamUsage.STREAM_USAGE_MUSIC;
+        const min = volumes.getMinVolumeByStream(usage);
+        const max = volumes.getMaxVolumeByStream(usage);
+        // A level just requested may not be applied yet; continue from it rather than the stale system value.
+        const start = this.volumeLevel >= 0 && uptime() - this.lastVolumeMove < 1000 ?
+          this.volumeLevel : volumes.getVolumeByStream(usage);
+        if (max > min) this.drag = new VolumeDrag(start, min, max, height * VOLUME_GESTURE_TRAVEL);
+      } catch (e) {
+        console.error('AOD volume: ' + (e instanceof Error ? e.message : String(e)));  // no gesture; volume keys still work
+      }
+    } else if (event.type === TouchType.Move && this.drag !== undefined) {
+      const target = this.drag.move(touch.y - this.dragY);
+      this.dragY = touch.y;
+      if (target !== undefined) {
+        this.volumeLevel = target;
+        this.lastVolumeMove = uptime();
+      }
+    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      this.drag = undefined;
+    }
   }
 
   build() {
     Stack({ alignContent: Alignment.TopEnd }) {
-      AodDisplay({ settings: this.settings, clock: this.clock, left: this.left, right: this.right,
-        status: this.status, metrics: this.metrics, elapsedMs: this.elapsedMs })
+      AodDisplay({ settings: this.settings, clock: this.clock, status: this.status, metrics: this.metrics,
+        driftSeconds: this.driftSeconds, frameMs: this.frameMs, wave: this.wave })
+      AVVolumePanel({ volumeLevel: this.volumeLevel }).width(1).height(1)
+      Column() {
+        Column().width('100%').layoutWeight(1)
+          .onTouch((event: TouchEvent) => this.onVolumeTouch(event, event.target.area.height as number))
+      }
+      .width('33.3%').height('100%').padding({ top: 64, right: 16, bottom: 48 })
       Button('Close')
-        .height(48).backgroundColor(Color.Transparent).fontSize(13).fontColor('#99FFFFFF')
-        .margin({ right: 10, top: 6 }).opacity(this.showClose ? 1 : 0)
+        .height(48 * this.k).backgroundColor(Color.Transparent).fontSize(13 * this.k).fontColor('#55FFFFFF')
+        .margin({ right: 10 * this.k, top: 6 * this.k }).opacity(this.showClose ? 1 : 0)
         .animation({ duration: 700 }).enabled(this.showClose)
         .onClick(() => this.close())
     }
     .width('100%').height('100%').backgroundColor(Color.Black)
+    .onAreaChange((_: Area, area: Area) => { this.k = aodScale(area.width as number, area.height as number); })
     .onTouch(() => { this.lastTouch = uptime(); this.showClose = true; })
   }
 }

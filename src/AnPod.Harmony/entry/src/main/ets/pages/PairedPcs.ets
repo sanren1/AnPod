@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
-import { AodDisplay } from '../components/AodDisplay';
-import { AodSettings, aodStore, loadAodSettings } from '../model/AodSettings';
+import { display } from '@kit.ArkUI';
+import { AodDisplay, AodWave } from '../components/AodDisplay';
+import { AodSettings, aodMetrics, aodStore, loadAodSettings } from '../model/AodSettings';
 import anpod from 'libanpod_core.so';
 
 @Entry
@@ -11,13 +12,20 @@ struct PairedPcs {
 
   @State settings: AodSettings = new AodSettings();
   @State optionsOpen: boolean = false;
-  private readonly previewWave: number[] = [];
+  private readonly previewWave: AodWave = new AodWave();
+  // Android previews the real screen in landscape: long side x short side.
+  private previewWidth: number = 800;
+  private previewHeight: number = 360;
 
   aboutToAppear(): void {
     this.settings = loadAodSettings(this.getUIContext().getHostContext() as common.Context);
     for (let i = 0; i < 96; i++) {
-      this.previewWave.push(0.22 + 0.65 * Math.pow(Math.sin(i * 0.23), 2));
+      this.previewWave.left.push(0.22 + 0.65 * Math.pow(Math.sin(i * 0.23), 2));
     }
+    this.previewWave.right = this.previewWave.left;
+    const screen = display.getDefaultDisplaySync();
+    this.previewWidth = Math.max(screen.width, screen.height) / screen.densityPixels;
+    this.previewHeight = Math.min(screen.width, screen.height) / screen.densityPixels;
     this.load();
   }
 
@@ -42,36 +50,25 @@ struct PairedPcs {
     this.settings.save(aodStore(this.getUIContext().getHostContext() as common.Context));
   }
 
-  previewMetrics(): string[] {
-    const metrics: string[] = [];
-    if (this.settings.showProtocol) metrics.push('USB');
-    if (this.settings.showReceiveRate) metrics.push('1.54 Mbps');
-    if (this.settings.showBuffer) metrics.push('BUF 48 ms');
-    if (this.settings.showLoss) metrics.push('LOSS 0');
-    if (this.settings.showAudioFormat) metrics.push('48 kHz / 16-bit');
-    if (this.settings.showUnderruns) metrics.push('XRUN 0');
-    if (this.settings.showOutputEngine) metrics.push('OHAudio');
-    return metrics;
-  }
-
+  // Builder rows take getters: a value argument would be a stale copy after the setting changes.
   @Builder
-  toggleRow(label: Resource, checked: boolean, changed: (value: boolean) => void) {
+  toggleRow(label: Resource, checked: () => boolean, changed: (value: boolean) => void) {
     Row({ space: 12 }) {
       Text(label).layoutWeight(1)
-      Toggle({ type: ToggleType.Switch, isOn: checked })
+      Toggle({ type: ToggleType.Switch, isOn: checked() })
         .accessibilityText(label)
         .onChange((value: boolean) => { changed(value); this.save(); })
     }.width('100%').constraintSize({ minHeight: 48 })
   }
 
   @Builder
-  sliderRow(label: Resource, value: number, min: number, max: number, suffix: string,
+  sliderRow(label: Resource, value: () => number, min: number, max: number, suffix: string,
     changed: (value: number) => void) {
     Row() {
       Text(label).layoutWeight(1)
-      Text(value.toString() + suffix)
+      Text(value().toString() + suffix)
     }.width('100%')
-    Slider({ value: value, min: min, max: max, step: 1 })
+    Slider({ value: value(), min: min, max: max, step: 1 })
       .width('100%')
       .accessibilityText(label)
       .onChange((v: number, mode: SliderChangeMode) => {
@@ -84,10 +81,11 @@ struct PairedPcs {
   options() {
     Scroll() {
       Column({ space: 8 }) {
-        AodDisplay({ settings: this.settings, clock: '21:38', left: this.previewWave, right: this.previewWave,
-          elapsedMs: 0, status: 'Receiving', metrics: this.previewMetrics(), preview: true })
+        AodDisplay({ settings: this.settings, clock: '21:38', status: 'Not connected',
+          metrics: aodMetrics(this.settings, undefined, '—'), wave: this.previewWave,
+          previewWidth: this.previewWidth, previewHeight: this.previewHeight })
           .width('100%').height(140)
-        this.sliderRow($r('app.string.aod_clock_scale'), this.settings.clockScale, 80, 120, '%',
+        this.sliderRow($r('app.string.aod_clock_scale'), () => this.settings.clockScale, 80, 120, '%',
           (v: number) => { this.settings.clockScale = v; })
         Row({ space: 8 }) {
           Text($r('app.string.aod_clock_font')).layoutWeight(1)
@@ -98,23 +96,23 @@ struct PairedPcs {
             .accessibilityText($r('app.string.aod_clock_font'))
             .onSelect((index: number) => { this.settings.clockFont = index; this.save(); })
         }.width('100%').constraintSize({ minHeight: 48 })
-        this.sliderRow($r('app.string.aod_clock_weight'), this.settings.clockWeightLevel, 1, 9, '',
+        this.sliderRow($r('app.string.aod_clock_weight'), () => this.settings.clockWeightLevel, 1, 9, '',
           (v: number) => { this.settings.clockWeightLevel = v; })
-        this.sliderRow($r('app.string.aod_wave_weight'), this.settings.waveformWeightLevel, 1, 9, '',
+        this.sliderRow($r('app.string.aod_wave_weight'), () => this.settings.waveformWeightLevel, 1, 9, '',
           (v: number) => { this.settings.waveformWeightLevel = v; })
-        this.toggleRow($r('app.string.aod_protocol'), this.settings.showProtocol,
+        this.toggleRow($r('app.string.aod_protocol'), () => this.settings.showProtocol,
           (v: boolean) => { this.settings.showProtocol = v; })
-        this.toggleRow($r('app.string.aod_receive_rate'), this.settings.showReceiveRate,
+        this.toggleRow($r('app.string.aod_receive_rate'), () => this.settings.showReceiveRate,
           (v: boolean) => { this.settings.showReceiveRate = v; })
-        this.toggleRow($r('app.string.aod_buffer'), this.settings.showBuffer,
+        this.toggleRow($r('app.string.aod_buffer'), () => this.settings.showBuffer,
           (v: boolean) => { this.settings.showBuffer = v; })
-        this.toggleRow($r('app.string.aod_loss'), this.settings.showLoss,
+        this.toggleRow($r('app.string.aod_loss'), () => this.settings.showLoss,
           (v: boolean) => { this.settings.showLoss = v; })
-        this.toggleRow($r('app.string.aod_audio_format'), this.settings.showAudioFormat,
+        this.toggleRow($r('app.string.aod_audio_format'), () => this.settings.showAudioFormat,
           (v: boolean) => { this.settings.showAudioFormat = v; })
-        this.toggleRow($r('app.string.aod_underruns'), this.settings.showUnderruns,
+        this.toggleRow($r('app.string.aod_underruns'), () => this.settings.showUnderruns,
           (v: boolean) => { this.settings.showUnderruns = v; })
-        this.toggleRow($r('app.string.aod_output_engine'), this.settings.showOutputEngine,
+        this.toggleRow($r('app.string.aod_output_engine'), () => this.settings.showOutputEngine,
           (v: boolean) => { this.settings.showOutputEngine = v; })
       }.width('100%').padding({ left: 24, right: 24, bottom: 24 })
     }.width('100%')
@@ -156,7 +154,7 @@ struct PairedPcs {
 
       Scroll() {
         Column({ space: 8 }) {
-          this.toggleRow($r('app.string.aod_auto'), this.settings.enabled,
+          this.toggleRow($r('app.string.aod_auto'), () => this.settings.enabled,
             (v: boolean) => { this.settings.enabled = v; })
           Button($r('app.string.aod_open')).width('100%')
             .onClick(() => { this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' }); })

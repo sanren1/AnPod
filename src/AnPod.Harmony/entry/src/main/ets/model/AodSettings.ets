@@ -1,14 +1,39 @@
 import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
+import { AodSnapshot } from 'libanpod_core.so';
+
+const STORE = 'receiver';
+const LEGACY_STORE = 'anpod_receiver';  // the M3 draft kept AOD settings in their own file
+const KEYS = ['aod_enabled', 'aod_clock_scale', 'aod_clock_font', 'aod_clock_weight_level', 'aod_waveform_weight_level',
+  'aod_show_protocol', 'aod_show_receive_rate', 'aod_show_buffer', 'aod_show_loss', 'aod_show_audio_format',
+  'aod_show_underruns', 'aod_show_output_engine'];
+
+// One-time move of the draft's values into the receiver store; values already in the store win.
+export function migrateAodSettings(legacy: preferences.Preferences, store: preferences.Preferences): boolean {
+  const moved = KEYS.filter((key: string) => legacy.hasSync(key));
+  if (moved.length === 0) return false;
+  for (const key of moved) {
+    if (!store.hasSync(key)) store.putSync(key, legacy.getSync(key, false));
+  }
+  store.flushSync();
+  legacy.clearSync();
+  legacy.flushSync();
+  return true;
+}
 
 export function aodStore(context: common.Context): preferences.Preferences {
-  return preferences.getPreferencesSync(context, { name: 'anpod_receiver' });
+  const store = preferences.getPreferencesSync(context, { name: STORE });
+  if (migrateAodSettings(preferences.getPreferencesSync(context, { name: LEGACY_STORE }), store)) {
+    preferences.deletePreferences(context, LEGACY_STORE).catch((e: Error) => console.error('AOD prefs: ' + e.message));
+  }
+  return store;
 }
 
 export function loadAodSettings(context: common.Context): AodSettings {
   return AodSettings.read(aodStore(context));
 }
 
+@Observed
 export class AodSettings {
   enabled: boolean = false;
   clockScale: number = 100;
@@ -55,4 +80,21 @@ export class AodSettings {
     store.putSync('aod_show_output_engine', this.showOutputEngine);
     store.flushSync();
   }
+}
+
+// AOD footer labels (English by design). No snapshot (settings preview, no session): every value is "—".
+export function aodMetrics(cfg: AodSettings, s: AodSnapshot | undefined, protocol: string): string[] {
+  const items: string[] = [];
+  if (cfg.showProtocol) items.push('Protocol ' + protocol);
+  const bps = s?.bitsPerSecond;
+  if (cfg.showReceiveRate) items.push('Recv ' + (bps === undefined ? '—' :
+    bps >= 1000000 ? (bps / 1000000).toFixed(2) + ' Mbps' : (bps / 1000).toFixed(0) + ' kbps'));
+  if (cfg.showBuffer) items.push('Buffer ' + (s?.bufferMs === undefined ? '—' : s.bufferMs.toFixed(0) + ' ms'));
+  if (cfg.showLoss) items.push('Loss ' + (s?.lossPercent === undefined ? '—' : s.lossPercent.toFixed(1) + '%'));
+  if (cfg.showAudioFormat) items.push('Format ' + (s?.sampleRate === undefined || s.channels === undefined ||
+    s.encoding === undefined ? '—' : (s.sampleRate / 1000) + ' kHz Float32 ' + s.channels + 'ch'));
+  if (cfg.showUnderruns) items.push('Underruns ' + (s?.underruns ?? '—'));
+  if (cfg.showOutputEngine) items.push('Output ' + (s?.latencyMode === undefined ? '—' :
+    s.latencyMode === 'fast' ? 'OHAudio Fast' : 'OHAudio'));
+  return items;
 }

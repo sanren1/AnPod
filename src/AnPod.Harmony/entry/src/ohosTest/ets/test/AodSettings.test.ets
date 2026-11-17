@@ -1,7 +1,7 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { application } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
-import { AodSettings } from '../../../main/ets/model/AodSettings';
+import { AodSettings, migrateAodSettings } from '../../../main/ets/model/AodSettings';
 
 export default function aodSettingsTest() {
   describe('AodSettings', () => {
@@ -29,6 +29,36 @@ export default function aodSettingsTest() {
         expect(restored.showAudioFormat).assertTrue();
       } finally {
         await preferences.deletePreferences(context, name);
+      }
+    });
+    it('draft_store_moves_into_receiver_store_once', 0, async () => {
+      const context = await application.createModuleContext(application.getApplicationContext(), 'entry');
+      const legacy = preferences.getPreferencesSync(context, { name: 'aod_legacy_test' });
+      const store = preferences.getPreferencesSync(context, { name: 'aod_store_test' });
+      try {
+        legacy.clearSync();
+        store.clearSync();
+        expect(migrateAodSettings(legacy, store)).assertFalse();
+        legacy.putSync('aod_clock_scale', 113);
+        legacy.putSync('aod_show_audio_format', true);
+        legacy.putSync('aod_enabled', true);
+        legacy.putSync('unrelated', 'x');
+        store.putSync('aod_enabled', false);  // already in the receiver store: kept
+        store.putSync('wireless', true);
+        expect(migrateAodSettings(legacy, store)).assertTrue();
+        const moved = AodSettings.read(store);
+        expect(moved.clockScale).assertEqual(113);
+        expect(moved.showAudioFormat).assertTrue();
+        expect(moved.enabled).assertFalse();
+        expect(store.getSync('wireless', false)).assertTrue();
+        expect(store.hasSync('unrelated')).assertFalse();
+        expect(legacy.hasSync('aod_clock_scale')).assertFalse();
+        store.putSync('aod_clock_scale', 90);
+        expect(migrateAodSettings(legacy, store)).assertFalse();
+        expect(store.getSync('aod_clock_scale', 0)).assertEqual(90);
+      } finally {
+        await preferences.deletePreferences(context, 'aod_legacy_test');
+        await preferences.deletePreferences(context, 'aod_store_test');
       }
     });
   });

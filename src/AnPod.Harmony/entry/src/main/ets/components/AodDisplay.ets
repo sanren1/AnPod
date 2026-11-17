@@ -1,22 +1,66 @@
 import { AodSettings } from '../model/AodSettings';
-import { curve, wrapMetrics } from '../model/AodGeometry';
+import {
+  aodScale, baseClockSize, clockLayout, curve, EDGE_FADE_FRACTION, gapBeforeSeparator, GLOW_STROKE_WIDTH,
+  MAX_DRIFT_X, MAX_DRIFT_Y, STROKE_WIDTH, wrapMetrics
+} from '../model/AodGeometry';
 
 const WEIGHTS = [300, 400, 450, 500, 550, 600, 700, 775, 850];
 const FAMILIES = ['rubik', 'sans', 'serif', 'mono'];
 
+// Written in place by the AOD page every frame; only the waveform canvas reads it, so no page rebuild.
+export class AodWave {
+  left: number[] = [];
+  right: number[] = [];
+}
+
+interface View {
+  w: number;
+  h: number;
+  scale: number;
+  ox: number;
+  oy: number;
+}
+
+interface ClockText {
+  family: string;
+  size: number;
+  spacing: number;
+  left: number;
+  width: number;
+  top: number;
+}
+
+interface WaveFrame {
+  view: View;
+  x: number;
+  width: number;
+  center: number;
+  amplitude: number;
+  stroke: number;
+}
+
 @Component
 export struct AodDisplay {
-  @Prop @Watch('draw') settings: AodSettings = new AodSettings();
-  @Prop @Watch('draw') clock: string = '';
-  @Prop left: number[] = [];
-  @Prop right: number[] = [];
-  @Prop @Watch('draw') elapsedMs: number = 0;
-  @Prop @Watch('draw') status: string = '';
-  @Prop @Watch('draw') metrics: string[] = [];
-  @Prop preview: boolean = false;
-  private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
-  private ready: boolean = false;
+  @ObjectLink @Watch('drawText') settings: AodSettings;
+  @Prop @Watch('drawText') clock: string = '';
+  @Prop @Watch('drawText') status: string = '';
+  @Prop @Watch('drawText') metrics: string[] = [];
+  @Prop @Watch('drawText') driftSeconds: number = 0;
+  @Prop @Watch('drawWave') frameMs: number = 0;
+  @Prop previewWidth: number = 0;  // > 0: settings preview of a previewWidth x previewHeight screen
+  @Prop previewHeight: number = 0;
+  wave: AodWave = new AodWave();
+  private text: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  private waves: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  private frame?: WaveFrame;
+  @State placed: ClockText = { family: '', size: 0, spacing: 0, left: 0, width: 0, top: 0 };
   private registered: string[] = [];
+
+  // Registered before the canvases are ready, so the first frame already measures the real font.
+  aboutToAppear(): void {
+    this.register('rubik_black');
+    this.fontName();
+  }
 
   private fontName(): string {
     const family = FAMILIES[this.settings.clockFont];
@@ -24,112 +68,207 @@ export struct AodDisplay {
     let filename = family + '_w' + weight;
     if (family === 'rubik' && weight === 400) filename = 'rubik_regular';
     if (family === 'rubik' && weight === 850) filename = 'rubik_black';
+    this.register(filename);
+    return filename;
+  }
+
+  private register(filename: string): void {
     if (!this.registered.includes(filename)) {
       this.getUIContext().getFont().registerFont({ familyName: filename, familySrc: $rawfile('aod/' + filename + '.ttf') });
       this.registered.push(filename);
     }
-    return filename;
   }
 
-  private trace(history: number[], amplitude: number, right: boolean, width: number, center: number): void {
-    const c = this.ctx;
-    const offsets = curve(history, amplitude, this.elapsedMs, right);
-    const gradient = c.createLinearGradient(0, 0, width, 0);
-    const color = right ? '#22D3EE' : '#67E8F9';
-    gradient.addColorStop(0, 'transparent');
-    gradient.addColorStop(0.16, color);
-    gradient.addColorStop(0.84, color);
-    gradient.addColorStop(1, 'transparent');
-    c.strokeStyle = gradient;
-    const stroke = 0.25 + this.settings.waveformWeightLevel * 0.25;
-    c.beginPath();
-    if (history.every((x: number) => x === 0) || offsets.length < 2) {
-      c.moveTo(0, center);
-      c.lineTo(width, center);
-      c.lineWidth = 2 * stroke;
-      c.stroke();
-      return;
-    }
-    const step = width / (offsets.length - 1);
-    c.moveTo(0, center - offsets[0]);
-    for (let i = 0; i < offsets.length - 1; i++) {
-      const a = offsets[i];
-      const b = offsets[i + 1];
-      const low = Math.min(a, b);
-      const high = Math.max(a, b);
-      const cp1 = Math.max(low, Math.min(high, a + (b - offsets[Math.max(0, i - 1)]) / 6));
-      const cp2 = Math.max(low, Math.min(high, b - (offsets[Math.min(offsets.length - 1, i + 2)] - a) / 6));
-      c.bezierCurveTo((i + 1 / 3) * step, center - cp1, (i + 2 / 3) * step, center - cp2,
-        (i + 1) * step, center - b);
-    }
-    c.globalAlpha = 0.15;
-    c.lineWidth = 12 * stroke;
-    c.stroke();
-    c.globalAlpha = 1;
-    c.lineWidth = 3.6 * stroke;
-    c.stroke();
+  // A "px" canvas font size is physical pixels, while measureText answers in vp.
+  private px(vp: number): number {
+    return this.getUIContext().vp2px(vp);
   }
 
-  private draw(): void {
-    if (!this.ready) return;
-    const c = this.ctx;
-    const scale = this.preview ? Math.min(c.width / 800, c.height / 360) : 1;
-    if (scale <= 0) return;
-    const w = this.preview ? 800 : c.width;
-    const h = this.preview ? 360 : c.height;
+  private view(c: CanvasRenderingContext2D): View | undefined {
+    if (c.width <= 0 || c.height <= 0) return undefined;
+    if (this.previewWidth <= 0) return { w: c.width, h: c.height, scale: 1, ox: 0, oy: 0 };
+    const scale = Math.min(c.width / this.previewWidth, c.height / this.previewHeight);
+    return {
+      w: this.previewWidth, h: this.previewHeight, scale: scale,
+      ox: (c.width - this.previewWidth * scale) / 2, oy: (c.height - this.previewHeight * scale) / 2
+    };
+  }
+
+  // Clock, status and metrics: redrawn on a change or a drift step, never per waveform frame.
+  private drawText(): void {
+    const c = this.text;
+    const v = this.view(c);
     c.clearRect(0, 0, c.width, c.height);
+    if (v === undefined) return;
     c.save();
-    c.translate((c.width - w * scale) / 2, (c.height - h * scale) / 2);
-    c.scale(scale, scale);
-    if (!this.preview) {
-      c.translate(16 * Math.sin(this.elapsedMs * Math.PI / 60000), 9 * Math.cos(this.elapsedMs * Math.PI / 75000));
+    c.translate(v.ox, v.oy);
+    c.scale(v.scale, v.scale);
+    const w = v.w;
+    const h = v.h;
+    if (this.previewWidth > 0) {
+      c.fillStyle = '#000000';
+      c.fillRect(0, 0, w, h);
     }
-    c.textAlign = 'center';
+    const k = aodScale(w, h);
+    const preview = this.previewWidth > 0;
+    const dx = preview ? 0 : MAX_DRIFT_X * Math.sin(this.driftSeconds / 120 * 2 * Math.PI);
+    const dy = preview ? 0 : MAX_DRIFT_Y * Math.cos(this.driftSeconds / 150 * 2 * Math.PI);
+
+    // Footer: status line, then metrics justified across the row with "|" centered in each gap.
+    c.letterSpacing = '0vp';
+    c.font = this.px(14 * k) + 'px sans-serif';
     c.textBaseline = 'middle';
-    c.font = '14px sans-serif';
-    const rows = wrapMetrics(this.metrics, w - 56, (s: string) => c.measureText(s).width);
-    const footer = h - 22 - 19 * (rows.length + 1);
-    const lineWidth = c.measureText(this.status).width;
+    const line = Math.max(8 * k, c.measureText('Ag').height);
+    const pad = 8 * k;
+    const spacing = 2 * k;
+    const available = w - 56 * k;
+    const widths = this.metrics.map((s: string) => c.measureText(s).width);
+    const bar = c.measureText('|').width;
+    const separator = this.metrics.length > 1 ? bar + pad * 2 : 0;
+    const rows = wrapMetrics(widths, separator, available);
+    const footerHeight = line + rows.length * line + Math.max(0, rows.length - 1) * spacing;
+
+    // Clock: Android AodVisualLayout sizing from the reference and widest-time measurements.
+    const base = baseClockSize(w, h);
+    const ceiling = base * 1.2;
+    this.register('rubik_black');
+    c.letterSpacing = '-5vp';
+    c.font = this.px(base) + 'px rubik_black';
+    const reference = c.measureText('04:44').height;
+    const name = this.fontName();
+    c.letterSpacing = this.settings.clockFont === 0 ? '-5vp' : '0vp';
+    c.font = this.px(ceiling) + 'px ' + name;
+    let pairs = 0;
+    for (let n = 0; n < 60; n++) pairs = Math.max(pairs, c.measureText(String(n).padStart(2, '0')).width);
+    let hours = 0;
+    for (let n = 0; n < 24; n++) hours = Math.max(hours, c.measureText(String(n).padStart(2, '0')).width);
+    // shortcut: widest hour + ":" + widest minute ignores kerning around the colon; exact would measure all 1440.
+    const widest = [hours + c.measureText(':').width + pairs, c.measureText('00:00').height];
+    const layout = clockLayout(w, h, footerHeight, reference, widest, this.settings.clockScale);
+    const footerTop = layout.footerTop + dy;
+    // Canvas fillText ignores registered fonts (measureText honours them), so the clock is a Text on top.
+    c.font = this.px(layout.clockSize) + 'px ' + name;
+    const clockHeight = c.measureText(this.clock).height;
+    const placed: ClockText = {
+      family: name, size: layout.clockSize * v.scale, spacing: this.settings.clockFont === 0 ? -5 * v.scale : 0,
+      left: v.ox + dx * v.scale, width: w * v.scale, top: v.oy + (layout.clockBottom + dy - clockHeight) * v.scale
+    };
+    if (JSON.stringify(placed) !== JSON.stringify(this.placed)) this.placed = placed;
+
+    c.letterSpacing = '0vp';
+    c.font = this.px(14 * k) + 'px sans-serif';
+    c.textBaseline = 'middle';
+    c.textAlign = 'left';
+    const statusWidth = c.measureText(this.status).width;
+    const start = (w - (8 * k + 7 * k + statusWidth)) / 2 + dx;
     c.fillStyle = this.status === 'Receiving' ? '#22D3EE' : this.status === 'Connected' ? '#0891B2' :
       this.status === 'Reconnecting' ? '#F59E0B' : '#4B5563';
     c.beginPath();
-    c.arc(w / 2 - (lineWidth + 15) / 2 + 4, footer + 9, 4, 0, Math.PI * 2);
+    c.arc(start + 4 * k, footerTop + line / 2, 4 * k, 0, Math.PI * 2);
     c.fill();
     c.fillStyle = '#E6E6E6';
-    c.fillText(this.status, (w + 15) / 2, footer + 9);
+    c.fillText(this.status, start + 15 * k, footerTop + line / 2);
     c.fillStyle = '#B3B3B3';
-    rows.forEach((s: string, i: number) => c.fillText(s, w / 2, footer + 28 + i * 19));
-    const base = Math.max(96, Math.min(184, h * 0.40));
-    const bottom = Math.min(h * 0.1 + base * 1.2, footer - 26 - Math.min(64, h * 0.32));
-    const name = this.fontName();
-    c.font = '100px ' + name;
-    let digit = 0;
-    for (let i = 0; i < 10; i++) digit = Math.max(digit, c.measureText(String(i)).width);
-    const tracking = this.settings.clockFont === 0 ? -5 : 0;
-    const widest = 4 * digit + c.measureText(':').width;
-    const size = Math.max(0, Math.min(base * 1.2, (w * 0.92 - 32 - 4 * tracking) * 100 / widest,
-      (bottom - 25) / 1.2)) * this.settings.clockScale / 120;
-    c.font = size + 'px ' + name;
-    c.fillStyle = '#F7F7F7';
-    c.textAlign = 'left';
-    const chars = this.clock.split('');
-    const widths = chars.map((ch: string) => c.measureText(ch).width);
-    let x = (w - widths.reduce((a: number, b: number) => a + b, 0) - tracking * (chars.length - 1)) / 2;
-    chars.forEach((ch: string, i: number) => {
-      c.fillText(ch, x, bottom - size * 0.6);
-      x += widths[i] + tracking;
+    rows.forEach((row: number[], r: number) => {
+      const y = footerTop + line + r * (line + spacing) + line / 2;
+      const count = row[1] - row[0];
+      let natural = separator * (count - 1);
+      for (let i = row[0]; i < row[1]; i++) natural += widths[i];
+      const gap = count > 1 ? Math.max(0, available - natural) / (count - 1) : 0;
+      let x = 28 * k + dx + (count === 1 ? Math.max(0, available - natural) / 2 : 0);
+      for (let i = row[0]; i < row[1]; i++) {
+        c.fillText(this.metrics[i], x, y);
+        x += widths[i];
+        if (i < row[1] - 1) {
+          c.fillText('|', x + pad + gapBeforeSeparator(gap), y);
+          x += separator + gap;
+        }
+      }
     });
-    c.translate(w * 0.05, 0);
-    const amplitude = Math.max(0, (footer - bottom) / 2 - 19) * 0.60;
-    this.trace(this.left, amplitude, false, w * 0.9, (footer + bottom) / 2);
-    this.trace(this.right, amplitude, true, w * 0.9, (footer + bottom) / 2);
+    c.restore();
+    this.frame = {
+      view: v, x: w * 0.05 + dx, width: w * 0.9, center: layout.wave.centerY + dy,
+      amplitude: layout.wave.maximumAmplitude, stroke: (0.25 + this.settings.waveformWeightLevel * 0.25) * k
+    };
+    this.drawWave();
+  }
+
+  private gradient(c: CanvasRenderingContext2D, width: number, color: string): CanvasGradient {
+    const gradient = c.createLinearGradient(0, 0, width, 0);
+    gradient.addColorStop(0, 'transparent');
+    gradient.addColorStop(EDGE_FADE_FRACTION, color);
+    gradient.addColorStop(1 - EDGE_FADE_FRACTION, color);
+    gradient.addColorStop(1, 'transparent');
+    return gradient;
+  }
+
+  // Catmull-Rom samples as one bounded Bezier path (Android smoothWaveformPath).
+  private path(c: CanvasRenderingContext2D, offsets: number[], width: number, center: number): void {
+    const step = width / (offsets.length - 1);
+    const y = (i: number) => center - offsets[Math.max(0, Math.min(offsets.length - 1, i))];
+    c.beginPath();
+    c.moveTo(0, y(0));
+    for (let i = 0; i < offsets.length - 1; i++) {
+      const low = Math.min(y(i), y(i + 1));
+      const high = Math.max(y(i), y(i + 1));
+      const cp1 = Math.max(low, Math.min(high, y(i) + (y(i + 1) - y(i - 1)) / 6));
+      const cp2 = Math.max(low, Math.min(high, y(i + 1) - (y(i + 2) - y(i)) / 6));
+      c.bezierCurveTo((i + 1 / 3) * step, cp1, (i + 2 / 3) * step, cp2, (i + 1) * step, y(i + 1));
+    }
+  }
+
+  private drawWave(): void {
+    const c = this.waves;
+    c.clearRect(0, 0, c.width, c.height);
+    const f = this.frame;
+    if (f === undefined) return;
+    c.save();
+    c.translate(f.view.ox, f.view.oy);
+    c.scale(f.view.scale, f.view.scale);
+    c.translate(f.x, 0);
+    const left = this.gradient(c, f.width, '#67E8F9');
+    const right = this.gradient(c, f.width, '#22D3EE');
+    const silent = (s: number[]) => s.every((x: number) => x === 0);
+    if (f.amplitude <= 0 || this.wave.left.length < 2 || (silent(this.wave.left) && silent(this.wave.right))) {
+      c.lineWidth = 2 * f.stroke;
+      for (const style of [left, right]) {
+        c.strokeStyle = style;
+        c.beginPath();
+        c.moveTo(0, f.center);
+        c.lineTo(f.width, f.center);
+        c.stroke();
+      }
+    } else {
+      const traces = [curve(this.wave.left, f.amplitude, this.frameMs, false),
+        curve(this.wave.right, f.amplitude, this.frameMs, true)];
+      const styles = [left, right];
+      c.globalAlpha = 0.15;
+      c.lineWidth = GLOW_STROKE_WIDTH * f.stroke;
+      traces.forEach((t: number[], i: number) => { c.strokeStyle = styles[i]; this.path(c, t, f.width, f.center); c.stroke(); });
+      c.globalAlpha = 1;
+      c.lineWidth = STROKE_WIDTH * f.stroke;
+      traces.forEach((t: number[], i: number) => { c.strokeStyle = styles[i]; this.path(c, t, f.width, f.center); c.stroke(); });
+    }
     c.restore();
   }
 
   build() {
-    Canvas(this.ctx)
-      .width('100%').height('100%').backgroundColor(Color.Black)
-      .accessibilityText(this.clock + ' ' + this.status + ' ' + this.metrics.join(', '))
-      .onReady(() => { this.ready = true; this.draw(); })
+    Stack() {
+      Canvas(this.text).width('100%').height('100%')
+        .onReady(() => this.drawText())
+      Canvas(this.waves).width('100%').height('100%')
+        .onReady(() => this.drawWave())
+      if (this.placed.size > 0) {
+        Text(this.clock)
+          .fontFamily(this.placed.family).fontSize(this.placed.size).letterSpacing(this.placed.spacing)
+          .fontColor('#F7F7F7').maxLines(1).textAlign(TextAlign.Center).width(this.placed.width)
+          .position({ x: this.placed.left, y: this.placed.top })
+      }
+    }
+    .width('100%').height('100%')
+    .backgroundColor(this.previewWidth > 0 ? Color.Transparent : Color.Black)
+    .onAreaChange(() => this.drawText())
+    .accessibilityGroup(true)
+    .accessibilityText(this.clock + ' ' + this.status + ' ' + this.metrics.join(', '))
   }
 }

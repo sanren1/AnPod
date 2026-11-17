@@ -23,6 +23,17 @@ export function formatText(e: CoreEvent): string {
   return `${khz} kHz | Float32 | ${e.channels ?? 0}ch${latency}`;
 }
 
+// AOD status words (English by design) from the session's real state; recent audio means Receiving.
+export function aodStatus(state: string, receiving: boolean): string {
+  if (receiving) return 'Receiving';
+  if (state === 'connected' || state === 'playing' || state === 'paused') return 'Connected';
+  return state === 'reconnecting' ? 'Reconnecting' : 'Not connected';
+}
+
+export function aodProtocol(status: string, transport: string): string {
+  return status === 'Not connected' ? '—' : transport === 'wired' ? 'hdc' : 'UDP';
+}
+
 function set(key: string, value: string | boolean): void {
   AppStorage.setOrCreate(key, value);
 }
