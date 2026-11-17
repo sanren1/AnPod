@@ -1,7 +1,7 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { application } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
-import { AodSettings, migrateAodSettings } from '../../../main/ets/model/AodSettings';
+import { AodSettings, OnceGate, migrateAodSettings } from '../../../main/ets/model/AodSettings';
 
 export default function aodSettingsTest() {
   describe('AodSettings', () => {
@@ -55,6 +55,13 @@ export default function aodSettingsTest() {
       } finally {
         await preferences.deletePreferences(context, name);
       }
+    });
+    it('once_gate_runs_step_once', 0, () => {
+      const gate = new OnceGate();
+      let runs = 0;
+      gate.run(() => { runs++; });
+      gate.run(() => { runs++; });
+      expect(runs).assertEqual(1);
     });
     it('draft_store_moves_into_receiver_store_once', 0, async () => {
       const context = await application.createModuleContext(application.getApplicationContext(), 'entry');

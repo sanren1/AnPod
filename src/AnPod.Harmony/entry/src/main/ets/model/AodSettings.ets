@@ -21,8 +21,25 @@ export function migrateAodSettings(legacy: preferences.Preferences, store: prefe
   return true;
 }
 
+// Runs a step at most once per process (marked before the attempt: a failed move retries on the next start).
+export class OnceGate {
+  done: boolean = false;
+  run(step: () => void): void {
+    if (this.done) return;
+    this.done = true;
+    step();
+  }
+}
+
+const migrationGate = new OnceGate();
+
 export function aodStore(context: common.Context): preferences.Preferences {
   const store = preferences.getPreferencesSync(context, { name: STORE });
+  migrationGate.run(() => migrateLegacy(context, store));
+  return store;
+}
+
+function migrateLegacy(context: common.Context, store: preferences.Preferences): void {
   try {
     if (migrateAodSettings(preferences.getPreferencesSync(context, { name: LEGACY_STORE }), store)) {
       preferences.deletePreferences(context, LEGACY_STORE).catch((e: Error) => console.error('AOD prefs: ' + e.message));
@@ -31,7 +48,6 @@ export function aodStore(context: common.Context): preferences.Preferences {
     // A failed move leaves the draft file for the next start; settings read from the receiver store meanwhile.
     console.error('AOD prefs migration: ' + (e instanceof Error ? e.message : String(e)).slice(0, 200));
   }
-  return store;
 }
 
 export function loadAodSettings(context: common.Context): AodSettings {

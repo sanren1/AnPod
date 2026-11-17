@@ -83,7 +83,7 @@ struct Aod {
       this.timer = -1;
     }
     windowChanges = windowChanges.then(() => this.applyWindow(visible))
-      .catch((e: Error) => console.error('AOD window: ' + e.message));
+      .catch((e: Error) => console.error('AOD window: ' + e.message.slice(0, 200)));
   }
 
   private async applyWindow(visible: boolean): Promise<void> {
@@ -119,6 +119,7 @@ struct Aod {
     const status = aodStatus(this.state, snapshot.receiving);
     if (this.gap.expired(status !== 'Not connected', now)) {
       clearInterval(this.timer);
+      AppStorage.setOrCreate('aodDismissed', false);  // Index is disconnected now; the next connection may auto-enter again
       this.getUIContext().getRouter().back();
       return;
     }
@@ -156,7 +157,7 @@ struct Aod {
           this.volumeLevel = start;
         }
       } catch (e) {
-        console.error('AOD volume: ' + (e instanceof Error ? e.message : String(e)));  // no gesture; volume keys still work
+        console.error('AOD volume: ' + (e instanceof Error ? e.message : String(e)).slice(0, 200));  // no gesture; volume keys still work
       }
     } else if (event.type === TouchType.Move && this.drag !== undefined) {
       const target = this.drag.move(touch.y - this.dragY);

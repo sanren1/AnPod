@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { SettingsSheet } from '../components/SettingsSheet';
-import { loadAodSettings } from '../model/AodSettings';
+import { aodStore } from '../model/AodSettings';
 import { floatingSheet, isWideWindow } from '../model/SheetLayout';
 import anpod from 'libanpod_core.so';
 import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_HOST, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
@@ -94,7 +94,7 @@ struct Index {
     if (!this.pageVisible || !this.foreground || (this.coreState !== 'connected' && this.coreState !== 'playing') ||
       AppStorage.get<boolean>('aodDismissed') === true) return;
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    if (!loadAodSettings(context).enabled) return;
+    if (aodStore(context).getSync('aod_enabled', false) !== true) return;
     this.openAod();
   }
 
