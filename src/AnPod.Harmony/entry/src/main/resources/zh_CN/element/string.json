@@ -139,6 +139,74 @@
     {
       "name": "error_already_paired",
       "value": "已拒绝配对：此电脑已配对"
+    },
+    {
+      "name": "aod_auto",
+      "value": "播放时自动进入常显"
+    },
+    {
+      "name": "aod_open",
+      "value": "进入常显"
+    },
+    {
+      "name": "aod_options",
+      "value": "常显设置"
+    },
+    {
+      "name": "aod_clock_scale",
+      "value": "时钟字号"
+    },
+    {
+      "name": "aod_clock_font",
+      "value": "时钟字体"
+    },
+    {
+      "name": "aod_clock_weight",
+      "value": "时钟粗细"
+    },
+    {
+      "name": "aod_wave_weight",
+      "value": "波形粗细"
+    },
+    {
+      "name": "aod_protocol",
+      "value": "协议"
+    },
+    {
+      "name": "aod_receive_rate",
+      "value": "接收速率"
+    },
+    {
+      "name": "aod_buffer",
+      "value": "缓冲"
+    },
+    {
+      "name": "aod_loss",
+      "value": "丢包"
+    },
+    {
+      "name": "aod_audio_format",
+      "value": "音频格式"
+    },
+    {
+      "name": "aod_underruns",
+      "value": "欠载"
+    },
+    {
+      "name": "aod_output_engine",
+      "value": "输出引擎"
+    },
+    {
+      "name": "aod_sans",
+      "value": "无衬线"
+    },
+    {
+      "name": "aod_serif",
+      "value": "衬线"
+    },
+    {
+      "name": "aod_mono",
+      "value": "等宽"
     }
   ]
 }

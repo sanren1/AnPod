@@ -490,6 +490,55 @@ napi_value StartHdcSession(napi_env env, napi_callback_info info) {
     return undefinedValue(env);
 }
 
+napi_value GetAodSnapshot(napi_env env, napi_callback_info) {
+    std::shared_ptr<Run> run;
+    {
+        std::lock_guard lock(gMutex);
+        run = gRun;
+    }
+    AodSnapshot s;
+    if (run) {
+        std::lock_guard lock(run->mutex);
+        if (run->session && !run->sessionEnded && !run->stopRequested) {
+            s = run->session->aodSnapshot();
+        }
+    }
+    napi_value out, value;
+    napi_create_object(env, &out);
+    auto number = [&](const char* key, double n) {
+        napi_create_double(env, n, &value);
+        setValue(env, out, key, value);
+    };
+    auto wave = [&](const char* key, const auto& side) {
+        napi_value array;
+        napi_create_array_with_length(env, side.size(), &array);
+        for (size_t i = 0; i < side.size(); ++i) {
+            napi_create_double(env, side[i], &value);
+            napi_set_element(env, array, i, value);
+        }
+        setValue(env, out, key, array);
+    };
+    wave("left", s.left);
+    wave("right", s.right);
+    napi_get_boolean(env, s.receiving, &value);
+    setValue(env, out, "receiving", value);
+    if (s.bitsPerSecond) number("bitsPerSecond", *s.bitsPerSecond);
+    if (s.bufferMs) number("bufferMs", *s.bufferMs);
+    if (s.lossPercent) number("lossPercent", *s.lossPercent);
+    if (s.underruns) number("underruns", *s.underruns);
+    if (s.sampleRate) {
+        number("sampleRate", s.sampleRate);
+        number("channels", s.channels);
+        napi_create_string_utf8(env, "float32", NAPI_AUTO_LENGTH, &value);
+        setValue(env, out, "encoding", value);
+        if (s.fast.has_value()) {
+            napi_create_string_utf8(env, *s.fast ? "fast" : "normal", NAPI_AUTO_LENGTH, &value);
+            setValue(env, out, "latencyMode", value);
+        }
+    }
+    return out;
+}
+
 napi_value AnswerPairing(napi_env env, napi_callback_info info) {
     auto argv = args(env, info, 1);
     bool accept = false;
@@ -722,6 +771,7 @@ napi_value SelfTestLoopback(napi_env env, napi_callback_info info) {
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
         {"startWireless", nullptr, StartWireless, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getAodSnapshot", nullptr, GetAodSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startHdcSession", nullptr, StartHdcSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"answerPairing", nullptr, AnswerPairing, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stopSession", nullptr, StopSession, nullptr, nullptr, nullptr, napi_default, nullptr},

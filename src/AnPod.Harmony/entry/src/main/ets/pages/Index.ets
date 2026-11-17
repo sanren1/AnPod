@@ -1,3 +1,5 @@
+import { common } from '@kit.AbilityKit';
+import { loadAodSettings } from '../model/AodSettings';
 import anpod from 'libanpod_core.so';
 import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_HOST, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
 
@@ -48,7 +50,7 @@ struct PairingDialog {
 @Entry
 @Component
 struct Index {
-  @StorageProp(KEY_STATE) coreState: string = 'idle';
+  @StorageProp(KEY_STATE) @Watch('maybeEnterAod') coreState: string = 'idle';
   @StorageProp(KEY_FORMAT) formatText: string = '';
   @StorageProp(KEY_ERROR) errorMessage: string = '';
   @StorageProp(KEY_HOST) activeHost: string = '';
@@ -57,6 +59,8 @@ struct Index {
   @State hosts: string[] = [];
   @State bindingError: boolean = false;
   @State wide: boolean = true;
+  @StorageProp('aodForeground') @Watch('maybeEnterAod') foreground: boolean = false;
+  private pageVisible: boolean = false;
   private dialogOpen: boolean = false;
   private dialog: CustomDialogController = new CustomDialogController({
     builder: PairingDialog(),
@@ -79,8 +83,26 @@ struct Index {
     this.onPairingCode();
   }
 
+  onPageHide(): void {
+    this.pageVisible = false;
+  }
+
+  maybeEnterAod(): void {
+    if (!this.pageVisible || !this.foreground || (this.coreState !== 'connected' && this.coreState !== 'playing') ||
+      AppStorage.get<boolean>('aodDismissed') === true) return;
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (!loadAodSettings(context).enabled) return;
+    AppStorage.setOrCreate('aodDismissed', true);
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/Aod' }).catch((error: Error) => {
+      AppStorage.setOrCreate('aodDismissed', false);
+      console.error('Cannot open AOD: ' + error.message);
+    });
+  }
+
   onPageShow(): void {
+    this.pageVisible = true;
     this.reloadBindings();
+    this.maybeEnterAod();
   }
 
   reloadBindings(): void {

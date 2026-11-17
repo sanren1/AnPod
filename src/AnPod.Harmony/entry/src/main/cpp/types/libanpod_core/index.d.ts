@@ -13,3 +13,17 @@ export function forgetBinding(hostIdHex: string): boolean;
 export function selfTest(): string[];
 export function selfTestLoopback(port: number): string[];  // for Task 9
 export function startWireless(hostIdHex: string, onEvent: (e: CoreEvent) => void): void;
+export interface AodSnapshot {
+  left: number[];
+  right: number[];
+  receiving: boolean;
+  bitsPerSecond?: number;
+  bufferMs?: number;
+  lossPercent?: number;
+  underruns?: number;
+  sampleRate?: number;
+  channels?: number;
+  encoding?: 'float32';
+  latencyMode?: 'fast' | 'normal';
+}
+export function getAodSnapshot(): AodSnapshot;

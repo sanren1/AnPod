@@ -236,7 +236,11 @@ AnpdIngress::Result AnpdIngress::accept(std::span<const uint8_t> d) {
     // A record stream must open with the format descriptor.
     if (type != kAnpdFormat && !formatSeen_) return Result::FormatRejected;
     if (ledger) {
-        if (ledger_.apply(*ledger) == LedgerApply::Invalid) return Result::FormatRejected;
+        auto applied = ledger_.apply(*ledger);
+        if (applied == LedgerApply::Invalid) return Result::FormatRejected;
+        if (applied != LedgerApply::Ignored)
+            sampler_.settlement(ledger->sourceSegmentStart, ledger->settledThrough, format_.sampleRate,
+                                ledger->hasSourceSegmentStart && ledger_.complete());
         commit(sequence);
         return Result::LossLedger;
     }
@@ -269,7 +273,10 @@ AnpdIngress::Result AnpdIngress::acceptFloat(uint8_t type, uint64_t sequence, ui
     commit(sequence);
     authenticatedAudioFrames_ += frames;
     authenticatedAudioPayloadBytes_ += payload.size();
-    if (!sink_(frameIndex, std::span<const float>(samples.data(), count), frames)) droppedFrames_ += frames;
+    auto pcm = std::span<const float>(samples.data(), count);
+    bool accepted = sink_(frameIndex, pcm, frames);
+    if (!accepted) droppedFrames_ += frames;
+    sampler_.audio(frameIndex, pcm, format_.channels, accepted, lastAuthenticatedAudioAtNanos_);
     return Result::Audio;
 }
 

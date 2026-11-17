@@ -79,6 +79,7 @@ public:
     void stop(bool userInitiated);
 
     // Test seam: the UDP socket opened by a wireless BIND, -1 before.
+    AodSnapshot aodSnapshot();
     int udpSocketForTest() const { return udpFd_; }
 
 private:
@@ -111,6 +112,8 @@ private:
     uint64_t sessionId_ = 0;
     bool playbackStarted_ = false;  // reader thread only
     std::unique_ptr<AnpdIngress> ingress_;
+    std::mutex snapshotMutex_;
+    bool outputReady_ = false;
 
     std::mutex mutex_;
     std::condition_variable wake_;

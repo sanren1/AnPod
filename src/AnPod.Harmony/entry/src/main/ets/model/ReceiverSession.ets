@@ -47,6 +47,7 @@ export class ReceiverSession {
 
   private static reset(mode: string, state: string): number {
     ReceiverSession.generation++;
+    set('aodDismissed', false);
     set('transportPage', mode);
     set(KEY_STATE, state);
     set(KEY_FORMAT, '');
@@ -128,6 +129,7 @@ export class ReceiverSession {
       if (e.host !== undefined) {
         set(KEY_HOST, e.host);
       } else if (e.state === 'listening') {
+        set('aodDismissed', false);
         set(KEY_HOST, '');
       }
       if (e.state === 'reconnecting') {

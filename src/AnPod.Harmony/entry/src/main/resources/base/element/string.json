@@ -139,6 +139,74 @@
     {
       "name": "error_already_paired",
       "value": "Pairing refused: this PC is already paired"
+    },
+    {
+      "name": "aod_auto",
+      "value": "Automatically enter always-on display"
+    },
+    {
+      "name": "aod_open",
+      "value": "Enter always-on display"
+    },
+    {
+      "name": "aod_options",
+      "value": "Display settings"
+    },
+    {
+      "name": "aod_clock_scale",
+      "value": "Clock size"
+    },
+    {
+      "name": "aod_clock_font",
+      "value": "Clock font"
+    },
+    {
+      "name": "aod_clock_weight",
+      "value": "Clock weight"
+    },
+    {
+      "name": "aod_wave_weight",
+      "value": "Waveform weight"
+    },
+    {
+      "name": "aod_protocol",
+      "value": "Protocol"
+    },
+    {
+      "name": "aod_receive_rate",
+      "value": "Receive rate"
+    },
+    {
+      "name": "aod_buffer",
+      "value": "Buffer"
+    },
+    {
+      "name": "aod_loss",
+      "value": "Packet loss"
+    },
+    {
+      "name": "aod_audio_format",
+      "value": "Audio format"
+    },
+    {
+      "name": "aod_underruns",
+      "value": "Underruns"
+    },
+    {
+      "name": "aod_output_engine",
+      "value": "Output engine"
+    },
+    {
+      "name": "aod_sans",
+      "value": "Sans serif"
+    },
+    {
+      "name": "aod_serif",
+      "value": "Serif"
+    },
+    {
+      "name": "aod_mono",
+      "value": "Monospace"
     }
   ]
 }

@@ -4,6 +4,7 @@
 // and the nonce is 0x414e5048 | sequence (big-endian). Only profiles with Float32 samples are accepted.
 #pragma once
 
+#include "aod_sampler.h"
 #include "crypto.h"
 #include "pairing_protocol.h"
 
@@ -84,6 +85,7 @@ public:
     // block (write into a ring and return). The counters below are safe to read from other threads.
     Result accept(std::span<const uint8_t> packet);
 
+    AodSnapshot aodSnapshot(int64_t now) { return sampler_.snapshot(now, authenticatedAudioPayloadBytes_); }
     uint64_t authenticatedAudioFrames() const { return authenticatedAudioFrames_; }
     uint64_t authenticatedAudioPayloadBytes() const { return authenticatedAudioPayloadBytes_; }
     uint64_t droppedFrames() const { return droppedFrames_; }
@@ -102,6 +104,7 @@ private:
     Key32 key_;
     const AudioFormatV2 format_;
     const FloatSink sink_;
+    AodSampler sampler_;
     LossLedgerStore ledger_;
     bool formatSeen_ = false;
     bool hasHighest_ = false;

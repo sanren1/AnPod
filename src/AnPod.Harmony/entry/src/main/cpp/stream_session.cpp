@@ -63,6 +63,10 @@ void StreamSession::launch() {
         self->udpStopping_ = true;
         if (self->udpThread_.joinable()) self->udpThread_.join();
         if (self->udpFd_ >= 0) ::close(self->udpFd_);
+        {
+            std::lock_guard lock(self->snapshotMutex_);
+            self->outputReady_ = false;
+        }
         if (self->playbackStarted_) self->sink_.close();
         std::string message;
         {
@@ -82,6 +86,20 @@ StreamSession::~StreamSession() {
     stop(false);
     if (reader_.joinable()) reader_.join();
     if (watchdog_.joinable()) watchdog_.join();
+}
+
+AodSnapshot StreamSession::aodSnapshot() {
+    std::lock_guard lock(snapshotMutex_);
+    if (!outputReady_) return {};
+    auto snapshot = ingress_->aodSnapshot(nowNanos());
+    auto stats = sink_.stats();
+    snapshot.fast = sink_.fast();
+    snapshot.sampleRate = format_.sampleRate;
+    snapshot.channels = format_.channels;
+    if (stats.pendingFrames >= 0)
+        snapshot.bufferMs = 1000.0 * stats.pendingFrames / format_.sampleRate;
+    if (stats.underrunCount != UINT32_MAX) snapshot.underruns = stats.underrunCount;
+    return snapshot;
 }
 
 void StreamSession::stop(bool userInitiated) {
@@ -333,6 +351,10 @@ std::string StreamSession::controlLoop() {
                     break;
                 }
                 playbackStarted = true;
+                {
+                    std::lock_guard lock(snapshotMutex_);
+                    outputReady_ = true;
+                }
                 if (wireless) udpThread_ = std::thread([this] { receiveUdp(); });
                 if (callbacks_.onFormat) callbacks_.onFormat(format_);
                 setState(SessionState::ReceiverRunning);

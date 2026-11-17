@@ -33,6 +33,18 @@ export default class EntryAbility extends UIAbility {
     this.setLive(false);
   }
 
+  onForeground(): void {
+    AppStorage.setOrCreate('aodForeground', true);
+  }
+
+  onBackground(): void {
+    AppStorage.setOrCreate('aodForeground', false);
+  }
+
+  onWindowStageDestroy(): void {
+    AppStorage.setOrCreate('aodForeground', false);
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
     windowStage.loadContent('pages/Index');
   }

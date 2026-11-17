@@ -1,6 +1,7 @@
 // On-device self-tests, run by ohosTest CoreSelfTest through the NAPI selfTest() export.
 // Expected vectors come from Python hmac/hashlib and from PairingProtocol.java's own *ForVector helpers
 // (see .superpowers/sdd/2026-11-14-harmonyos-m1-wired/findings.md), never from this C++ code.
+#include "aod_sampler.h"
 #include "anhb_codec.h"
 #include "anpd_ingress.h"
 #include "anpu_codec.h"
@@ -24,6 +25,34 @@ namespace anpod {
 void runSessionSelfTests(std::vector<std::string>& failures);  // self_test_session.cpp
 
 namespace {
+
+bool aodSamplesAreSessionScoped() {
+    AodSampler session;
+    const float stereo[]{-0.25f, 0.75f};
+    if (session.snapshot(0, 0).bitsPerSecond || session.snapshot(0, 0).receiving) return false;
+    session.audio(0, stereo, 2, true, 0);
+    session.audio(2, stereo, 2, false, 10000000);
+    session.settlement(0, 3, 48000, true);
+    auto recent = session.snapshot(10000000, 16);
+    if (!recent.receiving || recent.left[0] != .25f || recent.right[0] != .75f ||
+        !recent.lossPercent || std::abs(*recent.lossPercent - 200.0 / 3) > .001) return false;
+    auto idle = session.snapshot(500000000, 16);
+    // Late delivery fills the gap. Only accepted frames in the trailing minute are eligible as good.
+    session.audio(1, stereo, 2, true, 600000000);
+    session.settlement(0, 3, 48000, true);
+    auto reordered = session.snapshot(600000000, 24);
+    if (!reordered.lossPercent || std::abs(*reordered.lossPercent - 100.0 / 3) > .001) return false;
+    session.audio(62, stereo, 2, true, 700000000);
+    session.settlement(0, 63, 1, true);
+    auto minute = session.snapshot(700000000, 32);
+    if (!minute.lossPercent || std::abs(*minute.lossPercent - 5900.0 / 60) > .001) return false;
+    session.settlement(0, 63, 1, false);
+    if (session.snapshot(700000000, 32).lossPercent) return false;
+    AodSampler replacement;
+    return idle.bitsPerSecond == 256 && idle.left[0] == 0 &&
+           !session.snapshot(2700000001LL, 32).receiving &&
+           !replacement.snapshot(500000000, 0).lossPercent;
+}
 
 Bytes fromHex(const char* h) {
     Bytes out;
@@ -496,6 +525,7 @@ bool anpdFloat32BitsExact() {
     Bytes audio = fromHex(kJavaFloatPacket);
     if (ingress->accept(format) != AnpdIngress::Result::Format || ingress->accept(audio) != AnpdIngress::Result::Audio)
         return false;
+    if (!ingress->aodSnapshot(ingress->lastAuthenticatedAudioAtNanos()).receiving) return false;
     if (cap.frames != 4 || cap.bits.size() != 8 || ingress->authenticatedAudioFrames() != 4 ||
         ingress->authenticatedAudioPayloadBytes() != 32 || !ingress->hasAuthenticatedAudio())
         return false;
@@ -669,6 +699,7 @@ std::vector<std::string> runSelfTests() {
         bool (*fn)();
     };
     static constexpr Case cases[] = {
+        {"aod_samples_are_session_scoped", aodSamplesAreSessionScoped},
         {"discovery_offer_matches_desktop", offerMatchesDesktop},
         {"discovery_matches_android", discoveryMatchesAndroid},
         {"hmac_rfc4231_case2", hmacRfc4231Case2},
