@@ -29,13 +29,13 @@ public:
     bool open(const AudioFormatV2& format) override;
     bool write(const float* interleaved, size_t frames) override;
     void pause() override;
-    void resume() override;
+    bool resume() override;
     void close() override;
     PlaybackStats stats() const override;
 
     bool isOpen() const { return renderer_ != nullptr; }
     // The latency path the system actually granted (OH_AudioRenderer_GetFastStatus after start).
-    bool fast() const { return fast_; }
+    std::optional<bool> fast() const override { return fast_; }
     std::string failureReason() const override { return failure_; }
 
     // OHAudio C callbacks (public so the .cpp can take their address).
@@ -43,11 +43,13 @@ public:
     void interrupt(int32_t forceType, int32_t hint);
 
 private:
+    bool startMixedRenderer();
     InterruptListener onInterrupt_;
     OH_AudioRendererStruct* renderer_ = nullptr;
     SpscFloatRing ring_;
     uint32_t sampleRate_ = 0, channels_ = 0, startThresholdFrames_ = 0;
-    bool fast_ = false;
+    std::optional<bool> fast_;
+    bool mixHeld_ = false;
     std::atomic<bool> paused_{false}, interrupted_{false}, primed_{false}, closing_{false};
     std::mutex interruptMutex_;
     std::string failure_;

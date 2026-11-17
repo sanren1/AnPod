@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstring>
 #include <hilog/log.h>
+#include <ohaudio/native_audio_session_manager.h>
 #include <ohaudio/native_audiorenderer.h>
 #include <ohaudio/native_audiostreambuilder.h>
 
@@ -15,6 +16,27 @@ namespace {
 constexpr uint32_t kStartMs[2] = {40, 20};
 constexpr uint32_t kCapacityMs[2] = {200, 75};
 constexpr int64_t kAdvancingWindowNanos = 200'000'000;
+
+// AudioSession belongs to the process. A replaced renderer may close after its successor starts.
+std::mutex mixMutex;
+OH_AudioSessionManager* mixManager = nullptr;
+unsigned mixUsers = 0;
+
+int activateMix(bool& held) {
+    std::lock_guard lock(mixMutex);
+    if (!mixManager) {
+        auto result = OH_AudioManager_GetAudioSessionManager(&mixManager);
+        if (result != AUDIOCOMMON_RESULT_SUCCESS) return result;
+    }
+    OH_AudioSession_Strategy strategy{CONCURRENCY_MIX_WITH_OTHERS};
+    auto result = OH_AudioSessionManager_IsAudioSessionActivated(mixManager) && mixUsers
+        ? AUDIOCOMMON_RESULT_SUCCESS : OH_AudioSessionManager_ActivateAudioSession(mixManager, &strategy);
+    if (result == AUDIOCOMMON_RESULT_SUCCESS && !held) {
+        held = true;
+        ++mixUsers;
+    }
+    return result;
+}
 
 int64_t nowNanos() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -40,6 +62,18 @@ void logFailure(const char* step, int result, uint32_t rate, int mode) {
 OhAudioOutput::OhAudioOutput(InterruptListener onInterrupt) : onInterrupt_(std::move(onInterrupt)) {}
 
 OhAudioOutput::~OhAudioOutput() { close(); }
+
+bool OhAudioOutput::startMixedRenderer() {
+    // The system can deactivate the process session while a renderer remains paused.
+    int result = activateMix(mixHeld_);
+    if (result != AUDIOCOMMON_RESULT_SUCCESS) {
+        logFailure("activate concurrent playback", result, sampleRate_, fast_.value_or(false));
+        return false;
+    }
+    result = OH_AudioRenderer_Start(renderer_);
+    if (result != AUDIOSTREAM_SUCCESS) logFailure("start", result, sampleRate_, fast_.value_or(false));
+    return result == AUDIOSTREAM_SUCCESS;
+}
 
 bool OhAudioOutput::open(const AudioFormatV2& format) {
     if (renderer_ || format.sampleFormat != 3 || format.channels == 0 || format.mode > 1) return false;
@@ -96,16 +130,16 @@ bool OhAudioOutput::open(const AudioFormatV2& format) {
         close();
         return false;
     }
-    if ((result = OH_AudioRenderer_Start(renderer_)) != AUDIOSTREAM_SUCCESS) {
-        logFailure("start", result, format.sampleRate, mode);
+    if (!startMixedRenderer()) {
         close();
         return false;
     }
     OH_AudioStream_FastStatus status = AUDIOSTREAM_FASTSTATUS_NORMAL;
-    fast_ = OH_AudioRenderer_GetFastStatus(renderer_, &status) == AUDIOSTREAM_SUCCESS &&
-            status == AUDIOSTREAM_FASTSTATUS_FAST;
+    fast_.reset();
+    if (OH_AudioRenderer_GetFastStatus(renderer_, &status) == AUDIOSTREAM_SUCCESS)
+        fast_ = status == AUDIOSTREAM_FASTSTATUS_FAST;
     // LowLatency is the FAST path or nothing: never continue on the normal path in its name (ruling R10).
-    if (mode == 1 && !fast_) {
+    if (mode == 1 && !fast_.value_or(false)) {
         logFailure("fast path", static_cast<int>(status), format.sampleRate, mode);
         close();
         failure_ = "low latency unsupported";
@@ -150,7 +184,7 @@ void OhAudioOutput::interrupt(int32_t forceType, int32_t hint) {
         if (onInterrupt_) onInterrupt_(true);
     } else if (hint == AUDIOSTREAM_INTERRUPT_HINT_RESUME && interrupted_) {
         primed_ = false;
-        if (!paused_) OH_AudioRenderer_Start(renderer_);
+        if (!paused_ && !startMixedRenderer()) return;
         interrupted_ = false;
         if (onInterrupt_) onInterrupt_(false);
     }
@@ -161,10 +195,11 @@ void OhAudioOutput::pause() {
     if (renderer_) OH_AudioRenderer_Pause(renderer_);
 }
 
-void OhAudioOutput::resume() {
+bool OhAudioOutput::resume() {
     primed_ = false;
-    if (renderer_ && !interrupted_) OH_AudioRenderer_Start(renderer_);
+    if (!renderer_ || (!interrupted_ && !startMixedRenderer())) return false;
     paused_ = false;
+    return true;
 }
 
 void OhAudioOutput::close() {
@@ -176,6 +211,14 @@ void OhAudioOutput::close() {
     OH_AudioRenderer_Stop(renderer_);
     OH_AudioRenderer_Release(renderer_);
     renderer_ = nullptr;
+    {
+        std::lock_guard lock(mixMutex);
+        if (mixHeld_ && --mixUsers == 0) {
+            auto result = OH_AudioSessionManager_DeactivateAudioSession(mixManager);
+            if (result != AUDIOCOMMON_RESULT_SUCCESS) logFailure("release audio session", result, sampleRate_, fast_.value_or(false));
+        }
+        mixHeld_ = false;
+    }
     ring_.resetAfterQuiescence();
 }
 

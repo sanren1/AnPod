@@ -35,13 +35,14 @@ public:
     virtual bool write(const float* interleaved, size_t frames) = 0;
     // P5-C PAUSE / RESUME after an open (AoaReceiverCoordinator calls playback.pause / resume).
     virtual void pause() = 0;
-    virtual void resume() = 0;
+    virtual bool resume() = 0;
     // STOP or session end after an open; called once, on the reader thread.
     virtual void close() = 0;
     // Why the last open() failed, when the sink knows more than "cannot open" (e.g. "low latency unsupported").
     virtual std::string failureReason() const { return {}; }
     // playbackAdvancing == true reports the STREAMING state.
     virtual PlaybackStats stats() const = 0;
+    virtual std::optional<bool> fast() const { return std::nullopt; }
 };
 
 // P5-C receiver states (wire values).

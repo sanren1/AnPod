@@ -44,7 +44,7 @@ struct Event {
     std::string code, message, host;  // host: hex hostId of the wireless peer, on state events
     uint32_t sampleRate = 0;
     uint32_t channels = 0;
-    bool fast = false;
+    std::optional<bool> fast;
     bool pcConfirmed = false;
 };
 
@@ -145,8 +145,10 @@ void callJs(napi_env env, napi_value callback, void*, void* data) {
         setValue(env, object, "channels", value);
         napi_create_string_utf8(env, "float32", NAPI_AUTO_LENGTH, &value);
         setValue(env, object, "encoding", value);
-        napi_create_string_utf8(env, e->fast ? "fast" : "normal", NAPI_AUTO_LENGTH, &value);
-        setValue(env, object, "latencyMode", value);
+        if (e->fast.has_value()) {
+            napi_create_string_utf8(env, *e->fast ? "fast" : "normal", NAPI_AUTO_LENGTH, &value);
+            setValue(env, object, "latencyMode", value);
+        }
     }
     napi_value undefined, result;
     napi_get_undefined(env, &undefined);
@@ -660,7 +662,7 @@ public:
         return true;
     }
     void pause() override { pauses++; }
-    void resume() override { resumes++; }
+    bool resume() override { resumes++; return true; }
     void close() override { closes++; }
     PlaybackStats stats() const override {
         PlaybackStats s;

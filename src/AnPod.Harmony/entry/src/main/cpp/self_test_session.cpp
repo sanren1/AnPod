@@ -367,7 +367,8 @@ public:
         return true;
     }
     void pause() override { pauses++; }
-    void resume() override { resumes++; }
+    bool resumeAllowed = true;
+    bool resume() override { resumes++; return resumeAllowed; }
     void close() override { closes++; }
     PlaybackStats stats() const override { return {}; }
     std::atomic<int> pauses{0}, resumes{0}, closes{0};
@@ -719,10 +720,11 @@ bool wirelessControlLengthOutOfBoundsRejected() {
     return true;
 }
 
-bool sessionPauseResumeStopReachSink() {
+bool sessionPauseResumeStopReachSink(bool resumeAllowed) {
     Pipe pipe = makePipe();
     PipeEnd& pc = *pipe.pc;
     MemorySink sink;
+    sink.resumeAllowed = resumeAllowed;
     Ended ended;
     auto session = StreamSession::start(std::move(pipe.tablet), sessionBinding(), sink, ended.callbacks());
     Host host{pc};
@@ -733,6 +735,12 @@ bool sessionPauseResumeStopReachSink() {
     bool ok = host.capabilities().size() == 20 && host.exchange(p5c::kBind, zeroPort).size() == 13 &&
               host.exchange(p5c::kSelectMode, mode).size() == 13 && host.exchange(p5c::kStart).size() == 13;
     ok = ok && host.exchange(p5c::kPause).size() == 13 && host.exchange(p5c::kPause).size() == 13 && sink.pauses == 1;
+    if (!resumeAllowed) {
+        auto ack = host.exchange(p5c::kResume);
+        auto error = ended.wait();
+        return ok && ack.size() == 13 && ack[9] == 2 && ack[10] == static_cast<uint8_t>(SessionState::Paused) &&
+               error && *error == "audio output cannot resume";
+    }
     ok = ok && host.exchange(p5c::kResume).size() == 13 && host.exchange(p5c::kResume).size() == 13 &&
          sink.resumes == 1 && sink.closes == 0;
     Bytes stop = host.exchange(p5c::kStop);
@@ -766,7 +774,7 @@ bool ohaudioOpensNegotiatedFloat32() {
 bool ohaudioLowLatencyIsFastOrRejected() {
     OhAudioOutput output;
     bool opened = output.open(*AudioFormatV2::forProfile(4, 1));
-    if (opened) return output.isOpen() && output.fast() && output.failureReason().empty();
+    if (opened) return output.isOpen() && output.fast().value_or(false) && output.failureReason().empty();
     return !output.isOpen() && output.failureReason() == "low latency unsupported";
 }
 
@@ -776,7 +784,7 @@ public:
     bool open(const AudioFormatV2&) override { return false; }
     bool write(const float*, size_t) override { return false; }
     void pause() override {}
-    void resume() override {}
+    bool resume() override { return true; }
     void close() override { closes++; }
     std::string failureReason() const override { return "low latency unsupported"; }
     PlaybackStats stats() const override { return {}; }
@@ -904,7 +912,8 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"wireless_hello_selects_host", wirelessHelloSelectsHostWithoutConsumingBytes},
         {"session_rejects_replayed_command", sessionRejectsReplayedCommand},
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},
-        {"session_pause_resume_stop_reach_sink", sessionPauseResumeStopReachSink},
+        {"session_pause_resume_stop_reach_sink", [] { return sessionPauseResumeStopReachSink(true); }},
+        {"session_resume_failure_reaches_host", [] { return sessionPauseResumeStopReachSink(false); }},
         {"ohaudio_rejects_unsupported_without_fallback", ohaudioRejectsUnsupportedWithoutFallback},
         {"ohaudio_opens_negotiated_float32", ohaudioOpensNegotiatedFloat32},
         {"ohaudio_low_latency_is_fast_or_rejected", ohaudioLowLatencyIsFastOrRejected},

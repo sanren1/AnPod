@@ -356,7 +356,12 @@ std::string StreamSession::controlLoop() {
                     return "invalid RESUME state";
                 if (state == SessionState::Paused) {
                     std::lock_guard lock(udpOutputMutex_);
-                    sink_.resume();
+                    if (!sink_.resume()) {
+                        endError = "audio output cannot resume";
+                        result = kResultFailed;
+                        terminate = true;
+                        break;
+                    }
                     udpPaused_ = false;
                 }
                 setState(SessionState::ReceiverRunning);
