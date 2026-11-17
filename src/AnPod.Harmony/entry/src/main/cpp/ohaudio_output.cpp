@@ -82,7 +82,7 @@ bool OhAudioOutput::open(const AudioFormatV2& format) {
     sampleRate_ = format.sampleRate;
     channels_ = format.channels;
     startThresholdFrames_ = format.sampleRate * kStartMs[mode] / 1000;
-    paused_ = interrupted_ = primed_ = closing_ = false;
+    paused_ = interrupted_ = primed_ = closing_ = resumeFailed_ = false;
     failure_.clear();
     underruns_ = 0;
     lastAdvanceNanos_ = 0;
@@ -184,7 +184,10 @@ void OhAudioOutput::interrupt(int32_t forceType, int32_t hint) {
         if (onInterrupt_) onInterrupt_(true);
     } else if (hint == AUDIOSTREAM_INTERRUPT_HINT_RESUME && interrupted_) {
         primed_ = false;
-        if (!paused_ && !startMixedRenderer()) return;
+        if (!paused_ && !startMixedRenderer()) {
+            resumeFailed_ = true;  // the session ends with kOutputResumeError at the next HEARTBEAT / progress query
+            return;
+        }
         interrupted_ = false;
         if (onInterrupt_) onInterrupt_(false);
     }

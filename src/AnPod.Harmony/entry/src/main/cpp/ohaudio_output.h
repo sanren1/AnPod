@@ -36,6 +36,7 @@ public:
     bool isOpen() const { return renderer_ != nullptr; }
     // The latency path the system actually granted (OH_AudioRenderer_GetFastStatus after start).
     std::optional<bool> fast() const override { return fast_; }
+    bool outputLost() const override { return resumeFailed_; }
     std::string failureReason() const override { return failure_; }
 
     // OHAudio C callbacks (public so the .cpp can take their address).
@@ -50,7 +51,7 @@ private:
     uint32_t sampleRate_ = 0, channels_ = 0, startThresholdFrames_ = 0;
     std::optional<bool> fast_;
     bool mixHeld_ = false;
-    std::atomic<bool> paused_{false}, interrupted_{false}, primed_{false}, closing_{false};
+    std::atomic<bool> paused_{false}, interrupted_{false}, primed_{false}, closing_{false}, resumeFailed_{false};
     std::mutex interruptMutex_;
     std::string failure_;
     std::atomic<uint32_t> underruns_{0};

@@ -45,6 +45,8 @@ public:
     // playbackAdvancing == true reports the STREAMING state.
     virtual PlaybackStats stats() const = 0;
     virtual std::optional<bool> fast() const { return std::nullopt; }
+    // true once the output stopped for good on its own (an interrupt RESUME that could not restart it).
+    virtual bool outputLost() const { return false; }
 };
 
 // P5-C receiver states (wire values).

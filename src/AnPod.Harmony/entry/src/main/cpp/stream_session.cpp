@@ -390,6 +390,12 @@ std::string StreamSession::controlLoop() {
                 break;
             case p5c::kHeartbeat: {
                 if (!payload.empty()) return "invalid HEARTBEAT";
+                if (playbackStarted && sink_.outputLost()) {
+                    endError = kOutputResumeError;
+                    result = kResultFailed;
+                    terminate = true;
+                    break;
+                }
                 bool streaming = playbackStarted && sink_.stats().playbackAdvancing.value_or(false);
                 if (playbackStarted && state == SessionState::ReceiverRunning && streaming)
                     setState(SessionState::Streaming);
@@ -400,6 +406,12 @@ std::string StreamSession::controlLoop() {
             case p5c::kPlaybackProgressQuery: {
                 // Only the base v2 schema: CAP_PROGRESS_EXT is not advertised.
                 if (!payload.empty()) return "invalid progress query";
+                if (playbackStarted && sink_.outputLost()) {
+                    endError = kOutputResumeError;
+                    result = kResultFailed;
+                    terminate = true;
+                    break;
+                }
                 PlaybackStats stats = sink_.stats();
                 extra = p5c::playbackProgressPayloadV2(p5c::playbackProgressPayload(stats), playbackStarted ? 3 : 0,
                                                        playbackStarted ? format_.channels : 0,

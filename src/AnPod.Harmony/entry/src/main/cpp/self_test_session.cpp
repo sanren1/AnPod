@@ -749,6 +749,29 @@ bool sessionPauseResumeStopReachSink(bool resumeAllowed) {
     return ok && stop.size() == 13 && message && message->empty() && sink.closes == 1;
 }
 
+// An interrupt RESUME that cannot restart the renderer ends the session at the next HEARTBEAT instead of staying
+// "paused" forever. Start on a renderer the system did not pause is an illegal state: that forces the failure.
+bool sessionEndsWhenInterruptResumeFails() {
+    Pipe pipe = makePipe();
+    PipeEnd& pc = *pipe.pc;
+    OhAudioOutput sink;
+    Ended ended;
+    auto session = StreamSession::start(std::move(pipe.tablet), sessionBinding(), sink, ended.callbacks());
+    Host host{pc};
+    auto format = *AudioFormatV2::forProfile(4, 0);
+    if (!host.handshake(sessionBinding().deriveAdbStream(), format)) return false;
+    const uint8_t zeroPort[2] = {0, 0};
+    const uint8_t mode[1] = {format.mode};
+    bool ok = host.capabilities().size() == 20 && host.exchange(p5c::kBind, zeroPort).size() == 13 &&
+              host.exchange(p5c::kSelectMode, mode).size() == 13 && host.exchange(p5c::kStart).size() == 13 &&
+              host.exchange(p5c::kHeartbeat).size() == 13;
+    sink.interrupt(AUDIOSTREAM_INTERRUPT_FORCE, AUDIOSTREAM_INTERRUPT_HINT_PAUSE);
+    sink.interrupt(AUDIOSTREAM_INTERRUPT_SHARE, AUDIOSTREAM_INTERRUPT_HINT_RESUME);
+    auto ack = host.exchange(p5c::kHeartbeat);
+    auto error = ended.wait();
+    return ok && sink.outputLost() && ack.size() == 13 && ack[9] == 2 && error && *error == kOutputResumeError;
+}
+
 // OHAudio itself accepts 384 kHz (it resamples to the device), so the rejected cases are a rate the builder refuses
 // and a non-Float32 descriptor: both fail, and no other format is tried.
 bool ohaudioRejectsUnsupportedWithoutFallback() {
@@ -941,6 +964,7 @@ void runSessionSelfTests(std::vector<std::string>& failures) {
         {"session_rejects_non_float32_profile", sessionRejectsNonFloat32Profile},
         {"session_pause_resume_stop_reach_sink", [] { return sessionPauseResumeStopReachSink(true); }},
         {"session_resume_failure_reaches_host", [] { return sessionPauseResumeStopReachSink(false); }},
+        {"session_ends_when_interrupt_resume_fails", sessionEndsWhenInterruptResumeFails},
         {"ohaudio_rejects_unsupported_without_fallback", ohaudioRejectsUnsupportedWithoutFallback},
         {"ohaudio_opens_negotiated_float32", ohaudioOpensNegotiatedFloat32},
         {"ohaudio_low_latency_is_fast_or_rejected", ohaudioLowLatencyIsFastOrRejected},
