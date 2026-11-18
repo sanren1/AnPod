@@ -64,6 +64,8 @@ struct Index {
   @State windowWidth: number = 600;
   @StorageProp('safeTop') safeTop: number = 0;
   @StorageProp('safeBottom') safeBottom: number = 0;
+  @StorageProp('safeLeft') safeLeft: number = 0;
+  @StorageProp('safeRight') safeRight: number = 0;
   @State settingsOpen: boolean = false;
   @StorageProp('aodForeground') @Watch('maybeEnterAod') foreground: boolean = false;
   private pageVisible: boolean = false;
@@ -393,7 +395,7 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .padding({ bottom: this.safeBottom })
+    .padding({ bottom: this.safeBottom, left: this.safeLeft, right: this.safeRight })
     .onAreaChange((_old: Area, area: Area) => {
       this.windowWidth = Number(area.width);
     })

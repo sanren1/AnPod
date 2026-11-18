@@ -11,6 +11,7 @@ const DOMAIN = 0xA0D0;
 export default class EntryAbility extends UIAbility {
   private avSession?: avSession.AVSession;
   private live = false;
+  private removeAvoidListener?: () => void;
   // Start / end of the background hold run strictly in order.
   private background: Promise<void> = Promise.resolve();
 
@@ -42,6 +43,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
+    this.removeAvoidListener?.();
+    this.removeAvoidListener = undefined;
     AppStorage.setOrCreate('aodForeground', false);
   }
 
@@ -54,12 +57,17 @@ export default class EntryAbility extends UIAbility {
     // Bar heights in vp: pages pad their controls by these.
     const publish = () => {
       const density = display.getDefaultDisplaySync().densityPixels;
-      AppStorage.setOrCreate('safeTop', main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect.height / density);
+      const system = main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const cutout = main.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
+      AppStorage.setOrCreate('safeTop', Math.max(system.topRect.height, cutout.topRect.height) / density);
+      AppStorage.setOrCreate('safeLeft', Math.max(system.leftRect.width, cutout.leftRect.width) / density);
+      AppStorage.setOrCreate('safeRight', Math.max(system.rightRect.width, cutout.rightRect.width) / density);
       AppStorage.setOrCreate('safeBottom',
         main.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR).bottomRect.height / density);
     };
     publish();
     main.on('avoidAreaChange', publish);
+    this.removeAvoidListener = () => main.off('avoidAreaChange', publish);
     windowStage.loadContent('pages/Index');
   }
 

@@ -129,8 +129,8 @@ struct Aod {
 
   // Per display frame only the waveform canvas redraws; text state changes at most every 250 ms.
   private tick(): void {
-    const now = uptime();
     const snapshot = anpod.getAodSnapshot();
+    const now = uptime();
     const status = aodStatus(this.state, snapshot.receiving);
     if (this.gap.expired(status !== 'Not connected', now)) {
       this.stopFrames();

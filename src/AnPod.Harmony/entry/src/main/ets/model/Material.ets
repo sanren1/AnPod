@@ -42,11 +42,11 @@ const KIND: MaterialKind = detect();
 
 function surface(style: uiMaterial.ImmersiveStyle, fallbackFill: ResourceColor): Surface {
   const s = new Surface();
-  // The fill always stays: where the system draws no material (the emulator) the surface is still visible.
-  s.fill = fallbackFill;
   if (KIND === MaterialKind.IMMERSIVE) {
+    // The tint rides on the material alone; a second backgroundColor would double it.
     s.material = new uiMaterial.ImmersiveMaterial({ style: style, materialColor: fallbackFill });
   } else {
+    s.fill = fallbackFill;
     s.blur = BlurStyle.COMPONENT_REGULAR;
   }
   return s;

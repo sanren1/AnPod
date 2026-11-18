@@ -5,6 +5,7 @@ export const GLOW_STROKE_WIDTH = 12;
 export const EDGE_FADE_FRACTION = 0.16;
 const DRIFT_X = 16;  // vp at k = 1; the whole display layer drifts by this x k
 const DRIFT_Y = 9;
+// keep in sync with kAodBucketNanos / kAodPoints in cpp/aod_sampler.h
 export const BUCKET_MS = 10;
 export const WAVE_POINTS = 120;  // x BUCKET_MS = 1.2 s window (spec section 17, waveform B)
 // Section 17: stroke = level scale x sqrt(k); level 3 = 1, stored levels 1..9 unchanged.
