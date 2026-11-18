@@ -4,6 +4,8 @@
     { "name": "status_ok", "value": "#1E9E5A" },
     { "name": "status_error", "value": "#E84026" },
     { "name": "status_idle", "value": "#99000000" },
-    { "name": "card_bg", "value": "#F1F3F5" }
+    { "name": "card_bg", "value": "#F1F3F5" },
+    { "name": "bar_glass", "value": "#99FFFFFF" },
+    { "name": "card_glass", "value": "#CCFFFFFF" }
   ]
 }

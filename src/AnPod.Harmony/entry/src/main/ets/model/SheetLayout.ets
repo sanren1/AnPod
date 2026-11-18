@@ -1,3 +1,5 @@
+import { CARD_SURFACE } from './Material';
+
 // Windows at least this wide (vp) get the two-column main page and centered floating sheets.
 const WIDE_WINDOW_VP = 600;
 
@@ -17,6 +19,7 @@ export function floatingSheet(title: ResourceStr, width: number, height: SheetSi
     preferType: sheetType(width),
     height: height,
     showClose: true,
+    systemMaterial: CARD_SURFACE.material,
     enableOutsideInteractive: false,
     onDisappear: onDisappear
   };

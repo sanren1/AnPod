@@ -2,7 +2,7 @@ import { AbilityConstant, UIAbility, Want, wantAgent } from '@kit.AbilityKit';
 import { avSession } from '@kit.AVSessionKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { window } from '@kit.ArkUI';
+import { display, window } from '@kit.ArkUI';
 import { parseLaunchParams } from '../model/LaunchParams';
 import { ReceiverSession } from '../model/ReceiverSession';
 
@@ -46,6 +46,20 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    // Content under the system bars; pages keep their controls inside the safe area.
+    const main = windowStage.getMainWindowSync();
+    main.setWindowLayoutFullScreen(true).catch((e: Error) => {
+      hilog.error(DOMAIN, 'AnPod', 'full screen layout failed: %{public}s', e.message.slice(0, 200));
+    });
+    // Bar heights in vp: pages pad their controls by these.
+    const publish = () => {
+      const density = display.getDefaultDisplaySync().densityPixels;
+      AppStorage.setOrCreate('safeTop', main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect.height / density);
+      AppStorage.setOrCreate('safeBottom',
+        main.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR).bottomRect.height / density);
+    };
+    publish();
+    main.on('avoidAreaChange', publish);
     windowStage.loadContent('pages/Index');
   }
 

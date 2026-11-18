@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { SettingsSheet } from '../components/SettingsSheet';
 import { aodStore } from '../model/AodSettings';
+import { BAR_SURFACE, CARD_SURFACE } from '../model/Material';
 import { floatingSheet, isWideWindow } from '../model/SheetLayout';
 import anpod from 'libanpod_core.so';
 import { KEY_CODE, KEY_ERROR, KEY_FORMAT, KEY_HOST, KEY_PC_CONFIRMED, KEY_STATE, ReceiverSession } from '../model/ReceiverSession';
@@ -61,6 +62,8 @@ struct Index {
   @State hosts: string[] = [];
   @State bindingError: boolean = false;
   @State windowWidth: number = 600;
+  @StorageProp('safeTop') safeTop: number = 0;
+  @StorageProp('safeBottom') safeBottom: number = 0;
   @State settingsOpen: boolean = false;
   @StorageProp('aodForeground') @Watch('maybeEnterAod') foreground: boolean = false;
   private pageVisible: boolean = false;
@@ -281,7 +284,9 @@ struct Index {
     .alignItems(HorizontalAlign.Start)
     .padding(24)
     .borderRadius(CARD_RADIUS)
-    .backgroundColor($r('app.color.card_bg'))
+    .systemMaterial(CARD_SURFACE.material)
+    .backgroundColor(CARD_SURFACE.fill)
+    .backgroundBlurStyle(CARD_SURFACE.blur)
   }
 
   @Builder
@@ -307,7 +312,9 @@ struct Index {
     .width('100%')
     .padding(24)
     .borderRadius(CARD_RADIUS)
-    .backgroundColor($r('app.color.card_bg'))
+    .systemMaterial(CARD_SURFACE.material)
+    .backgroundColor(CARD_SURFACE.fill)
+    .backgroundBlurStyle(CARD_SURFACE.blur)
   }
 
   @Builder
@@ -316,7 +323,15 @@ struct Index {
   }
 
   build() {
+    Stack() {
+    Column().width('100%').height('100%').backgroundColor($r('sys.color.ohos_id_color_sub_background'))
     Column() {
+      // The material layer reaches under the status bar; the controls stay below it.
+      Stack({ alignContent: Alignment.Bottom }) {
+        Column().width('100%').height('100%')
+          .systemMaterial(BAR_SURFACE.material)
+          .backgroundColor(BAR_SURFACE.fill)
+          .backgroundBlurStyle(BAR_SURFACE.blur)
       Row() {
         Text('AnPod')
           .fontSize(24)
@@ -343,6 +358,9 @@ struct Index {
       .width('100%')
       .height(56)
       .padding({ left: 24, right: 12 })
+      }
+      .width('100%')
+      .height(56 + this.safeTop)
 
       // The playback card exists only while a session is live; idle, the status card fills the width.
       if (isWideWindow(this.windowWidth)) {
@@ -375,9 +393,10 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor($r('sys.color.ohos_id_color_background'))
+    .padding({ bottom: this.safeBottom })
     .onAreaChange((_old: Area, area: Area) => {
       this.windowWidth = Number(area.width);
     })
+    }
   }
 }
