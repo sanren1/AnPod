@@ -54,6 +54,29 @@ export function loadAodSettings(context: common.Context): AodSettings {
   return AodSettings.read(aodStore(context));
 }
 
+export const MAX_METRICS = 5;
+
+export function metricCount(s: AodSettings): number {
+  return [s.showProtocol, s.showReceiveRate, s.showBuffer, s.showLoss, s.showAudioFormat, s.showUnderruns,
+    s.showOutputEngine].filter((on: boolean) => on).length;
+}
+
+// Section 17: at most 5 detail metrics; extra enabled ones past the fifth (settings order) are switched off.
+// Returns whether anything changed.
+export function limitMetrics(s: AodSettings): boolean {
+  let kept = 0;
+  const keep = (on: boolean): boolean => on && ++kept <= MAX_METRICS;
+  const before = metricCount(s);
+  s.showProtocol = keep(s.showProtocol);
+  s.showReceiveRate = keep(s.showReceiveRate);
+  s.showBuffer = keep(s.showBuffer);
+  s.showLoss = keep(s.showLoss);
+  s.showAudioFormat = keep(s.showAudioFormat);
+  s.showUnderruns = keep(s.showUnderruns);
+  s.showOutputEngine = keep(s.showOutputEngine);
+  return metricCount(s) !== before;
+}
+
 // aod_clock_font: 0 Rubik, 1 sans serif, 2 serif, 3 monospace (Android values), 4 HarmonyOS Sans.
 const CLOCK_FONT_MAX = 4;
 
@@ -87,6 +110,17 @@ export class AodSettings {
     value.showAudioFormat = store.getSync('aod_show_audio_format', value.showAudioFormat) as boolean;
     value.showUnderruns = store.getSync('aod_show_underruns', value.showUnderruns) as boolean;
     value.showOutputEngine = store.getSync('aod_show_output_engine', value.showOutputEngine) as boolean;
+    if (limitMetrics(value)) {
+      // Write back only the metric switches; every other key stays as stored.
+      store.putSync('aod_show_protocol', value.showProtocol);
+      store.putSync('aod_show_receive_rate', value.showReceiveRate);
+      store.putSync('aod_show_buffer', value.showBuffer);
+      store.putSync('aod_show_loss', value.showLoss);
+      store.putSync('aod_show_audio_format', value.showAudioFormat);
+      store.putSync('aod_show_underruns', value.showUnderruns);
+      store.putSync('aod_show_output_engine', value.showOutputEngine);
+      store.flushSync();
+    }
     return value;
   }
 

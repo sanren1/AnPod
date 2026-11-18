@@ -1,7 +1,7 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { application } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
-import { AodSettings, OnceGate, migrateAodSettings } from '../../../main/ets/model/AodSettings';
+import { AodSettings, OnceGate, limitMetrics, metricCount, migrateAodSettings } from '../../../main/ets/model/AodSettings';
 
 export default function aodSettingsTest() {
   describe('AodSettings', () => {
@@ -52,6 +52,46 @@ export default function aodSettingsTest() {
         }
         store.putSync('aod_clock_font', 'serif');
         expect(AodSettings.read(store).clockFont).assertEqual(0);
+      } finally {
+        await preferences.deletePreferences(context, name);
+      }
+    });
+    it('metrics_limited_to_five_in_settings_order_and_written_back', 0, async () => {
+      const all = new AodSettings();
+      all.showAudioFormat = true;
+      all.showUnderruns = true;
+      all.showOutputEngine = true;
+      expect(metricCount(all)).assertEqual(7);
+      expect(limitMetrics(all)).assertTrue();
+      expect(metricCount(all)).assertEqual(5);
+      expect(all.showAudioFormat).assertTrue();  // the fifth enabled item
+      expect(all.showUnderruns).assertFalse();
+      expect(all.showOutputEngine).assertFalse();
+      expect(limitMetrics(all)).assertFalse();
+      const sparse = new AodSettings();
+      sparse.showProtocol = false;
+      sparse.showUnderruns = true;
+      sparse.showOutputEngine = true;
+      expect(limitMetrics(sparse)).assertFalse();  // 5 enabled: untouched
+      const context = await application.createModuleContext(application.getApplicationContext(), 'entry');
+      const name = 'aod_limit_test';
+      const store = preferences.getPreferencesSync(context, { name: name });
+      try {
+        store.clearSync();
+        for (const key of ['aod_show_protocol', 'aod_show_receive_rate', 'aod_show_buffer', 'aod_show_loss',
+          'aod_show_audio_format', 'aod_show_underruns', 'aod_show_output_engine']) store.putSync(key, true);
+        store.putSync('aod_clock_scale', 111);
+        store.putSync('wireless', true);
+        const read = AodSettings.read(store);
+        expect(metricCount(read)).assertEqual(5);
+        expect(store.getSync('aod_show_buffer', false)).assertTrue();
+        expect(store.getSync('aod_show_loss', false)).assertTrue();
+        expect(store.getSync('aod_show_audio_format', false)).assertTrue();  // the fifth enabled item stays
+        expect(store.getSync('aod_show_underruns', true)).assertFalse();
+        expect(store.getSync('aod_show_output_engine', true)).assertFalse();
+        expect(store.getSync('aod_clock_scale', 0)).assertEqual(111);
+        expect(store.getSync('wireless', false)).assertTrue();
+        expect(metricCount(AodSettings.read(store))).assertEqual(5);
       } finally {
         await preferences.deletePreferences(context, name);
       }

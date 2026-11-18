@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
-  AodGap, aodScale, clockFace, clockLayout, curve, fitClockSize, gapBeforeSeparator, VolumeDrag, waveLayout,
-  wrapMetrics
+  AodGap, aodScale, clockFace, clockLayout, curve, driftOffset, fitClockSize, fitMetricsFont, gapBeforeSeparator,
+  interpolatedWindow, VolumeDrag, waveLayout, waveStrokeScale
 } from '../../../main/ets/model/AodGeometry';
 
 function near(actual: number, expected: number): boolean {
@@ -30,13 +30,49 @@ export default function aodDisplayTest() {
       expect(left[1]).assertEqual(left[3]);
       expect(curve([0, 0], 50, 0, false)[1]).assertEqual(0);
     });
-    // AodMetricsGeometryTest vectors.
-    it('aod_footer_wraps_whole_metrics_and_centers_separators', 0, () => {
-      const rows = wrapMetrics([40, 42, 38, 50], 12, 100);
-      expect(JSON.stringify(rows)).assertEqual('[[0,2],[2,4]]');
-      expect(JSON.stringify(wrapMetrics([], 12, 100))).assertEqual('[]');
+    it('aod_footer_separator_gap_splits_evenly', 0, () => {
       expect(gapBeforeSeparator(20)).assertEqual(10);
       expect(gapBeforeSeparator(21)).assertEqual(10);
+    });
+    it('aod_metrics_font_fits_one_line_with_floor', 0, () => {
+      expect(fitMetricsFont([100, 100], 20, 400, 1)).assertEqual(14);
+      expect(fitMetricsFont([], 0, 400, 2)).assertEqual(28);
+      expect(fitMetricsFont([200, 200, 200], 20, 320, 1)).assertEqual(10);
+      expect(near(fitMetricsFont([100, 100, 100], 20, 280, 1), 14 * 280 / 340)).assertTrue();
+      expect(fitMetricsFont([400, 400, 400], 40, 100, 2)).assertEqual(20);
+    });
+    it('aod_wave_stroke_uses_new_levels_times_sqrt_k', 0, () => {
+      const levels = [0.3, 0.6, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
+      levels.forEach((scale: number, i: number) => expect(near(waveStrokeScale(i + 1, 1), scale)).assertTrue());
+      expect(near(waveStrokeScale(3, 4), 2)).assertTrue();
+      expect(near(waveStrokeScale(1, 2.2), 0.3 * Math.sqrt(2.2))).assertTrue();
+      expect(waveStrokeScale(0, 1)).assertEqual(1);  // unknown stored level: default
+      expect(waveStrokeScale(10, 1)).assertEqual(1);
+    });
+    it('aod_drift_scales_with_k_and_keeps_periods', 0, () => {
+      expect(JSON.stringify(driftOffset(0, 1))).assertEqual('[0,9]');
+      expect(near(driftOffset(30, 2)[0], 32)).assertTrue();  // quarter of the 120 s period
+      expect(near(driftOffset(75, 2)[1], -18)).assertTrue();  // half of the 150 s period
+      expect(near(driftOffset(120, 2.2)[0], 0)).assertTrue();
+      expect(near(driftOffset(150, 2.2)[1], 9 * 2.2)).assertTrue();
+      for (let t = 0; t < 600; t += 7) {
+        expect(Math.abs(driftOffset(t, 2.2)[0]) <= 16 * 2.2 + 1e-9).assertTrue();
+        expect(Math.abs(driftOffset(t, 2.2)[1]) <= 9 * 2.2 + 1e-9).assertTrue();
+      }
+    });
+    it('aod_window_interpolates_between_buckets', 0, () => {
+      const points = [0.8, 0.4, 0.2, 0];
+      expect(JSON.stringify(interpolatedWindow(points, 1000, 1000))).assertEqual(JSON.stringify(points));
+      const half = interpolatedWindow(points, 1012.5, 1000);
+      expect(half[0]).assertEqual(0.8);
+      expect(near(half[1], 0.6)).assertTrue();
+      expect(near(half[2], 0.3)).assertTrue();
+      expect(near(half[3], 0.1)).assertTrue();
+      const full = interpolatedWindow(points, 1025, 1000);  // equals the next bucket's window
+      expect(JSON.stringify(full)).assertEqual(JSON.stringify([0.8, 0.8, 0.4, 0.2]));
+      expect(JSON.stringify(interpolatedWindow(points, 1500, 1000))).assertEqual(JSON.stringify(full));  // clamped
+      expect(JSON.stringify(interpolatedWindow(points, 900, 1000))).assertEqual(JSON.stringify(points));  // clock skew
+      expect(interpolatedWindow([], 5, 0).length).assertEqual(0);
     });
     // PcmWaveformTapTest.waveformLayoutKeepsGlowClearOfClockAndFooter + measuredClockFitHonorsWidthAndHeightBounds.
     it('aod_android_wave_layout_and_clock_fit_vectors', 0, () => {
@@ -67,10 +103,10 @@ export default function aodDisplayTest() {
       expect(landscape.k).assertEqual(2);
       expect(landscape.footerTop).assertEqual(800 - 44 - 80);
       expect(landscape.clockSize > 184).assertTrue();
-      expect(Math.ceil(1100 * landscape.clockSize / (800 * 0.42 * 1.2)) <= 1280 * 0.92 - 32).assertTrue();
+      expect(Math.ceil(1100 * landscape.clockSize / (800 * 0.42 * 1.2)) <= 1280 * 0.92 - 64).assertTrue();
       const portrait = clockLayout(800, 1280, 80, 373, [1100, 450], 120);
       expect(portrait.k).assertEqual(2);
-      expect(Math.ceil(1100 * portrait.clockSize / (800 * 0.42 * 1.2)) <= 800 * 0.92 - 32).assertTrue();
+      expect(Math.ceil(1100 * portrait.clockSize / (800 * 0.42 * 1.2)) <= 800 * 0.92 - 64).assertTrue();
       expect(portrait.wave.regionHeight > 0).assertTrue();
     });
     it('aod_scale_caps_at_2_2', 0, () => {

@@ -1,13 +1,14 @@
 import { AodSettings } from '../model/AodSettings';
 import {
-  aodScale, baseClockSize, ClockFace, clockFace, clockLayout, curve, EDGE_FADE_FRACTION, gapBeforeSeparator, GLOW_STROKE_WIDTH,
-  MAX_DRIFT_X, MAX_DRIFT_Y, STROKE_WIDTH, wrapMetrics
+  aodScale, baseClockSize, ClockFace, clockFace, clockLayout, curve, driftOffset, EDGE_FADE_FRACTION, fitMetricsFont,
+  gapBeforeSeparator, GLOW_STROKE_WIDTH, interpolatedWindow, STROKE_WIDTH, waveStrokeScale
 } from '../model/AodGeometry';
 
 // Written in place by the AOD page every frame; only the waveform canvas reads it, so no page rebuild.
 export class AodWave {
   left: number[] = [];
   right: number[] = [];
+  newestAt: number = 0;  // uptime ms at which the newest bucket was first seen
 }
 
 interface View {
@@ -118,8 +119,9 @@ export struct AodDisplay {
     }
     const k = aodScale(w, h);
     const preview = this.previewWidth > 0;
-    const dx = preview ? 0 : MAX_DRIFT_X * Math.sin(this.driftSeconds / 120 * 2 * Math.PI);
-    const dy = preview ? 0 : MAX_DRIFT_Y * Math.cos(this.driftSeconds / 150 * 2 * Math.PI);
+    const drift = preview ? [0, 0] : driftOffset(this.driftSeconds, k);
+    const dx = drift[0];
+    const dy = drift[1];
 
     // Footer: status line, then metrics justified across the row with "|" centered in each gap.
     c.letterSpacing = '0vp';
@@ -128,13 +130,14 @@ export struct AodDisplay {
     // One text line as Text lays it out (Android Compose Text), not the glyph box.
     const line = Math.max(8 * k, this.measure('Ag', undefined, 400, 14 * k, 0)[1]);
     const pad = 8 * k;
-    const spacing = 2 * k;
     const available = w - 56 * k;
     const widths = this.metrics.map((s: string) => c.measureText(s).width);
     const bar = c.measureText('|').width;
     const separator = this.metrics.length > 1 ? bar + pad * 2 : 0;
-    const rows = wrapMetrics(widths, separator, available);
-    const footerHeight = line + rows.length * line + Math.max(0, rows.length - 1) * spacing;
+    // One row only: shrink the font in proportion (floor 10k) instead of wrapping.
+    const size = fitMetricsFont(widths, separator, available, k);
+    const shrink = size / (14 * k);
+    const footerHeight = line + (this.metrics.length > 0 ? line : 0);
 
     // Clock: Android AodVisualLayout sizing from the reference and widest-time measurements.
     const base = baseClockSize(w, h);
@@ -180,26 +183,26 @@ export struct AodDisplay {
     c.fillStyle = '#E6E6E6';
     c.fillText(this.status, start + 15 * k, footerTop + line / 2);
     c.fillStyle = '#B3B3B3';
-    rows.forEach((row: number[], r: number) => {
-      const y = footerTop + line + r * (line + spacing) + line / 2;
-      const count = row[1] - row[0];
-      let natural = separator * (count - 1);
-      for (let i = row[0]; i < row[1]; i++) natural += widths[i];
-      const gap = count > 1 ? Math.max(0, available - natural) / (count - 1) : 0;
-      let x = 28 * k + dx + (count === 1 ? Math.max(0, available - natural) / 2 : 0);
-      for (let i = row[0]; i < row[1]; i++) {
-        c.fillText(this.metrics[i], x, y);
-        x += widths[i];
-        if (i < row[1] - 1) {
-          c.fillText('|', x + pad + gapBeforeSeparator(gap), y);
-          x += separator + gap;
-        }
+    c.font = this.px(size) + 'px sans-serif';
+    const y = footerTop + line + line / 2;
+    const count = this.metrics.length;
+    const gap = separator * shrink;
+    let natural = gap * Math.max(0, count - 1);
+    for (const w of widths) natural += w * shrink;
+    const spread = count > 1 ? Math.max(0, available - natural) / (count - 1) : 0;
+    let x = 28 * k + dx + (count === 1 ? Math.max(0, available - natural) / 2 : 0);
+    this.metrics.forEach((metric: string, i: number) => {
+      c.fillText(metric, x, y);
+      x += widths[i] * shrink;
+      if (i < count - 1) {
+        c.fillText('|', x + pad * shrink + gapBeforeSeparator(spread), y);
+        x += gap + spread;
       }
     });
     c.restore();
     this.frame = {
       view: v, x: w * 0.05 + dx, width: w * 0.9, center: layout.wave.centerY + dy,
-      amplitude: layout.wave.maximumAmplitude, stroke: (0.25 + this.settings.waveformWeightLevel * 0.25) * k
+      amplitude: layout.wave.maximumAmplitude, stroke: waveStrokeScale(this.settings.waveformWeightLevel, k)
     };
     this.drawWave();
   }
@@ -250,8 +253,8 @@ export struct AodDisplay {
         c.stroke();
       }
     } else {
-      const traces = [curve(this.wave.left, f.amplitude, this.frameMs, false),
-        curve(this.wave.right, f.amplitude, this.frameMs, true)];
+      const traces = [curve(interpolatedWindow(this.wave.left, this.frameMs, this.wave.newestAt), f.amplitude, this.frameMs, false),
+        curve(interpolatedWindow(this.wave.right, this.frameMs, this.wave.newestAt), f.amplitude, this.frameMs, true)];
       const styles = [left, right];
       c.globalAlpha = 0.15;
       c.lineWidth = GLOW_STROKE_WIDTH * f.stroke;

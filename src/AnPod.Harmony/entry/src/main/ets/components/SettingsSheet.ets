@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { display } from '@kit.ArkUI';
 import { AodDisplay, AodWave } from './AodDisplay';
-import { AodSettings, aodMetrics, aodStore, loadAodSettings } from '../model/AodSettings';
+import { AodSettings, aodMetrics, aodStore, loadAodSettings, MAX_METRICS, metricCount } from '../model/AodSettings';
 import { floatingSheet } from '../model/SheetLayout';
 import anpod from 'libanpod_core.so';
 
@@ -61,10 +61,11 @@ export struct SettingsSheet {
 
   // Builder rows take getters: a value argument would be a stale copy after the setting changes.
   @Builder
-  toggleRow(label: Resource, checked: () => boolean, changed: (value: boolean) => void) {
+  toggleRow(label: Resource, checked: () => boolean, changed: (value: boolean) => void, limited: boolean = false) {
     Row({ space: 12 }) {
       Text(label).layoutWeight(1)
       Toggle({ type: ToggleType.Switch, isOn: checked() })
+        .enabled(!limited || checked() || metricCount(this.settings) < MAX_METRICS)
         .accessibilityText(label)
         .onChange((value: boolean) => { changed(value); this.save(); })
     }.width('100%').constraintSize({ minHeight: 48 })
@@ -150,20 +151,22 @@ export struct SettingsSheet {
             (v: number) => { this.settings.clockWeightLevel = v; })
           this.sliderRow($r('app.string.aod_wave_weight'), () => this.settings.waveformWeightLevel, 1, 9, '',
             (v: number) => { this.settings.waveformWeightLevel = v; })
+          Text(metricCount(this.settings) + '/' + MAX_METRICS).fontSize(14)
+            .fontColor($r('sys.color.ohos_id_color_text_secondary')).width('100%').textAlign(TextAlign.End)
           this.toggleRow($r('app.string.aod_protocol'), () => this.settings.showProtocol,
-            (v: boolean) => { this.settings.showProtocol = v; })
+            (v: boolean) => { this.settings.showProtocol = v; }, true)
           this.toggleRow($r('app.string.aod_receive_rate'), () => this.settings.showReceiveRate,
-            (v: boolean) => { this.settings.showReceiveRate = v; })
+            (v: boolean) => { this.settings.showReceiveRate = v; }, true)
           this.toggleRow($r('app.string.aod_buffer'), () => this.settings.showBuffer,
-            (v: boolean) => { this.settings.showBuffer = v; })
+            (v: boolean) => { this.settings.showBuffer = v; }, true)
           this.toggleRow($r('app.string.aod_loss'), () => this.settings.showLoss,
-            (v: boolean) => { this.settings.showLoss = v; })
+            (v: boolean) => { this.settings.showLoss = v; }, true)
           this.toggleRow($r('app.string.aod_audio_format'), () => this.settings.showAudioFormat,
-            (v: boolean) => { this.settings.showAudioFormat = v; })
+            (v: boolean) => { this.settings.showAudioFormat = v; }, true)
           this.toggleRow($r('app.string.aod_underruns'), () => this.settings.showUnderruns,
-            (v: boolean) => { this.settings.showUnderruns = v; })
+            (v: boolean) => { this.settings.showUnderruns = v; }, true)
           this.toggleRow($r('app.string.aod_output_engine'), () => this.settings.showOutputEngine,
-            (v: boolean) => { this.settings.showOutputEngine = v; })
+            (v: boolean) => { this.settings.showOutputEngine = v; }, true)
         }.width('100%').padding({ left: 24, right: 24, top: 8, bottom: 8 }).alignItems(HorizontalAlign.Start)
       }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
       Column() {

@@ -2,6 +2,7 @@ import { window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { audio, AVVolumePanel } from '@kit.AudioKit';
 import { systemDateTime } from '@kit.BasicServicesKit';
+import { displaySync } from '@kit.ArkGraphics2D';
 import anpod from 'libanpod_core.so';
 import { AodDisplay, AodWave } from '../components/AodDisplay';
 import { AodSettings, aodMetrics, loadAodSettings } from '../model/AodSettings';
@@ -11,6 +12,10 @@ import { aodProtocol, aodStatus, KEY_STATE } from '../model/ReceiverSession';
 let windowChanges: Promise<void> = Promise.resolve();
 function uptime(): number {
   return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP);
+}
+
+function sameWindow(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((v: number, i: number) => v === b[i]);
 }
 
 const VOLUME_GESTURE_TRAVEL = 0.60;  // share of the gesture area height spanning the whole media range
@@ -33,7 +38,7 @@ struct Aod {
   private readonly wave: AodWave = new AodWave();
   private shown: boolean = false;
   private active: boolean = false;
-  private timer: number = -1;
+  private frames?: displaySync.DisplaySync;
   private lastTouch: number = 0;
   private nextDetails: number = 0;
   private gap: AodGap = new AodGap();
@@ -43,6 +48,7 @@ struct Aod {
   private savedWindow?: window.Window;
   private savedBrightness: number = -1;
   private savedKeepOn: boolean = false;
+  private savedOrientation: window.Orientation = window.Orientation.UNSPECIFIED;
   private visibleBars: window.SpecificSystemBar[] = [];
 
   onPageShow(): void {
@@ -76,14 +82,22 @@ struct Aod {
     if (visible) {
       this.lastTouch = uptime();
       this.nextDetails = 0;
-      this.timer = setInterval(() => this.tick(), 33);
+      const frames = displaySync.create();
+      frames.setExpectedFrameRateRange({ min: 30, max: 120, expected: 60 });
+      frames.on('frame', () => this.tick());
+      frames.start();
+      this.frames = frames;
       this.tick();
     } else {
-      clearInterval(this.timer);
-      this.timer = -1;
+      this.stopFrames();
     }
     windowChanges = windowChanges.then(() => this.applyWindow(visible))
       .catch((e: Error) => console.error('AOD window: ' + e.message.slice(0, 200)));
+  }
+
+  private stopFrames(): void {
+    this.frames?.stop();
+    this.frames = undefined;
   }
 
   private async applyWindow(visible: boolean): Promise<void> {
@@ -95,34 +109,41 @@ struct Aod {
       this.savedWindow = win;
       this.savedBrightness = properties.brightness;
       this.savedKeepOn = properties.isKeepScreenOn;
+      this.savedOrientation = win.getPreferredOrientation();
       this.visibleBars = [];
       if (win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect.height > 0) this.visibleBars.push('status');
       if (win.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR).bottomRect.height > 0) {
         this.visibleBars.push('navigationIndicator');
       }
+      await win.setPreferredOrientation(window.Orientation.AUTO_ROTATION_LANDSCAPE)  // AOD is always landscape
+        .catch((e: Error) => console.error('AOD orientation: ' + e.message.slice(0, 200)));
       await win.setWindowKeepScreenOn(true);
       await win.setWindowBrightness(properties.brightness < 0 ? 0.08 : Math.min(0.08, properties.brightness));
       for (const bar of this.visibleBars) await win.setSpecificSystemBarEnabled(bar, false);
     } else if (this.savedWindow !== undefined) {
       const win = this.savedWindow;
       this.savedWindow = undefined;
-      const changes = [win.setWindowBrightness(this.savedBrightness), win.setWindowKeepScreenOn(this.savedKeepOn)];
+      const changes = [win.setWindowBrightness(this.savedBrightness), win.setWindowKeepScreenOn(this.savedKeepOn),
+        win.setPreferredOrientation(this.savedOrientation).catch((e: Error) => console.error('AOD orientation: ' + e.message.slice(0, 200)))];
       for (const bar of this.visibleBars) changes.push(win.setSpecificSystemBarEnabled(bar, true));
       await Promise.all(changes);
     }
   }
 
-  // Per frame only the waveform canvas redraws; text state changes at most every 250 ms.
+  // Per display frame only the waveform canvas redraws; text state changes at most every 250 ms.
   private tick(): void {
     const now = uptime();
     const snapshot = anpod.getAodSnapshot();
     const status = aodStatus(this.state, snapshot.receiving);
     if (this.gap.expired(status !== 'Not connected', now)) {
-      clearInterval(this.timer);
+      this.stopFrames();
       AppStorage.setOrCreate('aodDismissed', false);  // Index is disconnected now; the next connection may auto-enter again
       this.getUIContext().getRouter().back();
       return;
     }
+    // shortcut: a new bucket is detected when the polled window changes (error <= one frame); a bucket identical
+    // to the last (steady silence or tone) draws the same trace anyway.
+    if (!sameWindow(snapshot.left, this.wave.left) || !sameWindow(snapshot.right, this.wave.right)) this.wave.newestAt = now;
     this.wave.left = snapshot.left;
     this.wave.right = snapshot.right;
     if (now >= this.nextDetails) {

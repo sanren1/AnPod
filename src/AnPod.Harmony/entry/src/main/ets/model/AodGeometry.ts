@@ -3,8 +3,11 @@
 export const STROKE_WIDTH = 3.6;
 export const GLOW_STROKE_WIDTH = 12;
 export const EDGE_FADE_FRACTION = 0.16;
-export const MAX_DRIFT_X = 16;
-export const MAX_DRIFT_Y = 9;
+const DRIFT_X = 16;  // vp at k = 1; the whole display layer drifts by this x k
+const DRIFT_Y = 9;
+export const BUCKET_MS = 25;
+// Section 17: stroke = level scale x sqrt(k); level 3 = 1, stored levels 1..9 unchanged.
+const WAVE_LEVEL_SCALES = [0.3, 0.6, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
 const AMPLITUDE_FILL = 0.60;
 const CARRIER_STEP_RADIANS = 0.34;
 const CARRIER_RADIANS_PER_MS = 0.015;
@@ -24,6 +27,31 @@ export class AodGap {
     }
     return this.since >= 0 && now - this.since > 15000;
   }
+}
+
+export function waveStrokeScale(level: number, k: number): number {
+  const index = Number.isInteger(level) && level >= 1 && level <= 9 ? level : 3;
+  return WAVE_LEVEL_SCALES[index - 1] * Math.sqrt(k);
+}
+
+// Burn-in drift [dx, dy] for the whole layer; seconds is the 1 s step counter (Android drifts in 1 s steps).
+export function driftOffset(seconds: number, k: number): number[] {
+  return [DRIFT_X * k * Math.sin(seconds / 120 * 2 * Math.PI), DRIFT_Y * k * Math.cos(seconds / 150 * 2 * Math.PI)];
+}
+
+// Footer metrics stay on one line: font 14k, shrunk in proportion to fit, never below 10k.
+// widths and separator are measured at 14k.
+export function fitMetricsFont(widths: number[], separator: number, available: number, k: number): number {
+  const base = 14 * k;
+  const natural = widths.reduce((sum: number, w: number) => sum + w, 0) + separator * Math.max(0, widths.length - 1);
+  return natural <= available ? base : Math.max(10 * k, base * available / natural);
+}
+
+// history[0] is the newest bucket. The window slides outward by the share of a bucket that has elapsed
+// since the newest one arrived, so the trace moves continuously between buckets.
+export function interpolatedWindow(points: number[], now: number, newestAt: number): number[] {
+  const share = Math.max(0, Math.min(1, (now - newestAt) / BUCKET_MS));
+  return points.map((p: number, i: number) => i === 0 ? p : points[i - 1] * share + p * (1 - share));
 }
 
 export function aodScale(width: number, height: number): number {
@@ -96,35 +124,18 @@ export function clockLayout(width: number, height: number, footerHeight: number,
   const k = aodScale(width, height);
   const clearance = 4;
   const footerTop = height - 22 * k - footerHeight;
-  const bottom = clockBottom(height, referenceHeight, footerTop, MAX_DRIFT_Y, clearance, 64 * k);
+  const driftX = DRIFT_X * k;
+  const driftY = DRIFT_Y * k;
+  const bottom = clockBottom(height, referenceHeight, footerTop, driftY, clearance, 64 * k);
   const ceiling = baseClockSize(width, height) * 1.2;
-  const maximumWidth = Math.max(0, width * 0.92 - 2 * MAX_DRIFT_X);
-  const maximumHeight = Math.max(0, bottom - (16 + MAX_DRIFT_Y));
+  const maximumWidth = Math.max(0, width * 0.92 - 2 * driftX);
+  const maximumHeight = Math.max(0, bottom - (16 + driftY));
   const fitted = fitClockSize(ceiling, Math.floor(maximumWidth), Math.floor(maximumHeight),
     (size: number) => [Math.ceil(widest[0] * size / ceiling), Math.ceil(widest[1] * size / ceiling)]);
   return {
     k: k, footerTop: footerTop, clockBottom: bottom, clockSize: scaledClockSize(fitted, clockScale),
-    wave: waveLayout(bottom, footerTop, MAX_DRIFT_Y, clearance, GLOW_STROKE_WIDTH * k)
+    wave: waveLayout(bottom, footerTop, driftY, clearance, GLOW_STROKE_WIDTH * Math.sqrt(k))
   };
-}
-
-// Android AodMetricsGeometry.wrap: whole metrics per row as [start, end) index pairs.
-export function wrapMetrics(itemWidths: number[], separatorWidth: number, availableWidth: number): number[][] {
-  const rows: number[][] = [];
-  let start = 0;
-  let rowWidth = 0;
-  for (let index = 0; index < itemWidths.length; index++) {
-    const added = itemWidths[index] + (index === start ? 0 : separatorWidth);
-    if (index > start && rowWidth + added > availableWidth) {
-      rows.push([start, index]);
-      start = index;
-      rowWidth = itemWidths[index];
-    } else {
-      rowWidth += added;
-    }
-  }
-  if (start < itemWidths.length) rows.push([start, itemWidths.length]);
-  return rows;
 }
 
 export function gapBeforeSeparator(distributedGap: number): number {
