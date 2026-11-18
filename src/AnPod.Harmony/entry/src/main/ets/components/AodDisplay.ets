@@ -8,7 +8,7 @@ import {
 export class AodWave {
   left: number[] = [];
   right: number[] = [];
-  newestAt: number = 0;  // uptime ms at which the newest bucket was first seen
+  newestAt: number = 0;  // uptime ms at which the newest bucket was published (native age, see newestBucketAt)
 }
 
 interface View {
@@ -186,16 +186,19 @@ export struct AodDisplay {
     c.font = this.px(size) + 'px sans-serif';
     const y = footerTop + line + line / 2;
     const count = this.metrics.length;
-    const gap = separator * shrink;
-    let natural = gap * Math.max(0, count - 1);
-    for (const w of widths) natural += w * shrink;
+    let natural = separator * shrink * Math.max(0, count - 1);
+    for (const width of widths) natural += width * shrink;
+    // Past the font floor the row would leave the screen: compress glyph runs and gaps to fit.
+    const squeeze = natural > available ? available / natural : 1;
+    const gap = separator * shrink * squeeze;
+    natural *= squeeze;
     const spread = count > 1 ? Math.max(0, available - natural) / (count - 1) : 0;
     let x = 28 * k + dx + (count === 1 ? Math.max(0, available - natural) / 2 : 0);
     this.metrics.forEach((metric: string, i: number) => {
-      c.fillText(metric, x, y);
-      x += widths[i] * shrink;
+      c.fillText(metric, x, y, widths[i] * shrink * squeeze);
+      x += widths[i] * shrink * squeeze;
       if (i < count - 1) {
-        c.fillText('|', x + pad * shrink + gapBeforeSeparator(spread), y);
+        c.fillText('|', x + pad * shrink * squeeze + gapBeforeSeparator(spread), y);
         x += gap + spread;
       }
     });

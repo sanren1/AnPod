@@ -6,16 +6,12 @@ import { displaySync } from '@kit.ArkGraphics2D';
 import anpod from 'libanpod_core.so';
 import { AodDisplay, AodWave } from '../components/AodDisplay';
 import { AodSettings, aodMetrics, loadAodSettings } from '../model/AodSettings';
-import { AodGap, aodScale, VolumeDrag } from '../model/AodGeometry';
+import { AodGap, aodScale, newestBucketAt, VolumeDrag } from '../model/AodGeometry';
 import { aodProtocol, aodStatus, KEY_STATE } from '../model/ReceiverSession';
 
 let windowChanges: Promise<void> = Promise.resolve();
 function uptime(): number {
   return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP);
-}
-
-function sameWindow(a: number[], b: number[]): boolean {
-  return a.length === b.length && a.every((v: number, i: number) => v === b[i]);
 }
 
 const VOLUME_GESTURE_TRAVEL = 0.60;  // share of the gesture area height spanning the whole media range
@@ -83,7 +79,7 @@ struct Aod {
       this.lastTouch = uptime();
       this.nextDetails = 0;
       const frames = displaySync.create();
-      frames.setExpectedFrameRateRange({ min: 30, max: 120, expected: 60 });
+      frames.setExpectedFrameRateRange({ min: 30, max: 60, expected: 60 });
       frames.on('frame', () => this.tick());
       frames.start();
       this.frames = frames;
@@ -96,6 +92,7 @@ struct Aod {
   }
 
   private stopFrames(): void {
+    this.frames?.off('frame');
     this.frames?.stop();
     this.frames = undefined;
   }
@@ -141,9 +138,7 @@ struct Aod {
       this.getUIContext().getRouter().back();
       return;
     }
-    // shortcut: a new bucket is detected when the polled window changes (error <= one frame); a bucket identical
-    // to the last (steady silence or tone) draws the same trace anyway.
-    if (!sameWindow(snapshot.left, this.wave.left) || !sameWindow(snapshot.right, this.wave.right)) this.wave.newestAt = now;
+    this.wave.newestAt = newestBucketAt(now, snapshot.newestAgeNanos);
     this.wave.left = snapshot.left;
     this.wave.right = snapshot.right;
     if (now >= this.nextDetails) {

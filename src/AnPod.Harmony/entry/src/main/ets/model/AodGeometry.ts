@@ -5,12 +5,14 @@ export const GLOW_STROKE_WIDTH = 12;
 export const EDGE_FADE_FRACTION = 0.16;
 const DRIFT_X = 16;  // vp at k = 1; the whole display layer drifts by this x k
 const DRIFT_Y = 9;
-export const BUCKET_MS = 25;
+export const BUCKET_MS = 10;
+export const WAVE_POINTS = 120;  // x BUCKET_MS = 1.2 s window (spec section 17, waveform B)
 // Section 17: stroke = level scale x sqrt(k); level 3 = 1, stored levels 1..9 unchanged.
 const WAVE_LEVEL_SCALES = [0.3, 0.6, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
 const AMPLITUDE_FILL = 0.60;
-const CARRIER_STEP_RADIANS = 0.34;
-const CARRIER_RADIANS_PER_MS = 0.015;
+// Android: 0.34 rad per point at 48 points (about 5 ripples across); scaled to the 120-point window.
+const CARRIER_STEP_RADIANS = 0.34 * 48 / WAVE_POINTS;
+const CARRIER_RADIANS_PER_MS = 0.0075;  // 7.5 rad/s, half of Android's 15
 const AMPLITUDE_LOG_RANGE = Math.log1p(10000);
 
 // Android SESSION_GAP_EXIT_MS: a session that went away for this long closes the AOD.
@@ -45,6 +47,12 @@ export function fitMetricsFont(widths: number[], separator: number, available: n
   const base = 14 * k;
   const natural = widths.reduce((sum: number, w: number) => sum + w, 0) + separator * Math.max(0, widths.length - 1);
   return natural <= available ? base : Math.max(10 * k, base * available / natural);
+}
+
+// Frame-clock time at which the newest bucket was published: native reports its age at snapshot time,
+// so no shared epoch between std::chrono::steady_clock and the ArkTS uptime is needed.
+export function newestBucketAt(now: number, ageNanos: number | undefined): number {
+  return ageNanos === undefined ? now : now - Math.max(0, ageNanos) / 1e6;
 }
 
 // history[0] is the newest bucket. The window slides outward by the share of a bucket that has elapsed

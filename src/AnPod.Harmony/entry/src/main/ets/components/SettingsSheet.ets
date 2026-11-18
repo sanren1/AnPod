@@ -28,7 +28,7 @@ export struct SettingsSheet {
 
   aboutToAppear(): void {
     this.settings = loadAodSettings(this.getUIContext().getHostContext() as common.Context);
-    for (let i = 0; i < 96; i++) {
+    for (let i = 0; i < 120; i++) {
       this.previewWave.left.push(0.22 + 0.65 * Math.pow(Math.sin(i * 0.23), 2));
     }
     this.previewWave.right = this.previewWave.left;

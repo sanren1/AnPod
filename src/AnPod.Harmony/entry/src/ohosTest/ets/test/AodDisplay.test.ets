@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
   AodGap, aodScale, clockFace, clockLayout, curve, driftOffset, fitClockSize, fitMetricsFont, gapBeforeSeparator,
-  interpolatedWindow, VolumeDrag, waveLayout, waveStrokeScale
+  interpolatedWindow, newestBucketAt, VolumeDrag, WAVE_POINTS, BUCKET_MS, waveLayout, waveStrokeScale
 } from '../../../main/ets/model/AodGeometry';
 
 function near(actual: number, expected: number): boolean {
@@ -63,16 +63,49 @@ export default function aodDisplayTest() {
     it('aod_window_interpolates_between_buckets', 0, () => {
       const points = [0.8, 0.4, 0.2, 0];
       expect(JSON.stringify(interpolatedWindow(points, 1000, 1000))).assertEqual(JSON.stringify(points));
-      const half = interpolatedWindow(points, 1012.5, 1000);
+      const half = interpolatedWindow(points, 1005, 1000);
       expect(half[0]).assertEqual(0.8);
       expect(near(half[1], 0.6)).assertTrue();
       expect(near(half[2], 0.3)).assertTrue();
       expect(near(half[3], 0.1)).assertTrue();
-      const full = interpolatedWindow(points, 1025, 1000);  // equals the next bucket's window
+      const full = interpolatedWindow(points, 1010, 1000);  // equals the next bucket's window
       expect(JSON.stringify(full)).assertEqual(JSON.stringify([0.8, 0.8, 0.4, 0.2]));
       expect(JSON.stringify(interpolatedWindow(points, 1500, 1000))).assertEqual(JSON.stringify(full));  // clamped
       expect(JSON.stringify(interpolatedWindow(points, 900, 1000))).assertEqual(JSON.stringify(points));  // clock skew
       expect(interpolatedWindow([], 5, 0).length).assertEqual(0);
+    });
+    it('aod_newest_bucket_time_comes_from_native_age', 0, () => {
+      expect(newestBucketAt(5000, 7000000)).assertEqual(4993);  // 7 ms old
+      expect(newestBucketAt(5000, 0)).assertEqual(5000);
+      expect(newestBucketAt(5000, undefined)).assertEqual(5000);  // no live wave
+      expect(newestBucketAt(5000, -3000000)).assertEqual(5000);  // never in the future
+      const points = [0.8, 0.4, 0.2, 0];
+      const at = newestBucketAt(1000, 5000000);  // 5 ms old = half of a 10 ms bucket
+      expect(near(interpolatedWindow(points, 1000, at)[1], 0.6)).assertTrue();
+    });
+    it('aod_waveform_b_window_ripples_and_phase_speed', 0, () => {
+      expect(WAVE_POINTS).assertEqual(120);
+      expect(WAVE_POINTS * BUCKET_MS).assertEqual(1200);
+      const history: number[] = [];
+      for (let i = 0; i < WAVE_POINTS; i++) history.push(1);
+      const trace = curve(history, 100, 0, false);
+      expect(trace.length).assertEqual(2 * WAVE_POINTS - 1);
+      // Phase advance across half the width, in cycles; Android: 48 points, 0.34 rad per point, 15 rad/s.
+      const cycles = (age: number, step: number): number => (Math.sqrt(age * age + 16) - 4) * step / (2 * Math.PI);
+      const android = 2 * cycles(47, 0.34);
+      const here = 2 * cycles(WAVE_POINTS - 1, 0.34 * 48 / WAVE_POINTS);
+      expect(near(android, 4.68)).assertTrue();
+      expect(Math.abs(here - android) < 0.5).assertTrue();  // about 5 ripples across, like Android
+      // Zero crossings of the unmodulated carrier (taper keeps the sign): 2 per cycle.
+      let crossings = 0;
+      for (let i = 1; i < trace.length; i++) if (trace[i - 1] * trace[i] < 0) crossings++;
+      expect(Math.abs(crossings / 2 - here) <= 1).assertTrue();
+      // Phase speed 7.5 rad/s: the centre point peaks at 0, is at -1 half a period later, 0 after a full one.
+      const centre = (ms: number): number => curve(history, 100, ms, false)[WAVE_POINTS - 1];
+      expect(near(centre(0), 100)).assertTrue();
+      expect(near(centre(Math.PI / 0.0075), -100)).assertTrue();
+      expect(near(centre(2 * Math.PI / 0.0075), 100)).assertTrue();
+      expect(near(centre(Math.PI / 2 / 0.0075), 0)).assertTrue();
     });
     // PcmWaveformTapTest.waveformLayoutKeepsGlowClearOfClockAndFooter + measuredClockFitHonorsWidthAndHeightBounds.
     it('aod_android_wave_layout_and_clock_fit_vectors', 0, () => {

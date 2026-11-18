@@ -54,27 +54,31 @@ bool aodSamplesAreSessionScoped() {
            !replacement.snapshot(500000000, 0).lossPercent;
 }
 
-// 96 points x 25 ms: a peak stays visible for about 2.4 s, then ages out; 400 ms of no audio still clears it.
-bool aodWaveformSpans96PointsOf25Ms() {
+// 120 points x 10 ms: a peak stays visible for 1.2 s, then ages out; 400 ms of no audio still clears it.
+bool aodWaveformSpans120PointsOf10Ms() {
     AodSampler s;
     const float loud[]{0.5f, -0.5f}, quiet[]{0.f, 0.f};
-    if (std::tuple_size_v<decltype(AodSnapshot::left)> != 96) return false;
+    if (std::tuple_size_v<decltype(AodSnapshot::left)> != 120 || kAodBucketNanos != 10000000) return false;
     s.audio(0, loud, 2, true, 0);
     uint64_t frame = 1;
     int64_t t = 5000000;
     auto feedUntil = [&](int64_t end) {
         for (; t <= end; t += 5000000) s.audio(frame++, quiet, 2, true, t);
     };
-    feedUntil(1000000000);  // 40 buckets
+    feedUntil(1000000000);  // 100 buckets
     auto second = s.snapshot(1000000000, 0);
-    if (second.left[39] != .5f || second.right[39] != .5f || second.left[38] != 0 || second.left[40] != 0) return false;
-    feedUntil(2400000000LL);  // 96 buckets: the oldest point
-    if (s.snapshot(2400000000LL, 0).left[95] != .5f) return false;
-    feedUntil(2425000000LL);
-    if (s.snapshot(2425000000LL, 0).left[95] != 0) return false;
-    s.audio(frame++, loud, 2, true, 2430000000LL);
-    s.audio(frame++, quiet, 2, true, 2450000000LL);
-    return s.snapshot(2849000000LL, 0).left[0] == .5f && s.snapshot(2851000000LL, 0).left[0] == 0;
+    if (second.left[99] != .5f || second.right[99] != .5f || second.left[98] != 0 || second.left[100] != 0) return false;
+    if (!second.newestAgeNanos || *second.newestAgeNanos != 0) return false;
+    if (*s.snapshot(1007000000, 0).newestAgeNanos != 7000000) return false;
+    feedUntil(1200000000LL);  // 120 buckets: the oldest point
+    if (s.snapshot(1200000000LL, 0).left[119] != .5f) return false;
+    feedUntil(1210000000LL);
+    if (s.snapshot(1210000000LL, 0).left[119] != 0) return false;
+    s.audio(frame++, loud, 2, true, 1215000000LL);
+    s.audio(frame++, quiet, 2, true, 1220000000LL);
+    if (s.snapshot(1619000000LL, 0).left[0] != .5f) return false;
+    auto expired = s.snapshot(1621000000LL, 0);
+    return expired.left[0] == 0 && !expired.newestAgeNanos;
 }
 
 Bytes fromHex(const char* h) {
@@ -723,7 +727,7 @@ std::vector<std::string> runSelfTests() {
     };
     static constexpr Case cases[] = {
         {"aod_samples_are_session_scoped", aodSamplesAreSessionScoped},
-        {"aod_waveform_spans_96_points_of_25ms", aodWaveformSpans96PointsOf25Ms},
+        {"aod_waveform_spans_120_points_of_10ms", aodWaveformSpans120PointsOf10Ms},
         {"discovery_offer_matches_desktop", offerMatchesDesktop},
         {"discovery_matches_android", discoveryMatchesAndroid},
         {"hmac_rfc4231_case2", hmacRfc4231Case2},

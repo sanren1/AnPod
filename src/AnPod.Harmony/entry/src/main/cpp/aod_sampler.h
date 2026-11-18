@@ -11,9 +11,9 @@
 
 namespace anpod {
 
-// Spec section 16: 96 points x 25 ms, about 2.4 s of history (Android PcmWaveformTap: 48 x 10 ms).
-inline constexpr size_t kAodPoints = 96;
-inline constexpr int64_t kAodBucketNanos = 25000000;
+// Spec section 17 (waveform B): 120 points x 10 ms = 1.2 s; Android PcmWaveformTap buckets are also 10 ms.
+inline constexpr size_t kAodPoints = 120;
+inline constexpr int64_t kAodBucketNanos = 10000000;
 
 struct AodSnapshot {
     std::array<float, kAodPoints> left{}, right{};
@@ -22,6 +22,7 @@ struct AodSnapshot {
     std::optional<double> bitsPerSecond, bufferMs, lossPercent;
     uint32_t sampleRate = 0, channels = 0;
     std::optional<uint32_t> underruns;
+    std::optional<int64_t> newestAgeNanos;  // now - time the newest bucket was published; absent with no live wave
 };
 
 // One ANPD reader writes. The UI copies only the published peak history; the writer never waits for it.
@@ -80,6 +81,7 @@ public:
             if (now - publishedAt_ <= 400000000) {
                 out.left = published_[0];
                 out.right = published_[1];
+                out.newestAgeNanos = now - publishedAt_;
             }
         }
         if (windowStart_ < 0) {

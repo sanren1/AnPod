@@ -526,6 +526,7 @@ napi_value GetAodSnapshot(napi_env env, napi_callback_info) {
     if (s.bufferMs) number("bufferMs", *s.bufferMs);
     if (s.lossPercent) number("lossPercent", *s.lossPercent);
     if (s.underruns) number("underruns", *s.underruns);
+    if (s.newestAgeNanos) number("newestAgeNanos", static_cast<double>(*s.newestAgeNanos));
     if (s.sampleRate) {
         number("sampleRate", s.sampleRate);
         number("channels", s.channels);

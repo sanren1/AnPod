@@ -21,6 +21,7 @@ export interface AodSnapshot {
   bufferMs?: number;
   lossPercent?: number;
   underruns?: number;
+  newestAgeNanos?: number;  // age of the newest wave bucket at snapshot time; absent without a live wave
   sampleRate?: number;
   channels?: number;
   encoding?: 'float32';
