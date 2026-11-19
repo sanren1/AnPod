@@ -4,14 +4,14 @@
 
 <h1 align="center">AnPod</h1>
 
-把 Windows 电脑的声音发送到 Android 手机，支持 USB 和无线连接、音质与播放模式切换，以及带时钟和音频波形的手机常显。[下载最新版](https://github.com/sanren1/AnPod/releases/latest)。
+把 Windows 电脑的声音发送到 Android 手机或鸿蒙（HarmonyOS NEXT）平板，支持 USB 和无线连接、音质与播放模式切换，以及带时钟和音频波形的常显。[下载最新版](https://github.com/sanren1/AnPod/releases/latest)。
 
 PC 使用 Soft Minimal 布局：设备、连接路径、真实状态和主操作按使用顺序呈现，设置与帮助/诊断入口保持易达；设置分为常规、音频、连接、关于四个标签页，并区分请求音质档位和实际格式。
 
 ## 使用要求
 
 - Windows 10/11 x64；需 Microsoft Edge WebView2 Runtime，便携包不包含该运行时。
-- Android 6.0 或更高版本。
+- Android 6.0 或更高版本；或 HarmonyOS NEXT（API 26 验证），电脑需安装 DevEco Studio（提供 hdc 与签名）。
 - 首次安装和配对需通过 USB 调试授权电脑；USB Direct 配件模式另需手机授权。
 - 无线 UDP 需要电脑和手机网络可互访，并在手机安装本版附带的 Receiver APK。
 - 默认使用 Receiver 手机应用接收；Legacy 兼容方式在“设置 → 连接”中选择，无线 UDP／ADB 在主界面的“连接模式”中切换。
@@ -37,12 +37,22 @@ USB Direct 使用独立的 AOA 认证会话，不是 USB/ADB 的别名。当前�
 ## 无线 UDP 快速开始
 
 1. 首次使用先用 USB 连接手机，按 PC 端“首次设置”完成配对和手机应用安装。
-2. PC 选择“无线”，点击“连接手机”。需要时选择电脑网络和已配对手机；若进入等待，在手机点“连接电脑”，再由 PC 确认请求。高保真／Hi-Res 使用相同流程。
+2. PC 选择“无线”，点击“连接手机”。已配对设备按型号列出并显示在线状态，点该行的“连接”即可；也可在手机点“连接电脑”，PC 对应行出现“请求连接”后点“接受”。网络接口、手动地址等高级选项收在“更多”里。高保真／Hi-Res 使用相同流程。
 3. 若要让手机在后台等待 PC，可在“其他设置”中开启“允许电脑连接”，并按手机提示授权。找不到手机时展开连接页的帮助。
 
 监听和已保存授权不会自动开始播放；授权可在两端查看、取消。关闭“允许电脑连接”不等于撤销已保存的授权。
 
 “设置”中的“登录 Windows 时启动 AnPod”默认关闭。便携版升级时先退出旧版，再运行新版一次以更新同一个登录启动项；确认新版正常后再删除旧目录。以后若主动运行旧版，其启动项会重新指向旧路径。
+
+## 鸿蒙接收端（HarmonyOS NEXT，预览）
+
+适用于纯血鸿蒙（HarmonyOS NEXT / 5 及以上）设备，已在 MatePad 12.2（HarmonyOS 7，API 26）上开发验证。Android 兼容的旧版鸿蒙（2–4）请继续使用 Receiver APK。
+
+- **安装**：发布页提供"带 HAP"的便携包，内含**未签名**的 `AnPod-Harmony-unsigned.hap`。鸿蒙不允许安装未签名应用，需用 DevEco Studio 打开源码 `src/AnPod.Harmony` 并用你自己的华为开发者账号自动签名后安装（平板需开启开发者模式与 USB 调试）；调试证书到期后需重新签名安装。
+- **有线**：PC 通过 DevEco 自带的 `hdc` 自动识别鸿蒙设备（显示为"HarmonyOS 7"），经 hdc 端口转发传输。首次连接两端显示同一 6 位配对码，先在 PC 确认、再在平板确认。仅支持 HiFi／Hi-Res（Float32）。
+- **无线**：首次需有线配对；之后在平板"无线"页点电脑，或在 PC 无线连接列表中点"连接"，走 UDP，与 Android 共用协议。
+- **常显**：横屏锁定、大屏等比适配、单行指标（最多 5 项）、慢速双声道波形与防烧屏漂移；设置、常显设置和已配对电脑使用鸿蒙原生悬浮面板与沉浸光感材质。
+- 低延迟档需设备提供 OHAudio FAST 通道，不支持时会明确提示而不降档。
 
 ## 手机常显（AOD）
 
@@ -113,7 +123,7 @@ PC 与手机请使用同一套发布包中的配套程序；仅 PC 更新时可�
 
 ## 下载与反馈
 
-从 [最新版发布页](https://github.com/sanren1/AnPod/releases/latest) 下载，历史变更见 [Release 记录](https://github.com/sanren1/AnPod/releases)。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
+从 [最新版发布页](https://github.com/sanren1/AnPod/releases/latest) 下载。每个版本提供两种便携包：`AnPod-<版本>-tauri-win-x64-portable.zip`（PC + Android Receiver APK，应用内更新使用此包）和 `AnPod-<版本>-harmony-tauri-win-x64-portable.zip`（PC + 未签名鸿蒙 HAP），两者的 PC 程序相同，校验值见 `SHA256SUMS.txt`。历史变更见 [Release 记录](https://github.com/sanren1/AnPod/releases)。问题反馈请到 [GitHub Issues](https://github.com/sanren1/AnPod/issues)，附上连接方式、Windows/Android 版本和复现步骤；提交诊断前请检查设备名、网络地址等隐私信息。
 
 ## 开发
 
