@@ -212,3 +212,12 @@ it("explains a stopped tablet session whose detail carries the tablet prefix", (
   expect(runtime.noticeSummary(detail)).toBe(strings.app.harmonyStartRejected);
   expect(runtime.errorDetail(detail)).toBe("LAN 音频会话已停止；本机音频已清理；P5-C receiver did not confirm playback start.");
 });
+
+describe("bindingChoiceLabels", () => {
+  it("labels by model, numbers repeats, and falls back to the saved-phone number", () => {
+    runtime.rememberBindingModels({ a: { model: "Pixel 8" }, b: { model: "Pixel 8" }, c: {}, d: { model: "HUAWEI MatePad" }, e: { model: "Pixel 8" } });
+    const labels = runtime.bindingChoiceLabels(["a", "b", "c", "d", "e"]);
+    expect([...labels.values()]).toEqual(["Pixel 8", "Pixel 8 2", strings.network.savedPhoneNumber(3), "HUAWEI MatePad", "Pixel 8 3"]);
+    runtime.rememberBindingModels({});
+  });
+});

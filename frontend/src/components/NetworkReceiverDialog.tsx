@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Search } from "lucide-react";
 import { strings } from "../strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
-import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
+import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingChoiceLabels, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
@@ -500,9 +500,10 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       targetVersionCode: updateCandidate.versionCode, returnPanel: receiverManagerOnly ? "receiver" : setupWizard ? "setup" : "network",
     });
   };
+  const choiceLabels = bindingChoiceLabels(bindings);
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
   const mainSummary = receiverManagerOnly ? selectedReceiverDevice?.displayName ?? strings.network.chooseAuthorizedUsb : method === "paired"
-    ? bindingReference ? strings.network.savedPhoneNumber(bindings.indexOf(bindingReference) + 1) : strings.network.choosePairedReceiver
+    ? bindingReference ? choiceLabels.get(bindingReference) : strings.network.choosePairedReceiver
     : selectedReceiverDevice?.displayName ?? strings.network.chooseUsbPhone;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
@@ -669,7 +670,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
             <label className="network-field">{strings.network.pairedReceiver}
               <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); backgroundChoiceInvalidated.current.bindingReference = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
                 <option value="">{strings.network.chooseBinding}</option>
-                {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
+                {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
               </select>
             </label>
             <BindingReferenceList bindings={bindings} />

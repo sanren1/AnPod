@@ -196,7 +196,6 @@ export const en: typeof zhCN = {
     showTechnicalDetails: "Show details",
     phoneApplication: "Phone app",
     choosePhoneAndNetwork: "Choose phone and network",
-    pairedDeviceNumber: (number: number) => `Paired record ${number}`,
     pairedRecordReferences: "Show pairing references",
     rememberBinding: "Remember this computer until you revoke it",
     connectionTrust: "Background connection authorization",

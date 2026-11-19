@@ -1,4 +1,5 @@
 import { strings } from "../strings";
+import { bindingChoiceLabels } from "../appRuntime";
 
 export function NetworkConnectionEntry({
   audioSessionActive, busy, bindings, bindingReference, setBindingReference, onConnect, onRecover, onClose,
@@ -7,6 +8,7 @@ export function NetworkConnectionEntry({
   setBindingReference: (value: string) => void; onConnect: (bindingReference?: string) => void;
   onRecover: () => void; onClose: () => void;
 }) {
+  const choiceLabels = bindingChoiceLabels(bindings);
   return <section className="connection-entry">
     {audioSessionActive ? <>
       <p>{strings.network.phoneAlreadyConnected}</p>
@@ -16,7 +18,7 @@ export function NetworkConnectionEntry({
       {bindings.length > 1 && <label className="network-field">{strings.network.savedPhoneChoice}
         <select value={bindingReference} onChange={event => setBindingReference(event.target.value)}>
           <option value="">{strings.network.chooseSavedPhone}</option>
-          {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
+          {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
         </select>
       </label>}
       <button className="primary-button" type="button" disabled={busy || (bindings.length > 1 && !bindingReference)} onClick={() => onConnect(bindingReference || undefined)}>

@@ -1,7 +1,7 @@
 import { LoaderCircle } from "lucide-react";
 import { strings } from "../strings";
 import type { BindingResetPreview, BindingResetResult, Device, ReceiverPackageCandidate, ReceiverStatus, ReceiverUsbOperation, ReceiverUsbOperationResult, Snapshot } from "../appTypes";
-import { bindingReferenceLabel, commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
+import { bindingChoiceLabels, bindingReferenceLabel, commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
 import { BindingReferenceList } from "./BindingReferenceList";
 import { ErrorDetails } from "./Modal";
 
@@ -28,6 +28,7 @@ export function ReceiverAppManager({
   invalidateBindingReset: () => void; confirmBindingReset: () => Promise<void>;
   tabletBindings: string[]; forgetTabletDisabled: boolean; onForgetTablet: (reference: string) => void;
 }) {
+  const choiceLabels = bindingChoiceLabels(bindings);
   return <section className="receiver-manager receiver-usb-card" aria-label={strings.network.receiverUsbManagementLabel}>
     <label className="network-field">{strings.network.authorizedOnlineUsb}
       <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); onClearErrors(); }}>
@@ -61,7 +62,7 @@ export function ReceiverAppManager({
       <label className="network-field receiver-maintenance-binding">{strings.network.requiredSessionBinding}
         <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); onClearErrors(); }}>
           <option value="">{strings.network.chooseSessionBindingOption}</option>
-          {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
+          {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
         </select>
       </label>
       {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
@@ -71,7 +72,7 @@ export function ReceiverAppManager({
       <label className="network-field receiver-maintenance-binding">{strings.network.optionalSavedBinding}
         <select value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); onClearErrors(); }}>
           <option value="">{strings.network.noBindingUsbMaintenance}</option>
-          {bindings.map((value, index) => <option key={value} value={value}>{strings.network.savedPhoneNumber(index + 1)}</option>)}
+          {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
         </select>
       </label>
       {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}

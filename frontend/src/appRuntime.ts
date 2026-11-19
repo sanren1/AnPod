@@ -42,6 +42,17 @@ export const rememberBindingModels = (profiles: Record<string, { model?: string 
   bindingModels.clear();
   for (const [reference, profile] of Object.entries(profiles)) if (profile.model) bindingModels.set(reference, profile.model);
 };
+// Choice-list labels: the phone model (repeats get " 2", " 3"), or "Saved phone N" when no model was recorded.
+export const bindingChoiceLabels = (refs: string[]) => {
+  const seen = new Map<string, number>();
+  return new Map(refs.map((reference, index) => {
+    const model = bindingModels.get(reference);
+    if (!model) return [reference, strings.network.savedPhoneNumber(index + 1)];
+    const count = (seen.get(model) ?? 0) + 1;
+    seen.set(model, count);
+    return [reference, count === 1 ? model : `${model} ${count}`];
+  }));
+};
 export const bindingWirelessProtocol = (saved: Snapshot["settings"]["wirelessProtocol"], profiles: Record<string, { platform?: string }>, reference: string | null | undefined) =>
   reference && profiles[reference]?.platform === "harmony" ? "udp" : saved;
 export const harmonyBindingReferences = (profiles: Record<string, { platform?: string }>) =>

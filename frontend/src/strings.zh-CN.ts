@@ -193,7 +193,6 @@ export const zhCN = {
     showTechnicalDetails: "查看详情",
     phoneApplication: "手机应用",
     choosePhoneAndNetwork: "选择手机和网络",
-    pairedDeviceNumber: (number: number) => `配对记录 ${number}`,
     pairedRecordReferences: "查看配对标识",
     rememberBinding: "记住这台电脑，直到你取消",
     connectionTrust: "后台连接授权",
