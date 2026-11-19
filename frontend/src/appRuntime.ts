@@ -53,6 +53,10 @@ export const bindingChoiceLabels = (refs: string[]) => {
     return [reference, count === 1 ? model : `${model} ${count}`];
   }));
 };
+// A phone request belongs to the saved phone the listener waits for; a lone saved phone owns every request.
+export const offerBindingFor = (offers: { automaticBinding?: string | null }, references: string[]) =>
+  offers.automaticBinding ? references.includes(offers.automaticBinding) ? offers.automaticBinding : null
+    : references.length === 1 ? references[0] : null;
 export const bindingWirelessProtocol = (saved: Snapshot["settings"]["wirelessProtocol"], profiles: Record<string, { platform?: string }>, reference: string | null | undefined) =>
   reference && profiles[reference]?.platform === "harmony" ? "udp" : saved;
 export const harmonyBindingReferences = (profiles: Record<string, { platform?: string }>) =>

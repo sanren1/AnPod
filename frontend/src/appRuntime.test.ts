@@ -221,3 +221,16 @@ describe("bindingChoiceLabels", () => {
     runtime.rememberBindingModels({});
   });
 });
+
+describe("offerBindingFor", () => {
+  it("uses the binding the listener waits for when it is a row", () => {
+    expect(runtime.offerBindingFor({ automaticBinding: "b" }, ["a", "b"])).toBe("b");
+  });
+  it("gives a lone saved phone every request", () => {
+    expect(runtime.offerBindingFor({ automaticBinding: null }, ["a"])).toBe("a");
+  });
+  it("leaves requests unmatched when the binding is not listed or ambiguous", () => {
+    expect(runtime.offerBindingFor({ automaticBinding: "z" }, ["a"])).toBeNull();
+    expect(runtime.offerBindingFor({ automaticBinding: null }, ["a", "b"])).toBeNull();
+  });
+});

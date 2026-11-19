@@ -1,7 +1,7 @@
 import { LoaderCircle } from "lucide-react";
 import { strings } from "../strings";
 import type { BindingResetPreview, BindingResetResult, Device, ReceiverPackageCandidate, ReceiverStatus, ReceiverUsbOperation, ReceiverUsbOperationResult, Snapshot } from "../appTypes";
-import { bindingChoiceLabels, bindingReferenceLabel, commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
+import { bindingReferenceLabel, commitmentSummary, resetOutcomeLabel, resetPcStateLabel, resetPhoneStateLabel } from "../appRuntime";
 import { BindingReferenceList } from "./BindingReferenceList";
 import { ErrorDetails } from "./Modal";
 
@@ -11,7 +11,7 @@ export function ReceiverAppManager({
   canRequestUsbInstall, canRequestUsbMaintenance, canRequestUsbUpgrade, requestUsbOperation, onRefreshDevices,
   receiverOperationResult, currentVersionLabel, bindings, bindingReference, setBindingReference, onClearErrors,
   bindingResetPreview, bindingResetResult, bindingResetError, bindingResetLoading, bindingResetBusy,
-  previewBindingReset, invalidateBindingReset, confirmBindingReset, tabletBindings, forgetTabletDisabled, onForgetTablet,
+  previewBindingReset, invalidateBindingReset, confirmBindingReset, tabletBindings, forgetTabletDisabled, onForgetTablet, choiceLabels,
 }: {
   snapshot: Snapshot; busy: boolean; candidateLoading: boolean; receiverAction: "checking" | null; receiverError: string;
   serial: string; setSerial: (serial: string) => void; onReceiverSerialChange: (serial: string) => void;
@@ -27,8 +27,8 @@ export function ReceiverAppManager({
   previewBindingReset: (serial: string, recheck?: boolean) => Promise<void>;
   invalidateBindingReset: () => void; confirmBindingReset: () => Promise<void>;
   tabletBindings: string[]; forgetTabletDisabled: boolean; onForgetTablet: (reference: string) => void;
+  choiceLabels: Map<string, string>;
 }) {
-  const choiceLabels = bindingChoiceLabels(bindings);
   return <section className="receiver-manager receiver-usb-card" aria-label={strings.network.receiverUsbManagementLabel}>
     <label className="network-field">{strings.network.authorizedOnlineUsb}
       <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); onClearErrors(); }}>
@@ -65,7 +65,7 @@ export function ReceiverAppManager({
           {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
         </select>
       </label>
-      {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
+      {bindings.length > 1 && <BindingReferenceList bindings={bindings} labels={choiceLabels} />}
     </>}
     {receiverNeedsUpgrade && snapshot.sessionTransport !== "lan" && bindings.length > 0 && <details className="receiver-maintenance-details">
       <summary>{strings.network.upgradeTargetDetails}</summary>
@@ -75,7 +75,7 @@ export function ReceiverAppManager({
           {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
         </select>
       </label>
-      {bindings.length > 1 && <BindingReferenceList bindings={bindings} />}
+      {bindings.length > 1 && <BindingReferenceList bindings={bindings} labels={choiceLabels} />}
       {!bindingReference && <small>{strings.network.noBindingMaintenanceNote}</small>}
     </details>}
     {receiverError && <ErrorDetails className="receiver-error" summary={strings.app.operationNotCompleted} details={receiverError} />}

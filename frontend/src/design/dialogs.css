@@ -89,7 +89,27 @@
 .connection-entry { display: grid; gap: 12px; }
 .connection-entry > p { margin: 0; line-height: 1.5; color: var(--muted); }
 .connection-entry > button { min-height: 48px; }
-.network-recovery-back { min-height: 44px; justify-self: start; }
+.saved-devices { display: grid; gap: 10px; }
+.saved-devices > ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.device-row { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.device-row.is-request { border-color: var(--accent); background: var(--accent-soft); }
+.device-row.is-failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.device-row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; min-width: 0; }
+.device-row-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--muted); opacity: .5; }
+.device-row-dot[data-online] { background: var(--positive); opacity: 1; }
+.device-row-copy { flex: 1 1 110px; min-width: 0; display: grid; gap: 1px; }
+.device-row-copy strong { overflow-wrap: anywhere; }
+.device-row-copy small { color: var(--muted); line-height: 17px; }
+.device-row-main > button, .device-row-actions button { min-width: 72px; min-height: 40px; flex: 0 0 auto; white-space: nowrap; }
+.device-row-actions { display: flex; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.device-row .device-row-error { margin: 0; overflow-wrap: anywhere; outline: none; }
+.saved-devices-hint { margin: 0; }
+.saved-devices-add { justify-self: start; min-height: 40px; margin-left: -7px; }
+.network-more { border-top: 1px solid var(--line); }
+.network-more .background-trust-disclosure { border-top: 0; }
+.network-more > summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); cursor: pointer; font-weight: 600; }
+.network-more-actions { display: flex; flex-wrap: wrap; gap: 2px 12px; padding-bottom: 10px; }
+.network-more-actions .text-button { min-height: 40px; white-space: normal; text-align: left; }
 .network-summary { min-width: 0; display: grid; gap: 3px; padding: 2px 1px; overflow-wrap: anywhere; }
 .network-summary span { color: var(--muted); font-size: 12px; line-height: 18px; }
 .network-connect { width: 100%; min-height: 44px; }

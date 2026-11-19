@@ -1,20 +1,22 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Search } from "lucide-react";
+import { createDialogOfferListener } from "../dialogOfferListener";
 import { strings } from "../strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
-import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingChoiceLabels, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
+import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingChoiceLabels, offerBindingFor, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
-import { NetworkConnectionEntry } from "./NetworkConnectionEntry";
+import { SavedDeviceRow } from "./SavedDeviceRow";
+import type { DeviceRowError } from "./SavedDeviceRow";
 import { NetworkSetupWizard } from "./NetworkSetupWizard";
 import { ReceiverAppManager } from "./ReceiverAppManager";
 import { ConfirmDialog } from "./ConfirmDialog";
 
-export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, networkRecoveryMode, onNetworkRecoveryChange, onConnect, preferredBindingReference, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, bindingProfiles, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onOpenReceiverManager, onClose }: {
+export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroundChoicePrefill, networkRecoveryMode, onConnect, preferredBindingReference, setupWizard, usbDevices, usbSeenDevices, receiverManagerOnly, initialReceiverSerial, requiredChoices, disabled, receiverOperationBusy, receiverOperationResult, receiverOperationProgress, audioSessionActive, bindingProfiles, offers, error, onError, onStart, onSetOfferListener, onAcceptOffer, onReceiverSerialChange, onRefreshDevices, onReceiverOperation, onAddPhone, onAddDevice, onRestoreOfferListener, onOpenReceiverManager, onClose }: {
   snapshot: Snapshot;
   backgroundStartMode: boolean; backgroundChoicePrefill: { localAddress: string; bindingReference: string };
-  networkRecoveryMode: boolean; onNetworkRecoveryChange: (value: boolean) => void; onConnect: (bindingReference?: string) => void; preferredBindingReference: string;
+  networkRecoveryMode: boolean; onConnect: (bindingReference?: string, localAddress?: string) => void; preferredBindingReference: string;
   setupWizard: boolean;
   receiverManagerOnly: boolean;
   initialReceiverSerial: string;
@@ -22,7 +24,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   usbDevices: Device[]; usbSeenDevices: Device[]; disabled: boolean; receiverOperationBusy: boolean; receiverOperationResult: ReceiverUsbOperationResult | null; receiverOperationProgress: ReceiverInstallProgress | null; audioSessionActive: boolean; bindingProfiles: Record<string, { platform?: string }>; offers: HostDiscoverySnapshot; error: string; onError: (error: string) => void;
   onStart: (request: NetworkStartRequest) => void; onSetOfferListener: (localAddress: string, allowed: boolean, bindingReference?: string, silent?: boolean) => Promise<boolean>;
   onAcceptOffer: (offerId: string, bindingReference: string) => void; onReceiverSerialChange: (serial: string) => void;
-  onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onAddPhone: () => void; onOpenReceiverManager: () => void; onClose: () => void;
+  onRefreshDevices: () => void; onReceiverOperation: (operation: ReceiverUsbOperation) => void; onAddPhone: () => void; onAddDevice: () => void; onRestoreOfferListener: () => void; onOpenReceiverManager: () => void; onClose: () => void;
 }) {
   const [method, setMethod] = useState<"bootstrap" | "paired">(backgroundStartMode ? "paired" : "bootstrap");
   const [setupStep, setSetupStep] = useState<1 | 2 | 3>(1);
@@ -46,9 +48,15 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const udpMode = snapshot.connectionTransport === "wireless" && bindingWirelessProtocol(snapshot.settings.wirelessProtocol, bindingProfiles, bindingReference) === "udp";
   const [candidateLoading, setCandidateLoading] = useState(false);
   const [localError, setLocalError] = useState("");
-  // Waiting for a phone that taps "连接电脑" is automatic once the network and binding are known.
+  // Waiting for a phone that taps "连接电脑" starts while the dialog is open and is undone on close.
   const listenerCall = useRef(onSetOfferListener);
   listenerCall.current = onSetOfferListener;
+  const restoreListener = useEffectEvent(onRestoreOfferListener);
+  const [offerListener] = useState(createDialogOfferListener);
+  const [bindingsLoaded, setBindingsLoaded] = useState(false);
+  const [rowTarget, setRowTarget] = useState("");
+  const [dismissedOffers, setDismissedOffers] = useState<string[]>([]);
+  const [moreOpen, setMoreOpen] = useState(networkRecoveryMode && (requiredChoices.interfaceAddress || requiredChoices.bindingReference));
   const [addressNotice, setAddressNotice] = useState("");
   const [bindingResetPreview, setBindingResetPreview] = useState<BindingResetPreview | null>(null);
   const [bindingResetResult, setBindingResetResult] = useState<BindingResetResult | null>(null);
@@ -67,7 +75,6 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const serialRef = useRef(serial);
   serialRef.current = serial;
   const discoveryGeneration = useRef(0);
-  const [candidateDiscoveryComplete, setCandidateDiscoveryComplete] = useState(false);
   const networkInfoGeneration = useRef(0);
   const bindingResetGeneration = useRef(0);
   const backgroundTrustGeneration = useRef(0);
@@ -91,7 +98,6 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
         : receiverProgressStage === "completed" ? strings.network.receiverProgressCompleted
           : receiverProgressStage === "failed" ? strings.network.receiverProgressFailed : "";
   const receiverDeviceKey = usbDevices.map(device => device.serial).join("\u0000");
-  const selectedReceiverDevice = usbDevices.find(device => device.serial === serial);
   const validBootstrapPairs = useMemo(() => bootstrapNetworkPairs(interfaces, receiverInterfaces), [interfaces, receiverInterfaces]);
   const compatibleReceiverInterfaces = useMemo(() => localAddress
     ? receiverInterfaces.filter(receiver => {
@@ -140,7 +146,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     } else errors.push(String(interfacesResult.reason));
     if (bindingsResult.status === "fulfilled") {
       const values = bindingsResult.value;
-      setBindings(values);
+      setBindings(values); setBindingsLoaded(true);
       setBindingReference(current => {
         if (values.includes(current)) return current;
         if (backgroundStartMode && current) { backgroundChoiceInvalidated.current.bindingReference = true; return ""; }
@@ -342,7 +348,6 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     const local = interfaces.find(value => value.address === localAddress);
     if (!local) return;
     const generation = ++discoveryGeneration.current;
-    setCandidateDiscoveryComplete(false);
     setLoading(true); setCandidates([]);
     if (backgroundStartMode && peerSelectionSource.current === "candidate") {
       peerSelectionSource.current = null; peerManuallyEdited.current = false; setPeer("");
@@ -363,7 +368,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
           : strings.network.noCandidateSuggestion);
       if (usable.length === 0 && !automatic) setLocalError(strings.network.noReceiverDiscovered);
     } catch (reason) { if (discoveryGeneration.current === generation) { setAddressNotice(""); onError(String(reason)); } }
-    finally { if (discoveryGeneration.current === generation) { setCandidateDiscoveryComplete(true); setLoading(false); } }
+    finally { if (discoveryGeneration.current === generation) setLoading(false); }
   };
   useEffect(() => {
     if (method !== "paired" || !localAddress) return;
@@ -375,11 +380,6 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
       setLoading(false);
     };
   }, [interfaces, localAddress, method, bindingReference]);
-  useEffect(() => {
-    if (!udpMode || receiverManagerOnly || setupWizard || audioSessionActive || method !== "paired" || !localAddress || !bindingReference || !candidateDiscoveryComplete || candidates.length) return;
-    void listenerCall.current(localAddress, true, bindingReference);
-    return () => { void listenerCall.current("", false); };
-  }, [udpMode, receiverManagerOnly, setupWizard, audioSessionActive, method, localAddress, bindingReference, candidateDiscoveryComplete, candidates.length]);
   const submit = (event: React.FormEvent) => {
     event.preventDefault(); setLocalError(""); onError("");
     if (receiverManagerOnly) return;
@@ -501,12 +501,211 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     });
   };
   const choiceLabels = bindingChoiceLabels(bindings);
+  const ownRowMessages: string[] = [strings.network.rowNotFound, strings.network.manyUnverifiedCandidates, strings.network.chooseComputerInterface];
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
-  const mainSummary = receiverManagerOnly ? selectedReceiverDevice?.displayName ?? strings.network.chooseAuthorizedUsb : method === "paired"
-    ? bindingReference ? choiceLabels.get(bindingReference) : strings.network.choosePairedReceiver
-    : selectedReceiverDevice?.displayName ?? strings.network.chooseUsbPhone;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
+  const rowRefs = bindings.filter(reference => bindingWirelessProtocol(snapshot.settings.wirelessProtocol, bindingProfiles, reference) === "udp");
+  const listenerBinding = rowRefs.length === 1 ? rowRefs[0] : rowRefs.includes(bindingReference) ? bindingReference : rowRefs[0] ?? "";
+  const liveOffers = offers.offers.filter(offer => !dismissedOffers.includes(offer.id));
+  const offerBinding = offerBindingFor(offers, rowRefs);
+  const unmatchedOffers = offerBinding ? [] : liveOffers;
+  const errorBlock = <>{error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={errorDetail(error)} summaryRef={alertRef} />
+    : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}</>;
+  const advanced = <>
+  <div className="network-primary">
+    {receiverManagerOnly && <ReceiverAppManager
+      snapshot={snapshot} busy={busy} candidateLoading={candidateLoading} receiverAction={receiverAction} receiverError={receiverError}
+      serial={serial} setSerial={setSerial} onReceiverSerialChange={onReceiverSerialChange} receiverStatus={receiverStatus}
+      receiverNeedsUpgrade={receiverNeedsUpgrade} receiverAlreadyCurrent={receiverAlreadyCurrent} updateCandidateError={updateCandidateError}
+      usbDevices={usbDevices} unauthorizedUsb={unauthorizedUsb} updateCandidate={updateCandidate} checkReceiver={checkReceiver}
+      canRequestUsbInstall={canRequestUsbInstall} canRequestUsbMaintenance={canRequestUsbMaintenance} canRequestUsbUpgrade={canRequestUsbUpgrade}
+      requestUsbOperation={requestUsbOperation} onRefreshDevices={onRefreshDevices} receiverOperationResult={receiverOperationResult}
+      currentVersionLabel={currentVersionLabel} choiceLabels={choiceLabels} bindings={bindings.filter(reference => !tabletBindings.includes(reference))} bindingReference={bindingReference} setBindingReference={setBindingReference}
+      onClearErrors={() => { setLocalError(""); onError(""); }} bindingResetPreview={bindingResetPreview}
+      bindingResetResult={bindingResetResult} bindingResetError={bindingResetError} bindingResetLoading={bindingResetLoading}
+      bindingResetBusy={bindingResetBusy} previewBindingReset={previewBindingReset} invalidateBindingReset={invalidateBindingReset}
+      confirmBindingReset={confirmBindingReset} tabletBindings={tabletBindings} forgetTabletDisabled={busy || audioSessionActive} onForgetTablet={setForgetTablet}
+    />}
+    {pairedServiceStopped && <div className="network-recovery" role="status">
+      <span>{strings.network.receiverServiceStopped}</span>
+      <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); }}>{strings.network.startSelectedPhoneOverUsb}</button>
+    </div>}
+    {receiverManagerOnly && errorBlock}
+    {busy && !receiverOperationBusy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
+    {!receiverManagerOnly && udpMode && unmatchedOffers.length > 0 && <section className="receiver-manager offer-manager" aria-label={strings.network.offerListenerLabel}>
+      <div className="receiver-status-row">
+        <div className="receiver-status-copy" role="status" aria-live="polite">
+          <strong>{offers.active ? strings.network.listeningAt(offers.interfaceAddress ?? strings.network.networkInterface) : strings.network.allowBoundPhone}</strong>
+          <small>{offers.active
+            ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.offers.length === 1 ? strings.network.confirmRequestOnPc : strings.network.waitPhoneReceive
+            : bindings.length === 0 ? strings.network.firstUseBindOverUsb : strings.network.phoneCanStartOneTap}</small>
+        </div>
+      </div>
+      {offers.active && <>
+        {offers.offers.length > 0
+          ? <div className="candidate-list" aria-label={strings.network.unverifiedPhoneRequests}>
+              {offers.offers.map(offer => <button type="button" key={offer.id} disabled={busy || audioSessionActive} aria-pressed={selectedOffer?.id === offer.id} onClick={() => setSelectedOfferId(offer.id)}>
+                <span>{offer.endpoint}</span><small>{strings.network.unverifiedPhoneRequest(selectedOffer?.id === offer.id)}</small>
+              </button>)}
+            </div>
+          : <p className="network-hint">{strings.network.waitPhoneReceive}</p>}
+        <p className="network-hint">{bindings.length === 0 ? strings.network.noSavedBinding
+          : bindingReference ? strings.network.useBindingWhenAccepted(bindingLabel(bindingReference))
+            : strings.network.multipleSavedBindings}</p>
+        {offers.offers.length > 1 && !selectedOffer && <p className="network-hint">{strings.network.chooseRequestToAccept}</p>}
+        {audioSessionActive && <p className="network-hint">{strings.network.cannotAcceptDuringAudio}</p>}
+      </>}
+    </section>}
+  </div>
+  <div className="network-options">
+      {!setupWizard && udpMode && <details className="background-trust-disclosure">
+        <summary>{strings.network.backgroundTrustTitle}</summary>
+        <section className="background-trust" aria-label={strings.network.backgroundTrustTitle}>
+        {backgroundTrustTarget ? <>
+          <small>{backgroundTrustTarget.target === "activeSession"
+            ? strings.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
+            : strings.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer)}</small>
+          <small>{bindingLabel(backgroundTrustTarget.bindingReference)}</small>
+          <div className="background-trust-actions">
+            <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(false)}>{strings.network.backgroundTrustQuery}</button>
+            <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(true)}>{strings.network.backgroundTrustRevoke}</button>
+          </div>
+          {backgroundTrust && <div className="background-trust-result" role="status" aria-live="polite">
+            <span>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</span>
+            <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
+            <small>{strings.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
+            {backgroundTrust.value.kind === "none" && backgroundTrust.value.target === "activeSession" && !audioSessionActive && <small>{strings.network.backgroundTrustRecent}</small>}
+            {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
+          </div>}
+          {confirmBackgroundTrustRevoke && <div className="background-trust-confirm" role="group" aria-label={strings.network.backgroundTrustConfirmTitle}>
+            <p>{strings.network.backgroundTrustConfirmBody(
+              backgroundTrustTarget.target === "activeSession"
+                ? strings.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
+                : strings.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer),
+              bindingReferenceLabel(backgroundTrustTarget.bindingReference))}</p>
+            <div className="background-trust-actions">
+              <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(false)}>{strings.network.backgroundTrustCancel}</button>
+              <button className="primary-button" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(true)}>{strings.network.backgroundTrustConfirm}</button>
+            </div>
+          </div>}
+        </> : backgroundTrust?.value.target === "activeSession" && !audioSessionActive
+          ? <div className="background-trust-result" role="status" aria-live="polite">
+              <strong>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</strong>
+              <small>{strings.network.backgroundTrustScopeActive(backgroundTrust.value.sessionGeneration ?? 0)} · {backgroundTrust.value.bindingReference}</small>
+              <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
+              <small>{strings.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
+              <small>{strings.network.backgroundTrustRecent}</small>
+              {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
+            </div>
+          : <small>{strings.network.backgroundTrustNoTarget}</small>}
+        {backgroundTrustBusy && <small role="status">{strings.network.checking}</small>}
+        {backgroundTrustError && <ErrorDetails summary={strings.network.backgroundTrustUnknown} details={backgroundTrustError} />}
+        </section>
+      </details>}
+      {!receiverManagerOnly && !backgroundStartMode && <div className="network-methods" role="group" aria-label={strings.network.receiverConnectionMode}>
+          <button type="button" aria-pressed={method === "bootstrap"} disabled={busy || backgroundStartMode} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>{strings.network.usbFirstBinding}</button>
+        <button type="button" aria-pressed={method === "paired"} disabled={busy || bindings.length === 0} onClick={() => { methodManuallySelected.current = true; setMethod("paired"); onError(""); setLocalError(""); }}>{strings.network.connectPairedPhone}</button>
+      </div>}
+      {!receiverManagerOnly && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" && <div className="network-entry-actions">
+        <button className="text-button" type="button" disabled={busy} onClick={onAddPhone}>{strings.app.addPhone}</button>
+      </div>}
+      {!receiverManagerOnly && <label className="network-field">{strings.network.computerInterface}
+        <select required value={localAddress} disabled={busy} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (backgroundStartMode || !peerManuallyEdited.current) { peerSelectionSource.current = null; peerManuallyEdited.current = false; setPeer(""); } backgroundChoiceInvalidated.current.interfaceAddress = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+          <option value="">{strings.network.chooseIpv4Interface}</option>
+          {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
+        </select>
+      </label>}
+      {method === "bootstrap" ? <>
+        {!receiverManagerOnly && <label className="network-field">{strings.network.authorizedOnlineUsb}
+          <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">{strings.network.chooseUsbPlaceholder}</option>
+            {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
+          </select>
+        </label>}
+        {!receiverManagerOnly && serial && <section className="receiver-manager" aria-label={strings.network.receiverManagement}>
+          <div className="receiver-status-row">
+            <div className="receiver-status-copy" role="status" aria-live="polite">
+              <strong>{receiverOperationBusy ? strings.network.installingAndVerifying : receiverAction === "checking" ? strings.network.checkingReceiver : receiverError ? strings.network.receiverCheckFailed : !receiverStatus ? strings.network.waitingReceiverCheck : !receiverStatus.installed ? strings.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? strings.network.receiverHealthy : strings.network.receiverUnhealthy : strings.network.receiverStopped}</strong>
+              {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : strings.network.versionCode(receiverStatus.versionCode), receiverStatus.foreground ? strings.network.foregroundService : ""].filter(Boolean).join(" · ")}</small>}
+              {receiverStatus?.audioActive && <small>{strings.network.audioActiveNotPlaying}</small>}
+              {receiverStatus && !receiverStatus.healthy && <ErrorDetails summary={strings.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
+              {!receiverManagerOnly && receiverNeedsUpgrade && <small>{strings.network.oldCompatibleUsbUpgrade}</small>}
+            </div>
+            <div className="receiver-status-actions">
+              <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? strings.network.checking : strings.network.checkStatus}</button>
+              {!receiverManagerOnly && canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{strings.network.installReceiver(updateCandidate.versionCode)}</button>}
+              {!receiverManagerOnly && receiverNeedsUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.network.usbUpgradeOptions}</button>}
+            </div>
+          </div>
+          {receiverError && <ErrorDetails className="receiver-error" summary={needsReceiverUpdate(receiverError) ? receiverErrorMessage(receiverError) : strings.app.operationNotCompleted} details={receiverError} summaryRef={alertRef} />}
+          {!receiverManagerOnly && receiverNeedsInstall && <p className="network-note">{strings.network.installPackageFirstVerify}</p>}
+          {!receiverManagerOnly && receiverNeedsUpgrade && <button type="button" className="text-button" disabled={busy} onClick={onOpenReceiverManager}>{strings.network.openUsbUpgradeManager}</button>}
+        </section>}
+        {!receiverManagerOnly && <label className="network-field">{strings.network.phoneCurrentIpv4}
+          <select required value={receiverAddress} disabled={busy || !serial || receiverStatus?.installed !== true} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">{strings.network.choosePhoneInterface}</option>
+            {compatibleReceiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
+          </select>
+        </label>}
+        {!receiverManagerOnly && <p className="network-note">{strings.network.onlySameSubnetPhoneAddresses}</p>}
+      </> : <>
+        <label className="network-field">{strings.network.pairedReceiver}
+          <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); backgroundChoiceInvalidated.current.bindingReference = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
+            <option value="">{strings.network.chooseBinding}</option>
+            {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
+          </select>
+        </label>
+        <BindingReferenceList bindings={bindings} />
+        <label className="network-field">{strings.network.receiverIpv4Endpoint}
+          <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; peerSelectionSource.current = "manual"; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
+        </label>
+        <small id="network-peer-hint" className="network-hint">{strings.network.addressSuggestionNeedsConnection}</small>
+        {snapshot.settings.lastReceiverEndpoint && <small className="network-hint">{strings.network.lastReceiverHint(snapshot.settings.lastReceiverEndpoint)}</small>}
+        {(snapshot.presence ?? []).map(entry => <small className="network-hint" key={entry.bindingReference}>{strings.network.presenceLine(entry.online, entry.lastAddress, entry.lastSeenUnix)}</small>)}
+        {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{strings.network.invalidSubnetConnectDisabled}</small>}
+        <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
+        <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{strings.network.searchAddressAgain}</button>
+        {candidates.length > 0 && <div className="candidate-list" aria-label={strings.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); if (candidate.bindingReference) setBindingReference(candidate.bindingReference); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>{candidate.bindingReference ? strings.network.verifiedCandidate : strings.network.unverifiedCandidate}</small></button>)}</div>}
+      </>}
+      {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />{strings.network.refreshInterfacesAndBindings}</button>}
+      {!receiverManagerOnly && <button className="primary-button network-connect" type={canAcceptSelectedOffer ? "button" : "submit"} disabled={busy || (!canStart && !canAcceptSelectedOffer)} onClick={canAcceptSelectedOffer ? () => { if (selectedOffer && bindingReference) onAcceptOffer(selectedOffer.id, bindingReference); } : undefined}>{disabled ? strings.network.processing : canAcceptSelectedOffer ? strings.network.acceptSelectedPhone : !canStart && offers.active ? strings.network.waitPhoneReceive : backgroundStartMode ? strings.app.backgroundStartConnect : method === "bootstrap" ? strings.network.firstBindAndConnect : strings.network.connectReceiverDirectly}</button>}
+      </div>
+  </>;
+  const listenerEligible = !setupWizard && !receiverManagerOnly && !audioSessionActive && !disabled && bindingsLoaded
+    && snapshot.connectionTransport === "wireless" && !!localAddress && !!listenerBinding;
+  useEffect(() => {
+    if (!listenerEligible) return;
+    void offerListener.ensure(`${localAddress}|${listenerBinding}`, snapshotRef.current.wirelessConnectionOffers.active,
+      () => listenerCall.current(localAddress, true, listenerBinding, true), restoreListener);
+  }, [offerListener, listenerEligible, localAddress, listenerBinding]);
+  useEffect(() => {
+    offerListener.open();
+    return () => offerListener.release(restoreListener);
+  }, [offerListener]);
+  const rowErrorFor = (reference: string): DeviceRowError | null => {
+    if (!error || rowTarget !== reference) return null;
+    return ownRowMessages.includes(error) ? { summary: error, details: "" }
+      : { summary: needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted, details: errorDetail(error) };
+  };
+  const rowErrorShown = !!error && rowRefs.includes(rowTarget);
+  const deviceList = audioSessionActive ? <section className="connection-entry">
+    <p>{strings.network.phoneAlreadyConnected}</p>
+    <button className="dialog-secondary" type="button" onClick={onClose}>{strings.network.done}</button>
+  </section> : bindingsLoaded && rowRefs.length === 0 ? <section className="connection-entry">
+    <button className="primary-button" type="button" disabled={busy} onClick={onAddDevice}>{strings.network.addDeviceUsb}</button>
+    {errorBlock}
+  </section> : <section className="saved-devices">
+    <ul>{rowRefs.map(reference => <SavedDeviceRow key={reference} label={choiceLabels.get(reference) ?? bindingLabel(reference)}
+      online={(snapshot.presence ?? []).some(entry => entry.bindingReference === reference && entry.online)}
+      offer={reference === offerBinding ? liveOffers[0] ?? null : null} error={rowErrorFor(reference)} errorRef={alertRef} busy={busy}
+      connecting={disabled && rowTarget === reference} onConnect={() => { setRowTarget(reference); onConnect(reference, localAddress); }}
+      onAccept={() => { const offer = liveOffers[0]; if (!offer) return; setRowTarget(reference); onAcceptOffer(offer.id, reference); }}
+      onDecline={() => { const offer = liveOffers[0]; if (offer) setDismissedOffers(current => [...current, offer.id]); }} />)}</ul>
+    {offers.active && <p className="network-hint saved-devices-hint">{strings.network.connectFromPhoneHint}</p>}
+    {!rowErrorShown && errorBlock}
+    <button className="text-button saved-devices-add" type="button" disabled={busy} onClick={onAddDevice}>{strings.network.addDeviceUsb}</button>
+  </section>;
   return <><Modal title={setupWizard ? strings.network.dialogSetup : receiverManagerOnly ? strings.network.dialogReceiverManager : strings.network.dialogWirelessReceiver} onClose={onClose} className={`network-dialog${setupWizard ? " setup-wizard-dialog" : ""}`}>
     <form className="network-pane" onSubmit={submit}>
       {setupWizard && <NetworkSetupWizard
@@ -521,174 +720,16 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
         hasValidBootstrapPairs={validBootstrapPairs.length > 0} singleBootstrapPair={validBootstrapPairs.length === 1} localError={localError} loadNetworkInfo={loadNetworkInfo}
         canStart={canStart} onInstallOrUpgrade={requestUsbOperation} onClearErrors={() => { setLocalError(""); onError(""); }}
       />}
-      {!setupWizard && !receiverManagerOnly && !networkRecoveryMode && <NetworkConnectionEntry
-        audioSessionActive={audioSessionActive} busy={busy} bindings={bindings} bindingReference={bindingReference}
-        setBindingReference={setBindingReference} onConnect={onConnect} onRecover={() => onNetworkRecoveryChange(true)} onClose={onClose}
-      />}
-      {!setupWizard && !receiverManagerOnly && networkRecoveryMode && <button className="text-button network-recovery-back" type="button" onClick={() => onNetworkRecoveryChange(false)}>{strings.network.backToSimpleConnection}</button>}
-      {!setupWizard && (receiverManagerOnly || networkRecoveryMode) && <>
-      <div className="network-primary">
-        {!receiverManagerOnly && <div className="network-summary"><strong>{mainSummary}</strong></div>}
-        {receiverManagerOnly && <ReceiverAppManager
-          snapshot={snapshot} busy={busy} candidateLoading={candidateLoading} receiverAction={receiverAction} receiverError={receiverError}
-          serial={serial} setSerial={setSerial} onReceiverSerialChange={onReceiverSerialChange} receiverStatus={receiverStatus}
-          receiverNeedsUpgrade={receiverNeedsUpgrade} receiverAlreadyCurrent={receiverAlreadyCurrent} updateCandidateError={updateCandidateError}
-          usbDevices={usbDevices} unauthorizedUsb={unauthorizedUsb} updateCandidate={updateCandidate} checkReceiver={checkReceiver}
-          canRequestUsbInstall={canRequestUsbInstall} canRequestUsbMaintenance={canRequestUsbMaintenance} canRequestUsbUpgrade={canRequestUsbUpgrade}
-          requestUsbOperation={requestUsbOperation} onRefreshDevices={onRefreshDevices} receiverOperationResult={receiverOperationResult}
-          currentVersionLabel={currentVersionLabel} bindings={bindings.filter(reference => !tabletBindings.includes(reference))} bindingReference={bindingReference} setBindingReference={setBindingReference}
-          onClearErrors={() => { setLocalError(""); onError(""); }} bindingResetPreview={bindingResetPreview}
-          bindingResetResult={bindingResetResult} bindingResetError={bindingResetError} bindingResetLoading={bindingResetLoading}
-          bindingResetBusy={bindingResetBusy} previewBindingReset={previewBindingReset} invalidateBindingReset={invalidateBindingReset}
-          confirmBindingReset={confirmBindingReset} tabletBindings={tabletBindings} forgetTabletDisabled={busy || audioSessionActive} onForgetTablet={setForgetTablet}
-        />}
-        {pairedServiceStopped && <div className="network-recovery" role="status">
-          <span>{strings.network.receiverServiceStopped}</span>
-          <button type="button" className="text-button" disabled={busy} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); }}>{strings.network.startSelectedPhoneOverUsb}</button>
-        </div>}
-        {error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={errorDetail(error)} summaryRef={alertRef} />
-          : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}
-        {busy && !receiverOperationBusy && <p className="network-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={15} />{receiverAction === "checking" ? strings.network.checkingReceiver : candidateLoading ? strings.network.checkingBundledVersion : strings.network.readingNetworkInfo}</p>}
-        {!receiverManagerOnly && udpMode && <p className="network-hint connect-choice-hint">{strings.network.connectChoiceHint}</p>}
-        {!receiverManagerOnly && udpMode && <section className="receiver-manager offer-manager" aria-label={strings.network.offerListenerLabel}>
-          <div className="receiver-status-row">
-            <div className="receiver-status-copy" role="status" aria-live="polite">
-              <strong>{offers.active ? strings.network.listeningAt(offers.interfaceAddress ?? strings.network.networkInterface) : strings.network.allowBoundPhone}</strong>
-              <small>{offers.active
-                ? offers.offers.length > 1 ? strings.network.multipleRequests : offers.offers.length === 1 ? strings.network.confirmRequestOnPc : strings.network.waitPhoneReceive
-                : bindings.length === 0 ? strings.network.firstUseBindOverUsb : strings.network.phoneCanStartOneTap}</small>
-            </div>
-          </div>
-          {offers.active && <>
-            {offers.offers.length > 0
-              ? <div className="candidate-list" aria-label={strings.network.unverifiedPhoneRequests}>
-                  {offers.offers.map(offer => <button type="button" key={offer.id} disabled={busy || audioSessionActive} aria-pressed={selectedOffer?.id === offer.id} onClick={() => setSelectedOfferId(offer.id)}>
-                    <span>{offer.endpoint}</span><small>{strings.network.unverifiedPhoneRequest(selectedOffer?.id === offer.id)}</small>
-                  </button>)}
-                </div>
-              : <p className="network-hint">{strings.network.waitPhoneReceive}</p>}
-            <p className="network-hint">{bindings.length === 0 ? strings.network.noSavedBinding
-              : bindingReference ? strings.network.useBindingWhenAccepted(bindingLabel(bindingReference))
-                : strings.network.multipleSavedBindings}</p>
-            {offers.offers.length > 1 && !selectedOffer && <p className="network-hint">{strings.network.chooseRequestToAccept}</p>}
-            {audioSessionActive && <p className="network-hint">{strings.network.cannotAcceptDuringAudio}</p>}
-          </>}
-        </section>}
-      </div>
-      <div className="network-options">
-          {!setupWizard && udpMode && <details className="background-trust-disclosure">
-            <summary>{strings.network.backgroundTrustTitle}</summary>
-            <section className="background-trust" aria-label={strings.network.backgroundTrustTitle}>
-            {backgroundTrustTarget ? <>
-              <small>{backgroundTrustTarget.target === "activeSession"
-                ? strings.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
-                : strings.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer)}</small>
-              <small>{bindingLabel(backgroundTrustTarget.bindingReference)}</small>
-              <div className="background-trust-actions">
-                <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(false)}>{strings.network.backgroundTrustQuery}</button>
-                <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(true)}>{strings.network.backgroundTrustRevoke}</button>
-              </div>
-              {backgroundTrust && <div className="background-trust-result" role="status" aria-live="polite">
-                <span>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</span>
-                <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
-                <small>{strings.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
-                {backgroundTrust.value.kind === "none" && backgroundTrust.value.target === "activeSession" && !audioSessionActive && <small>{strings.network.backgroundTrustRecent}</small>}
-                {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
-              </div>}
-              {confirmBackgroundTrustRevoke && <div className="background-trust-confirm" role="group" aria-label={strings.network.backgroundTrustConfirmTitle}>
-                <p>{strings.network.backgroundTrustConfirmBody(
-                  backgroundTrustTarget.target === "activeSession"
-                    ? strings.network.backgroundTrustScopeActive(backgroundTrustTarget.sessionGeneration)
-                    : strings.network.backgroundTrustScopeReceiver(backgroundTrustTarget.localAddress, backgroundTrustTarget.peer),
-                  bindingReferenceLabel(backgroundTrustTarget.bindingReference))}</p>
-                <div className="background-trust-actions">
-                  <button className="dialog-secondary" type="button" disabled={busy} onClick={() => setConfirmBackgroundTrustRevoke(false)}>{strings.network.backgroundTrustCancel}</button>
-                  <button className="primary-button" type="button" disabled={busy} onClick={() => void operateBackgroundTrust(true)}>{strings.network.backgroundTrustConfirm}</button>
-                </div>
-              </div>}
-            </> : backgroundTrust?.value.target === "activeSession" && !audioSessionActive
-              ? <div className="background-trust-result" role="status" aria-live="polite">
-                  <strong>{backgroundTrustKindLabel(backgroundTrust.value.kind)} · {backgroundTrustPersistenceLabel(backgroundTrust.value.persistence)}</strong>
-                  <small>{strings.network.backgroundTrustScopeActive(backgroundTrust.value.sessionGeneration ?? 0)} · {backgroundTrust.value.bindingReference}</small>
-                  <small>{backgroundTrustRemaining(backgroundTrust.value.remainingMs)}</small>
-                  <small>{strings.network.backgroundTrustVerifiedAt(new Date(backgroundTrust.checkedAt).toLocaleTimeString())}</small>
-                  <small>{strings.network.backgroundTrustRecent}</small>
-                  {backgroundTrustNotice && <small>{backgroundTrustNotice}</small>}
-                </div>
-              : <small>{strings.network.backgroundTrustNoTarget}</small>}
-            {backgroundTrustBusy && <small role="status">{strings.network.checking}</small>}
-            {backgroundTrustError && <ErrorDetails summary={strings.network.backgroundTrustUnknown} details={backgroundTrustError} />}
-            </section>
-          </details>}
-          {!receiverManagerOnly && !backgroundStartMode && <div className="network-methods" role="group" aria-label={strings.network.receiverConnectionMode}>
-              <button type="button" aria-pressed={method === "bootstrap"} disabled={busy || backgroundStartMode} onClick={() => { methodManuallySelected.current = true; setMethod("bootstrap"); onError(""); setLocalError(""); }}>{strings.network.usbFirstBinding}</button>
-            <button type="button" aria-pressed={method === "paired"} disabled={busy || bindings.length === 0} onClick={() => { methodManuallySelected.current = true; setMethod("paired"); onError(""); setLocalError(""); }}>{strings.network.connectPairedPhone}</button>
-          </div>}
-          {!receiverManagerOnly && snapshot.connectionTransport === "wireless" && snapshot.settings.wirelessProtocol === "adb" && <div className="network-entry-actions">
-            <button className="text-button" type="button" disabled={busy} onClick={onAddPhone}>{strings.app.addPhone}</button>
-          </div>}
-          {!receiverManagerOnly && <label className="network-field">{strings.network.computerInterface}
-            <select required value={localAddress} disabled={busy || offers.active} onChange={event => { setLocalAddress(event.target.value); setCandidates([]); if (backgroundStartMode || !peerManuallyEdited.current) { peerSelectionSource.current = null; peerManuallyEdited.current = false; setPeer(""); } backgroundChoiceInvalidated.current.interfaceAddress = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !localAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-              <option value="">{strings.network.chooseIpv4Interface}</option>
-              {interfaces.map(value => <option key={`${value.index}-${value.address}`} value={value.address}>{value.name} · {value.address}/{value.prefixLength}</option>)}
-            </select>
-          </label>}
-          {method === "bootstrap" ? <>
-            {!receiverManagerOnly && <label className="network-field">{strings.network.authorizedOnlineUsb}
-              <select required value={serial} disabled={busy} onChange={event => { invalidateBindingReset(); setSerial(event.target.value); onReceiverSerialChange(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !serial || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-                <option value="">{strings.network.chooseUsbPlaceholder}</option>
-                {usbDevices.map(device => <option key={device.serial} value={device.serial}>{device.displayName}</option>)}
-              </select>
-            </label>}
-            {!receiverManagerOnly && serial && <section className="receiver-manager" aria-label={strings.network.receiverManagement}>
-              <div className="receiver-status-row">
-                <div className="receiver-status-copy" role="status" aria-live="polite">
-                  <strong>{receiverOperationBusy ? strings.network.installingAndVerifying : receiverAction === "checking" ? strings.network.checkingReceiver : receiverError ? strings.network.receiverCheckFailed : !receiverStatus ? strings.network.waitingReceiverCheck : !receiverStatus.installed ? strings.network.receiverNotInstalled : receiverStatus.serviceActive ? receiverStatus.healthy ? strings.network.receiverHealthy : strings.network.receiverUnhealthy : strings.network.receiverStopped}</strong>
-                  {receiverStatus?.installed && <small>{[receiverStatus.versionName, receiverStatus.versionCode === null ? "" : strings.network.versionCode(receiverStatus.versionCode), receiverStatus.foreground ? strings.network.foregroundService : ""].filter(Boolean).join(" · ")}</small>}
-                  {receiverStatus?.audioActive && <small>{strings.network.audioActiveNotPlaying}</small>}
-                  {receiverStatus && !receiverStatus.healthy && <ErrorDetails summary={strings.app.operationNotCompleted} details={receiverStatus.error || receiverStatus.message} />}
-                  {!receiverManagerOnly && receiverNeedsUpgrade && <small>{strings.network.oldCompatibleUsbUpgrade}</small>}
-                </div>
-                <div className="receiver-status-actions">
-                  <button className="dialog-secondary" type="button" disabled={busy} onClick={() => void checkReceiver(serial)}>{receiverAction === "checking" ? strings.network.checking : strings.network.checkStatus}</button>
-                  {!receiverManagerOnly && canRequestUsbInstall && <button className="primary-button" type="button" disabled={busy} onClick={() => requestUsbOperation("install")}>{strings.network.installReceiver(updateCandidate.versionCode)}</button>}
-                  {!receiverManagerOnly && receiverNeedsUpgrade && <button className="primary-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.network.usbUpgradeOptions}</button>}
-                </div>
-              </div>
-              {receiverError && <ErrorDetails className="receiver-error" summary={needsReceiverUpdate(receiverError) ? receiverErrorMessage(receiverError) : strings.app.operationNotCompleted} details={receiverError} summaryRef={alertRef} />}
-              {!receiverManagerOnly && receiverNeedsInstall && <p className="network-note">{strings.network.installPackageFirstVerify}</p>}
-              {!receiverManagerOnly && receiverNeedsUpgrade && <button type="button" className="text-button" disabled={busy} onClick={onOpenReceiverManager}>{strings.network.openUsbUpgradeManager}</button>}
-            </section>}
-            {!receiverManagerOnly && <label className="network-field">{strings.network.phoneCurrentIpv4}
-              <select required value={receiverAddress} disabled={busy || !serial || receiverStatus?.installed !== true} onChange={event => { setReceiverAddress(event.target.value); setLocalError(""); onError(""); }} aria-invalid={!!shownError && !receiverAddress || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-                <option value="">{strings.network.choosePhoneInterface}</option>
-                {compatibleReceiverInterfaces.map(value => <option key={`${value.interfaceIndex}-${value.address}`} value={value.address}>{value.interfaceName} · {value.address}/{value.prefixLength}</option>)}
-              </select>
-            </label>}
-            {!receiverManagerOnly && <p className="network-note">{strings.network.onlySameSubnetPhoneAddresses}</p>}
-          </> : <>
-            <label className="network-field">{strings.network.pairedReceiver}
-              <select required value={bindingReference} disabled={busy} onChange={event => { setBindingReference(event.target.value); backgroundChoiceInvalidated.current.bindingReference = false; setLocalError(""); onError(""); }} aria-invalid={!!shownError && !bindingReference || undefined} aria-describedby={shownError ? "network-flow-error" : undefined}>
-                <option value="">{strings.network.chooseBinding}</option>
-                {bindings.map(value => <option key={value} value={value}>{choiceLabels.get(value)}</option>)}
-              </select>
-            </label>
-            <BindingReferenceList bindings={bindings} />
-            <label className="network-field">{strings.network.receiverIpv4Endpoint}
-              <input required value={peer} disabled={busy} onChange={event => { peerManuallyEdited.current = true; peerSelectionSource.current = "manual"; setPeer(event.target.value); setLocalError(""); onError(""); }} placeholder="192.0.2.20:45678" autoComplete="off" inputMode="decimal" aria-invalid={!!shownError && !isIpv4Endpoint(peer) || peerOutsideSubnet || undefined} aria-describedby={`network-peer-hint${peerOutsideSubnet ? " network-peer-network-warning" : ""}${shownError ? " network-flow-error" : ""}`} />
-            </label>
-            <small id="network-peer-hint" className="network-hint">{strings.network.addressSuggestionNeedsConnection}</small>
-            {snapshot.settings.lastReceiverEndpoint && <small className="network-hint">{strings.network.lastReceiverHint(snapshot.settings.lastReceiverEndpoint)}</small>}
-            {(snapshot.presence ?? []).map(entry => <small className="network-hint" key={entry.bindingReference}>{strings.network.presenceLine(entry.online, entry.lastAddress, entry.lastSeenUnix)}</small>)}
-            {peerOutsideSubnet && <small id="network-peer-network-warning" className="network-validation-warning">{strings.network.invalidSubnetConnectDisabled}</small>}
-            <p className="network-hint" role="status" aria-live="polite">{addressNotice}</p>
-            <button className="text-button network-refresh" type="button" onClick={() => void discoverCandidates()} disabled={busy || !localAddress}><Search size={15} />{strings.network.searchAddressAgain}</button>
-            {candidates.length > 0 && <div className="candidate-list" aria-label={strings.network.unverifiedDiscoveryCandidates}>{candidates.map(candidate => <button type="button" key={candidate.endpoint} disabled={busy} aria-pressed={peer === candidate.endpoint} onClick={() => { peerManuallyEdited.current = true; peerSelectionSource.current = "candidate"; setPeer(candidate.endpoint); if (candidate.bindingReference) setBindingReference(candidate.bindingReference); setLocalError(""); onError(""); }}><span>{candidate.endpoint}</span><small>{candidate.bindingReference ? strings.network.verifiedCandidate : strings.network.unverifiedCandidate}</small></button>)}</div>}
-          </>}
-          {!receiverManagerOnly && <button className="text-button network-refresh" type="button" onClick={() => void loadNetworkInfo()} disabled={busy}><Search size={15} />{strings.network.refreshInterfacesAndBindings}</button>}
-          {!receiverManagerOnly && <button className="primary-button network-connect" type={canAcceptSelectedOffer ? "button" : "submit"} disabled={busy || (!canStart && !canAcceptSelectedOffer)} onClick={canAcceptSelectedOffer ? () => { if (selectedOffer && bindingReference) onAcceptOffer(selectedOffer.id, bindingReference); } : undefined}>{disabled ? strings.network.processing : canAcceptSelectedOffer ? strings.network.acceptSelectedPhone : !canStart && offers.active ? strings.network.waitPhoneReceive : backgroundStartMode ? strings.app.backgroundStartConnect : method === "bootstrap" ? strings.network.firstBindAndConnect : strings.network.connectReceiverDirectly}</button>}
-          </div>
-      </>}
+      {!setupWizard && receiverManagerOnly && advanced}
+      {!setupWizard && !receiverManagerOnly && deviceList}
+      {!setupWizard && !receiverManagerOnly && <details className="network-more" open={moreOpen || unmatchedOffers.length > 0} onToggle={event => setMoreOpen(event.currentTarget.open)}>
+        <summary>{strings.network.more}</summary>
+        {advanced}
+        <div className="network-more-actions">
+          <button className="text-button" type="button" disabled={busy} onClick={onOpenReceiverManager}>{strings.network.pairingRepair}</button>
+          {tabletBindings.map(reference => <button className="text-button" key={reference} type="button" disabled={busy || audioSessionActive} onClick={() => setForgetTablet(reference)}>{strings.network.forgetTablet} · {choiceLabels.get(reference)}</button>)}
+        </div>
+      </details>}
       {receiverProgressStage && <div className={`receiver-operation-progress${receiverProgressStage === "failed" ? " is-failed" : ""}`} role={receiverProgressStage === "failed" ? "alert" : "status"} aria-live={receiverProgressStage === "failed" ? "assertive" : "polite"}>
         <span>{receiverProgressLabel}</span>
         {(receiverProgressStage === "checking" || receiverProgressStage === "transferring" || receiverProgressStage === "verifying") && <progress aria-label={receiverProgressLabel} />}

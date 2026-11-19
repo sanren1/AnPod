@@ -209,11 +209,12 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
     return { selectedAddress, selectedBinding, addressChoiceInvalidated, bindingChoiceInvalidated, availableInterfaces, availableBindings };
   };
 
-  const startBackgroundConnection = async (bindingReference?: string) => {
+  // Connects a saved phone from the dialog; every failure is reported through the dialog error so the row can show it.
+  const startBackgroundConnection = async (bindingReference?: string, localAddress = "") => {
     if (!snapshot || working || snapshot.busy || active) return;
     setWorking(true); setNetworkDialogError("");
     try {
-      const choice = await resolveWirelessChoice("", bindingReference);
+      const choice = await resolveWirelessChoice(localAddress, bindingReference);
       setNetworkChoiceNeedsConfirmation({ interfaceAddress: choice.addressChoiceInvalidated, bindingReference: choice.bindingChoiceInvalidated });
       const choices = { localAddress: choice.selectedAddress, bindingReference: choice.selectedBinding ?? "" };
       if (!choices.bindingReference && choice.availableBindings.length === 0) {
@@ -222,14 +223,14 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
         return;
       }
       if (!choices.localAddress || !choices.bindingReference) {
-        openNetworkDialog(true, choices, true);
+        setNetworkDialogError(strings.network.chooseComputerInterface);
         return;
       }
       const local = choice.availableInterfaces.find(value => value.address === choices.localAddress);
       const candidates = (await invokeApp<NetworkCandidate[]>("discover_network_receivers", { localAddress: choices.localAddress }))
         .filter(candidate => (!candidate.bindingReference || candidate.bindingReference === choices.bindingReference) && endpointFitsInterface(candidate.endpoint, local));
       if (candidates.length !== 1) {
-        openNetworkDialog(true, choices, true);
+        setNetworkDialogError(candidates.length === 0 ? strings.network.rowNotFound : strings.network.manyUnverifiedCandidates);
         return;
       }
       try {
@@ -243,12 +244,10 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
         setPanel(null);
       } catch (error) {
         if (panelRef.current !== "network" && panelRef.current !== "setup") return;
-        openNetworkDialog(true, choices, true);
         setNetworkDialogError(String(error));
       }
     } catch (error) {
       if (panelRef.current !== "network" && panelRef.current !== "setup") return;
-      openNetworkDialog(true, { localAddress: "", bindingReference: "" }, true);
       setNetworkDialogError(String(error));
     } finally { setWorking(false); }
   };
