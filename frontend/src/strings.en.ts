@@ -660,6 +660,7 @@ export const en: typeof zhCN = {
     acceptRequest: "Accept",
     declineRequest: "Decline",
     connectFromPhoneHint: "Or tap “Connect to computer” on the phone",
+    connectOnDevice: "Tap “Connect to computer” on the device",
     rowNotFound: "Phone not found. Make sure it is on the same network.",
   },
   modal: { close: "Close" },

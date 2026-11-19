@@ -57,6 +57,11 @@ export const bindingChoiceLabels = (refs: string[]) => {
 export const offerBindingFor = (offers: { automaticBinding?: string | null }, references: string[]) =>
   offers.automaticBinding ? references.includes(offers.automaticBinding) ? offers.automaticBinding : null
     : references.length === 1 ? references[0] : null;
+// Requests are unauthenticated until binding, so one lands on the listener's row only when it comes from that phone's last
+// known address (or that phone is the only one); anything else stays unmatched. shortcut: true per-row matching needs the backend.
+export const offerRowFor = (offer: { endpoint: string }, listenerRow: string | null, rowRefs: string[], presence: { bindingReference: string; lastAddress: string | null }[]) =>
+  !listenerRow ? null : rowRefs.length === 1 ? listenerRow
+    : presence.find(entry => entry.bindingReference === listenerRow)?.lastAddress === offer.endpoint.split(":")[0] ? listenerRow : null;
 export const bindingWirelessProtocol = (saved: Snapshot["settings"]["wirelessProtocol"], profiles: Record<string, { platform?: string }>, reference: string | null | undefined) =>
   reference && profiles[reference]?.platform === "harmony" ? "udp" : saved;
 export const harmonyBindingReferences = (profiles: Record<string, { platform?: string }>) =>

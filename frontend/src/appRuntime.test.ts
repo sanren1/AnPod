@@ -229,6 +229,15 @@ describe("offerBindingFor", () => {
   it("gives a lone saved phone every request", () => {
     expect(runtime.offerBindingFor({ automaticBinding: null }, ["a"])).toBe("a");
   });
+  it("attributes a request to the listener row only by last address or a lone phone", () => {
+    const presence = [{ bindingReference: "a", lastAddress: "192.0.2.20" }, { bindingReference: "b", lastAddress: null }];
+    const offer = (endpoint: string) => ({ endpoint });
+    expect(runtime.offerRowFor(offer("192.0.2.20:4000"), "a", ["a", "b"], presence)).toBe("a");
+    expect(runtime.offerRowFor(offer("192.0.2.99:4000"), "a", ["a", "b"], presence)).toBeNull();
+    expect(runtime.offerRowFor(offer("192.0.2.20:4000"), "b", ["a", "b"], presence)).toBeNull();
+    expect(runtime.offerRowFor(offer("192.0.2.99:4000"), "a", ["a"], presence)).toBe("a");
+    expect(runtime.offerRowFor(offer("192.0.2.20:4000"), null, ["a"], presence)).toBeNull();
+  });
   it("leaves requests unmatched when the binding is not listed or ambiguous", () => {
     expect(runtime.offerBindingFor({ automaticBinding: "z" }, ["a"])).toBeNull();
     expect(runtime.offerBindingFor({ automaticBinding: null }, ["a", "b"])).toBeNull();

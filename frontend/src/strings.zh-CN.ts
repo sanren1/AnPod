@@ -657,6 +657,7 @@ export const zhCN = {
     acceptRequest: "接受",
     declineRequest: "拒绝",
     connectFromPhoneHint: "也可在手机上点“连接电脑”",
+    connectOnDevice: "请在设备上点“连接电脑”",
     rowNotFound: "未发现这台手机，请确认它在同一网络。",
   },
   modal: { close: "关闭" },

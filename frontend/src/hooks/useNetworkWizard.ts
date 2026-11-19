@@ -239,7 +239,11 @@ export function useNetworkWizard({ active, apply, cancelOperationLockRef, cleanu
           // A phone that answered discovery is awake; do not demand the standby capability (that is only for the explicit background flow).
           bindingReference: choices.bindingReference, backgroundAuthorizationRequired: false,
         });
-        if (!started) return;
+        if (!started) {
+          // The phone wants to start the connection itself: startNetworkAudio left the offer listener on for it.
+          if (offerListenerChoice.current && panelRef.current === "network") setNetworkDialogError(strings.network.connectOnDevice);
+          return;
+        }
         lastOfferListenerChoice.current = { localAddress: choices.localAddress, bindingReference: choices.bindingReference };
         setPanel(null);
       } catch (error) {

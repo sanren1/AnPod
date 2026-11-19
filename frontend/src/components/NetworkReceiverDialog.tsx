@@ -3,7 +3,7 @@ import { LoaderCircle, Search } from "lucide-react";
 import { createDialogOfferListener } from "../dialogOfferListener";
 import { strings } from "../strings";
 import type { Device, Snapshot, PrivateIpv4Interface, ReceiverIpv4Interface, ReceiverStatus, NetworkCandidate, ReceiverPackageCandidate, BindingResetPreview, BindingResetResult, ReceiverUsbOperation, ReceiverUsbOperationResult, ReceiverInstallProgress, HostDiscoverySnapshot, NetworkStartRequest, BackgroundTrustTarget, BackgroundTrustStatus } from "../appTypes";
-import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingChoiceLabels, offerBindingFor, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
+import { invokeApp, errorDetail, bindingWirelessProtocol, harmonyBindingReferences, hasActiveSession, bindingLabel, bindingChoiceLabels, offerBindingFor, offerRowFor, bindingReferenceLabel, backgroundTrustKindLabel, backgroundTrustPersistenceLabel, backgroundTrustRemaining, needsReceiverUpdate, receiverErrorMessage, isIpv4Endpoint, sameIpv4Subnet, bootstrapNetworkPairs, endpointFitsInterface } from "../appRuntime";
 import { Modal } from "./Modal";
 import { ErrorDetails } from "./Modal";
 import { BindingReferenceList } from "./BindingReferenceList";
@@ -54,7 +54,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const restoreListener = useEffectEvent(onRestoreOfferListener);
   const [offerListener] = useState(createDialogOfferListener);
   const [bindingsLoaded, setBindingsLoaded] = useState(false);
-  const [rowTarget, setRowTarget] = useState("");
+  const [rowTarget, setRowTarget] = useState({ reference: "", key: "" });
   const [dismissedOffers, setDismissedOffers] = useState<string[]>([]);
   const [moreOpen, setMoreOpen] = useState(networkRecoveryMode && (requiredChoices.interfaceAddress || requiredChoices.bindingReference));
   const [addressNotice, setAddressNotice] = useState("");
@@ -501,7 +501,7 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     });
   };
   const choiceLabels = bindingChoiceLabels(bindings);
-  const ownRowMessages: string[] = [strings.network.rowNotFound, strings.network.manyUnverifiedCandidates, strings.network.chooseComputerInterface];
+  const ownRowMessages: string[] = [strings.network.rowNotFound, strings.network.manyUnverifiedCandidates, strings.network.chooseComputerInterface, strings.network.connectOnDevice];
   const pairedServiceStopped = method === "paired" && !!serial && receiverStatus?.installed === true && !receiverStatus.serviceActive;
 
   const unauthorizedUsb = usbSeenDevices.some(device => device.state === "unauthorized" || device.statusText.includes("未授权"));
@@ -509,7 +509,12 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   const listenerBinding = rowRefs.length === 1 ? rowRefs[0] : rowRefs.includes(bindingReference) ? bindingReference : rowRefs[0] ?? "";
   const liveOffers = offers.offers.filter(offer => !dismissedOffers.includes(offer.id));
   const offerBinding = offerBindingFor(offers, rowRefs);
-  const unmatchedOffers = offerBinding ? [] : liveOffers;
+  const offerRow = (offer: { endpoint: string }) => offerRowFor(offer, offerBinding, rowRefs, snapshot.presence ?? []);
+  const unmatchedOffers = liveOffers.filter(offer => !offerRow(offer));
+  // A target only owns later errors while the listener choice it was clicked under is unchanged.
+  const targetKey = `${localAddress}|${listenerBinding}`;
+  const targetRef = rowTarget.key === targetKey ? rowTarget.reference : "";
+  const selectRow = (reference: string) => setRowTarget({ reference, key: targetKey });
   const errorBlock = <>{error ? <ErrorDetails id="network-flow-error" className="network-error" summary={needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted} details={errorDetail(error)} summaryRef={alertRef} />
     : localError && <p id="network-flow-error" ref={alertRef} className="inline-error network-error" role="alert" tabIndex={-1}>{receiverErrorMessage(localError)}</p>}</>;
   const advanced = <>
@@ -684,11 +689,11 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
     return () => offerListener.release(restoreListener);
   }, [offerListener]);
   const rowErrorFor = (reference: string): DeviceRowError | null => {
-    if (!error || rowTarget !== reference) return null;
+    if (!error || targetRef !== reference) return null;
     return ownRowMessages.includes(error) ? { summary: error, details: "" }
       : { summary: needsReceiverUpdate(error) || errorDetail(error) !== error ? receiverErrorMessage(error) : strings.app.connectionNotCompleted, details: errorDetail(error) };
   };
-  const rowErrorShown = !!error && rowRefs.includes(rowTarget);
+  const rowErrorShown = !!error && rowRefs.includes(targetRef);
   const deviceList = audioSessionActive ? <section className="connection-entry">
     <p>{strings.network.phoneAlreadyConnected}</p>
     <button className="dialog-secondary" type="button" onClick={onClose}>{strings.network.done}</button>
@@ -698,10 +703,10 @@ export function NetworkReceiverDialog({ snapshot, backgroundStartMode, backgroun
   </section> : <section className="saved-devices">
     <ul>{rowRefs.map(reference => <SavedDeviceRow key={reference} label={choiceLabels.get(reference) ?? bindingLabel(reference)}
       online={(snapshot.presence ?? []).some(entry => entry.bindingReference === reference && entry.online)}
-      offer={reference === offerBinding ? liveOffers[0] ?? null : null} error={rowErrorFor(reference)} errorRef={alertRef} busy={busy}
-      connecting={disabled && rowTarget === reference} onConnect={() => { setRowTarget(reference); onConnect(reference, localAddress); }}
-      onAccept={() => { const offer = liveOffers[0]; if (!offer) return; setRowTarget(reference); onAcceptOffer(offer.id, reference); }}
-      onDecline={() => { const offer = liveOffers[0]; if (offer) setDismissedOffers(current => [...current, offer.id]); }} />)}</ul>
+      offer={liveOffers.find(offer => offerRow(offer) === reference) ?? null} error={rowErrorFor(reference)} errorRef={alertRef} busy={busy}
+      connecting={disabled && targetRef === reference} onConnect={() => { selectRow(reference); onConnect(reference, localAddress); }}
+      onAccept={() => { const offer = liveOffers.find(value => offerRow(value) === reference); if (!offer) return; selectRow(reference); onAcceptOffer(offer.id, reference); }}
+      onDecline={() => { const offer = liveOffers.find(value => offerRow(value) === reference); if (offer) setDismissedOffers(current => [...current, offer.id]); }} />)}</ul>
     {offers.active && <p className="network-hint saved-devices-hint">{strings.network.connectFromPhoneHint}</p>}
     {!rowErrorShown && errorBlock}
     <button className="text-button saved-devices-add" type="button" disabled={busy} onClick={onAddDevice}>{strings.network.addDeviceUsb}</button>
